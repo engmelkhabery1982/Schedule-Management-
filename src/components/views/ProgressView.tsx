@@ -1,0 +1,295 @@
+import { useState, useEffect } from 'react';
+import { supabase } from '@/lib/supabase';
+import type { Project, Activity, ProgressUpdate } from '@/types';
+import { TrendingUp, Save, Calendar, CheckCircle, Clock } from 'lucide-react';
+
+interface ProgressViewProps {
+  project: Project | null;
+}
+
+export default function ProgressView({ project }: ProgressViewProps) {
+  const [activities, setActivities] = useState<Activity[]>([]);
+  const [updates, setUpdates] = useState<ProgressUpdate[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [selectedActivity, setSelectedActivity] = useState<string | null>(null);
+  const [updateForm, setUpdateForm] = useState({
+    percent_complete: 0,
+    actual_quantity: 0,
+    notes: '',
+    update_date: new Date().toISOString().split('T')[0],
+  });
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (project) loadData();
+    else setLoading(false);
+  }, [project]);
+
+  async function loadData() {
+    if (!project) return;
+    setLoading(true);
+    const [actRes, updRes] = await Promise.all([
+      supabase.from('activities').select('*').eq('project_id', project.id).order('sort_order', { ascending: true }),
+      supabase.from('progress_updates').select('*').eq('project_id', project.id).order('update_date', { ascending: false }),
+    ]);
+    setActivities(actRes.data || []);
+    setUpdates(updRes.data || []);
+    setLoading(false);
+  }
+
+  async function handleSaveUpdate() {
+    if (!project || !selectedActivity) return;
+    setSaving(true);
+    const activity = activities.find((a) => a.id === selectedActivity);
+    if (!activity) return;
+
+    // Insert progress update
+    const { error: insErr } = await supabase.from('progress_updates').insert({
+      project_id: project.id,
+      activity_id: selectedActivity,
+      update_date: updateForm.update_date,
+      percent_complete: updateForm.percent_complete,
+      actual_quantity: updateForm.actual_quantity,
+      notes: updateForm.notes || null,
+    });
+    if (insErr) {
+      setSaving(false);
+      return;
+    }
+
+    // Update activity percent complete and actual dates
+    const updates: { percent_complete: number; actual_start?: string; actual_finish?: string } = {
+      percent_complete: updateForm.percent_complete,
+    };
+    if (updateForm.percent_complete > 0 && !activity.actual_start) {
+      updates.actual_start = updateForm.update_date;
+    }
+    if (updateForm.percent_complete >= 100) {
+      updates.actual_finish = updateForm.update_date;
+    }
+    await supabase.from('activities').update(updates).eq('id', selectedActivity);
+
+    // Reload
+    await loadData();
+    setUpdateForm({ percent_complete: 0, actual_quantity: 0, notes: '', update_date: new Date().toISOString().split('T')[0] });
+    setSelectedActivity(null);
+    setSaving(false);
+  }
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-full">
+        <div className="animate-spin rounded-full h-12 w-12 border-4 border-amber-500 border-t-transparent"></div>
+      </div>
+    );
+  }
+
+  if (!project) {
+    return <div className="text-center text-slate-400 py-8">لا يوجد مشروع محدد</div>;
+  }
+
+  if (activities.length === 0) {
+    return (
+      <div className="text-center py-12">
+        <TrendingUp size={48} className="text-slate-300 mx-auto mb-3" />
+        <p className="text-slate-500">لا توجد أنشطة. استورد المقايسة أولاً</p>
+      </div>
+    );
+  }
+
+  const completed = activities.filter((a) => a.percent_complete >= 100).length;
+  const inProgress = activities.filter((a) => a.percent_complete > 0 && a.percent_complete < 100).length;
+  const overall = activities.length > 0 ? activities.reduce((s, a) => s + a.percent_complete, 0) / activities.length : 0;
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <h1 className="text-2xl font-bold text-slate-800">تتبع التقدم اليومي</h1>
+        <p className="text-sm text-slate-500 mt-1">تحديث حالة الأنشطة ونسية الإنجاز</p>
+      </div>
+
+      {/* Summary cards */}
+      <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-4">
+          <div className="flex items-center gap-2 text-slate-500 mb-1">
+            <TrendingUp size={18} />
+            <span className="text-sm">الإنجاز الكلي</span>
+          </div>
+          <p className="text-2xl font-bold text-slate-800">{overall.toFixed(1)}%</p>
+          <div className="h-2 bg-slate-100 rounded-full mt-2 overflow-hidden">
+            <div className="h-full bg-emerald-500 rounded-full transition-all" style={{ width: `${overall}%` }} />
+          </div>
+        </div>
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-4">
+          <div className="flex items-center gap-2 text-slate-500 mb-1">
+            <CheckCircle size={18} />
+            <span className="text-sm">مكتملة</span>
+          </div>
+          <p className="text-2xl font-bold text-emerald-600">{completed}</p>
+        </div>
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-4">
+          <div className="flex items-center gap-2 text-slate-500 mb-1">
+            <Clock size={18} />
+            <span className="text-sm">قيد التنفيذ</span>
+          </div>
+          <p className="text-2xl font-bold text-blue-600">{inProgress}</p>
+        </div>
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-4">
+          <div className="flex items-center gap-2 text-slate-500 mb-1">
+            <Calendar size={18} />
+            <span className="text-sm">إجمالي الأنشطة</span>
+          </div>
+          <p className="text-2xl font-bold text-slate-800">{activities.length}</p>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {/* Activity list for selection */}
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+          <h3 className="font-semibold text-slate-800 p-4 border-b border-slate-100">اختر نشاطاً للتحديث</h3>
+          <div className="max-h-96 overflow-y-auto divide-y divide-slate-100">
+            {activities.map((act) => (
+              <button
+                key={act.id}
+                onClick={() => {
+                  setSelectedActivity(act.id);
+                  setUpdateForm({
+                    percent_complete: act.percent_complete,
+                    actual_quantity: 0,
+                    notes: '',
+                    update_date: new Date().toISOString().split('T')[0],
+                  });
+                }}
+                className={`w-full text-right p-3 hover:bg-slate-50 transition-colors ${
+                  selectedActivity === act.id ? 'bg-amber-50 border-r-4 border-amber-500' : ''
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-medium text-slate-700 truncate">{act.name}</p>
+                    <p className="text-xs text-slate-400">{act.code} · {act.duration_days} يوم</p>
+                  </div>
+                  <div className="flex items-center gap-2 flex-shrink-0">
+                    <div className="w-20 h-2 bg-slate-100 rounded-full overflow-hidden">
+                      <div className="h-full bg-emerald-500 rounded-full" style={{ width: `${act.percent_complete}%` }} />
+                    </div>
+                    <span className="text-xs font-semibold text-slate-600 w-10">{act.percent_complete}%</span>
+                  </div>
+                </div>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Update form */}
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
+          <h3 className="font-semibold text-slate-800 mb-4">تحديث التقدم</h3>
+          {selectedActivity ? (
+            <div className="space-y-4">
+              <div>
+                <p className="text-sm text-slate-500 mb-1">النشاط المحدد:</p>
+                <p className="text-sm font-medium text-slate-700">
+                  {activities.find((a) => a.id === selectedActivity)?.name}
+                </p>
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-slate-600 mb-1">التاريخ</label>
+                <input
+                  type="date"
+                  value={updateForm.update_date}
+                  onChange={(e) => setUpdateForm({ ...updateForm, update_date: e.target.value })}
+                  className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-amber-500 focus:border-transparent outline-none text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-slate-600 mb-1">نسبة الإنجاز (%)</label>
+                <input
+                  type="number"
+                  min="0"
+                  max="100"
+                  value={updateForm.percent_complete}
+                  onChange={(e) => setUpdateForm({ ...updateForm, percent_complete: Math.min(100, Math.max(0, parseFloat(e.target.value) || 0)) })}
+                  className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-amber-500 focus:border-transparent outline-none text-sm"
+                />
+                <input
+                  type="range"
+                  min="0"
+                  max="100"
+                  value={updateForm.percent_complete}
+                  onChange={(e) => setUpdateForm({ ...updateForm, percent_complete: parseFloat(e.target.value) })}
+                  className="w-full mt-2 accent-amber-500"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-slate-600 mb-1">الكمية المنفذة</label>
+                <input
+                  type="number"
+                  value={updateForm.actual_quantity}
+                  onChange={(e) => setUpdateForm({ ...updateForm, actual_quantity: parseFloat(e.target.value) || 0 })}
+                  className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-amber-500 focus:border-transparent outline-none text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-slate-600 mb-1">ملاحظات</label>
+                <textarea
+                  value={updateForm.notes}
+                  onChange={(e) => setUpdateForm({ ...updateForm, notes: e.target.value })}
+                  rows={3}
+                  className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-amber-500 focus:border-transparent outline-none text-sm resize-none"
+                />
+              </div>
+              <button
+                onClick={handleSaveUpdate}
+                disabled={saving}
+                className="w-full flex items-center justify-center gap-2 bg-amber-500 text-slate-900 py-2.5 rounded-lg font-semibold hover:bg-amber-400 transition-colors disabled:opacity-50"
+              >
+                <Save size={18} />
+                {saving ? 'جاري الحفظ...' : 'حفظ التحديث'}
+              </button>
+            </div>
+          ) : (
+            <p className="text-sm text-slate-400 text-center py-8">اختر نشاطاً من القائمة لتحديث تقدمه</p>
+          )}
+        </div>
+      </div>
+
+      {/* Recent updates */}
+      {updates.length > 0 && (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+          <h3 className="font-semibold text-slate-800 p-4 border-b border-slate-100">آخر التحديثات</h3>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead className="bg-slate-50 text-slate-600">
+                <tr>
+                  <th className="text-right p-3 font-medium">التاريخ</th>
+                  <th className="text-right p-3 font-medium">النشاط</th>
+                  <th className="text-right p-3 font-medium">نسبة الإنجاز</th>
+                  <th className="text-right p-3 font-medium">ملاحظات</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {updates.slice(0, 20).map((u) => {
+                  const act = activities.find((a) => a.id === u.activity_id);
+                  return (
+                    <tr key={u.id} className="hover:bg-slate-50">
+                      <td className="p-3 text-slate-600 whitespace-nowrap">{u.update_date}</td>
+                      <td className="p-3 text-slate-700 max-w-xs truncate">{act?.name || '-'}</td>
+                      <td className="p-3">
+                        <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${
+                          u.percent_complete >= 100 ? 'bg-emerald-100 text-emerald-700' : 'bg-blue-100 text-blue-700'
+                        }`}>
+                          {u.percent_complete}%
+                        </span>
+                      </td>
+                      <td className="p-3 text-slate-500 max-w-xs truncate">{u.notes || '-'}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
