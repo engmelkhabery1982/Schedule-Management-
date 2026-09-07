@@ -423,71 +423,14 @@ export default function Dashboard({ project, onNavigate }: DashboardProps) {
       </div>
 
       {/* KPI Cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4 items-stretch">
         {kpis.map((kpi) => {
           const Icon = kpi.icon;
           return (
-            <div key={kpi.label} className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 hover:shadow-md transition-shadow">
+            <div key={kpi.label} className="min-w-0 bg-white rounded-xl shadow-sm border border-slate-200 p-5 hover:shadow-md transition-shadow">
               <div className="flex items-start justify-between mb-3">
                 <div className={`w-12 h-12 ${kpi.bg} rounded-lg flex items-center justify-center`}>
                   <Icon size={24} className={kpi.text} />
-                </div>
-
-                <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
-                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
-                    <div>
-                      <h3 className="font-semibold text-slate-800">الصحة التشغيلية للمشروع</h3>
-                      <p className="text-xs text-slate-500 mt-1">درجة مركبة من الأداء والإنذارات وخط الأساس والموارد</p>
-                    </div>
-
-                    <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
-                      <div className="flex items-center justify-between mb-3">
-                        <h3 className="font-semibold text-slate-800">محاكاة سيناريو التعافي</h3>
-                        <span className={`text-xs px-3 py-1 rounded-full ${recoveryScenario.feasibility === 'feasible' ? 'bg-emerald-50 text-emerald-700' : recoveryScenario.feasibility === 'strained' ? 'bg-amber-50 text-amber-700' : 'bg-red-50 text-red-700'}`}>
-                          {recoveryScenario.feasibility === 'feasible' ? 'قابل للتنفيذ' : recoveryScenario.feasibility === 'strained' ? 'مجهد' : 'غير قابل للتنفيذ'}
-                        </span>
-                      </div>
-                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-sm">
-                        <div className="rounded bg-slate-50 p-3"><span className="text-slate-500">التسليم بعد المحاكاة</span><p className="font-bold">{recoveryScenario.finishDate || '-'}</p></div>
-                        <div className="rounded bg-slate-50 p-3"><span className="text-slate-500">التكلفة الإضافية</span><p className="font-bold text-amber-700">{recoveryScenario.incrementalCost.toLocaleString()}</p></div>
-                        <div className="rounded bg-slate-50 p-3"><span className="text-slate-500">الأنشطة الحساسة</span><p className="font-bold text-red-700">{recoveryScenario.impactedActivities}</p></div>
-                      </div>
-                      <p className="mt-3 text-xs text-slate-500">المحاكاة تفترض رفع الإنتاجية 10% وزيادة القدرة 10% وتكلفة إضافية 8%، ولا تغيّر الخطة المعتمدة.</p>
-                    </div>
-
-                    <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
-                      <div className="flex items-center justify-between mb-3">
-                        <h3 className="font-semibold text-slate-800">خطة التعافي المطلوبة</h3>
-                        <span className={`text-xs px-3 py-1 rounded-full ${
-                          recovery.feasibility === 'unlikely' ? 'bg-red-50 text-red-700' :
-                            recovery.feasibility === 'strained' ? 'bg-amber-50 text-amber-700' :
-                              'bg-emerald-50 text-emerald-700'
-                        }`}>
-                          {recovery.feasibility === 'not_required' ? 'لا تحتاج تعافي' : recovery.feasibility === 'feasible' ? 'قابلة للتنفيذ' : recovery.feasibility === 'strained' ? 'مجهدة' : 'غير مرجحة'}
-                        </span>
-                      </div>
-                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-sm">
-                        <div className="rounded bg-slate-50 p-3"><span className="text-slate-500">SPI المطلوب</span><p className="font-bold text-slate-800">{recovery.requiredSpi.toFixed(2)}</p></div>
-                        <div className="rounded bg-slate-50 p-3"><span className="text-slate-500">الإنتاج اليومي المطلوب</span><p className="font-bold text-slate-800">{recovery.requiredDailyQuantity.toFixed(2)}</p></div>
-                        <div className="rounded bg-slate-50 p-3"><span className="text-slate-500">فجوة التكلفة</span><p className="font-bold text-amber-700">{recovery.costGap.toLocaleString()}</p></div>
-                      </div>
-                      <p className="mt-3 text-sm text-slate-600">{recovery.action}</p>
-                    </div>
-                    <div className={`text-3xl font-bold ${controlHealth.score >= 80 ? 'text-emerald-600' : controlHealth.score >= 60 ? 'text-amber-600' : 'text-red-600'}`}>
-                      {controlHealth.score}/100
-                    </div>
-                  </div>
-                  <div className="h-3 bg-slate-100 rounded-full overflow-hidden mb-4">
-                    <div className={`h-full rounded-full ${controlHealth.score >= 80 ? 'bg-emerald-500' : controlHealth.score >= 60 ? 'bg-amber-500' : 'bg-red-500'}`} style={{ width: `${controlHealth.score}%` }} />
-                  </div>
-                  <div className="space-y-2">
-                    {controlHealth.recommendations.map((recommendation) => (
-                      <div key={recommendation.title} className="rounded-lg bg-slate-50 p-3">
-                        <p className="text-sm font-semibold text-slate-700">{recommendation.title}</p>
-                        <p className="text-xs text-slate-500 mt-1">{recommendation.action}</p>
-                      </div>
-                    ))}
-                  </div>
                 </div>
                 <span className="text-2xl font-bold text-slate-800">{kpi.value}</span>
               </div>
@@ -506,6 +449,27 @@ export default function Dashboard({ project, onNavigate }: DashboardProps) {
             </div>
           );
         })}
+      </div>
+
+      <div className="grid grid-cols-1 xl:grid-cols-3 gap-6 items-stretch">
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 min-w-0">
+          <div className="flex items-center justify-between mb-4">
+            <div><h3 className="font-semibold text-slate-800">الصحة التشغيلية</h3><p className="text-xs text-slate-500 mt-1">مؤشر مركب للتحكم</p></div>
+            <span className={`text-3xl font-bold ${controlHealth.score >= 80 ? 'text-emerald-600' : controlHealth.score >= 60 ? 'text-amber-600' : 'text-red-600'}`}>{controlHealth.score}</span>
+          </div>
+          <div className="h-3 bg-slate-100 rounded-full overflow-hidden mb-4"><div className={`h-full ${controlHealth.score >= 80 ? 'bg-emerald-500' : controlHealth.score >= 60 ? 'bg-amber-500' : 'bg-red-500'}`} style={{ width: `${controlHealth.score}%` }} /></div>
+          <div className="space-y-2">{controlHealth.recommendations.slice(0, 3).map((item) => <div key={item.title} className="rounded-lg bg-slate-50 p-3"><p className="text-sm font-semibold text-slate-700">{item.title}</p><p className="text-xs text-slate-500 mt-1">{item.action}</p></div>)}</div>
+        </div>
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 min-w-0">
+          <div className="flex items-center justify-between mb-4"><h3 className="font-semibold text-slate-800">خطة التعافي</h3><span className="text-xs text-slate-500">{recovery.feasibility === 'not_required' ? 'لا تحتاج' : recovery.feasibility}</span></div>
+          <div className="grid grid-cols-3 gap-2 text-sm"><div className="rounded bg-slate-50 p-3"><span className="text-xs text-slate-500">SPI مطلوب</span><p className="font-bold">{recovery.requiredSpi.toFixed(2)}</p></div><div className="rounded bg-slate-50 p-3"><span className="text-xs text-slate-500">كمية/يوم</span><p className="font-bold">{recovery.requiredDailyQuantity.toFixed(1)}</p></div><div className="rounded bg-slate-50 p-3"><span className="text-xs text-slate-500">فجوة مالية</span><p className="font-bold text-amber-700">{recovery.costGap.toLocaleString()}</p></div></div>
+          <p className="mt-4 text-sm text-slate-600 leading-6">{recovery.action}</p>
+        </div>
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 min-w-0">
+          <div className="flex items-center justify-between mb-4"><h3 className="font-semibold text-slate-800">محاكاة التعافي</h3><span className="text-xs text-slate-500">{recoveryScenario.feasibility}</span></div>
+          <div className="space-y-3 text-sm"><div className="flex justify-between"><span className="text-slate-500">تاريخ التسليم</span><b>{recoveryScenario.finishDate || '-'}</b></div><div className="flex justify-between"><span className="text-slate-500">تكلفة إضافية</span><b className="text-amber-700">{recoveryScenario.incrementalCost.toLocaleString()}</b></div><div className="flex justify-between"><span className="text-slate-500">أنشطة حساسة</span><b className="text-red-700">{recoveryScenario.impactedActivities}</b></div></div>
+          <p className="mt-4 text-xs text-slate-500 leading-5">رفع افتراضي للإنتاجية والقدرة بنسبة 10% وتكلفة 8%، دون تعديل الخطة المعتمدة.</p>
+        </div>
       </div>
 
       {/* Two column layout */}

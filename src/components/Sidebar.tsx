@@ -11,7 +11,7 @@ interface SidebarProps {
   activeView: ViewName;
   onViewChange: (view: ViewName) => void;
   project: Project | null;
-  onProjectChange: () => void;
+  onProjectChange: (project?: Project) => void;
 }
 
 export default function Sidebar({ activeView, onViewChange, project, onProjectChange }: SidebarProps) {
@@ -29,9 +29,8 @@ export default function Sidebar({ activeView, onViewChange, project, onProjectCh
   }
 
   async function selectProject(p: Project) {
-    await supabase.from('projects').update({}).eq('id', p.id);
     setShowProjectList(false);
-    onProjectChange();
+    onProjectChange(p);
   }
 
   const navItems: { view: ViewName; label: string; icon: typeof LayoutDashboard }[] = [

@@ -31,7 +31,12 @@ function App() {
     setLoading(false);
   }
 
-  function handleProjectChange() {
+  function handleProjectChange(selectedProject?: Project) {
+    if (selectedProject) {
+      setProject(selectedProject);
+      setActiveView('dashboard');
+      return;
+    }
     loadLastProject();
   }
 
