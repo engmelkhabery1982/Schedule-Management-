@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { supabase } from '@/lib/supabase';
-import type { Project, Activity, Risk, Issue, BudgetLine, ProgressUpdate, BaselineActivity, ProjectAlert, CostTransaction } from '@/types';
-import { analyzeForecast, calculateEvmMetrics, calculateWeightedProgress } from '@/lib/planningEngine';
+import type { Project, Activity, Risk, Issue, BudgetLine, ProgressUpdate, BaselineActivity, ProjectAlert, CostTransaction, BoqItem } from '@/types';
+import { analyzeForecast, calculateQuantityBasedEvm, calculateWeightedProgress } from '@/lib/planningEngine';
 import { generateScheduleAlerts } from '@/lib/alertEngine';
 import { generateScheduleQualityAlerts } from '@/lib/scheduleQualityEngine';
 import { generateResourceConflictAlerts } from '@/lib/resourceConflictEngine';
@@ -28,6 +28,7 @@ export default function Dashboard({ project, onNavigate }: DashboardProps) {
   const [progressUpdates, setProgressUpdates] = useState<ProgressUpdate[]>([]);
   const [baselineActivities, setBaselineActivities] = useState<BaselineActivity[]>([]);
   const [approvedActualCost, setApprovedActualCost] = useState(0);
+  const [boqItems, setBoqItems] = useState<BoqItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [alerts, setAlerts] = useState<ProjectAlert[]>([]);
   const [error, setError] = useState('');
@@ -41,7 +42,7 @@ export default function Dashboard({ project, onNavigate }: DashboardProps) {
     if (!project) return;
     setLoading(true);
     setError('');
-    const [actRes, riskRes, issueRes, budgetRes, progRes, costRes, baselineRes, alertsRes, linksRes, assignmentsRes, resourcesRes] = await Promise.all([
+    const [actRes, riskRes, issueRes, budgetRes, progRes, costRes, baselineRes, alertsRes, linksRes, assignmentsRes, resourcesRes, boqRes] = await Promise.all([
       supabase.from('activities').select('*, wbs_node:wbs_nodes(*)').eq('project_id', project.id),
       supabase.from('risks').select('*').eq('project_id', project.id),
       supabase.from('issues').select('*').eq('project_id', project.id),
@@ -53,8 +54,9 @@ export default function Dashboard({ project, onNavigate }: DashboardProps) {
       supabase.from('activity_links').select('*').eq('project_id', project.id),
       supabase.from('activity_resources').select('*').eq('project_id', project.id),
       supabase.from('resources').select('*').eq('project_id', project.id),
+      supabase.from('boq_items').select('*').eq('project_id', project.id),
     ]);
-    const queryError = [actRes, riskRes, issueRes, budgetRes, progRes, costRes, baselineRes, alertsRes, linksRes, assignmentsRes, resourcesRes]
+    const queryError = [actRes, riskRes, issueRes, budgetRes, progRes, costRes, baselineRes, alertsRes, linksRes, assignmentsRes, resourcesRes, boqRes]
       .find((result) => result.error)?.error;
     if (queryError) {
       setError(`تعذر تحميل بيانات التحكم: ${queryError.message}`);
@@ -67,6 +69,7 @@ export default function Dashboard({ project, onNavigate }: DashboardProps) {
     setBudgetLines(budgetRes.data || []);
     setProgressUpdates(progRes.data || []);
     setApprovedActualCost((costRes.data || []).reduce((sum, item) => sum + Number(item.amount || 0), 0));
+    setBoqItems((boqRes.data || []) as BoqItem[]);
     setBaselineActivities((baselineRes.data || []) as BaselineActivity[]);
     setAlerts((alertsRes.data || []) as ProjectAlert[]);
     const activityData = (actRes.data || []) as Activity[];
@@ -87,7 +90,7 @@ export default function Dashboard({ project, onNavigate }: DashboardProps) {
           return sum + (todayTime <= start ? 0 : todayTime >= finish || finish <= start ? 1 : (todayTime - start) / (finish - start));
         }, 0) / baselineData.length
       : 0;
-    const metrics = calculateEvmMetrics(planned, plannedProgress, progress, actual);
+    const metrics = calculateQuantityBasedEvm(activityData, boqRes.data || [], budgetData, plannedProgress, actual);
     const snapshotStart = activityData.reduce((min, activity) => !activity.early_start || (min && min <= activity.early_start) ? min : activity.early_start, null as string | null);
     const snapshotFinish = activityData.reduce((max, activity) => !activity.early_finish || (max && max >= activity.early_finish) ? max : activity.early_finish, null as string | null);
     const snapshotForecast = analyzeForecast(
@@ -263,7 +266,7 @@ export default function Dashboard({ project, onNavigate }: DashboardProps) {
     })()
     : 0;
 
-  const plannedBudget = budgetLines.reduce((sum, b) => sum + (b.planned_cost || 0), 0);
+  const plannedBudget = budgetLines.reduce((sum, b) => sum + Number(b.approved_budget ?? b.estimated_cost ?? b.planned_cost ?? 0), 0);
   const actualCost = approvedActualCost > 0
     ? approvedActualCost
     : budgetLines.reduce((sum, b) => sum + (b.actual_cost || 0), 0);
@@ -295,12 +298,7 @@ export default function Dashboard({ project, onNavigate }: DashboardProps) {
   // Recent progress updates
   const recentUpdates = progressUpdates.slice(0, 5);
 
-  const evm = calculateEvmMetrics(
-    plannedBudget,
-    plannedProgress,
-    overallProgress / 100,
-    actualCost,
-  );
+  const evm = calculateQuantityBasedEvm(activities, boqItems, budgetLines, plannedProgress, actualCost);
   const scheduleWarning = evm.spi < 0.9 || (plannedProgress - overallProgress / 100) > 0.1 || criticalActivities > 0 || nearCriticalActivities > 0;
   const costWarning = evm.cpi < 0.9;
   const forecast = analyzeForecast(

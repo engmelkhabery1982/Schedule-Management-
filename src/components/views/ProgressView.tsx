@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { supabase } from '@/lib/supabase';
-import type { Project, Activity, ProgressUpdate } from '@/types';
+import type { Project, Activity, ProgressUpdate, InspectionRequest, BoqItem } from '@/types';
 import { TrendingUp, Save, Calendar, CheckCircle, Clock } from 'lucide-react';
 
 interface ProgressViewProps {
@@ -10,6 +10,9 @@ interface ProgressViewProps {
 export default function ProgressView({ project }: ProgressViewProps) {
   const [activities, setActivities] = useState<Activity[]>([]);
   const [updates, setUpdates] = useState<ProgressUpdate[]>([]);
+  const [inspections, setInspections] = useState<InspectionRequest[]>([]);
+  const [boqItems, setBoqItems] = useState<BoqItem[]>([]);
+  const [inspectionForm, setInspectionForm] = useState({ activity_id: '', boq_item_id: '', request_number: '', inspection_date: new Date().toISOString().split('T')[0], quantity: 0, parent_reference: '', notes: '' });
   const [loading, setLoading] = useState(true);
   const [selectedActivity, setSelectedActivity] = useState<string | null>(null);
   const [updateForm, setUpdateForm] = useState({
@@ -29,13 +32,53 @@ export default function ProgressView({ project }: ProgressViewProps) {
   async function loadData() {
     if (!project) return;
     setLoading(true);
-    const [actRes, updRes] = await Promise.all([
+    const [actRes, updRes, inspectionRes, boqRes] = await Promise.all([
       supabase.from('activities').select('*').eq('project_id', project.id).order('sort_order', { ascending: true }),
       supabase.from('progress_updates').select('*').eq('project_id', project.id).order('update_date', { ascending: false }),
+      supabase.from('inspection_requests').select('*').eq('project_id', project.id).order('inspection_date', { ascending: false }),
+      supabase.from('boq_items').select('*').eq('project_id', project.id).order('sort_order', { ascending: true }),
     ]);
     setActivities(actRes.data || []);
     setUpdates(updRes.data || []);
+    setInspections((inspectionRes.data || []) as InspectionRequest[]);
+    setBoqItems((boqRes.data || []) as BoqItem[]);
     setLoading(false);
+  }
+
+  async function submitInspection() {
+    if (!project || !inspectionForm.activity_id || !inspectionForm.request_number || inspectionForm.quantity <= 0) {
+      setMessage('أدخل رقم طلب الفحص والنشاط والكمية قبل الإرسال.');
+      return;
+    }
+    const { error } = await supabase.from('inspection_requests').insert({
+      project_id: project.id,
+      request_number: inspectionForm.request_number,
+      activity_id: inspectionForm.activity_id,
+      boq_item_id: inspectionForm.boq_item_id || null,
+      inspection_date: inspectionForm.inspection_date,
+      inspected_quantity: inspectionForm.quantity,
+      parent_reference: inspectionForm.parent_reference || null,
+      notes: inspectionForm.notes || null,
+      status: 'submitted',
+    });
+    if (error) {
+      setMessage(`تعذر إرسال طلب الفحص: ${error.message}`);
+      return;
+    }
+    setInspectionForm({ activity_id: '', boq_item_id: '', request_number: '', inspection_date: new Date().toISOString().split('T')[0], quantity: 0, parent_reference: '', notes: '' });
+    setMessage('تم إرسال طلب الفحص للمراجعة.');
+    await loadData();
+  }
+
+  async function reviewInspection(id: string, status: 'approved' | 'rejected') {
+    const result = status === 'approved'
+      ? await supabase.rpc('approve_inspection_request', { request_uuid: id, approver: 'operator' })
+      : await supabase.from('inspection_requests').update({ status, approved_by: 'operator' }).eq('id', id).eq('status', 'submitted');
+    if (result.error) {
+      setMessage(`تعذر اعتماد طلب الفحص: ${result.error.message}`);
+      return;
+    }
+    await loadData();
   }
 
   async function handleSaveUpdate() {
@@ -290,6 +333,28 @@ export default function ProgressView({ project }: ProgressViewProps) {
             <p className="text-sm text-slate-400 text-center py-8">اختر نشاطاً من القائمة لتحديث تقدمه</p>
           )}
         </div>
+      </div>
+
+      <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
+        <h3 className="font-semibold text-slate-800 mb-2">طلبات الفحص اليومية</h3>
+        <p className="text-xs text-slate-500 mb-4">الكمية المعتمدة فقط تُرحّل تلقائياً إلى التقدم والقيمة المكتسبة.</p>
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+          <input value={inspectionForm.request_number} onChange={(e) => setInspectionForm({ ...inspectionForm, request_number: e.target.value })} placeholder="رقم طلب الفحص" className="px-3 py-2 border border-slate-300 rounded-lg text-sm" />
+          <select value={inspectionForm.activity_id} onChange={(e) => setInspectionForm({ ...inspectionForm, activity_id: e.target.value })} className="px-3 py-2 border border-slate-300 rounded-lg text-sm bg-white">
+            <option value="">النشاط / البند الفرعي</option>
+            {activities.map((item) => <option key={item.id} value={item.id}>{item.code} - {item.name}</option>)}
+          </select>
+          <select value={inspectionForm.boq_item_id} onChange={(e) => setInspectionForm({ ...inspectionForm, boq_item_id: e.target.value })} className="px-3 py-2 border border-slate-300 rounded-lg text-sm bg-white">
+            <option value="">البند الرئيسي (اختياري)</option>
+            {boqItems.map((item) => <option key={item.id} value={item.id}>{item.code} - {item.description}</option>)}
+          </select>
+          <input type="date" value={inspectionForm.inspection_date} onChange={(e) => setInspectionForm({ ...inspectionForm, inspection_date: e.target.value })} className="px-3 py-2 border border-slate-300 rounded-lg text-sm" />
+          <input type="number" min="0" value={inspectionForm.quantity} onChange={(e) => setInspectionForm({ ...inspectionForm, quantity: parseFloat(e.target.value) || 0 })} placeholder="الكمية المفحوصة" className="px-3 py-2 border border-slate-300 rounded-lg text-sm" />
+          <input value={inspectionForm.parent_reference} onChange={(e) => setInspectionForm({ ...inspectionForm, parent_reference: e.target.value })} placeholder="مرجع البند الرئيسي / WBS" className="px-3 py-2 border border-slate-300 rounded-lg text-sm" />
+          <input value={inspectionForm.notes} onChange={(e) => setInspectionForm({ ...inspectionForm, notes: e.target.value })} placeholder="ملاحظات" className="px-3 py-2 border border-slate-300 rounded-lg text-sm" />
+          <button onClick={submitInspection} className="bg-amber-500 text-slate-900 rounded-lg font-semibold text-sm">إرسال طلب فحص</button>
+        </div>
+        {inspections.length > 0 && <div className="overflow-x-auto mt-4"><table className="w-full text-sm"><thead className="bg-slate-50"><tr><th className="p-2 text-right">الطلب</th><th className="p-2 text-right">التاريخ</th><th className="p-2 text-right">النشاط</th><th className="p-2 text-right">الكمية</th><th className="p-2 text-right">الحالة</th><th className="p-2 text-right">إجراء</th></tr></thead><tbody className="divide-y">{inspections.slice(0, 30).map((request) => <tr key={request.id}><td className="p-2">{request.request_number}</td><td className="p-2">{request.inspection_date}</td><td className="p-2">{activities.find((item) => item.id === request.activity_id)?.name || '-'}</td><td className="p-2">{request.inspected_quantity}</td><td className="p-2">{request.status === 'approved' ? 'معتمد' : request.status === 'rejected' ? 'مرفوض' : 'قيد المراجعة'}</td><td className="p-2">{request.status === 'submitted' && <div className="flex gap-2"><button onClick={() => reviewInspection(request.id, 'approved')} className="text-emerald-700 text-xs font-semibold">اعتماد وترحيل</button><button onClick={() => reviewInspection(request.id, 'rejected')} className="text-red-700 text-xs">رفض</button></div>}</td></tr>)}</tbody></table></div>}
       </div>
 
       {/* Recent updates */}

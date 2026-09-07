@@ -157,6 +157,9 @@ export interface BudgetLine {
   actual_cost: number;
   remaining_cost: number;
   created_at: string;
+  estimated_cost?: number;
+  approved_budget?: number;
+  budget_basis?: string;
 }
 
 export interface ProductivityRate {
@@ -208,6 +211,31 @@ export interface CostTransaction {
   source: string | null;
   status: 'draft' | 'submitted' | 'approved' | 'rejected';
   approved_at: string | null;
+  rejected_reason: string | null;
+  created_at: string;
+  invoice_number?: string | null;
+  vendor?: string | null;
+  quantity?: number;
+  unit?: string | null;
+  unit_rate?: number | null;
+  wbs_node_id?: string | null;
+}
+
+export interface InspectionRequest {
+  id: string;
+  project_id: string;
+  request_number: string;
+  boq_item_id: string | null;
+  activity_id: string;
+  parent_reference: string | null;
+  inspection_date: string;
+  inspected_quantity: number;
+  approved_quantity: number;
+  status: 'draft' | 'submitted' | 'approved' | 'rejected';
+  inspector: string | null;
+  notes: string | null;
+  approved_at: string | null;
+  approved_by: string | null;
   rejected_reason: string | null;
   created_at: string;
 }

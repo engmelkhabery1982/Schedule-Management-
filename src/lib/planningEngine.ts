@@ -1,4 +1,4 @@
-import type { ParsedBoqRow, EvmMetrics, Activity, Risk } from '@/types';
+import type { ParsedBoqRow, EvmMetrics, Activity, Risk, BoqItem, BudgetLine } from '@/types';
 
 export interface ProductivityRule {
   category: string;
@@ -114,6 +114,30 @@ export function calculateEvmMetrics(
     etc: Math.max(0, eac - actualCost),
     vac: bac - eac,
   };
+}
+
+export function calculateQuantityBasedEvm(
+  activities: Activity[],
+  boqItems: BoqItem[],
+  budgetLines: BudgetLine[],
+  plannedProgress: number,
+  actualCost: number,
+): EvmMetrics {
+  const boqById = new Map(boqItems.map((item) => [item.id, item]));
+  const bac = budgetLines.reduce((sum, line) => sum + Number(line.approved_budget ?? line.estimated_cost ?? line.planned_cost ?? 0), 0);
+  const ev = activities.reduce((sum, activity) => {
+    const boqId = activity.wbs_node?.boq_item_id;
+    const item = boqId ? boqById.get(boqId) : undefined;
+    const value = item ? Number(item.unit_price || 0) * Math.min(Number(item.quantity || 0), Math.max(0, Number(activity.actual_quantity || 0))) : 0;
+    return sum + value;
+  }, 0);
+  const pv = bac * Math.max(0, Math.min(plannedProgress, 1));
+  const sv = ev - pv;
+  const cv = ev - actualCost;
+  const spi = pv > 0 ? ev / pv : 1;
+  const cpi = actualCost > 0 ? ev / actualCost : 1;
+  const eac = cpi > 0 ? bac / cpi : bac;
+  return { bac, pv, ev, ac: actualCost, sv, cv, spi, cpi, eac, etc: Math.max(0, eac - actualCost), vac: bac - eac };
 }
 
 export function calculateWeightedProgress(

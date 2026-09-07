@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo } from 'react';
 import { supabase } from '@/lib/supabase';
-import type { Project, BudgetLine, CostTransaction } from '@/types';
+import type { Project, BudgetLine, CostTransaction, BoqItem, Activity } from '@/types';
 import { Wallet, TrendingUp, TrendingDown, DollarSign, Save } from 'lucide-react';
 
 interface BudgetViewProps {
@@ -13,7 +13,9 @@ export default function BudgetView({ project }: BudgetViewProps) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editActual, setEditActual] = useState(0);
   const [transactions, setTransactions] = useState<CostTransaction[]>([]);
-  const [transactionForm, setTransactionForm] = useState({ description: '', amount: 0, cost_type: 'direct' });
+  const [boqItems, setBoqItems] = useState<BoqItem[]>([]);
+  const [activities, setActivities] = useState<Activity[]>([]);
+  const [transactionForm, setTransactionForm] = useState({ description: '', amount: 0, cost_type: 'direct', boq_item_id: '', activity_id: '', vendor: '', invoice_number: '' });
 
   useEffect(() => {
     if (project) loadData();
@@ -23,17 +25,22 @@ export default function BudgetView({ project }: BudgetViewProps) {
   async function loadData() {
     if (!project) return;
     setLoading(true);
-    const [{ data }, { data: transactionData }] = await Promise.all([
+    const [{ data }, { data: transactionData }, { data: boqData }, { data: activityData }] = await Promise.all([
       supabase.from('budget_lines').select('*').eq('project_id', project.id),
       supabase.from('cost_transactions').select('*').eq('project_id', project.id).order('transaction_date', { ascending: false }),
+      supabase.from('boq_items').select('*').eq('project_id', project.id).order('sort_order'),
+      supabase.from('activities').select('*').eq('project_id', project.id).order('sort_order'),
     ]);
     setBudgetLines(data || []);
     setTransactions((transactionData || []) as CostTransaction[]);
+    setBoqItems((boqData || []) as BoqItem[]);
+    setActivities((activityData || []) as Activity[]);
     setLoading(false);
   }
 
   async function addTransaction() {
     if (!project || !transactionForm.description || transactionForm.amount <= 0) return;
+    if (!transactionForm.boq_item_id && !transactionForm.activity_id) return;
     const { error } = await supabase.from('cost_transactions').insert({
       project_id: project.id,
       description: transactionForm.description,
@@ -42,9 +49,13 @@ export default function BudgetView({ project }: BudgetViewProps) {
       transaction_date: new Date().toISOString().split('T')[0],
       source: 'manual',
       status: 'submitted',
+      boq_item_id: transactionForm.boq_item_id || null,
+      activity_id: transactionForm.activity_id || null,
+      vendor: transactionForm.vendor || null,
+      invoice_number: transactionForm.invoice_number || null,
     });
     if (error) return;
-    setTransactionForm({ description: '', amount: 0, cost_type: 'direct' });
+    setTransactionForm({ description: '', amount: 0, cost_type: 'direct', boq_item_id: '', activity_id: '', vendor: '', invoice_number: '' });
     await loadData();
   }
 
@@ -166,6 +177,19 @@ export default function BudgetView({ project }: BudgetViewProps) {
               placeholder="وصف المصروف أو الفاتورة"
               className="flex-1 px-3 py-2 border border-slate-300 rounded-lg text-sm outline-none focus:ring-2 focus:ring-amber-500"
             />
+            <select value={transactionForm.cost_type} onChange={(e) => setTransactionForm({ ...transactionForm, cost_type: e.target.value })} className="px-3 py-2 border border-slate-300 rounded-lg text-sm bg-white">
+              <option value="direct">تكلفة مباشرة</option><option value="labor">رواتب وعمالة</option><option value="materials">مواد</option><option value="equipment">إيجار معدات</option><option value="overhead">مصروفات غير مباشرة</option>
+            </select>
+            <select value={transactionForm.boq_item_id} onChange={(e) => setTransactionForm({ ...transactionForm, boq_item_id: e.target.value })} className="px-3 py-2 border border-slate-300 rounded-lg text-sm bg-white">
+              <option value="">تحميل على بند المقايسة</option>
+              {boqItems.map((item) => <option key={item.id} value={item.id}>{item.code} - {item.description.slice(0, 30)}</option>)}
+            </select>
+            <select value={transactionForm.activity_id} onChange={(e) => setTransactionForm({ ...transactionForm, activity_id: e.target.value })} className="px-3 py-2 border border-slate-300 rounded-lg text-sm bg-white">
+              <option value="">أو تحميل على نشاط</option>
+              {activities.map((item) => <option key={item.id} value={item.id}>{item.code} - {item.name.slice(0, 30)}</option>)}
+            </select>
+            <input value={transactionForm.vendor} onChange={(e) => setTransactionForm({ ...transactionForm, vendor: e.target.value })} placeholder="المورد/المقاول" className="w-full sm:w-40 px-3 py-2 border border-slate-300 rounded-lg text-sm border-slate-300" />
+            <input value={transactionForm.invoice_number} onChange={(e) => setTransactionForm({ ...transactionForm, invoice_number: e.target.value })} placeholder="رقم الفاتورة" className="w-full sm:w-32 px-3 py-2 border border-slate-300 rounded-lg text-sm" />
             <input
               type="number"
               min="0"
