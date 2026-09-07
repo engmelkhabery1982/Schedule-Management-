@@ -60,7 +60,22 @@ export default function BudgetView({ project }: BudgetViewProps) {
   }
 
   async function approveTransaction(id: string) {
-    const { error } = await supabase.rpc('approve_cost_transaction', { transaction_uuid: id, approver: 'operator' });
+    const transaction = transactions.find((item) => item.id === id);
+    const { error } = await supabase.rpc('review_cost_transaction', {
+      transaction_uuid: id,
+      approver: (transaction?.approval_level || 0) === 0 ? 'project_control' : 'finance_manager',
+      decision: 'approve',
+    });
+    if (!error) await loadData();
+  }
+
+  async function rejectTransaction(id: string) {
+    const { error } = await supabase.rpc('review_cost_transaction', {
+      transaction_uuid: id,
+      approver: 'reviewer',
+      decision: 'reject',
+      review_notes: 'مرفوض للمراجعة والتصحيح',
+    });
     if (!error) await loadData();
   }
 
@@ -209,10 +224,15 @@ export default function BudgetView({ project }: BudgetViewProps) {
                 <div key={transaction.id} className="flex items-center justify-between text-sm">
                   <span className="text-slate-600">{transaction.description} · {transaction.amount.toLocaleString()} ريال</span>
                   {transaction.status === 'submitted' ? (
-                    <button onClick={() => approveTransaction(transaction.id)} className="text-emerald-700 text-xs font-medium">اعتماد</button>
+                    <div className="flex items-center gap-2">
+                      <button onClick={() => approveTransaction(transaction.id)} className="text-emerald-700 text-xs font-medium">
+                        {transaction.approval_level === 0 ? 'اعتماد فني' : 'اعتماد مالي نهائي'}
+                      </button>
+                      <button onClick={() => rejectTransaction(transaction.id)} className="text-red-700 text-xs font-medium">رفض</button>
+                    </div>
                   ) : (
                     <span className={`text-xs ${transaction.status === 'approved' ? 'text-emerald-700' : 'text-slate-500'}`}>
-                      {transaction.status === 'approved' ? 'معتمد' : transaction.status === 'rejected' ? 'مرفوض' : 'مسودة'}
+                      {transaction.status === 'approved' ? 'معتمد نهائيًا' : transaction.status === 'rejected' ? 'مرفوض' : 'مسودة'}
                     </span>
                   )}
                 </div>

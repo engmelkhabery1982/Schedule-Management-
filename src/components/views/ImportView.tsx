@@ -247,6 +247,7 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
       setParseProgress('جاري إنشاء الميزانية...');
       const budgetInserts = schedule.budgetLines.map((b) => ({
         project_id: project.id,
+        activity_id: actCodeToId[schedule.activities.find((activity) => activity.name === b.description)?.code || ''] || null,
         wbs_node_id: b.wbs_node_code ? wbsCodeToId[b.wbs_node_code] || null : null,
         description: b.description,
         planned_cost: b.planned_cost,

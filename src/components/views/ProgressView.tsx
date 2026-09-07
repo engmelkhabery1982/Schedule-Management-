@@ -13,6 +13,7 @@ export default function ProgressView({ project }: ProgressViewProps) {
   const [inspections, setInspections] = useState<InspectionRequest[]>([]);
   const [boqItems, setBoqItems] = useState<BoqItem[]>([]);
   const [inspectionForm, setInspectionForm] = useState({ activity_id: '', boq_item_id: '', request_number: '', inspection_date: new Date().toISOString().split('T')[0], quantity: 0, parent_reference: '', notes: '' });
+  const [editingInspectionId, setEditingInspectionId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [selectedActivity, setSelectedActivity] = useState<string | null>(null);
   const [updateForm, setUpdateForm] = useState({
@@ -78,6 +79,30 @@ export default function ProgressView({ project }: ProgressViewProps) {
       setMessage(`تعذر اعتماد طلب الفحص: ${result.error.message}`);
       return;
     }
+
+    await loadData();
+  }
+
+  async function saveInspectionEdit() {
+    if (!editingInspectionId) return;
+    const { error } = await supabase.rpc('update_inspection_request', {
+      request_uuid: editingInspectionId,
+      request_data: {
+        request_number: inspectionForm.request_number,
+        activity_id: inspectionForm.activity_id,
+        boq_item_id: inspectionForm.boq_item_id,
+        inspection_date: inspectionForm.inspection_date,
+        inspected_quantity: inspectionForm.quantity,
+        parent_reference: inspectionForm.parent_reference,
+        notes: inspectionForm.notes,
+      },
+    });
+    if (error) {
+      setMessage(`تعذر تعديل طلب الفحص: ${error.message}`);
+      return;
+    }
+    setEditingInspectionId(null);
+    setMessage('تم حفظ تعديل طلب الفحص وأعيد إلى حالة المراجعة.');
     await loadData();
   }
 
@@ -352,9 +377,9 @@ export default function ProgressView({ project }: ProgressViewProps) {
           <input type="number" min="0" value={inspectionForm.quantity} onChange={(e) => setInspectionForm({ ...inspectionForm, quantity: parseFloat(e.target.value) || 0 })} placeholder="الكمية المفحوصة" className="px-3 py-2 border border-slate-300 rounded-lg text-sm" />
           <input value={inspectionForm.parent_reference} onChange={(e) => setInspectionForm({ ...inspectionForm, parent_reference: e.target.value })} placeholder="مرجع البند الرئيسي / WBS" className="px-3 py-2 border border-slate-300 rounded-lg text-sm" />
           <input value={inspectionForm.notes} onChange={(e) => setInspectionForm({ ...inspectionForm, notes: e.target.value })} placeholder="ملاحظات" className="px-3 py-2 border border-slate-300 rounded-lg text-sm" />
-          <button onClick={submitInspection} className="bg-amber-500 text-slate-900 rounded-lg font-semibold text-sm">إرسال طلب فحص</button>
+          <button onClick={editingInspectionId ? saveInspectionEdit : submitInspection} className="bg-amber-500 text-slate-900 rounded-lg font-semibold text-sm">{editingInspectionId ? 'حفظ تعديل الطلب' : 'إرسال طلب فحص'}</button>
         </div>
-        {inspections.length > 0 && <div className="overflow-x-auto mt-4"><table className="w-full text-sm"><thead className="bg-slate-50"><tr><th className="p-2 text-right">الطلب</th><th className="p-2 text-right">التاريخ</th><th className="p-2 text-right">النشاط</th><th className="p-2 text-right">الكمية</th><th className="p-2 text-right">الحالة</th><th className="p-2 text-right">إجراء</th></tr></thead><tbody className="divide-y">{inspections.slice(0, 30).map((request) => <tr key={request.id}><td className="p-2">{request.request_number}</td><td className="p-2">{request.inspection_date}</td><td className="p-2">{activities.find((item) => item.id === request.activity_id)?.name || '-'}</td><td className="p-2">{request.inspected_quantity}</td><td className="p-2">{request.status === 'approved' ? 'معتمد' : request.status === 'rejected' ? 'مرفوض' : 'قيد المراجعة'}</td><td className="p-2">{request.status === 'submitted' && <div className="flex gap-2"><button onClick={() => reviewInspection(request.id, 'approved')} className="text-emerald-700 text-xs font-semibold">اعتماد وترحيل</button><button onClick={() => reviewInspection(request.id, 'rejected')} className="text-red-700 text-xs">رفض</button></div>}</td></tr>)}</tbody></table></div>}
+        {inspections.length > 0 && <div className="overflow-x-auto mt-4"><table className="w-full text-sm"><thead className="bg-slate-50"><tr><th className="p-2 text-right">الطلب</th><th className="p-2 text-right">التاريخ</th><th className="p-2 text-right">النشاط</th><th className="p-2 text-right">الكمية</th><th className="p-2 text-right">الحالة</th><th className="p-2 text-right">إجراء</th></tr></thead><tbody className="divide-y">{inspections.slice(0, 30).map((request) => <tr key={request.id}><td className="p-2">{request.request_number}</td><td className="p-2">{request.inspection_date}</td><td className="p-2">{activities.find((item) => item.id === request.activity_id)?.name || '-'}</td><td className="p-2">{request.inspected_quantity}</td><td className="p-2">{request.status === 'approved' ? 'معتمد ومرحل' : request.status === 'rejected' ? 'مرفوض' : 'قيد المراجعة'}</td><td className="p-2">{request.status === 'submitted' && <div className="flex gap-2"><button onClick={() => { setEditingInspectionId(request.id); setInspectionForm({ activity_id: request.activity_id, boq_item_id: request.boq_item_id || '', request_number: request.request_number, inspection_date: request.inspection_date, quantity: request.inspected_quantity, parent_reference: request.parent_reference || '', notes: request.notes || '' }); }} className="text-amber-700 text-xs font-semibold">تعديل</button><button onClick={() => reviewInspection(request.id, 'approved')} className="text-emerald-700 text-xs font-semibold">اعتماد وترحيل</button><button onClick={() => reviewInspection(request.id, 'rejected')} className="text-red-700 text-xs">رفض</button></div>}</td></tr>)}</tbody></table></div>}
       </div>
 
       {/* Recent updates */}

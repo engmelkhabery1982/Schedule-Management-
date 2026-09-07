@@ -89,6 +89,11 @@ export interface Resource {
   unit_rate: number;
   availability: number;
   created_at: string;
+  ownership?: 'company' | 'rental' | 'subcontractor';
+  shift_hours?: number;
+  rental_rate?: number;
+  cost_rate?: number;
+  subcontractor?: string | null;
 }
 
 export interface ActivityResource {
@@ -219,6 +224,8 @@ export interface CostTransaction {
   unit?: string | null;
   unit_rate?: number | null;
   wbs_node_id?: string | null;
+  approval_level?: number;
+  submitted_by?: string | null;
 }
 
 export interface InspectionRequest {

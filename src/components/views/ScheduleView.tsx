@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
 import { supabase } from '@/lib/supabase';
-import type { Project, Activity, ActivityLink, WbsNode, BaselineActivity } from '@/types';
+import type { Project, Activity, ActivityLink, WbsNode, BaselineActivity, Resource, ActivityResource } from '@/types';
 import { parseScheduleFile, validateImportedSchedule, type ImportedScheduleActivity } from '@/lib/scheduleImporter';
 import { calculateCpm } from '@/lib/cpmEngine';
 import { ChevronRight, ChevronDown, Zap, Flag, Clock, Upload, Save, Pencil, X } from 'lucide-react';
@@ -19,6 +19,8 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
   const [wbsNodes, setWbsNodes] = useState<WbsNode[]>([]);
   const [baselineActivities, setBaselineActivities] = useState<BaselineActivity[]>([]);
   const [links, setLinks] = useState<ActivityLink[]>([]);
+  const [resources, setResources] = useState<Resource[]>([]);
+  const [assignments, setAssignments] = useState<ActivityResource[]>([]);
   const [loading, setLoading] = useState(true);
   const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set());
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -36,16 +38,20 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
   async function loadData() {
     if (!project) return;
     setLoading(true);
-    const [actRes, wbsRes, baselineRes, linkRes] = await Promise.all([
+    const [actRes, wbsRes, baselineRes, linkRes, resourceRes, assignmentRes] = await Promise.all([
       supabase.from('activities').select('*, wbs_node:wbs_nodes(*)').eq('project_id', project.id).order('sort_order', { ascending: true }),
       supabase.from('wbs_nodes').select('*').eq('project_id', project.id).order('sort_order', { ascending: true }),
       supabase.from('baseline_activities').select('*, project_baselines!inner(project_id, is_active, status)').eq('project_baselines.project_id', project.id).eq('project_baselines.is_active', true).eq('project_baselines.status', 'approved'),
       supabase.from('activity_links').select('*').eq('project_id', project.id),
+      supabase.from('resources').select('*').eq('project_id', project.id).order('name'),
+      supabase.from('activity_resources').select('*, resource:resources(*)').eq('project_id', project.id),
     ]);
     setActivities(actRes.data || []);
     setWbsNodes(wbsRes.data || []);
     setBaselineActivities((baselineRes.data || []) as BaselineActivity[]);
     setLinks((linkRes.data || []) as ActivityLink[]);
+    setResources((resourceRes.data || []) as Resource[]);
+    setAssignments((assignmentRes.data || []) as ActivityResource[]);
     // Expand all level 1 by default
     setExpandedNodes(new Set((wbsRes.data || []).filter((w) => w.level === 1).map((w) => w.id)));
     setLoading(false);
@@ -482,6 +488,27 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
           <div className="w-1/2 border-l border-slate-200">
             <div className="bg-slate-50 p-2 border-b border-slate-200 font-medium text-sm text-slate-600">
               WBS / النشاط
+            </div>
+
+            <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+              <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                <div className="p-4 border-b border-slate-100">
+                  <h3 className="font-semibold text-slate-800">شبكة العلاقات والتسلسل</h3>
+                  <p className="text-xs text-slate-500 mt-1">كل علاقة محفوظة فعليًا وتدخل في إعادة حساب CPM.</p>
+                </div>
+                <div className="max-h-72 overflow-y-auto">
+                  <table className="w-full text-sm"><thead className="bg-slate-50"><tr><th className="p-2 text-right">السابق</th><th className="p-2 text-right">العلاقة</th><th className="p-2 text-right">اللاحق</th><th className="p-2 text-right">Lag</th></tr></thead><tbody className="divide-y">{links.map((link) => <tr key={link.id}><td className="p-2">{activities.find((a) => a.id === link.predecessor_id)?.code || '-'}</td><td className="p-2 font-semibold text-blue-700">{link.link_type}</td><td className="p-2">{activities.find((a) => a.id === link.successor_id)?.code || '-'}</td><td className="p-2">{link.lag_days} يوم</td></tr>)}</tbody></table>
+                </div>
+              </div>
+              <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                <div className="p-4 border-b border-slate-100">
+                  <h3 className="font-semibold text-slate-800">الموارد والتكلفة المخططة</h3>
+                  <p className="text-xs text-slate-500 mt-1">التكلفة = الكمية المخططة × معدل المورد، مع تمييز ملكية المورد.</p>
+                </div>
+                <div className="max-h-72 overflow-y-auto">
+                  <table className="w-full text-sm"><thead className="bg-slate-50"><tr><th className="p-2 text-right">النشاط</th><th className="p-2 text-right">المورد</th><th className="p-2 text-right">النوع</th><th className="p-2 text-right">الكمية</th><th className="p-2 text-right">التكلفة</th></tr></thead><tbody className="divide-y">{assignments.map((assignment) => { const resource = assignment.resource || resources.find((item) => item.id === assignment.resource_id); const rate = Number(resource?.cost_rate || resource?.rental_rate || resource?.unit_rate || 0); return <tr key={assignment.id}><td className="p-2">{activities.find((a) => a.id === assignment.activity_id)?.code || '-'}</td><td className="p-2">{resource?.name || '-'}</td><td className="p-2">{resource?.ownership === 'rental' ? 'إيجار' : resource?.ownership === 'subcontractor' ? 'مقاول باطن' : 'ملك الشركة'}</td><td className="p-2">{assignment.planned_quantity}</td><td className="p-2 font-semibold">{(Number(assignment.planned_quantity || 0) * rate).toLocaleString()} ريال</td></tr>; })}</tbody></table>
+                </div>
+              </div>
             </div>
           </div>
           {/* Right: Timeline */}
