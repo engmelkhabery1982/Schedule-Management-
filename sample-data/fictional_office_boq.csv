@@ -1,0 +1,18 @@
+code,description,unit,quantity,unit_price,total_price,category,section
+EW-001,Excavation and disposal of soil,m3,420,28,11760,Earthworks,01 Earthworks
+EW-002,Backfilling and compaction,m3,260,35,9100,Earthworks,01 Earthworks
+CW-001,Plain concrete blinding,m3,42,410,17220,Concrete Works,02 Concrete
+CW-002,Reinforced concrete foundations,m3,118,520,61360,Foundations,02 Concrete
+RS-001,Reinforcement steel for foundations,ton,18,2850,51300,Reinforcement Steel,02 Concrete
+CW-003,Reinforced concrete columns and beams,m3,96,560,53760,Concrete Works,02 Concrete
+RS-002,Reinforcement steel for frame,ton,16,2950,47200,Reinforcement Steel,02 Concrete
+MS-001,Concrete block masonry walls,m2,1850,92,170200,Masonry,03 Architectural
+RF-001,Roof waterproofing and thermal insulation,m2,620,145,89900,Roofing & Insulation,03 Architectural
+PL-001,Internal cement plaster,m2,3900,38,148200,Plastering,03 Architectural
+TL-001,Porcelain floor tiles,m2,980,185,181300,Tiling & Flooring,03 Architectural
+DW-001,Aluminium doors and windows,m2,310,720,223200,Doors & Windows,03 Architectural
+PT-001,Internal and external painting,m2,4700,29,136300,Painting,03 Architectural
+EL-001,Electrical power and lighting points,point,420,175,73500,Electrical,04 MEP
+PLB-001,Water supply and drainage points,point,185,240,44400,Plumbing & Drainage,04 MEP
+HV-001,Split air conditioning units,unit,36,2850,102600,HVAC,04 MEP
+GN-001,Testing commissioning and handover,item,1,45000,45000,General,05 Completion
