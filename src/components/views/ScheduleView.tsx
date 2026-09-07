@@ -1,7 +1,9 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { supabase } from '@/lib/supabase';
-import type { Project, Activity, WbsNode } from '@/types';
-import { Calendar, ChevronRight, ChevronDown, Zap, Flag, Clock } from 'lucide-react';
+import type { Project, Activity, ActivityLink, WbsNode, BaselineActivity } from '@/types';
+import { parseScheduleFile, validateImportedSchedule, type ImportedScheduleActivity } from '@/lib/scheduleImporter';
+import { calculateCpm } from '@/lib/cpmEngine';
+import { ChevronRight, ChevronDown, Zap, Flag, Clock, Upload, Save, Pencil, X } from 'lucide-react';
 
 interface ScheduleViewProps {
   project: Project | null;
@@ -15,8 +17,16 @@ interface WbsTreeNode extends WbsNode {
 export default function ScheduleView({ project }: ScheduleViewProps) {
   const [activities, setActivities] = useState<Activity[]>([]);
   const [wbsNodes, setWbsNodes] = useState<WbsNode[]>([]);
+  const [baselineActivities, setBaselineActivities] = useState<BaselineActivity[]>([]);
+  const [links, setLinks] = useState<ActivityLink[]>([]);
   const [loading, setLoading] = useState(true);
   const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set());
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editForm, setEditForm] = useState<Partial<Activity>>({});
+  const [importedActivities, setImportedActivities] = useState<ImportedScheduleActivity[]>([]);
+  const [importFileName, setImportFileName] = useState('');
+  const [message, setMessage] = useState('');
+  const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (project) loadData();
@@ -26,15 +36,43 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
   async function loadData() {
     if (!project) return;
     setLoading(true);
-    const [actRes, wbsRes] = await Promise.all([
+    const [actRes, wbsRes, baselineRes, linkRes] = await Promise.all([
       supabase.from('activities').select('*, wbs_node:wbs_nodes(*)').eq('project_id', project.id).order('sort_order', { ascending: true }),
       supabase.from('wbs_nodes').select('*').eq('project_id', project.id).order('sort_order', { ascending: true }),
+      supabase.from('baseline_activities').select('*, project_baselines!inner(project_id, is_active, status)').eq('project_baselines.project_id', project.id).eq('project_baselines.is_active', true).eq('project_baselines.status', 'approved'),
+      supabase.from('activity_links').select('*').eq('project_id', project.id),
     ]);
     setActivities(actRes.data || []);
     setWbsNodes(wbsRes.data || []);
+    setBaselineActivities((baselineRes.data || []) as BaselineActivity[]);
+    setLinks((linkRes.data || []) as ActivityLink[]);
     // Expand all level 1 by default
     setExpandedNodes(new Set((wbsRes.data || []).filter((w) => w.level === 1).map((w) => w.id)));
     setLoading(false);
+  }
+
+  async function recalculatePersistedSchedule(nextActivities?: Activity[], nextLinks?: ActivityLink[]) {
+    if (!project) return true;
+    const calculation = calculateCpm(nextActivities || activities, nextLinks || links);
+    if (calculation.cycle) {
+      setMessage(`تم إيقاف إعادة الحساب: علاقة دائرية بين ${calculation.cycle.join(' ← ')}`);
+      return false;
+    }
+    for (const result of calculation.results) {
+      const { error } = await supabase.from('activities').update({
+        early_start: result.earlyStart,
+        early_finish: result.earlyFinish,
+        late_start: result.lateStart,
+        late_finish: result.lateFinish,
+        total_float: result.totalFloat,
+        is_critical: result.isCritical,
+      }).eq('id', result.activityId);
+      if (error) {
+        setMessage(`تعذر حفظ إعادة حساب الجدول: ${error.message}`);
+        return false;
+      }
+    }
+    return true;
   }
 
   // Build WBS tree
@@ -115,6 +153,175 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
     return { left: leftPct, width: widthPct };
   }
 
+  function getBaselineVariance(activity: Activity): number | null {
+    const baseline = baselineActivities.find((item) => item.activity_id === activity.id);
+    if (!baseline || !activity.early_finish) return null;
+    return Math.round((new Date(activity.early_finish).getTime() - new Date(baseline.early_finish).getTime()) / (1000 * 60 * 60 * 24));
+  }
+
+  function startEdit(activity: Activity) {
+    setEditingId(activity.id);
+    setEditForm({
+      name: activity.name,
+      early_start: activity.early_start,
+      early_finish: activity.early_finish,
+      duration_days: activity.duration_days,
+      planned_quantity: activity.planned_quantity,
+      is_critical: activity.is_critical,
+      is_milestone: activity.is_milestone,
+    });
+  }
+
+  async function saveEdit() {
+    if (!editingId || !editForm.name) return;
+    const { error } = await supabase.from('activities').update({
+      name: editForm.name,
+      early_start: editForm.early_start || null,
+      early_finish: editForm.early_finish || null,
+      duration_days: Math.max(0, Number(editForm.duration_days) || 0),
+      planned_quantity: Math.max(0, Number(editForm.planned_quantity) || 0),
+      is_critical: Boolean(editForm.is_critical),
+      is_milestone: Boolean(editForm.is_milestone),
+    }).eq('id', editingId);
+    if (error) {
+      setMessage(`تعذر حفظ النشاط: ${error.message}`);
+      return;
+    }
+    const changed = activities.map((activity) => activity.id === editingId ? {
+      ...activity,
+      ...editForm,
+      duration_days: Number(editForm.duration_days || activity.duration_days),
+    } : activity);
+    if (!await recalculatePersistedSchedule(changed, links)) return;
+    setEditingId(null);
+    setMessage('تم حفظ تعديل النشاط وتسجيله في سجل التدقيق.');
+    await loadData();
+  }
+
+  async function handleScheduleFile(file: File) {
+    setMessage('');
+    try {
+      const parsed = await parseScheduleFile(file);
+      if (!parsed.length) throw new Error('لم يتم العثور على أنشطة صالحة في الملف');
+      const validationErrors = validateImportedSchedule(parsed);
+      if (validationErrors.length) throw new Error(validationErrors.slice(0, 3).join(' | '));
+      setImportedActivities(parsed);
+      setImportFileName(file.name);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'تعذر قراءة ملف الجدول');
+    }
+  }
+
+  async function applyImportedSchedule() {
+    if (!project || !importedActivities.length) return;
+    const extension = importFileName.split('.').pop()?.toLowerCase() || 'unknown';
+    const { data: revision, error: revisionError } = await supabase.from('schedule_revisions').insert({
+      project_id: project.id,
+      source_format: extension,
+      source_filename: importFileName,
+      activity_count: importedActivities.length,
+      status: 'draft',
+    }).select().single();
+    if (revisionError || !revision) {
+      setMessage(`تعذر تسجيل نسخة الجدول: ${revisionError?.message || 'خطأ غير معروف'}`);
+      return;
+    }
+    const { error: revisionItemsError } = await supabase.from('schedule_revision_items').insert(
+      importedActivities.map((activity) => ({
+        revision_id: revision.id,
+        activity_code: activity.code,
+        payload: activity,
+      })),
+    );
+    if (revisionItemsError) {
+      setMessage(`تعذر حفظ تفاصيل نسخة الجدول: ${revisionItemsError.message}`);
+      return;
+    }
+    const byCode = new Map(activities.map((activity) => [activity.code, activity]));
+    const updates = importedActivities.filter((item) => byCode.has(item.code));
+    const inserts = importedActivities.filter((item) => !byCode.has(item.code));
+    for (const item of updates) {
+      const existing = byCode.get(item.code);
+      if (!existing) continue;
+      const { error } = await supabase.from('activities').update({
+        name: item.name,
+        early_start: item.early_start,
+        early_finish: item.early_finish,
+        duration_days: item.duration_days,
+        percent_complete: item.percent_complete,
+        actual_start: item.actual_start,
+        actual_finish: item.actual_finish,
+        is_milestone: item.is_milestone,
+      }).eq('id', existing.id);
+      if (error) {
+        setMessage(`تعذر تحديث النشاط ${item.code}: ${error.message}`);
+        return;
+      }
+    }
+    if (inserts.length) {
+      const { error } = await supabase.from('activities').insert(inserts.map((item, index) => ({
+        project_id: project.id,
+        wbs_node_id: null,
+        code: item.code,
+        name: item.name,
+        early_start: item.early_start,
+        early_finish: item.early_finish,
+        late_start: item.early_start,
+        late_finish: item.early_finish,
+        duration_days: item.duration_days,
+        planned_quantity: 0,
+        actual_quantity: 0,
+        unit: null,
+        percent_complete: item.percent_complete,
+        is_critical: false,
+        is_milestone: item.is_milestone,
+        actual_start: item.actual_start,
+        actual_finish: item.actual_finish,
+        sort_order: activities.length + index,
+      })));
+      if (error) {
+        setMessage(`تعذر إضافة الأنشطة الجديدة: ${error.message}`);
+        return;
+      }
+    }
+    const { data: refreshedActivities } = await supabase
+      .from('activities')
+      .select('id, code')
+      .eq('project_id', project.id);
+    const activityIds = new Map((refreshedActivities || []).map((activity) => [activity.code, activity.id]));
+    const importedLinks = importedActivities.flatMap((item) => {
+      const successorId = activityIds.get(item.code);
+      if (!successorId) return [];
+      return item.predecessor_codes.flatMap((predecessorCode) => {
+        const predecessorId = activityIds.get(predecessorCode);
+        return predecessorId ? [{ project_id: project.id, predecessor_id: predecessorId, successor_id: successorId, link_type: 'FS', lag_days: 0 }] : [];
+      });
+    });
+    if (importedLinks.length) {
+      const { error: linksError } = await supabase.from('activity_links').upsert(importedLinks, {
+        onConflict: 'predecessor_id,successor_id,link_type',
+        ignoreDuplicates: true,
+      });
+      if (linksError) {
+        setMessage(`تم تطبيق الأنشطة لكن تعذر تطبيق بعض العلاقات: ${linksError.message}`);
+      }
+    }
+    const { data: finalActivities } = await supabase.from('activities').select('*').eq('project_id', project.id);
+    const { data: finalLinks } = await supabase.from('activity_links').select('*').eq('project_id', project.id);
+    if (!await recalculatePersistedSchedule((finalActivities || []) as Activity[], (finalLinks || []) as ActivityLink[])) {
+      await supabase.from('schedule_revisions').update({ status: 'rejected' }).eq('id', revision.id).eq('status', 'draft');
+      return;
+    }
+    await supabase.from('schedule_revisions').update({
+      status: 'applied',
+      applied_at: new Date().toISOString(),
+    }).eq('id', revision.id).eq('status', 'draft');
+    setImportedActivities([]);
+    setImportFileName('');
+    setMessage(`تم تطبيق نسخة الجدول ${revision.id.slice(0, 8)}: تحديث ${updates.length} وإضافة ${inserts.length} نشاط.`);
+    await loadData();
+  }
+
   function renderWbsNode(node: WbsTreeNode, depth: number): React.ReactNode {
     const isExpanded = expandedNodes.has(node.id);
     return (
@@ -173,6 +380,7 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
                     </span>
                   </div>
                 </div>
+
               );
             })}
           </>
@@ -193,17 +401,9 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
     return <div className="text-center text-slate-400 py-8">لا يوجد مشروع محدد</div>;
   }
 
-  if (activities.length === 0) {
-    return (
-      <div className="text-center py-12">
-        <Calendar size={48} className="text-slate-300 mx-auto mb-3" />
-        <p className="text-slate-500">لا يوجد جدول زمني. استورد المقايسة لإنشاء الجدول تلقائياً</p>
-      </div>
-    );
-  }
-
   return (
     <div className="space-y-4">
+      {message && <div className="p-3 bg-blue-50 border border-blue-200 text-blue-700 rounded-lg text-sm">{message}</div>}
       {/* Header */}
       <div>
         <h1 className="text-2xl font-bold text-slate-800">الجدول الزمني</h1>
@@ -218,6 +418,41 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
             </>
           )}
         </div>
+      </div>
+
+      <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div>
+            <h3 className="font-semibold text-slate-800">استيراد نسخة جدول</h3>
+            <p className="text-xs text-slate-500 mt-1">يدعم Excel/CSV وPrimavera XER وMicrosoft Project XML. تتم مطابقة الأنشطة بالكود وتسجيل النسخة.</p>
+          </div>
+          <div className="flex gap-2">
+            <input
+              ref={fileRef}
+              type="file"
+              accept=".xlsx,.xls,.csv,.txt,.xer,.xml"
+              className="hidden"
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (file) void handleScheduleFile(file);
+                event.target.value = '';
+              }}
+            />
+            <button onClick={() => fileRef.current?.click()} className="flex items-center gap-2 bg-slate-800 text-white px-3 py-2 rounded-lg text-sm">
+              <Upload size={16} /> اختيار ملف
+            </button>
+            {importedActivities.length > 0 && (
+              <button onClick={() => void applyImportedSchedule()} className="flex items-center gap-2 bg-emerald-500 text-white px-3 py-2 rounded-lg text-sm">
+                <Save size={16} /> تطبيق {importedActivities.length} نشاط
+              </button>
+            )}
+          </div>
+        </div>
+        {importedActivities.length > 0 && (
+          <div className="mt-3 p-3 bg-emerald-50 rounded-lg text-sm text-emerald-700">
+            {importFileName}: تمت قراءة {importedActivities.length} نشاطاً. سيتم تحديث الأكواد المطابقة وإضافة الأكواد الجديدة، دون حذف بيانات المشروع.
+          </div>
+        )}
       </div>
 
       {/* Legend */}
@@ -284,6 +519,9 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
                 <th className="text-right p-3 font-medium">النهاية</th>
                 <th className="text-right p-3 font-medium">المدة</th>
                 <th className="text-right p-3 font-medium">الإنجاز</th>
+                <th className="text-right p-3 font-medium">الانحراف</th>
+                <th className="text-right p-3 font-medium">الهامش</th>
+                <th className="text-right p-3 font-medium">تحرير</th>
                 <th className="text-right p-3 font-medium">حرج</th>
               </tr>
             </thead>
@@ -291,7 +529,22 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
               {activities.map((act) => (
                 <tr key={act.id} className="hover:bg-slate-50 transition-colors">
                   <td className="p-3 text-slate-500 font-mono text-xs">{act.code}</td>
-                  <td className="p-3 text-slate-700 max-w-xs truncate">{act.name}</td>
+                  <td className="p-3 text-slate-700 max-w-xs truncate">
+                    {editingId === act.id ? (
+                      <div className="space-y-2 min-w-52">
+                        <input value={String(editForm.name || '')} onChange={(event) => setEditForm({ ...editForm, name: event.target.value })} className="w-full px-2 py-1 border rounded text-xs" />
+                        <div className="grid grid-cols-2 gap-1">
+                          <input type="date" value={String(editForm.early_start || '')} onChange={(event) => setEditForm({ ...editForm, early_start: event.target.value })} className="w-full px-1 py-1 border rounded text-[10px]" />
+                          <input type="date" value={String(editForm.early_finish || '')} onChange={(event) => setEditForm({ ...editForm, early_finish: event.target.value })} className="w-full px-1 py-1 border rounded text-[10px]" />
+                        </div>
+                        <input type="number" min="0" value={Number(editForm.duration_days || 0)} onChange={(event) => setEditForm({ ...editForm, duration_days: Number(event.target.value) })} className="w-full px-2 py-1 border rounded text-xs" placeholder="المدة بالأيام" />
+                        <div className="flex gap-1">
+                          <button onClick={() => void saveEdit()} className="text-emerald-600"><Save size={14} /></button>
+                          <button onClick={() => setEditingId(null)} className="text-slate-500"><X size={14} /></button>
+                        </div>
+                      </div>
+                    ) : act.name}
+                  </td>
                   <td className="p-3 text-slate-500 text-xs">{act.wbs_node?.code || '-'}</td>
                   <td className="p-3 text-slate-600 whitespace-nowrap">{act.early_start || '-'}</td>
                   <td className="p-3 text-slate-600 whitespace-nowrap">{act.early_finish || '-'}</td>
@@ -303,6 +556,25 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
                       </div>
                       <span className="text-xs text-slate-600">{act.percent_complete}%</span>
                     </div>
+                  </td>
+                  <td className={`p-3 ${Number(act.total_float || 0) <= 0 ? 'text-red-600 font-medium' : 'text-slate-600'}`}>
+                    {Number(act.total_float || 0)} يوم
+                  </td>
+                  <td className="p-3">
+                    {(() => {
+                      const variance = getBaselineVariance(act);
+                      if (variance === null) return <span className="text-slate-400">-</span>;
+                      return (
+                        <span className={variance > 0 ? 'text-red-600 font-medium' : 'text-emerald-600'}>
+                          {variance > 0 ? `+${variance}` : variance} يوم
+                        </span>
+                      );
+                    })()}
+                  </td>
+                  <td className="p-3">
+                    <button onClick={() => startEdit(act)} className="text-blue-600 hover:text-blue-800" title="تحرير النشاط">
+                      <Pencil size={15} />
+                    </button>
                   </td>
                   <td className="p-3">
                     {act.is_critical && <Zap size={16} className="text-red-500" />}

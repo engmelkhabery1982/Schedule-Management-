@@ -19,6 +19,7 @@ export default function ProgressView({ project }: ProgressViewProps) {
     update_date: new Date().toISOString().split('T')[0],
   });
   const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState('');
 
   useEffect(() => {
     if (project) loadData();
@@ -41,39 +42,71 @@ export default function ProgressView({ project }: ProgressViewProps) {
     if (!project || !selectedActivity) return;
     setSaving(true);
     const activity = activities.find((a) => a.id === selectedActivity);
-    if (!activity) return;
-
-    // Insert progress update
-    const { error: insErr } = await supabase.from('progress_updates').insert({
-      project_id: project.id,
-      activity_id: selectedActivity,
-      update_date: updateForm.update_date,
-      percent_complete: updateForm.percent_complete,
-      actual_quantity: updateForm.actual_quantity,
-      notes: updateForm.notes || null,
-    });
-    if (insErr) {
+    if (!activity) {
+      setMessage('تعذر تحديد النشاط للتحديث.');
       setSaving(false);
       return;
     }
 
-    // Update activity percent complete and actual dates
-    const updates: { percent_complete: number; actual_start?: string; actual_finish?: string } = {
-      percent_complete: updateForm.percent_complete,
-    };
-    if (updateForm.percent_complete > 0 && !activity.actual_start) {
-      updates.actual_start = updateForm.update_date;
+    const plannedQuantity = activity.planned_quantity || 0;
+    const enteredQuantity = Math.max(0, updateForm.actual_quantity);
+    const calculatedPercent = plannedQuantity > 0
+      ? Math.min(100, (enteredQuantity / plannedQuantity) * 100)
+      : updateForm.percent_complete;
+    const previousQuantity = activity.actual_quantity || 0;
+    const latestApproved = updates
+      .filter((update) => update.activity_id === selectedActivity && update.status === 'approved')
+      .sort((a, b) => b.update_date.localeCompare(a.update_date))[0];
+    if (enteredQuantity < previousQuantity) {
+      setMessage('لا يمكن خفض الكمية التراكمية. استخدم تصحيحاً موثقاً بدلاً من عكس الإنجاز.');
+      setSaving(false);
+      return;
     }
-    if (updateForm.percent_complete >= 100) {
-      updates.actual_finish = updateForm.update_date;
+    if (latestApproved && updateForm.update_date < latestApproved.update_date) {
+      setMessage(`تاريخ التحديث يجب ألا يسبق آخر تحديث معتمد (${latestApproved.update_date}).`);
+      setSaving(false);
+      return;
     }
-    await supabase.from('activities').update(updates).eq('id', selectedActivity);
+
+    // Store the submission first; only approved submissions update control KPIs.
+    const { error: insErr } = await supabase.from('progress_updates').insert({
+      project_id: project.id,
+      activity_id: selectedActivity,
+      update_date: updateForm.update_date,
+      percent_complete: calculatedPercent,
+      actual_quantity: Math.max(0, enteredQuantity - previousQuantity),
+      quantity_to_date: enteredQuantity,
+      notes: updateForm.notes || null,
+      status: 'submitted',
+    });
+    if (insErr) {
+      setMessage(`تعذر إرسال التحديث: ${insErr.message}`);
+      setSaving(false);
+      return;
+    }
 
     // Reload
     await loadData();
     setUpdateForm({ percent_complete: 0, actual_quantity: 0, notes: '', update_date: new Date().toISOString().split('T')[0] });
     setSelectedActivity(null);
+    setMessage('تم إرسال التحديث للمراجعة والاعتماد.');
     setSaving(false);
+  }
+
+  async function reviewUpdate(updateId: string, status: 'approved' | 'rejected') {
+    const update = updates.find((item) => item.id === updateId);
+    if (!update || !project) return;
+    const { error } = status === 'approved'
+      ? await supabase.rpc('approve_progress_update', { update_uuid: updateId, approver: 'operator' })
+      : await supabase.from('progress_updates')
+        .update({ status, approved_at: null, approved_by: 'operator' })
+        .eq('id', updateId)
+        .eq('status', 'submitted');
+    if (error) {
+      setMessage(`تعذر مراجعة التحديث: ${error.message}`);
+      return;
+    }
+    await loadData();
   }
 
   if (loading) {
@@ -107,6 +140,7 @@ export default function ProgressView({ project }: ProgressViewProps) {
         <h1 className="text-2xl font-bold text-slate-800">تتبع التقدم اليومي</h1>
         <p className="text-sm text-slate-500 mt-1">تحديث حالة الأنشطة ونسية الإنجاز</p>
       </div>
+      {message && <div className="p-3 bg-blue-50 border border-blue-200 text-blue-700 rounded-lg text-sm">{message}</div>}
 
       {/* Summary cards */}
       <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
@@ -155,7 +189,7 @@ export default function ProgressView({ project }: ProgressViewProps) {
                   setSelectedActivity(act.id);
                   setUpdateForm({
                     percent_complete: act.percent_complete,
-                    actual_quantity: 0,
+                    actual_quantity: act.actual_quantity || 0,
                     notes: '',
                     update_date: new Date().toISOString().split('T')[0],
                   });
@@ -221,13 +255,18 @@ export default function ProgressView({ project }: ProgressViewProps) {
                 />
               </div>
               <div>
-                <label className="block text-sm font-medium text-slate-600 mb-1">الكمية المنفذة</label>
+                <label className="block text-sm font-medium text-slate-600 mb-1">
+                  الكمية المنفذة حتى الآن {selectedActivity && `(${activities.find((a) => a.id === selectedActivity)?.unit || 'وحدة'})`}
+                </label>
                 <input
                   type="number"
                   value={updateForm.actual_quantity}
                   onChange={(e) => setUpdateForm({ ...updateForm, actual_quantity: parseFloat(e.target.value) || 0 })}
                   className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-amber-500 focus:border-transparent outline-none text-sm"
                 />
+                <p className="text-xs text-slate-400 mt-1">
+                  يتم حساب نسبة الإنجاز تلقائياً من الكمية المخططة عند توفرها.
+                </p>
               </div>
               <div>
                 <label className="block text-sm font-medium text-slate-600 mb-1">ملاحظات</label>
@@ -265,6 +304,7 @@ export default function ProgressView({ project }: ProgressViewProps) {
                   <th className="text-right p-3 font-medium">النشاط</th>
                   <th className="text-right p-3 font-medium">نسبة الإنجاز</th>
                   <th className="text-right p-3 font-medium">ملاحظات</th>
+                  <th className="text-right p-3 font-medium">الحالة</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
@@ -282,6 +322,18 @@ export default function ProgressView({ project }: ProgressViewProps) {
                         </span>
                       </td>
                       <td className="p-3 text-slate-500 max-w-xs truncate">{u.notes || '-'}</td>
+                      <td className="p-3">
+                        {u.status === 'submitted' ? (
+                          <div className="flex gap-2">
+                            <button onClick={() => reviewUpdate(u.id, 'approved')} className="text-xs text-emerald-700 font-medium">اعتماد</button>
+                            <button onClick={() => reviewUpdate(u.id, 'rejected')} className="text-xs text-red-700 font-medium">رفض</button>
+                          </div>
+                        ) : (
+                          <span className={`text-xs font-medium ${u.status === 'approved' ? 'text-emerald-700' : 'text-slate-500'}`}>
+                            {u.status === 'approved' ? 'معتمد' : u.status === 'rejected' ? 'مرفوض' : 'مسودة'}
+                          </span>
+                        )}
+                      </td>
                     </tr>
                   );
                 })}

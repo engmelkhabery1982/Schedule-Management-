@@ -96,7 +96,7 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
         section: row.section,
         sort_order: i,
       }));
-      const { data: boqData, error: boqErr } = await supabase
+      const { error: boqErr } = await supabase
         .from('boq_items')
         .insert(boqInserts)
         .select();
@@ -104,7 +104,11 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
 
       // 3. Generate schedule
       setParseProgress('جاري إنشاء WBS والجدول الزمني...');
-      const schedule = generateSchedule(parsedRows, projectInfo.start_date);
+      const { data: productivityData, error: productivityError } = await supabase
+        .from('productivity_rates')
+        .select('category, daily_output, crew_size, difficulty_factor');
+      if (productivityError) throw new Error(`فشل تحميل معدلات الإنتاجية: ${productivityError.message}`);
+      const schedule = generateSchedule(parsedRows, projectInfo.start_date, productivityData || []);
 
       // 4. Insert WBS nodes
       const wbsInserts = schedule.wbsNodes.map((w) => ({
@@ -146,6 +150,9 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
         late_start: a.late_start,
         late_finish: a.late_finish,
         duration_days: a.duration_days,
+        planned_quantity: a.planned_quantity,
+        actual_quantity: 0,
+        unit: a.unit,
         percent_complete: 0,
         is_critical: a.is_critical,
         is_milestone: a.is_milestone,
@@ -163,6 +170,36 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
       for (const a of actData || []) {
         actCodeToId[a.code] = a.id;
       }
+
+      // Save the generated plan as an immutable initial baseline.
+      const { data: baselineData, error: baselineErr } = await supabase
+        .from('project_baselines')
+        .insert({
+          project_id: project.id,
+          version: 1,
+          name: 'Initial Baseline',
+          status: 'approved',
+          approved_at: new Date().toISOString(),
+          is_active: true,
+        })
+        .select()
+        .single();
+      if (baselineErr || !baselineData) throw new Error('فشل إنشاء خط الأساس');
+
+      const baselineActivities = (schedule.activities || [])
+        .map((activity) => ({
+          baseline_id: baselineData.id,
+          activity_id: actCodeToId[activity.code],
+          early_start: activity.early_start,
+          early_finish: activity.early_finish,
+          duration_days: activity.duration_days,
+          planned_cost: schedule.budgetLines.find((line) => line.description === activity.name)?.planned_cost || 0,
+        }))
+        .filter((activity) => Boolean(activity.activity_id));
+      const { error: baselineActivitiesErr } = await supabase
+        .from('baseline_activities')
+        .insert(baselineActivities);
+      if (baselineActivitiesErr) throw new Error('فشل حفظ أنشطة خط الأساس');
 
       // 6. Insert links
       const linkInserts = schedule.links.map((l) => ({

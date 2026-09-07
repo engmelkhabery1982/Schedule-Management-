@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo } from 'react';
 import { supabase } from '@/lib/supabase';
-import type { Project, BudgetLine } from '@/types';
+import type { Project, BudgetLine, CostTransaction } from '@/types';
 import { Wallet, TrendingUp, TrendingDown, DollarSign, Save } from 'lucide-react';
 
 interface BudgetViewProps {
@@ -12,6 +12,8 @@ export default function BudgetView({ project }: BudgetViewProps) {
   const [loading, setLoading] = useState(true);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editActual, setEditActual] = useState(0);
+  const [transactions, setTransactions] = useState<CostTransaction[]>([]);
+  const [transactionForm, setTransactionForm] = useState({ description: '', amount: 0, cost_type: 'direct' });
 
   useEffect(() => {
     if (project) loadData();
@@ -21,19 +23,45 @@ export default function BudgetView({ project }: BudgetViewProps) {
   async function loadData() {
     if (!project) return;
     setLoading(true);
-    const { data } = await supabase.from('budget_lines').select('*').eq('project_id', project.id);
+    const [{ data }, { data: transactionData }] = await Promise.all([
+      supabase.from('budget_lines').select('*').eq('project_id', project.id),
+      supabase.from('cost_transactions').select('*').eq('project_id', project.id).order('transaction_date', { ascending: false }),
+    ]);
     setBudgetLines(data || []);
+    setTransactions((transactionData || []) as CostTransaction[]);
     setLoading(false);
+  }
+
+  async function addTransaction() {
+    if (!project || !transactionForm.description || transactionForm.amount <= 0) return;
+    const { error } = await supabase.from('cost_transactions').insert({
+      project_id: project.id,
+      description: transactionForm.description,
+      amount: transactionForm.amount,
+      cost_type: transactionForm.cost_type,
+      transaction_date: new Date().toISOString().split('T')[0],
+      source: 'manual',
+      status: 'submitted',
+    });
+    if (error) return;
+    setTransactionForm({ description: '', amount: 0, cost_type: 'direct' });
+    await loadData();
+  }
+
+  async function approveTransaction(id: string) {
+    const { error } = await supabase.rpc('approve_cost_transaction', { transaction_uuid: id, approver: 'operator' });
+    if (!error) await loadData();
   }
 
   async function saveActual(id: string) {
     const line = budgetLines.find((l) => l.id === id);
     if (!line) return;
     const remaining = line.planned_cost - editActual;
-    await supabase.from('budget_lines').update({
+    const { error } = await supabase.from('budget_lines').update({
       actual_cost: editActual,
       remaining_cost: remaining,
     }).eq('id', id);
+    if (error) return;
     setEditingId(null);
     await loadData();
   }
@@ -41,11 +69,15 @@ export default function BudgetView({ project }: BudgetViewProps) {
   const totals = useMemo(() => {
     const planned = budgetLines.reduce((s, l) => s + (l.planned_cost || 0), 0);
     const committed = budgetLines.reduce((s, l) => s + (l.committed_cost || 0), 0);
-    const actual = budgetLines.reduce((s, l) => s + (l.actual_cost || 0), 0);
+    const lineActual = budgetLines.reduce((s, l) => s + (l.actual_cost || 0), 0);
+    const transactionActual = transactions
+      .filter((transaction) => transaction.status === 'approved')
+      .reduce((s, t) => s + (t.amount || 0), 0);
+    const actual = transactionActual > 0 ? transactionActual : lineActual;
     const remaining = budgetLines.reduce((s, l) => s + (l.remaining_cost || 0), 0);
     const variance = planned - actual;
     return { planned, committed, actual, remaining, variance };
-  }, [budgetLines]);
+  }, [budgetLines, transactions]);
 
   if (loading) {
     return (
@@ -123,6 +155,46 @@ export default function BudgetView({ project }: BudgetViewProps) {
         <div className="flex items-center justify-between mb-2">
           <span className="text-sm font-medium text-slate-600">نسبة استهلاك الميزانية</span>
           <span className="text-sm font-bold text-slate-800">{utilization.toFixed(1)}%</span>
+        </div>
+
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
+          <h3 className="font-semibold text-slate-800 mb-3">تسجيل تكلفة فعلية</h3>
+          <div className="flex flex-col sm:flex-row gap-3">
+            <input
+              value={transactionForm.description}
+              onChange={(e) => setTransactionForm({ ...transactionForm, description: e.target.value })}
+              placeholder="وصف المصروف أو الفاتورة"
+              className="flex-1 px-3 py-2 border border-slate-300 rounded-lg text-sm outline-none focus:ring-2 focus:ring-amber-500"
+            />
+            <input
+              type="number"
+              min="0"
+              value={transactionForm.amount}
+              onChange={(e) => setTransactionForm({ ...transactionForm, amount: parseFloat(e.target.value) || 0 })}
+              placeholder="القيمة"
+              className="w-full sm:w-32 px-3 py-2 border border-slate-300 rounded-lg text-sm outline-none focus:ring-2 focus:ring-amber-500"
+            />
+            <button onClick={addTransaction} className="bg-amber-500 text-slate-900 px-4 py-2 rounded-lg text-sm font-semibold hover:bg-amber-400">
+              إضافة
+            </button>
+          </div>
+          <p className="text-xs text-slate-400 mt-2">إجمالي الحركات المسجلة: {transactions.reduce((sum, t) => sum + t.amount, 0).toLocaleString()} ريال</p>
+          {transactions.length > 0 && (
+            <div className="mt-4 border-t border-slate-100 pt-3 space-y-2">
+              {transactions.slice(0, 10).map((transaction) => (
+                <div key={transaction.id} className="flex items-center justify-between text-sm">
+                  <span className="text-slate-600">{transaction.description} · {transaction.amount.toLocaleString()} ريال</span>
+                  {transaction.status === 'submitted' ? (
+                    <button onClick={() => approveTransaction(transaction.id)} className="text-emerald-700 text-xs font-medium">اعتماد</button>
+                  ) : (
+                    <span className={`text-xs ${transaction.status === 'approved' ? 'text-emerald-700' : 'text-slate-500'}`}>
+                      {transaction.status === 'approved' ? 'معتمد' : transaction.status === 'rejected' ? 'مرفوض' : 'مسودة'}
+                    </span>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
         <div className="h-3 bg-slate-100 rounded-full overflow-hidden">
           <div

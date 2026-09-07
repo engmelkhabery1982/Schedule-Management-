@@ -19,7 +19,7 @@ function normalizeHeader(header: string): string {
 function parseNumber(val: unknown): number {
   if (val === null || val === undefined || val === '') return 0;
   if (typeof val === 'number') return val;
-  const s = String(val).replace(/[,\s]/g, '').replace(/[^\d.\-]/g, '');
+  const s = String(val).replace(/[,\s]/g, '').replace(/[^\d.-]/g, '');
   const n = parseFloat(s);
   return isNaN(n) ? 0 : n;
 }

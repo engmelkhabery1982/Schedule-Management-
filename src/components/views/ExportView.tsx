@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { supabase } from '@/lib/supabase';
 import type { Project, Activity, ActivityLink, WbsNode, Resource, ActivityResource } from '@/types';
-import { generateXer, downloadXer, downloadCsv, activitiesToCsv } from '@/lib/xerExporter';
+import { generateXer, downloadXer, downloadCsv, activitiesToCsv, activitiesToMsProjectXml } from '@/lib/xerExporter';
 import { Download, FileText, FileSpreadsheet, Database, Loader } from 'lucide-react';
 
 interface ExportViewProps {
@@ -66,6 +66,12 @@ export default function ExportView({ project }: ExportViewProps) {
     downloadCsv(csv, `${project.name.replace(/\s+/g, '_')}_Activities.csv`);
   }
 
+  function handleExportMsProjectXml() {
+    if (!project) return;
+    const xml = activitiesToMsProjectXml(activities, project.name);
+    downloadXer(xml, `${project.name.replace(/\s+/g, '_')}_Schedule.xml`);
+  }
+
   function handleExportWbsCsv() {
     if (!project) return;
     const headers = ['Code', 'Name', 'Level', 'Parent Code'];
@@ -114,6 +120,13 @@ export default function ExportView({ project }: ExportViewProps) {
       icon: FileSpreadsheet,
       color: 'bg-emerald-50 text-emerald-600',
       action: handleExportActivitiesCsv,
+    },
+    {
+      title: 'تصدير Microsoft Project (XML)',
+      description: 'تصدير الأنشطة والتواريخ والمدد بصيغة XML القابلة للفتح في Microsoft Project',
+      icon: FileText,
+      color: 'bg-indigo-50 text-indigo-600',
+      action: handleExportMsProjectXml,
     },
     {
       title: 'تصدير WBS (CSV)',

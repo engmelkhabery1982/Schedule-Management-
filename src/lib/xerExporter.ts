@@ -150,3 +150,28 @@ export function activitiesToCsv(activities: Activity[]): string {
   ].join(','));
   return [headers.join(','), ...rows].join('\n');
 }
+
+function xmlEscape(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+export function activitiesToMsProjectXml(activities: Activity[], projectName: string): string {
+  const tasks = activities.map((activity, index) => `
+    <Task>
+      <UID>${index + 1}</UID>
+      <ID>${index + 1}</ID>
+      <Name>${xmlEscape(activity.name)}</Name>
+      <WBS>${xmlEscape(activity.code)}</WBS>
+      <Start>${activity.early_start || ''}T08:00:00</Start>
+      <Finish>${activity.early_finish || ''}T17:00:00</Finish>
+      <Duration>PT${Math.max(0, activity.duration_days) * 8}H0M0S</Duration>
+      <PercentComplete>${Math.round(activity.percent_complete || 0)}</PercentComplete>
+      <Milestone>${activity.is_milestone ? 1 : 0}</Milestone>
+    </Task>`).join('');
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Project xmlns="http://schemas.microsoft.com/project">
+  <Name>${xmlEscape(projectName)}</Name>
+  <Tasks>${tasks}
+  </Tasks>
+</Project>`;
+}

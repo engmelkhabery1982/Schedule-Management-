@@ -1,5 +1,6 @@
 import type { ParsedBoqRow } from '@/types';
 import { categorizeBoqItem } from './boqParser';
+import { calculateProductionDuration, type ProductivityRule } from './planningEngine';
 
 export interface GenWbsNode {
   code: string;
@@ -18,6 +19,9 @@ export interface GenActivity {
   late_start: string;
   late_finish: string;
   duration_days: number;
+  planned_quantity: number;
+  actual_quantity: number;
+  unit: string;
   percent_complete: number;
   is_critical: boolean;
   is_milestone: boolean;
@@ -150,7 +154,11 @@ function formatDate(date: Date): string {
   return date.toISOString().split('T')[0];
 }
 
-export function generateSchedule(boqItems: ParsedBoqRow[], startDate: string): GeneratedSchedule {
+export function generateSchedule(
+  boqItems: ParsedBoqRow[],
+  startDate: string,
+  productivityRules: ProductivityRule[] = [],
+): GeneratedSchedule {
   const projectStart = new Date(startDate);
 
   const categorized: Record<string, ParsedBoqRow[]> = {};
@@ -192,7 +200,6 @@ export function generateSchedule(boqItems: ParsedBoqRow[], startDate: string): G
   let currentDate = new Date(projectStart);
 
   for (const cat of wbsCatMap) {
-    const baseDuration = CATEGORY_BASE_DURATION[cat.name] || 5;
     const catResources = CATEGORY_RESOURCES[cat.name] || CATEGORY_RESOURCES['General'];
 
     for (const res of catResources) {
@@ -206,8 +213,7 @@ export function generateSchedule(boqItems: ParsedBoqRow[], startDate: string): G
     for (let i = 0; i < cat.items.length; i++) {
       const item = cat.items[i];
       const wbsCode = cat.childCodes[i];
-      const qtyFactor = Math.max(1, Math.sqrt(item.quantity || 1));
-      const duration = Math.max(1, Math.round(baseDuration * Math.min(qtyFactor, 5)));
+      const duration = calculateProductionDuration(item.quantity, cat.name, productivityRules);
       const actStart = new Date(currentDate);
       const actFinish = addDays(actStart, duration);
 
@@ -220,6 +226,9 @@ export function generateSchedule(boqItems: ParsedBoqRow[], startDate: string): G
         late_start: formatDate(actStart),
         late_finish: formatDate(actFinish),
         duration_days: duration,
+        planned_quantity: item.quantity,
+        actual_quantity: 0,
+        unit: item.unit,
         percent_complete: 0,
         is_critical: true,
         is_milestone: false,
@@ -241,6 +250,9 @@ export function generateSchedule(boqItems: ParsedBoqRow[], startDate: string): G
     late_start: formatDate(currentDate),
     late_finish: formatDate(currentDate),
     duration_days: 0,
+    planned_quantity: 0,
+    actual_quantity: 0,
+    unit: '',
     percent_complete: 0,
     is_critical: true,
     is_milestone: true,

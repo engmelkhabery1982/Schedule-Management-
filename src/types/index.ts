@@ -51,7 +51,11 @@ export interface Activity {
   early_finish: string | null;
   late_start: string | null;
   late_finish: string | null;
+  total_float?: number;
   duration_days: number;
+  planned_quantity: number;
+  actual_quantity: number;
+  unit: string | null;
   percent_complete: number;
   is_critical: boolean;
   is_milestone: boolean;
@@ -105,6 +109,10 @@ export interface ProgressUpdate {
   update_date: string;
   percent_complete: number;
   actual_quantity: number;
+  quantity_to_date: number;
+  status: 'draft' | 'submitted' | 'approved' | 'rejected';
+  approved_at: string | null;
+  rejected_reason: string | null;
   notes: string | null;
   created_at: string;
 }
@@ -148,6 +156,123 @@ export interface BudgetLine {
   committed_cost: number;
   actual_cost: number;
   remaining_cost: number;
+  created_at: string;
+}
+
+export interface ProductivityRate {
+  id: string;
+  category: string;
+  unit: string;
+  daily_output: number;
+  crew_size: number;
+  difficulty_factor: number;
+  created_at: string;
+}
+
+export interface BaselineActivity {
+  id: string;
+  baseline_id: string;
+  activity_id: string;
+  early_start: string;
+  early_finish: string;
+  duration_days: number;
+  planned_cost: number;
+}
+
+export type BaselineStatus = 'draft' | 'submitted' | 'approved' | 'rejected';
+
+export interface EvmMetrics {
+  bac: number;
+  pv: number;
+  ev: number;
+  ac: number;
+  sv: number;
+  cv: number;
+  spi: number;
+  cpi: number;
+  eac: number;
+  etc: number;
+  vac: number;
+}
+
+export interface CostTransaction {
+  id: string;
+  project_id: string;
+  activity_id: string | null;
+  boq_item_id: string | null;
+  category: string | null;
+  transaction_date: string;
+  description: string;
+  cost_type: string;
+  amount: number;
+  source: string | null;
+  status: 'draft' | 'submitted' | 'approved' | 'rejected';
+  approved_at: string | null;
+  rejected_reason: string | null;
+  created_at: string;
+}
+
+export interface AuditLog {
+  id: string;
+  project_id: string | null;
+  table_name: string;
+  record_id: string;
+  action: 'INSERT' | 'UPDATE' | 'DELETE';
+  old_data: Record<string, unknown> | null;
+  new_data: Record<string, unknown> | null;
+  created_at: string;
+}
+
+export interface ProjectAlert {
+  id: string;
+  project_id: string;
+  fingerprint: string;
+  alert_type: 'schedule' | 'cost' | 'data_quality' | 'resource';
+  severity: 'info' | 'warning' | 'critical';
+  title: string;
+  message: string;
+  activity_id: string | null;
+  status: 'open' | 'acknowledged' | 'resolved' | 'dismissed';
+  first_seen_at: string;
+  last_seen_at: string;
+  acknowledged_at: string | null;
+  resolved_at: string | null;
+}
+
+export interface ForecastSnapshot {
+  id: string;
+  project_id: string;
+  snapshot_date: string;
+  spi: number;
+  cpi: number;
+  forecast_finish: string | null;
+  optimistic_finish: string | null;
+  pessimistic_finish: string | null;
+  eac_realistic: number;
+  confidence: number;
+  volatility: number;
+  created_at: string;
+}
+
+export interface RecoverySnapshot {
+  id: string;
+  project_id: string;
+  snapshot_date: string;
+  required_spi: number;
+  remaining_quantity: number;
+  required_daily_quantity: number;
+  cost_gap: number;
+  feasibility: 'feasible' | 'strained' | 'unlikely' | 'not_required';
+  action: string;
+  created_at: string;
+}
+
+export interface ScenarioSimulation {
+  id: string;
+  project_id: string;
+  name: string;
+  input: Record<string, number>;
+  result: Record<string, number | string | null>;
   created_at: string;
 }
 
