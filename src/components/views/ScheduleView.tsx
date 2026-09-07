@@ -106,6 +106,52 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
     return roots;
   }, [wbsNodes, activities]);
 
+  const executionActivities = useMemo(() => {
+    const byId = new Map(activities.map((activity) => [activity.id, activity]));
+    const outgoing = new Map<string, ActivityLink[]>();
+    const indegree = new Map(activities.map((activity) => [activity.id, 0]));
+    links.forEach((link) => {
+      outgoing.set(link.predecessor_id, [...(outgoing.get(link.predecessor_id) || []), link]);
+      indegree.set(link.successor_id, (indegree.get(link.successor_id) || 0) + 1);
+    });
+    const ready = activities.filter((activity) => (indegree.get(activity.id) || 0) === 0)
+      .sort((a, b) => a.sort_order - b.sort_order || a.code.localeCompare(b.code));
+    const ordered: Activity[] = [];
+    while (ready.length > 0) {
+      const next = ready.shift();
+      if (!next) break;
+      ordered.push(next);
+      (outgoing.get(next.id) || []).forEach((link) => {
+        const remaining = (indegree.get(link.successor_id) || 0) - 1;
+        indegree.set(link.successor_id, remaining);
+        if (remaining === 0) {
+          const successor = byId.get(link.successor_id);
+          if (successor) {
+            ready.push(successor);
+            ready.sort((a, b) => a.sort_order - b.sort_order || a.code.localeCompare(b.code));
+          }
+        }
+      });
+    }
+    const included = new Set(ordered.map((activity) => activity.id));
+    return [...ordered, ...activities.filter((activity) => !included.has(activity.id))
+      .sort((a, b) => a.sort_order - b.sort_order || a.code.localeCompare(b.code))];
+  }, [activities, links]);
+
+  function getActivityLinks(activityId: string) {
+    return {
+      predecessors: links.filter((link) => link.successor_id === activityId),
+      successors: links.filter((link) => link.predecessor_id === activityId),
+    };
+  }
+
+  function getResourceSummary(activityId: string) {
+    return assignments
+      .filter((assignment) => assignment.activity_id === activityId)
+      .map((assignment) => (assignment.resource || resources.find((resource) => resource.id === assignment.resource_id))?.name)
+      .filter((name): name is string => Boolean(name));
+  }
+
   // Calculate date range for Gantt
   const { minDate, maxDate, totalDays } = useMemo(() => {
     if (activities.length === 0) return { minDate: null, maxDate: null, totalDays: 0 };
@@ -547,11 +593,12 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
         {/* Body */}
         <div className="overflow-x-auto">
           <div style={{ minWidth: `${Math.max(totalDays * 4 + 400, 800)}px` }}>
-            {tree.length > 0 ? tree.map((node) => renderWbsNode(node, 0)) : activities.map((act) => {
+            {executionActivities.map((act) => {
               const bar = getBarStyle(act);
               return <div key={act.id} className="flex items-center border-b border-slate-100 min-h-10">
                 <div className="flex items-center gap-2 p-2 min-w-0 flex-1">
-                  <span className="text-xs text-slate-400 font-mono">{act.code}</span>
+                  <span className="text-xs text-slate-400 font-mono">{act.wbs_node?.code || '-'}</span>
+                  <span className="text-xs text-slate-500 font-mono">{act.code}</span>
                   <span className="text-sm text-slate-600 truncate">{act.name}</span>
                 </div>
                 <div className="relative h-8 flex-shrink-0 flex items-center" style={{ width: '50%' }}>
@@ -562,6 +609,51 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
               </div>;
             })}
           </div>
+        </div>
+      </div>
+
+      <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+        <div className="p-4 border-b border-slate-100">
+          <h3 className="font-semibold text-slate-800">جدول الأنشطة - Primavera Activity Layout</h3>
+          <p className="text-xs text-slate-500 mt-1">الترتيب مبني على التسلسل المنطقي للعلاقات ثم ترتيب التنفيذ، وليس ترتيب الإدخال.</p>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[1250px] text-xs">
+            <thead className="bg-slate-50 text-slate-600">
+              <tr>
+                <th className="p-2 text-right">#</th>
+                <th className="p-2 text-right">كود WBS/العقد</th>
+                <th className="p-2 text-right">كود النشاط</th>
+                <th className="p-2 text-right min-w-64">الوصف</th>
+                <th className="p-2 text-right">المدة</th>
+                <th className="p-2 text-right">البداية</th>
+                <th className="p-2 text-right">النهاية</th>
+                <th className="p-2 text-right">السابق</th>
+                <th className="p-2 text-right">العلاقة</th>
+                <th className="p-2 text-right">اللاحق</th>
+                <th className="p-2 text-right min-w-48">الموارد</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {executionActivities.map((activity, index) => {
+                const activityLinks = getActivityLinks(activity.id);
+                const resourceNames = getResourceSummary(activity.id);
+                return <tr key={activity.id} className={activity.is_critical ? 'bg-red-50/40' : 'hover:bg-slate-50'}>
+                  <td className="p-2 text-slate-400">{index + 1}</td>
+                  <td className="p-2 font-mono text-slate-500">{activity.wbs_node?.code || '-'}</td>
+                  <td className="p-2 font-mono font-semibold text-slate-700">{activity.code}</td>
+                  <td className="p-2 text-slate-700">{activity.name}</td>
+                  <td className="p-2 whitespace-nowrap">{activity.duration_days} يوم</td>
+                  <td className="p-2 whitespace-nowrap">{activity.early_start || '-'}</td>
+                  <td className="p-2 whitespace-nowrap">{activity.early_finish || '-'}</td>
+                  <td className="p-2 font-mono">{activityLinks.predecessors.map((link) => activities.find((item) => item.id === link.predecessor_id)?.code).filter(Boolean).join(', ') || '-'}</td>
+                  <td className="p-2 font-semibold text-blue-700 whitespace-nowrap">{activityLinks.predecessors.map((link) => `${link.link_type} (${link.lag_days || 0})`).join(', ') || '-'}</td>
+                  <td className="p-2 font-mono">{activityLinks.successors.map((link) => activities.find((item) => item.id === link.successor_id)?.code).filter(Boolean).join(', ') || '-'}</td>
+                  <td className="p-2 text-slate-600">{resourceNames.join('، ') || 'بدون تخصيص'}</td>
+                </tr>;
+              })}
+            </tbody>
+          </table>
         </div>
       </div>
 
@@ -612,7 +704,7 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {activities.map((act) => (
+              {executionActivities.map((act) => (
                 <tr key={act.id} className="hover:bg-slate-50 transition-colors">
                   <td className="p-3 text-slate-500 font-mono text-xs">{act.code}</td>
                   <td className="p-3 text-slate-700 max-w-xs truncate">
