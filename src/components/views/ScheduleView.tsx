@@ -28,6 +28,7 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
   const [importedActivities, setImportedActivities] = useState<ImportedScheduleActivity[]>([]);
   const [importFileName, setImportFileName] = useState('');
   const [message, setMessage] = useState('');
+  const [linkForm, setLinkForm] = useState({ predecessor_id: '', successor_id: '', link_type: 'FS', lag_days: 0 });
   const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -193,6 +194,7 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
       setMessage(`تعذر حفظ النشاط: ${error.message}`);
       return;
     }
+
     const changed = activities.map((activity) => activity.id === editingId ? {
       ...activity,
       ...editForm,
@@ -201,6 +203,43 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
     if (!await recalculatePersistedSchedule(changed, links)) return;
     setEditingId(null);
     setMessage('تم حفظ تعديل النشاط وتسجيله في سجل التدقيق.');
+    await loadData();
+  }
+
+  async function addRelationship() {
+    if (!project || !linkForm.predecessor_id || !linkForm.successor_id || linkForm.predecessor_id === linkForm.successor_id) {
+      setMessage('اختر نشاطين مختلفين لإضافة علاقة.');
+      return;
+    }
+    const { data, error } = await supabase.from('activity_links').insert({
+      project_id: project.id,
+      predecessor_id: linkForm.predecessor_id,
+      successor_id: linkForm.successor_id,
+      link_type: linkForm.link_type,
+      lag_days: Number(linkForm.lag_days) || 0,
+    }).select().single();
+    if (error) {
+      setMessage(`تعذر حفظ العلاقة: ${error.message}`);
+      return;
+    }
+    const nextLinks = [...links, data as ActivityLink];
+    setLinks(nextLinks);
+    if (await recalculatePersistedSchedule(activities, nextLinks)) {
+      setLinkForm({ predecessor_id: '', successor_id: '', link_type: 'FS', lag_days: 0 });
+      setMessage('تمت إضافة العلاقة وإعادة حساب CPM.');
+      await loadData();
+    }
+  }
+
+  async function removeRelationship(id: string) {
+    const { error } = await supabase.from('activity_links').delete().eq('id', id);
+    if (error) {
+      setMessage(`تعذر حذف العلاقة: ${error.message}`);
+      return;
+    }
+    const nextLinks = links.filter((link) => link.id !== id);
+    setLinks(nextLinks);
+    await recalculatePersistedSchedule(activities, nextLinks);
     await loadData();
   }
 
@@ -490,26 +529,6 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
               WBS / النشاط
             </div>
 
-            <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
-              <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-                <div className="p-4 border-b border-slate-100">
-                  <h3 className="font-semibold text-slate-800">شبكة العلاقات والتسلسل</h3>
-                  <p className="text-xs text-slate-500 mt-1">كل علاقة محفوظة فعليًا وتدخل في إعادة حساب CPM.</p>
-                </div>
-                <div className="max-h-72 overflow-y-auto">
-                  <table className="w-full text-sm"><thead className="bg-slate-50"><tr><th className="p-2 text-right">السابق</th><th className="p-2 text-right">العلاقة</th><th className="p-2 text-right">اللاحق</th><th className="p-2 text-right">Lag</th></tr></thead><tbody className="divide-y">{links.map((link) => <tr key={link.id}><td className="p-2">{activities.find((a) => a.id === link.predecessor_id)?.code || '-'}</td><td className="p-2 font-semibold text-blue-700">{link.link_type}</td><td className="p-2">{activities.find((a) => a.id === link.successor_id)?.code || '-'}</td><td className="p-2">{link.lag_days} يوم</td></tr>)}</tbody></table>
-                </div>
-              </div>
-              <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-                <div className="p-4 border-b border-slate-100">
-                  <h3 className="font-semibold text-slate-800">الموارد والتكلفة المخططة</h3>
-                  <p className="text-xs text-slate-500 mt-1">التكلفة = الكمية المخططة × معدل المورد، مع تمييز ملكية المورد.</p>
-                </div>
-                <div className="max-h-72 overflow-y-auto">
-                  <table className="w-full text-sm"><thead className="bg-slate-50"><tr><th className="p-2 text-right">النشاط</th><th className="p-2 text-right">المورد</th><th className="p-2 text-right">النوع</th><th className="p-2 text-right">الكمية</th><th className="p-2 text-right">التكلفة</th></tr></thead><tbody className="divide-y">{assignments.map((assignment) => { const resource = assignment.resource || resources.find((item) => item.id === assignment.resource_id); const rate = Number(resource?.cost_rate || resource?.rental_rate || resource?.unit_rate || 0); return <tr key={assignment.id}><td className="p-2">{activities.find((a) => a.id === assignment.activity_id)?.code || '-'}</td><td className="p-2">{resource?.name || '-'}</td><td className="p-2">{resource?.ownership === 'rental' ? 'إيجار' : resource?.ownership === 'subcontractor' ? 'مقاول باطن' : 'ملك الشركة'}</td><td className="p-2">{assignment.planned_quantity}</td><td className="p-2 font-semibold">{(Number(assignment.planned_quantity || 0) * rate).toLocaleString()} ريال</td></tr>; })}</tbody></table>
-                </div>
-              </div>
-            </div>
           </div>
           {/* Right: Timeline */}
           <div className="w-1/2 relative overflow-x-auto">
@@ -528,7 +547,47 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
         {/* Body */}
         <div className="overflow-x-auto">
           <div style={{ minWidth: `${Math.max(totalDays * 4 + 400, 800)}px` }}>
-            {tree.map((node) => renderWbsNode(node, 0))}
+            {tree.length > 0 ? tree.map((node) => renderWbsNode(node, 0)) : activities.map((act) => {
+              const bar = getBarStyle(act);
+              return <div key={act.id} className="flex items-center border-b border-slate-100 min-h-10">
+                <div className="flex items-center gap-2 p-2 min-w-0 flex-1">
+                  <span className="text-xs text-slate-400 font-mono">{act.code}</span>
+                  <span className="text-sm text-slate-600 truncate">{act.name}</span>
+                </div>
+                <div className="relative h-8 flex-shrink-0 flex items-center" style={{ width: '50%' }}>
+                  <div className="absolute h-5 rounded flex items-center overflow-hidden" style={{ left: `${bar.left}%`, width: `${bar.width}%`, backgroundColor: act.is_critical ? '#ef4444' : '#3b82f6' }}>
+                    <div className="h-full bg-emerald-400" style={{ width: `${act.percent_complete}%` }} />
+                  </div>
+                </div>
+              </div>;
+            })}
+          </div>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+          <div className="p-4 border-b border-slate-100">
+            <h3 className="font-semibold text-slate-800">شبكة العلاقات والتسلسل</h3>
+            <p className="text-xs text-slate-500 mt-1">العلاقات المحفوظة فعليًا والمستخدمة في CPM.</p>
+            <div className="grid grid-cols-2 gap-2 mt-3">
+              <select value={linkForm.predecessor_id} onChange={(event) => setLinkForm({ ...linkForm, predecessor_id: event.target.value })} className="px-2 py-1.5 border rounded text-xs bg-white"><option value="">النشاط السابق</option>{activities.map((activity) => <option key={activity.id} value={activity.id}>{activity.code} - {activity.name}</option>)}</select>
+              <select value={linkForm.successor_id} onChange={(event) => setLinkForm({ ...linkForm, successor_id: event.target.value })} className="px-2 py-1.5 border rounded text-xs bg-white"><option value="">النشاط اللاحق</option>{activities.map((activity) => <option key={activity.id} value={activity.id}>{activity.code} - {activity.name}</option>)}</select>
+              <select value={linkForm.link_type} onChange={(event) => setLinkForm({ ...linkForm, link_type: event.target.value })} className="px-2 py-1.5 border rounded text-xs bg-white"><option value="FS">FS - نهاية لبداية</option><option value="SS">SS - بداية لبداية</option><option value="FF">FF - نهاية لنهاية</option><option value="SF">SF - بداية لنهاية</option></select>
+              <div className="flex gap-2"><input type="number" value={linkForm.lag_days} onChange={(event) => setLinkForm({ ...linkForm, lag_days: Number(event.target.value) || 0 })} className="w-20 px-2 py-1.5 border rounded text-xs" placeholder="Lag" /><button onClick={() => void addRelationship()} className="flex-1 bg-blue-600 text-white rounded text-xs">إضافة علاقة</button></div>
+            </div>
+          </div>
+          <div className="max-h-72 overflow-y-auto">
+            <table className="w-full text-sm"><thead className="bg-slate-50"><tr><th className="p-2 text-right">السابق</th><th className="p-2 text-right">العلاقة</th><th className="p-2 text-right">اللاحق</th><th className="p-2 text-right">Lag</th><th></th></tr></thead><tbody className="divide-y">{links.map((link) => <tr key={link.id}><td className="p-2">{activities.find((a) => a.id === link.predecessor_id)?.code || '-'}</td><td className="p-2 font-semibold text-blue-700">{link.link_type}</td><td className="p-2">{activities.find((a) => a.id === link.successor_id)?.code || '-'}</td><td className="p-2">{link.lag_days} يوم</td><td className="p-2"><button onClick={() => void removeRelationship(link.id)} className="text-red-600 text-xs">حذف</button></td></tr>)}</tbody></table>
+          </div>
+        </div>
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+          <div className="p-4 border-b border-slate-100">
+            <h3 className="font-semibold text-slate-800">الموارد والتكلفة المخططة</h3>
+            <p className="text-xs text-slate-500 mt-1">الكمية المخططة × معدل المورد، حسب الملكية.</p>
+          </div>
+          <div className="max-h-72 overflow-y-auto">
+            <table className="w-full text-sm"><thead className="bg-slate-50"><tr><th className="p-2 text-right">النشاط</th><th className="p-2 text-right">المورد</th><th className="p-2 text-right">النوع</th><th className="p-2 text-right">الكمية</th><th className="p-2 text-right">التكلفة</th></tr></thead><tbody className="divide-y">{assignments.map((assignment) => { const resource = assignment.resource || resources.find((item) => item.id === assignment.resource_id); const rate = Number(resource?.cost_rate || resource?.rental_rate || resource?.unit_rate || 0); return <tr key={assignment.id}><td className="p-2">{activities.find((a) => a.id === assignment.activity_id)?.code || '-'}</td><td className="p-2">{resource?.name || '-'}</td><td className="p-2">{resource?.ownership === 'rental' ? 'إيجار' : resource?.ownership === 'subcontractor' ? 'مقاول باطن' : 'ملك الشركة'}</td><td className="p-2">{assignment.planned_quantity}</td><td className="p-2 font-semibold">{(Number(assignment.planned_quantity || 0) * rate).toLocaleString()} ريال</td></tr>; })}</tbody></table>
           </div>
         </div>
       </div>
