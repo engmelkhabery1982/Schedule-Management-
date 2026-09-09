@@ -1,7 +1,8 @@
 import { useState, useEffect } from 'react';
 import { supabase } from '@/lib/supabase';
-import type { Project, Risk, Issue } from '@/types';
-import { AlertTriangle, Plus, X, Lightbulb, Shield } from 'lucide-react';
+import type { Project, Risk, Issue, Activity, ActivityLink } from '@/types';
+import { runMonteCarloSimulation, type MonteCarloResult } from '@/lib/monteCarloEngine';
+import { AlertTriangle, Plus, X, Lightbulb, Shield, Dices, Play, CheckCircle2, TrendingUp, BarChart3 } from 'lucide-react';
 
 interface RisksViewProps {
   project: Project | null;
@@ -10,8 +11,10 @@ interface RisksViewProps {
 export default function RisksView({ project }: RisksViewProps) {
   const [risks, setRisks] = useState<Risk[]>([]);
   const [issues, setIssues] = useState<Issue[]>([]);
+  const [activities, setActivities] = useState<Activity[]>([]);
+  const [links, setLinks] = useState<ActivityLink[]>([]);
   const [loading, setLoading] = useState(true);
-  const [tab, setTab] = useState<'risks' | 'issues'>('risks');
+  const [tab, setTab] = useState<'risks' | 'issues' | 'simulation'>('risks');
   const [showRiskForm, setShowRiskForm] = useState(false);
   const [showIssueForm, setShowIssueForm] = useState(false);
   const [riskForm, setRiskForm] = useState({
@@ -21,6 +24,10 @@ export default function RisksView({ project }: RisksViewProps) {
     title: '', description: '', priority: 'medium', proposed_solution: '', assignee: '',
   });
 
+  // Monte Carlo simulation state
+  const [simulationResult, setSimulationResult] = useState<MonteCarloResult | null>(null);
+  const [isSimulating, setIsSimulating] = useState(false);
+
   useEffect(() => {
     if (project) loadData();
     else setLoading(false);
@@ -29,14 +36,39 @@ export default function RisksView({ project }: RisksViewProps) {
   async function loadData() {
     if (!project) return;
     setLoading(true);
-    const [riskRes, issueRes] = await Promise.all([
+    const [riskRes, issueRes, actRes, linkRes] = await Promise.all([
       supabase.from('risks').select('*').eq('project_id', project.id).order('severity', { ascending: false }),
       supabase.from('issues').select('*').eq('project_id', project.id).order('raised_date', { ascending: false }),
+      supabase.from('activities').select('*').eq('project_id', project.id),
+      supabase.from('activity_links').select('*').eq('project_id', project.id),
     ]);
-    setRisks(riskRes.data || []);
-    setIssues(issueRes.data || []);
+    const acts = (actRes.data || []) as Activity[];
+    const rsk = (riskRes.data || []) as Risk[];
+    const lnks = (linkRes.data || []) as ActivityLink[];
+
+    setRisks(rsk);
+    setIssues((issueRes.data || []) as Issue[]);
+    setActivities(acts);
+    setLinks(lnks);
+
+    // Initial simulation
+    if (acts.length > 0) {
+      const res = runMonteCarloSimulation(acts, lnks, rsk, project.contract_value || 1000000, 500);
+      setSimulationResult(res);
+    }
+
     setLoading(false);
   }
+
+  const handleRunSimulation = () => {
+    if (!project) return;
+    setIsSimulating(true);
+    setTimeout(() => {
+      const res = runMonteCarloSimulation(activities, links, risks, project.contract_value || 1000000, 1000);
+      setSimulationResult(res);
+      setIsSimulating(false);
+    }, 400);
+  };
 
   async function addRisk() {
     if (!project || !riskForm.title) return;
@@ -86,8 +118,8 @@ export default function RisksView({ project }: RisksViewProps) {
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center h-full">
-        <div className="animate-spin rounded-full h-12 w-12 border-4 border-amber-500 border-t-transparent"></div>
+      <div className="flex items-center justify-center h-full min-h-[400px]">
+        <div className="animate-spin rounded-full h-10 w-10 border-4 border-amber-500 border-t-transparent"></div>
       </div>
     );
   }
@@ -109,11 +141,13 @@ export default function RisksView({ project }: RisksViewProps) {
   }
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-5">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-bold text-slate-800">المخاطر والمشاكل</h1>
-          <p className="text-sm text-slate-500 mt-1">سجل المخاطر والمشاكل مع الحلول المقترحة</p>
+          <h1 className="text-2xl font-bold text-slate-800">إدارة المخاطر والتحليل الاحتمالي</h1>
+          <p className="text-sm text-slate-500 mt-1">
+            سجل المخاطر والقضايا الميدانية، ومحاكاة مونت كارلو (Monte Carlo Simulation) لتقدير احتمالات الإنجاز والتكاليف.
+          </p>
         </div>
       </div>
 
@@ -121,7 +155,7 @@ export default function RisksView({ project }: RisksViewProps) {
       <div className="flex items-center gap-2 border-b border-slate-200">
         <button
           onClick={() => setTab('risks')}
-          className={`flex items-center gap-2 px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
+          className={`flex items-center gap-2 px-4 py-2.5 text-sm font-semibold border-b-2 transition-colors ${
             tab === 'risks' ? 'border-amber-500 text-amber-600' : 'border-transparent text-slate-500 hover:text-slate-700'
           }`}
         >
@@ -130,12 +164,21 @@ export default function RisksView({ project }: RisksViewProps) {
         </button>
         <button
           onClick={() => setTab('issues')}
-          className={`flex items-center gap-2 px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
+          className={`flex items-center gap-2 px-4 py-2.5 text-sm font-semibold border-b-2 transition-colors ${
             tab === 'issues' ? 'border-amber-500 text-amber-600' : 'border-transparent text-slate-500 hover:text-slate-700'
           }`}
         >
           <AlertTriangle size={18} />
-          المشاكل ({issues.length})
+          المشاكل والتعثر ({issues.length})
+        </button>
+        <button
+          onClick={() => setTab('simulation')}
+          className={`flex items-center gap-2 px-4 py-2.5 text-sm font-semibold border-b-2 transition-colors ${
+            tab === 'simulation' ? 'border-purple-600 text-purple-600' : 'border-transparent text-slate-500 hover:text-slate-700'
+          }`}
+        >
+          <Dices size={18} />
+          محاكاة مونت كارلو الاحتمالية (Monte Carlo)
         </button>
       </div>
 
@@ -145,10 +188,10 @@ export default function RisksView({ project }: RisksViewProps) {
           <div className="flex justify-end">
             <button
               onClick={() => setShowRiskForm(!showRiskForm)}
-              className="flex items-center gap-2 bg-amber-500 text-slate-900 px-4 py-2 rounded-lg font-medium hover:bg-amber-400 transition-colors text-sm"
+              className="flex items-center gap-2 bg-amber-500 text-slate-900 px-4 py-2 rounded-lg font-semibold hover:bg-amber-400 transition-colors text-sm"
             >
               {showRiskForm ? <X size={18} /> : <Plus size={18} />}
-              {showRiskForm ? 'إلغاء' : 'إضافة خطر'}
+              {showRiskForm ? 'إلغاء' : 'إضافة خطر جديد'}
             </button>
           </div>
 
@@ -170,7 +213,7 @@ export default function RisksView({ project }: RisksViewProps) {
                     type="text"
                     value={riskForm.category}
                     onChange={(e) => setRiskForm({ ...riskForm, category: e.target.value })}
-                    placeholder="مثال: مالي، تقني، بيئي"
+                    placeholder="مثال: مالي، سلاسل الإمداد، فني، تصاريح"
                     className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-amber-500 outline-none text-sm"
                   />
                 </div>
@@ -203,7 +246,7 @@ export default function RisksView({ project }: RisksViewProps) {
                 />
               </div>
               <div>
-                <label className="block text-sm font-medium text-slate-600 mb-1">استراتيجية التخفيف</label>
+                <label className="block text-sm font-medium text-slate-600 mb-1">استراتيجية التخفيف (Mitigation)</label>
                 <textarea
                   value={riskForm.mitigation}
                   onChange={(e) => setRiskForm({ ...riskForm, mitigation: e.target.value })}
@@ -219,7 +262,7 @@ export default function RisksView({ project }: RisksViewProps) {
               </div>
               <button
                 onClick={addRisk}
-                className="bg-emerald-500 text-white px-6 py-2 rounded-lg font-medium hover:bg-emerald-600 transition-colors text-sm"
+                className="bg-amber-500 text-slate-900 px-6 py-2 rounded-lg font-semibold hover:bg-amber-400 transition-colors text-sm"
               >
                 حفظ الخطر
               </button>
@@ -275,10 +318,10 @@ export default function RisksView({ project }: RisksViewProps) {
           <div className="flex justify-end">
             <button
               onClick={() => setShowIssueForm(!showIssueForm)}
-              className="flex items-center gap-2 bg-amber-500 text-slate-900 px-4 py-2 rounded-lg font-medium hover:bg-amber-400 transition-colors text-sm"
+              className="flex items-center gap-2 bg-amber-500 text-slate-900 px-4 py-2 rounded-lg font-semibold hover:bg-amber-400 transition-colors text-sm"
             >
               {showIssueForm ? <X size={18} /> : <Plus size={18} />}
-              {showIssueForm ? 'إلغاء' : 'إضافة مشكلة'}
+              {showIssueForm ? 'إلغاء' : 'إضافة مشكلة ميدانية'}
             </button>
           </div>
 
@@ -340,7 +383,7 @@ export default function RisksView({ project }: RisksViewProps) {
               </div>
               <button
                 onClick={addIssue}
-                className="bg-emerald-500 text-white px-6 py-2 rounded-lg font-medium hover:bg-emerald-600 transition-colors text-sm"
+                className="bg-amber-500 text-slate-900 px-6 py-2 rounded-lg font-semibold hover:bg-amber-400 transition-colors text-sm"
               >
                 حفظ المشكلة
               </button>
@@ -392,6 +435,116 @@ export default function RisksView({ project }: RisksViewProps) {
               </div>
             ))}
           </div>
+        </div>
+      )}
+
+      {/* Monte Carlo Simulation Tab */}
+      {tab === 'simulation' && (
+        <div className="space-y-5">
+          <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 flex flex-wrap items-center justify-between gap-4">
+            <div>
+              <h3 className="font-semibold text-slate-800 flex items-center gap-2">
+                <Dices className="text-purple-600" size={20} />
+                محاكاة مونت كارلو الاحتمالية (Monte Carlo Quantitative Schedule & Cost Risk Analysis)
+              </h3>
+              <p className="text-xs text-slate-500 mt-1">
+                تشغيل 1,000 تكرار احتمالي مع توزيع PERT للأزمنة وتأثير المخاطر المفتوحة لحساب نسب الثقة (P50, P80, P90).
+              </p>
+            </div>
+
+            <button
+              onClick={handleRunSimulation}
+              disabled={isSimulating}
+              className="flex items-center gap-2 bg-purple-600 hover:bg-purple-700 text-white px-4 py-2.5 rounded-lg text-xs font-semibold transition-colors disabled:opacity-50"
+            >
+              <Play size={14} className={isSimulating ? 'animate-spin' : ''} />
+              {isSimulating ? 'جاري تشغيل 1,000 تكرار...' : 'إعادة تشغيل المحاكاة الآن'}
+            </button>
+          </div>
+
+          {simulationResult && (
+            <div className="space-y-5">
+              {/* Confidence Percentiles Cards */}
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                {/* P50 (Realistic) */}
+                <div className="bg-white rounded-xl border border-blue-200 p-5 shadow-sm">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-xs font-bold text-blue-600 bg-blue-50 px-2.5 py-1 rounded-full">P50 (الهدف الواقعي 50%)</span>
+                    <TrendingUp size={18} className="text-blue-500" />
+                  </div>
+                  <div className="mt-2">
+                    <span className="text-xs text-slate-400 block">تاريخ التسليم المتوقع</span>
+                    <span className="text-lg font-bold text-slate-800">{simulationResult.p50Finish}</span>
+                  </div>
+                  <div className="mt-3 pt-3 border-t border-slate-100">
+                    <span className="text-xs text-slate-400 block">التكلفة المتوقعة (P50)</span>
+                    <span className="text-sm font-semibold text-blue-700">{simulationResult.p50Cost.toLocaleString()} ريال</span>
+                  </div>
+                </div>
+
+                {/* P80 (Contractual Commitment Target) */}
+                <div className="bg-white rounded-xl border border-purple-300 p-5 shadow-sm bg-gradient-to-b from-purple-50/30 to-white">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-xs font-bold text-purple-700 bg-purple-100 px-2.5 py-1 rounded-full">P80 (المعيار الموصى به للتعاقد 80%)</span>
+                    <Shield size={18} className="text-purple-600" />
+                  </div>
+                  <div className="mt-2">
+                    <span className="text-xs text-slate-400 block">تاريخ التسليم الموثوق</span>
+                    <span className="text-lg font-bold text-purple-900">{simulationResult.p80Finish}</span>
+                  </div>
+                  <div className="mt-3 pt-3 border-t border-slate-100">
+                    <span className="text-xs text-slate-400 block">التكلفة مع الاحتياطي المالي</span>
+                    <span className="text-sm font-semibold text-purple-700">{simulationResult.p80Cost.toLocaleString()} ريال</span>
+                  </div>
+                </div>
+
+                {/* P90 (Conservative) */}
+                <div className="bg-white rounded-xl border border-amber-200 p-5 shadow-sm">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-xs font-bold text-amber-700 bg-amber-50 px-2.5 py-1 rounded-full">P90 (الحد التحفظي الأقصى 90%)</span>
+                    <AlertTriangle size={18} className="text-amber-500" />
+                  </div>
+                  <div className="mt-2">
+                    <span className="text-xs text-slate-400 block">أسوأ سيناريو متوقع</span>
+                    <span className="text-lg font-bold text-slate-800">{simulationResult.p90Finish}</span>
+                  </div>
+                  <div className="mt-3 pt-3 border-t border-slate-100">
+                    <span className="text-xs text-slate-400 block">التكلفة القصوى مع الطوارئ</span>
+                    <span className="text-sm font-semibold text-amber-700">{simulationResult.p90Cost.toLocaleString()} ريال</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Criticality Index Ranking */}
+              <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
+                <h4 className="font-semibold text-slate-800 text-sm mb-3 flex items-center gap-2">
+                  <BarChart3 size={18} className="text-purple-600" />
+                  مؤشر حرجيّة الأنشطة (Activity Criticality Index - CI)
+                </h4>
+                <p className="text-xs text-slate-500 mb-4">
+                  نسبة ظهور كل نشاط على المسار الحرج عبر الـ 1,000 سيناريو المحاكي. الأنشطة ذات النسبة العالية تتطلب رقابة مكثفة.
+                </p>
+
+                <div className="space-y-2.5">
+                  {simulationResult.criticalityIndex.slice(0, 7).map((item, idx) => (
+                    <div key={idx} className="flex items-center gap-3 text-xs">
+                      <span className="font-mono text-slate-500 w-20">{item.activityCode}</span>
+                      <span className="text-slate-700 flex-1 truncate">{item.activityName}</span>
+                      <div className="w-32 bg-slate-100 h-2.5 rounded-full overflow-hidden">
+                        <div
+                          className={`h-full rounded-full ${
+                            item.probability >= 70 ? 'bg-red-500' : item.probability >= 40 ? 'bg-amber-500' : 'bg-blue-500'
+                          }`}
+                          style={{ width: `${Math.max(5, item.probability)}%` }}
+                        />
+                      </div>
+                      <span className="font-bold w-12 text-left">{item.probability}%</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>

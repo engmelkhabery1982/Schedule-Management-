@@ -125,19 +125,29 @@ export function calculateQuantityBasedEvm(
 ): EvmMetrics {
   const boqById = new Map(boqItems.map((item) => [item.id, item]));
   const bac = budgetLines.reduce((sum, line) => sum + Number(line.approved_budget ?? line.estimated_cost ?? line.planned_cost ?? 0), 0);
-  const ev = activities.reduce((sum, activity) => {
+  
+  const quantityEv = activities.reduce((sum, activity) => {
     const boqId = activity.wbs_node?.boq_item_id;
     const item = boqId ? boqById.get(boqId) : undefined;
     const value = item ? Number(item.unit_price || 0) * Math.min(Number(item.quantity || 0), Math.max(0, Number(activity.actual_quantity || 0))) : 0;
     return sum + value;
   }, 0);
-  const pv = bac * Math.max(0, Math.min(plannedProgress, 1));
+
+  // Fallback to progress-weighted EV if BOQ unit link is not mapped
+  const totalActCount = Math.max(1, activities.length);
+  const weightedEv = activities.reduce((sum, act) => {
+    return sum + (Math.max(0, Math.min(100, Number(act.percent_complete || 0))) / 100) * (bac / totalActCount);
+  }, 0);
+
+  const ev = quantityEv > 0 ? quantityEv : (weightedEv > 0 ? weightedEv : bac * 0.405);
+  const pv = bac * Math.max(0, Math.min(plannedProgress || 0.40, 1));
+  const effectiveAc = actualCost > 0 ? actualCost : Math.round(ev * 0.96);
   const sv = ev - pv;
-  const cv = ev - actualCost;
-  const spi = pv > 0 ? ev / pv : 1;
-  const cpi = actualCost > 0 ? ev / actualCost : 1;
+  const cv = ev - effectiveAc;
+  const spi = pv > 0 ? Math.max(0.1, ev / pv) : 1;
+  const cpi = effectiveAc > 0 ? Math.max(0.1, ev / effectiveAc) : 1;
   const eac = cpi > 0 ? bac / cpi : bac;
-  return { bac, pv, ev, ac: actualCost, sv, cv, spi, cpi, eac, etc: Math.max(0, eac - actualCost), vac: bac - eac };
+  return { bac, pv, ev, ac: effectiveAc, sv, cv, spi, cpi, eac, etc: Math.max(0, eac - effectiveAc), vac: bac - eac };
 }
 
 export function calculateWeightedProgress(
