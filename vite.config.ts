@@ -13,10 +13,20 @@ export default defineConfig({
   server: {
     host: '0.0.0.0',
     port: 5173,
+    cors: true,
+    strictPort: true,
+    headers: {
+      'Access-Control-Allow-Origin': '*',
+    },
   },
   preview: {
     host: '0.0.0.0',
     port: 5173,
+    cors: true,
+    strictPort: true,
+    headers: {
+      'Access-Control-Allow-Origin': '*',
+    },
   },
   optimizeDeps: {
     exclude: ['lucide-react'],

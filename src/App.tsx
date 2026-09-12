@@ -4,7 +4,7 @@ import { getInitialSeedData } from '@/lib/mockSeed';
 import { getLanguage, setLanguage, type Language } from '@/lib/i18n';
 import type { Project, ViewName } from '@/types';
 import Sidebar from '@/components/Sidebar';
-import { Globe } from 'lucide-react';
+import { Globe, Calendar } from 'lucide-react';
 import PortfolioView from '@/components/views/PortfolioView';
 import Bim4DView from '@/components/views/Bim4DView';
 import LinearScheduleView from '@/components/views/LinearScheduleView';
@@ -106,18 +106,39 @@ function App() {
       {/* Main content - offset for sidebar on large screens */}
       <main className={`${lang === 'ar' ? 'lg:mr-72' : 'lg:ml-72'} min-h-screen transition-all duration-300`}>
         {/* Global Navigation Top Header */}
-        <header className="bg-white border-b border-slate-200 sticky top-0 z-30 px-4 sm:px-6 py-2.5 flex items-center justify-between shadow-xs">
+        <header className="bg-white border-b border-slate-200 sticky top-0 z-30 px-4 sm:px-6 py-2.5 flex flex-wrap items-center justify-between gap-3 shadow-xs">
           <div className="flex items-center gap-3">
             <span className="text-xs font-bold text-slate-800">
               {lang === 'ar' ? 'المشروع:' : 'Project:'}{' '}
               <span className="text-amber-600 font-black">{project?.name || (lang === 'ar' ? 'مشروع تجريبي' : 'Demo Project')}</span>
             </span>
-            <span className="hidden sm:inline-block px-2 py-0.5 rounded text-[10px] font-bold bg-slate-100 text-slate-600 border border-slate-200">
-              Data Date: {project?.data_date || '2026-11-15'}
-            </span>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2.5">
+            {/* Unified Global Reactive Data Date Controller */}
+            <div className="flex items-center gap-1.5 bg-slate-100 hover:bg-slate-200/80 border border-slate-300 px-2.5 py-1 rounded-lg transition-colors shadow-2xs">
+              <Calendar size={13} className="text-amber-600 shrink-0" />
+              <span className="text-[11px] font-bold text-slate-700 hidden sm:inline">
+                {lang === 'ar' ? 'تاريخ البيانات:' : 'Data Date:'}
+              </span>
+              <input
+                type="date"
+                value={project?.data_date || '2026-11-15'}
+                onChange={async (e) => {
+                  const newDate = e.target.value;
+                  if (!newDate || !project) return;
+                  const updated = { ...project, data_date: newDate };
+                  setProject(updated);
+                  await supabase.from('projects').update({ data_date: newDate }).eq('id', project.id);
+                  window.dispatchEvent(new CustomEvent('project-data-date-changed', {
+                    detail: { projectId: project.id, dataDate: newDate }
+                  }));
+                }}
+                className="text-[11px] font-mono font-bold text-amber-700 bg-white px-2 py-0.5 rounded border border-slate-300 focus:outline-none focus:ring-1 focus:ring-amber-500 cursor-pointer"
+                title={lang === 'ar' ? 'تعديل تاريخ قطع البيانات (Data Date Cutoff) ومزامنة كافة المؤشرات والجدول الزمني فورياً' : 'Modify Project Data Date Cutoff and live-sync schedule & EVM metrics'}
+              />
+            </div>
+
             {/* Direct Global Language Toggle */}
             <button
               onClick={() => {

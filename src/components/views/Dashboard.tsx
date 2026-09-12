@@ -98,8 +98,18 @@ export default function Dashboard({ project, onNavigate }: DashboardProps) {
     const handleLangChange = (e: any) => {
       setLang(e.detail?.lang || getLanguage());
     };
+    const handleDataDateChange = (e: any) => {
+      if (project && (!e.detail?.projectId || e.detail.projectId === project.id)) {
+        loadData();
+      }
+    };
+
     window.addEventListener('app-language-changed', handleLangChange);
-    return () => window.removeEventListener('app-language-changed', handleLangChange);
+    window.addEventListener('project-data-date-changed', handleDataDateChange);
+    return () => {
+      window.removeEventListener('app-language-changed', handleLangChange);
+      window.removeEventListener('project-data-date-changed', handleDataDateChange);
+    };
   }, [project]);
 
   async function loadData() {

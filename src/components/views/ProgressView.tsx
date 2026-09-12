@@ -699,6 +699,10 @@ export default function ProgressView({ project }: ProgressViewProps) {
         status_logic: outOfSequenceMode,
       }).eq('id', project.id);
 
+      window.dispatchEvent(new CustomEvent('project-data-date-changed', {
+        detail: { projectId: project.id, dataDate: cutoffDate }
+      }));
+
       const revisionKey = `schedule_diff_revisions_${project.id}`;
       const existingRevs = JSON.parse(localStorage.getItem(revisionKey) || '[]');
       const newRev = {

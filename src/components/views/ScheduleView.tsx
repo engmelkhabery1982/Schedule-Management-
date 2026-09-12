@@ -164,8 +164,22 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
     const handleLangChange = (e: any) => {
       setLang(e.detail?.lang || getLanguage());
     };
+    const handleGlobalDataDateChange = (e: any) => {
+      if (project && (!e.detail?.projectId || e.detail.projectId === project.id)) {
+        const dDate = e.detail?.dataDate || project.data_date;
+        if (dDate) {
+          setCurrentDataDate(dDate);
+          loadData();
+        }
+      }
+    };
+
     window.addEventListener('app-language-changed', handleLangChange);
-    return () => window.removeEventListener('app-language-changed', handleLangChange);
+    window.addEventListener('project-data-date-changed', handleGlobalDataDateChange);
+    return () => {
+      window.removeEventListener('app-language-changed', handleLangChange);
+      window.removeEventListener('project-data-date-changed', handleGlobalDataDateChange);
+    };
   }, [project]);
 
   useEffect(() => {
@@ -274,6 +288,9 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
     setCurrentDataDate(newDate);
     if (project) {
       await supabase.from('projects').update({ data_date: newDate }).eq('id', project.id);
+      window.dispatchEvent(new CustomEvent('project-data-date-changed', {
+        detail: { projectId: project.id, dataDate: newDate }
+      }));
       await recalculatePersistedSchedule(activities, links, selectedCalendar, newDate, statusLogic);
       await loadData();
       setMessage(`تم تحديث تاريخ المتابعة (Data Date) إلى ${newDate} وإعادة جدولة الأعمال المتبقية.`);
