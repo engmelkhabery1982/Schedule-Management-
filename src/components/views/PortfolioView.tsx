@@ -1,7 +1,8 @@
 import { useState, useMemo, useEffect } from 'react';
 import { supabase } from '@/lib/supabase';
 import { getLanguage, type Language } from '@/lib/i18n';
-import type { Project, ViewName, ProjectSector } from '@/types';
+import type { Project, ViewName, ProjectSector, Activity, BudgetLine, BoqItem, CostTransaction, ProgressUpdate, Risk, ActivityLink } from '@/types';
+import { calculateProjectEvmAtDataDate } from '@/lib/planningEngine';
 import {
   Briefcase,
   Building2,
@@ -31,9 +32,11 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
   const [projects, setProjects] = useState<Project[]>([]);
   const [allActivities, setAllActivities] = useState<any[]>([]);
   const [allBudgetLines, setAllBudgetLines] = useState<any[]>([]);
-  const [allCostTxns, setAllCostTxns] = useState<any[]>([]);
-  const [allRisks, setAllRisks] = useState<any[]>([]);
-  const [allLinks, setAllLinks] = useState<any[]>([]);
+  const [allCostTxns, setAllCostTxns] = useState<CostTransaction[]>([]);
+  const [allRisks, setAllRisks] = useState<Risk[]>([]);
+  const [allLinks, setAllLinks] = useState<ActivityLink[]>([]);
+  const [allBoqs, setAllBoqs] = useState<BoqItem[]>([]);
+  const [allProgress, setAllProgress] = useState<ProgressUpdate[]>([]);
   const [loading, setLoading] = useState(true);
   const [lang, setLang] = useState<Language>(getLanguage());
   const [sectorFilter, setSectorFilter] = useState<string>('all');
@@ -59,8 +62,15 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
     const handleLangChange = (e: any) => {
       setLang(e.detail?.lang || getLanguage());
     };
+    const handleGlobalDataDate = () => {
+      loadPortfolio();
+    };
     window.addEventListener('app-language-changed', handleLangChange);
-    return () => window.removeEventListener('app-language-changed', handleLangChange);
+    window.addEventListener('project-data-date-changed', handleGlobalDataDate);
+    return () => {
+      window.removeEventListener('app-language-changed', handleLangChange);
+      window.removeEventListener('project-data-date-changed', handleGlobalDataDate);
+    };
   }, []);
 
   async function loadPortfolio() {
@@ -73,6 +83,8 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
         { data: cstData },
         { data: rskData },
         { data: lnkData },
+        { data: boqData },
+        { data: prgData },
       ] = await Promise.all([
         supabase.from('projects').select('*').order('created_at', { ascending: false }),
         supabase.from('activities').select('*'),
@@ -80,6 +92,8 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
         supabase.from('cost_transactions').select('*'),
         supabase.from('risks').select('*'),
         supabase.from('activity_links').select('*'),
+        supabase.from('boq_items').select('*'),
+        supabase.from('progress_updates').select('*'),
       ]);
 
       setProjects(projData || []);
@@ -88,6 +102,8 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
       setAllCostTxns(cstData || []);
       setAllRisks(rskData || []);
       setAllLinks(lnkData || []);
+      setAllBoqs(boqData || []);
+      setAllProgress(prgData || []);
     } catch (err) {
       console.error('Error loading portfolio:', err);
     } finally {
@@ -95,39 +111,33 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
     }
   }
 
-  // Enriched project portfolio metrics with 100% dynamic live aggregation
+  // Enriched project portfolio metrics with 100% dynamic live aggregation matching Dashboard
   const portfolioProjects = useMemo(() => {
     return projects.map((p) => {
       const pActs = allActivities.filter((a) => a.project_id === p.id);
       const pBgts = allBudgetLines.filter((b) => b.project_id === p.id);
-      const pTxns = allCostTxns.filter((c) => c.project_id === p.id && c.status === 'approved');
+      const pBoqs = allBoqs.filter((b) => b.project_id === p.id);
+      const pTxns = allCostTxns.filter((c) => c.project_id === p.id);
+      const pPrgs = allProgress.filter((pr) => pr.project_id === p.id);
       const pRisks = allRisks.filter((r) => r.project_id === p.id && r.status === 'open');
 
-      const contractVal = Number(p.contract_value || pBgts.reduce((s, b) => s + Number(b.planned_cost || 0), 0) || 10000000);
-      
-      // Calculate real weighted progress
-      const totalActDur = pActs.reduce((s, a) => s + Math.max(1, Number(a.duration_days || 1)), 0);
-      const earnedActDur = pActs.reduce((s, a) => s + Math.max(1, Number(a.duration_days || 1)) * (Number(a.percent_complete || 0) / 100), 0);
-      const progress = totalActDur > 0 ? Number(((earnedActDur / totalActDur) * 100).toFixed(1)) : 0;
+      const evm = calculateProjectEvmAtDataDate(
+        p,
+        pActs,
+        pBgts,
+        pBoqs,
+        pTxns,
+        pPrgs,
+        p.data_date || '2026-11-15',
+      );
 
-      // Planned Progress calculation relative to project start, end, and data date
-      const startMs = new Date(p.start_date || '2026-09-15').getTime();
-      const endMs = new Date(p.end_date || '2027-04-30').getTime();
-      const dataDateMs = new Date(p.data_date || '2026-11-15').getTime();
-      const totalSpan = Math.max(1, endMs - startMs);
-      const elapsedSpan = Math.max(0, Math.min(totalSpan, dataDateMs - startMs));
-      const plannedProgressRatio = elapsedSpan / totalSpan;
-
-      const pv = Math.round(contractVal * plannedProgressRatio);
-      const ev = Math.round(contractVal * (progress / 100));
-      
-      // Real actual cost from approved transactions or budget lines
-      const txnAc = pTxns.reduce((s, t) => s + Number(t.amount || 0), 0);
-      const bgtAc = pBgts.reduce((s, b) => s + Number(b.actual_cost || 0), 0);
-      const ac = txnAc > 0 ? txnAc : (bgtAc > 0 ? bgtAc : Math.round(ev * 0.95));
-
-      const spi = pv > 0 ? Number((ev / pv).toFixed(2)) : 1.0;
-      const cpi = ac > 0 ? Number((ev / ac).toFixed(2)) : 1.0;
+      const contractVal = evm.bac;
+      const progress = evm.actualProgressPercent;
+      const pv = evm.pv;
+      const ev = evm.ev;
+      const ac = evm.ac;
+      const spi = evm.spi;
+      const cpi = evm.cpi;
       const dcmaScore = pActs.length > 0 ? 100 : 90;
       const eotDays = p.duration_days && p.duration_days > 300 ? 14 : 0;
       const activeRisks = pRisks.length;
@@ -149,7 +159,7 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
         ac,
       };
     });
-  }, [projects, allActivities, allBudgetLines, allCostTxns, allRisks]);
+  }, [projects, allActivities, allBudgetLines, allBoqs, allCostTxns, allProgress, allRisks]);
 
   // Filtered projects
   const filteredProjects = useMemo(() => {

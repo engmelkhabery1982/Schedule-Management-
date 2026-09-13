@@ -38,7 +38,11 @@ export function generateSCurveData(
   evm: EvmMetrics,
   projectStartDate?: string | null,
   projectEndDate?: string | null,
+  customDataDate?: string | null,
 ): SCurveData {
+  const effectiveDataDate = customDataDate || new Date().toISOString().split('T')[0];
+  const effectiveDataDateTime = parseDate(effectiveDataDate);
+
   if (activities.length === 0) {
     return {
       points: [],
@@ -46,7 +50,7 @@ export function generateSCurveData(
       currentEv: evm.ev,
       currentAc: evm.ac,
       forecastEac: evm.eac,
-      dataDate: new Date().toISOString().split('T')[0],
+      dataDate: effectiveDataDate,
     };
   }
 
@@ -64,9 +68,8 @@ export function generateSCurveData(
   if (projectEndDate) maxTime = Math.max(maxTime, parseDate(projectEndDate));
 
   if (minTime === Infinity || maxTime === -Infinity) {
-    const today = Date.now();
-    minTime = today;
-    maxTime = today + 90 * 86400000;
+    minTime = effectiveDataDateTime;
+    maxTime = effectiveDataDateTime + 90 * 86400000;
   }
 
   // Generate weekly/bi-weekly cut-off points
@@ -82,9 +85,6 @@ export function generateSCurveData(
     cutOffDates.push(currentCutoff);
     currentCutoff += stepMs;
   }
-
-  const todayStr = new Date().toISOString().split('T')[0];
-  const todayTime = parseDate(todayStr);
 
   const totalBac = Math.max(
     evm.bac,
@@ -149,7 +149,7 @@ export function generateSCurveData(
       }
     });
 
-    const isPastOrPresent = cutoff <= todayTime + stepMs / 2;
+    const isPastOrPresent = cutoff <= effectiveDataDateTime + stepMs / 2;
 
     // EV up to this cutoff
     let evVal: number | null = null;
@@ -172,7 +172,7 @@ export function generateSCurveData(
         evVal = Math.round(sumWeighted);
       } else {
         // Proportional to current EV
-        const timeRatio = Math.max(0, Math.min(1, (cutoff - minTime) / Math.max(1, todayTime - minTime)));
+        const timeRatio = Math.max(0, Math.min(1, (cutoff - minTime) / Math.max(1, effectiveDataDateTime - minTime)));
         evVal = Math.round(evm.ev * timeRatio);
       }
 
@@ -181,7 +181,7 @@ export function generateSCurveData(
       if (costsToDate.length > 0) {
         acVal = Math.round(costsToDate.reduce((sum, c) => sum + Number(c.amount || 0), 0));
       } else {
-        const timeRatio = Math.max(0, Math.min(1, (cutoff - minTime) / Math.max(1, todayTime - minTime)));
+        const timeRatio = Math.max(0, Math.min(1, (cutoff - minTime) / Math.max(1, effectiveDataDateTime - minTime)));
         acVal = Math.round(evm.ac * timeRatio);
       }
 
@@ -189,8 +189,8 @@ export function generateSCurveData(
       lastValidAc = acVal || lastValidAc;
     } else {
       // Future Projection (Forecast EAC Curve)
-      const remainingTime = maxTime - todayTime;
-      const currentOffset = cutoff - todayTime;
+      const remainingTime = maxTime - effectiveDataDateTime;
+      const currentOffset = cutoff - effectiveDataDateTime;
       const progressFactor = remainingTime > 0 ? Math.min(1, currentOffset / remainingTime) : 1;
       const remainingCost = Math.max(0, evm.eac - lastValidAc);
       forecastVal = Math.round(lastValidAc + remainingCost * progressFactor);
@@ -220,6 +220,6 @@ export function generateSCurveData(
     currentEv: lastValidEv || evm.ev,
     currentAc: lastValidAc || evm.ac,
     forecastEac: evm.eac,
-    dataDate: todayStr,
+    dataDate: effectiveDataDate,
   };
 }

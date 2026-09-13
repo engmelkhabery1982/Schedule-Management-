@@ -16,7 +16,12 @@ import type {
   ActivityResource,
   Resource,
 } from '@/types';
-import { analyzeForecast, calculateQuantityBasedEvm, calculateWeightedProgress } from '@/lib/planningEngine';
+import {
+  analyzeForecast,
+  calculateQuantityBasedEvm,
+  calculateWeightedProgress,
+  calculateProjectEvmAtDataDate,
+} from '@/lib/planningEngine';
 import { generateScheduleAlerts } from '@/lib/alertEngine';
 import { generateScheduleQualityAlerts } from '@/lib/scheduleQualityEngine';
 import { generateResourceConflictAlerts } from '@/lib/resourceConflictEngine';
@@ -219,51 +224,6 @@ ${noticeForm.contractorName}`;
   const inProgress = activities.filter((a) => a.percent_complete > 0 && a.percent_complete < 100).length;
   const notStarted = activities.filter((a) => a.percent_complete === 0).length;
 
-  const activityWeights = useMemo(() => {
-    return new Map(activities.map((activity) => [
-      activity.id,
-      Number(budgetLines.find((line) => line.description === activity.name)?.planned_cost || activity.planned_quantity || 0),
-    ]));
-  }, [activities, budgetLines]);
-
-  const overallProgress = useMemo(() => {
-    return calculateWeightedProgress(activities, activityWeights) * 100;
-  }, [activities, activityWeights]);
-
-  const plannedProgress = useMemo(() => {
-    if (!baselineActivities.length) return 0;
-    const todayTime = Date.now();
-    let weightedExpected = 0;
-    let totalBaselineCost = 0;
-    baselineActivities.forEach((baseline) => {
-      const start = new Date(baseline.early_start).getTime();
-      const finish = new Date(baseline.early_finish).getTime();
-      const expected = todayTime <= start ? 0 : todayTime >= finish || finish <= start ? 1 : (todayTime - start) / (finish - start);
-      const weight = Math.max(0, Number(baseline.planned_cost || 0));
-      weightedExpected += expected * weight;
-      totalBaselineCost += weight;
-    });
-    return totalBaselineCost > 0
-      ? weightedExpected / totalBaselineCost
-      : baselineActivities.reduce((sum, baseline) => sum + (Date.now() < new Date(`${baseline.early_start}T00:00:00Z`).getTime() ? 0 : 1), 0) / baselineActivities.length;
-  }, [baselineActivities]);
-
-  const plannedBudget = useMemo(() => {
-    return budgetLines.reduce((sum, b) => sum + Number(b.approved_budget ?? b.estimated_cost ?? b.planned_cost ?? 0), 0);
-  }, [budgetLines]);
-
-  const actualCost = useMemo(() => {
-    if (approvedActualCost > 0) return approvedActualCost;
-    return budgetLines.reduce((sum, b) => sum + (b.actual_cost || 0), 0);
-  }, [approvedActualCost, budgetLines]);
-
-  const committedCost = useMemo(() => {
-    return budgetLines.reduce((sum, b) => sum + (b.committed_cost || 0), 0);
-  }, [budgetLines]);
-
-  const remainingBudget = plannedBudget - actualCost;
-  const budgetUtilization = plannedBudget > 0 ? (actualCost / plannedBudget) * 100 : 0;
-
   const openRisks = risks.filter((r) => r.status === 'open').length;
   const highRisks = risks.filter((r) => r.severity >= 15).length;
   const openIssues = issues.filter((i) => i.status === 'open').length;
@@ -286,8 +246,29 @@ ${noticeForm.contractorName}`;
   const recentUpdates = useMemo(() => progressUpdates.slice(0, 5), [progressUpdates]);
 
   const evm = useMemo(() => {
-    return calculateQuantityBasedEvm(activities, boqItems, budgetLines, plannedProgress, actualCost);
-  }, [activities, boqItems, budgetLines, plannedProgress, actualCost]);
+    if (!project) return calculateEvmMetrics(0, 0.40, 0.40, 0);
+    return calculateProjectEvmAtDataDate(
+      project,
+      activities,
+      budgetLines,
+      boqItems,
+      costTransactions,
+      progressUpdates,
+      project.data_date || '2026-11-15',
+    );
+  }, [project, activities, budgetLines, boqItems, costTransactions, progressUpdates, project?.data_date]);
+
+  const overallProgress = evm.actualProgressPercent;
+  const plannedProgress = evm.plannedProgressPercent / 100;
+  const plannedBudget = evm.bac;
+  const actualCost = evm.ac;
+
+  const committedCost = useMemo(() => {
+    return budgetLines.reduce((sum, b) => sum + (b.committed_cost || 0), 0);
+  }, [budgetLines]);
+
+  const remainingBudget = plannedBudget - actualCost;
+  const budgetUtilization = plannedBudget > 0 ? (actualCost / plannedBudget) * 100 : 0;
 
   const forecast = useMemo(() => {
     return analyzeForecast(

@@ -9,11 +9,13 @@ import type {
   CostTransaction,
   ProgressUpdate,
   Risk,
+  BoqItem,
   EvmMetrics,
 } from '@/types';
 import { runDcma14PointAudit } from '@/lib/scheduleQualityEngine';
 import { generateSCurveData, type SCurveData } from '@/lib/sCurveEngine';
 import { calculateEarnedSchedule } from '@/lib/earnedScheduleEngine';
+import { calculateProjectEvmAtDataDate } from '@/lib/planningEngine';
 import SCurveChart from '@/components/views/SCurveChart';
 import {
   Printer,
@@ -38,6 +40,7 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
   const [budgetLines, setBudgetLines] = useState<BudgetLine[]>([]);
   const [transactions, setTransactions] = useState<CostTransaction[]>([]);
   const [progressUpdates, setProgressUpdates] = useState<ProgressUpdate[]>([]);
+  const [boqItems, setBoqItems] = useState<BoqItem[]>([]);
   const [risks, setRisks] = useState<Risk[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -49,13 +52,14 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
   async function loadData() {
     if (!project) return;
     setLoading(true);
-    const [actRes, linkRes, baselineRes, bgtRes, cstRes, prgRes, rskRes] = await Promise.all([
+    const [actRes, linkRes, baselineRes, bgtRes, cstRes, prgRes, boqRes, rskRes] = await Promise.all([
       supabase.from('activities').select('*').eq('project_id', project.id).order('sort_order'),
       supabase.from('activity_links').select('*').eq('project_id', project.id),
       supabase.from('baseline_activities').select('*'),
       supabase.from('budget_lines').select('*').eq('project_id', project.id),
       supabase.from('cost_transactions').select('*').eq('project_id', project.id),
       supabase.from('progress_updates').select('*').eq('project_id', project.id),
+      supabase.from('boq_items').select('*').eq('project_id', project.id),
       supabase.from('risks').select('*').eq('project_id', project.id),
     ]);
     setActivities(actRes.data || []);
@@ -64,6 +68,7 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
     setBudgetLines(bgtRes.data || []);
     setTransactions((cstRes.data || []) as CostTransaction[]);
     setProgressUpdates((prgRes.data || []) as ProgressUpdate[]);
+    setBoqItems((boqRes.data || []) as BoqItem[]);
     setRisks(rskRes.data || []);
     setLoading(false);
   }
@@ -78,35 +83,20 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
     );
   }, [activities, links, baselineActivities, project?.data_date]);
 
-  // Compute EVM metrics
-  const totalBac = project?.contract_value || 4850000;
-  const approvedActualCost = transactions
-    .filter((t) => t.status === 'approved')
-    .reduce((sum, t) => sum + Number(t.amount || 0), 0);
+  // Compute EVM metrics using unified engine
+  const evmMetrics: EvmMetrics = useMemo(() => {
+    return calculateProjectEvmAtDataDate(
+      project,
+      activities,
+      baselineActivities,
+      boqItems,
+      transactions,
+      progressUpdates,
+      project?.data_date || '2026-11-15',
+    );
+  }, [project, activities, baselineActivities, boqItems, transactions, progressUpdates]);
 
-  const earnedVal = activities.reduce((sum, a) => {
-    const actBac = (a.planned_quantity || 1) * 100;
-    return sum + actBac * ((a.percent_complete || 0) / 100);
-  }, 0);
-
-  const plannedVal = totalBac * 0.22;
-  const spi = plannedVal > 0 ? earnedVal / plannedVal : 1.0;
-  const cpi = approvedActualCost > 0 ? earnedVal / approvedActualCost : 1.0;
-  const eac = cpi > 0 ? totalBac / cpi : totalBac;
-
-  const evmMetrics: EvmMetrics = {
-    bac: totalBac,
-    pv: plannedVal,
-    ev: earnedVal,
-    ac: approvedActualCost,
-    sv: earnedVal - plannedVal,
-    cv: earnedVal - approvedActualCost,
-    spi,
-    cpi,
-    eac,
-    etc: Math.max(0, eac - approvedActualCost),
-    vac: totalBac - eac,
-  };
+  const totalBac = evmMetrics.bac;
 
   // Earned Schedule (ESM)
   const earnedScheduleData = useMemo(() => {
@@ -122,6 +112,7 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
       evmMetrics,
       project?.start_date,
       project?.end_date,
+      project?.data_date,
     );
   }, [activities, baselineActivities, progressUpdates, transactions, evmMetrics, project]);
 

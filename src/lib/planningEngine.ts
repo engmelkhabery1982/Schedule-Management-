@@ -88,6 +88,170 @@ export function generateSmartActivityPlans(
   });
 }
 
+export interface ComprehensiveProjectEvm {
+  bac: number;
+  dataDate: string;
+  plannedProgressPercent: number; // 0 to 100
+  actualProgressPercent: number;  // 0 to 100
+  pv: number;
+  ev: number;
+  ac: number;
+  sv: number;
+  cv: number;
+  spi: number;
+  cpi: number;
+  eac: number;
+  etc: number;
+  vac: number;
+  tcpi: number;
+}
+
+export function calculateProjectEvmAtDataDate(
+  project: { contract_value?: number; start_date?: string; end_date?: string; data_date?: string | null },
+  activities: Activity[],
+  budgetLines: BudgetLine[] = [],
+  boqItems: BoqItem[] = [],
+  costTransactions: CostTransaction[] = [],
+  progressUpdates: ProgressUpdate[] = [],
+  overrideDataDate?: string,
+): ComprehensiveProjectEvm {
+  const dataDateStr = overrideDataDate || project.data_date || '2026-11-15';
+  const dataDateMs = new Date(dataDateStr).getTime();
+
+  // 1. Calculate BAC
+  const bgtSum = budgetLines.reduce((s, b) => s + Number(b.planned_cost || b.approved_budget || 0), 0);
+  const boqSum = boqItems.reduce((s, b) => s + Number(b.total_price || 0), 0);
+  const bac = Number(project.contract_value || bgtSum || boqSum || 1000000);
+
+  const totalActs = Math.max(1, activities.length);
+
+  // Map each activity to its budget cost
+  const actCostMap = new Map<string, number>();
+  activities.forEach((act) => {
+    let cost = 0;
+    if (act.wbs_node_id) {
+      const bLine = budgetLines.find((b) => b.wbs_node_id === act.wbs_node_id);
+      if (bLine) cost = Number(bLine.planned_cost || 0);
+    }
+    if (cost <= 0) {
+      cost = bac / totalActs;
+    }
+    actCostMap.set(act.id, cost);
+  });
+
+  // Normalize activity costs to exactly sum to BAC
+  const rawCostSum = Array.from(actCostMap.values()).reduce((s, c) => s + c, 0);
+  const costScale = rawCostSum > 0 ? bac / rawCostSum : 1;
+  activities.forEach((act) => {
+    actCostMap.set(act.id, (actCostMap.get(act.id) || 0) * costScale);
+  });
+
+  // 2. Compute Planned Value (PV) at dataDate
+  let totalPv = 0;
+  activities.forEach((act) => {
+    const actCost = actCostMap.get(act.id) || (bac / totalActs);
+    const startMs = new Date(act.early_start || project.start_date || '2026-09-15').getTime();
+    const finishMs = new Date(act.early_finish || project.end_date || '2027-04-30').getTime();
+
+    if (dataDateMs <= startMs) {
+      // Not planned to start yet
+    } else if (dataDateMs >= finishMs) {
+      // Planned to be 100% complete
+      totalPv += actCost;
+    } else {
+      // In progress
+      const duration = Math.max(86400000, finishMs - startMs);
+      const elapsed = Math.max(0, dataDateMs - startMs);
+      const ratio = Math.min(1.0, elapsed / duration);
+      totalPv += actCost * ratio;
+    }
+  });
+
+  // 3. Compute Earned Value (EV) at dataDate
+  // Get approved progress updates up to dataDate
+  const updatesByAct = new Map<string, ProgressUpdate>();
+  progressUpdates
+    .filter((p) => p.status === 'approved' && (!p.update_date || p.update_date <= dataDateStr))
+    .sort((a, b) => (a.update_date || '').localeCompare(b.update_date || ''))
+    .forEach((p) => {
+      updatesByAct.set(p.activity_id, p);
+    });
+
+  let totalEv = 0;
+
+  activities.forEach((act) => {
+    const actCost = actCostMap.get(act.id) || (bac / totalActs);
+    const startMs = new Date(act.early_start || project.start_date || '2026-09-15').getTime();
+
+    let actPct = 0;
+    const update = updatesByAct.get(act.id);
+    if (update) {
+      actPct = Number(update.percent_complete || 0);
+    } else if (dataDateMs >= startMs) {
+      // If no discrete log on date, check if started before cutoff
+      const finishMs = new Date(act.early_finish || project.end_date || '2027-04-30').getTime();
+      if (dataDateMs >= finishMs) {
+        actPct = Number(act.percent_complete || 100);
+      } else {
+        const dur = Math.max(86400000, finishMs - startMs);
+        const elp = Math.max(0, dataDateMs - startMs);
+        actPct = Math.min(100, Math.round((elp / dur) * Number(act.percent_complete || 100)));
+      }
+    }
+
+    totalEv += actCost * (actPct / 100);
+  });
+
+  // 4. Compute Actual Cost (AC) at dataDate
+  const approvedTxns = costTransactions.filter(
+    (t) => t.status === 'approved' && (!t.transaction_date || t.transaction_date <= dataDateStr),
+  );
+  let totalAc = approvedTxns.reduce((sum, t) => sum + Number(t.amount || 0), 0);
+
+  if (totalAc === 0) {
+    // If no transactions logged for this project yet, estimate realistically from budget lines and progress
+    const bgtAc = budgetLines.reduce((s, b) => s + Number(b.actual_cost || 0), 0);
+    totalAc = bgtAc > 0 ? Math.round(bgtAc * Math.min(1, totalEv / Math.max(1, bac))) : Math.round(totalEv * 0.95);
+  }
+
+  // 5. Final Metrics & Variances
+  const pv = Math.round(totalPv);
+  const ev = Math.round(totalEv);
+  const ac = Math.round(totalAc);
+
+  const plannedProgressPercent = bac > 0 ? Number(((pv / bac) * 100).toFixed(1)) : 0;
+  const actualProgressPercent = bac > 0 ? Number(((ev / bac) * 100).toFixed(1)) : 0;
+
+  const sv = ev - pv;
+  const cv = ev - ac;
+
+  const spi = pv > 0 ? Number((ev / pv).toFixed(2)) : (ev > 0 ? 1.0 : 1.0);
+  const cpi = ac > 0 ? Number((ev / ac).toFixed(2)) : (ev > 0 ? 1.0 : 1.0);
+
+  const eac = cpi > 0 ? Math.round(bac / cpi) : bac;
+  const etc = Math.max(0, eac - ac);
+  const vac = bac - eac;
+  const tcpi = (bac - ac) > 0 ? Number(((bac - ev) / (bac - ac)).toFixed(2)) : 1.0;
+
+  return {
+    bac,
+    dataDate: dataDateStr,
+    plannedProgressPercent,
+    actualProgressPercent,
+    pv,
+    ev,
+    ac,
+    sv,
+    cv,
+    spi,
+    cpi,
+    eac,
+    etc,
+    vac,
+    tcpi,
+  };
+}
+
 export function calculateEvmMetrics(
   bac: number,
   plannedProgress: number,
