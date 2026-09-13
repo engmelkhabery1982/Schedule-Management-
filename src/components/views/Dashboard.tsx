@@ -259,10 +259,10 @@ ${noticeForm.contractorName}`;
       boqItems,
       costTransactions,
       progressUpdates,
-      // Deferred consumer GAP: this view still passes its own '2026-11-15' literal as an explicit
-      // override, which pre-empts the governed DEFAULT_DATA_DATE. View-level date fallbacks are
-      // out of Wave 2 scope (GAP-004 covers the central EVM path only).
-      project.data_date || '2026-11-15',
+      // GAP-007: the view-level '2026-11-15' override is removed. The canonical engine resolves
+      // `project.data_date || DEFAULT_DATA_DATE` itself, and this dashboard now feeds that resolved
+      // data date straight into the S-Curve, so a local literal here would silently move the
+      // actual/forecast cutoff away from the governed Data Date.
     );
   }, [project, activities, budgetLines, boqItems, costTransactions, progressUpdates, project?.data_date]);
 
@@ -319,8 +319,13 @@ ${noticeForm.contractorName}`;
       evm,
       project?.start_date || startDate,
       project?.end_date || endDate,
+      // No explicit cutoff: the engine uses the canonical EVM's own governed data date, so the
+      // actual series ends exactly at the Data Date instead of at the machine clock.
+      null,
+      // GAP-006: canonical sources for planned-value weighting and BAC reconciliation.
+      { project, budgetLines, boqItems },
     );
-  }, [activities, baselineActivities, progressUpdates, costTransactions, evm, project, startDate, endDate]);
+  }, [activities, baselineActivities, progressUpdates, costTransactions, evm, project, startDate, endDate, budgetLines, boqItems]);
 
   const kpis = [
     {

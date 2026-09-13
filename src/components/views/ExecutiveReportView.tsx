@@ -101,16 +101,14 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
       boqItems,
       transactions,
       progressUpdates,
-      project?.data_date || '2026-11-15',
+      // GAP-007: no view-level Data Date override. The canonical engine already resolves
+      // `project.data_date || DEFAULT_DATA_DATE`; the local '2026-11-15' literal that used to be
+      // passed here pre-empted the governed constant and made this report disagree with every
+      // other consumer whenever a project has no stored data date.
     );
   }, [project, activities, budgetLines, boqItems, transactions, progressUpdates]);
 
   const totalBac = evmMetrics.bac;
-
-  // Earned Schedule (ESM)
-  const earnedScheduleData = useMemo(() => {
-    return calculateEarnedSchedule(project, activities, 0.95);
-  }, [project, activities]);
 
   const sCurveData: SCurveData = useMemo(() => {
     return generateSCurveData(
@@ -122,8 +120,26 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
       project?.start_date,
       project?.end_date,
       project?.data_date,
+      // GAP-006: the canonical sources the curve needs so planned value is evaluated with the same
+      // cost allocation and the same BAC as the EVM above (final cumulative PV reconciles to BAC).
+      { project, budgetLines, boqItems },
     );
-  }, [activities, baselineActivities, progressUpdates, transactions, evmMetrics, project]);
+  }, [activities, baselineActivities, progressUpdates, transactions, evmMetrics, project, budgetLines, boqItems]);
+
+  // Earned Schedule (ESM) — consumes the canonical EVM above and the SAME S-Curve rendered below,
+  // so EV, CPI and the planned-value curve it inverts are the governed values (GAP-007/GAP-023).
+  const earnedScheduleData = useMemo(() => {
+    return calculateEarnedSchedule({
+      project,
+      activities,
+      evm: evmMetrics,
+      sCurve: sCurveData,
+      budgetLines,
+      boqItems,
+      costTransactions: transactions,
+      progressUpdates,
+    });
+  }, [project, activities, evmMetrics, sCurveData, budgetLines, boqItems, transactions, progressUpdates]);
 
   // Lookahead activities (next 3 weeks from data date)
   const lookaheadActivities = useMemo(() => {

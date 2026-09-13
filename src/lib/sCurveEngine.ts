@@ -1,4 +1,48 @@
-import type { Activity, BaselineActivity, CostTransaction, ProgressUpdate, EvmMetrics } from '@/types';
+import type { Activity, BaselineActivity, BoqItem, CostTransaction, ProgressUpdate, EvmMetrics } from '@/types';
+import { calculateProjectEvmAtDataDate, type EvmBudgetLineInput } from '@/lib/planningEngine';
+import { DEFAULT_DATA_DATE } from '@/lib/projectControlsConstants';
+
+/**
+ * Financial S-Curve engine (planned / earned / actual / forecast cumulative curves).
+ *
+ * TIME-PHASED SEMANTICS — one convention, documented because every invariant below depends on it:
+ *
+ *  1. Bucket frequency is adaptive to the project span: 7-day buckets up to 120 days, 14-day
+ *     buckets up to 360 days, 30-day buckets beyond that. The governed Data Date is ALWAYS
+ *     inserted as a bucket of its own, so the actual series ends exactly on the Data Date rather
+ *     than on whichever bucket happens to be nearest.
+ *  2. A bucket date is a PERIOD END / CUTOFF. Every cumulative value on that bucket means
+ *     "as of the end of that calendar day".
+ *  3. Cumulative PV / EV / AC are INCLUSIVE through the cutoff: a record dated exactly on the
+ *     cutoff belongs to that bucket (`record_date <= cutoff`, compared as ISO date strings).
+ *  4. Data Date cutoff rule: a bucket is ACTUAL iff `bucketDate <= dataDate`. There is no
+ *     half-bucket grace — a bucket after the Data Date is never reported as actual.
+ *  5. Forecast buckets are exactly those strictly after the Data Date. On actual buckets
+ *     `forecastCumulative` is null; on forecast buckets `evCumulative` / `acCumulative` are null,
+ *     so actual history and forecast can never be mixed inside one series.
+ *  6. Final cumulative PV reconciles to BAC by construction: PV is evaluated by the canonical
+ *     EVM engine (`calculateProjectEvmAtDataDate`) at each cutoff, and the last cutoff is at or
+ *     after every activity finish and the project end date, where the canonical engine has
+ *     already normalised the per-activity cost allocation to sum exactly to BAC.
+ *
+ * Cost weighting (GAP-006): the curve is weighted by the CANONICAL cost allocation — CBS budget
+ * lines matched to activities through `wbs_node_id`, falling back to an even `BAC / activityCount`
+ * share for an activity with no budget line, then normalised to BAC. Physical quantities are never
+ * used as financial weights: `planned_quantity` values carry heterogeneous units (m3, m2, points,
+ * tons, lots) and summing them invents an exchange rate between units. There is likewise no
+ * hidden SAR-per-unit conversion: BAC is the canonical EVM BAC, never `quantity * 100`.
+ *
+ * Historical EV / AC (GAP-024, GAP-025): history is evidence only.
+ *  - EV at cutoff T is the canonical earned-value roll-up of APPROVED progress updates dated
+ *    `<= T`. An activity with no approved update at T contributes ZERO, never its current
+ *    `percent_complete` — today's progress is not retroactively written into earlier periods.
+ *  - AC at cutoff T is the sum of APPROVED cost transactions dated `<= T`, and ZERO when there
+ *    are none. The canonical engine's current-state AC estimate (used when a project has no
+ *    transactions yet) is deliberately NOT backcast into history, and no `timeRatio` linear
+ *    interpolation is used anywhere: an empty period reports an empty period.
+ * The canonical EV / AC / EAC scalars at the Data Date remain the authoritative "current" values
+ * returned as `currentEv` / `currentAc` / `forecastEac`.
+ */
 
 export interface SCurvePoint {
   date: string; // 'YYYY-MM-DD'
@@ -22,6 +66,26 @@ export interface SCurveData {
   dataDate: string;
 }
 
+/**
+ * Source data the canonical EVM needs in order to evaluate the planned curve at arbitrary cutoffs.
+ *
+ * Both are the SAME inputs the caller already passed to `calculateProjectEvmAtDataDate`, which is
+ * what makes the final cumulative PV reconcile to `evm.bac` exactly instead of approximately.
+ */
+export interface SCurveCanonicalSources {
+  /** Structural subset of `Project` consumed by the canonical EVM (contract value and dates). */
+  project?: {
+    contract_value?: number | null;
+    start_date?: string | null;
+    end_date?: string | null;
+    data_date?: string | null;
+  } | null;
+  /** CBS budget lines — the legitimate per-activity cost allocation, matched by `wbs_node_id`. */
+  budgetLines?: EvmBudgetLineInput[];
+  /** BOQ items — canonical BAC fallback when there is neither a contract value nor budget lines. */
+  boqItems?: BoqItem[];
+}
+
 function parseDate(d: string): number {
   return new Date(`${d}T00:00:00Z`).getTime();
 }
@@ -35,24 +99,42 @@ export function generateSCurveData(
   baselineActivities: BaselineActivity[],
   progressUpdates: ProgressUpdate[],
   costTransactions: CostTransaction[],
-  evm: EvmMetrics,
+  evm: EvmMetrics & { dataDate?: string },
   projectStartDate?: string | null,
   projectEndDate?: string | null,
   customDataDate?: string | null,
+  canonicalSources: SCurveCanonicalSources = {},
 ): SCurveData {
-  const effectiveDataDate = customDataDate || new Date().toISOString().split('T')[0];
+  // Governed Data Date resolution: explicit cutoff -> the canonical EVM's own resolved data date
+  // -> the governed constant. `new Date()` is never used as the cutoff, so the curve cannot drift
+  // with the machine clock (GAP-007).
+  const effectiveDataDate = customDataDate || evm.dataDate || DEFAULT_DATA_DATE;
   const effectiveDataDateTime = parseDate(effectiveDataDate);
+
+  // Canonical BAC is authoritative. It is never replaced by a quantity-derived synthetic value.
+  const totalBac = Number(evm.bac || 0);
 
   if (activities.length === 0) {
     return {
       points: [],
-      bac: evm.bac,
+      bac: totalBac,
       currentEv: evm.ev,
       currentAc: evm.ac,
       forecastEac: evm.eac,
       dataDate: effectiveDataDate,
     };
   }
+
+  const budgetLines = canonicalSources.budgetLines || [];
+  const boqItems = canonicalSources.boqItems || [];
+  // Without a project the canonical engine would resolve its own BAC fallback; supplying the
+  // canonical BAC the caller already computed keeps the curve reconciled to it exactly.
+  const canonicalProject = canonicalSources.project ?? {
+    contract_value: totalBac,
+    start_date: projectStartDate ?? null,
+    end_date: projectEndDate ?? null,
+    data_date: effectiveDataDate,
+  };
 
   // Determine overall project date span
   let minTime = Infinity;
@@ -85,35 +167,30 @@ export function generateSCurveData(
     cutOffDates.push(currentCutoff);
     currentCutoff += stepMs;
   }
+  // The Data Date is always a bucket: the actual series must END on the Data Date and the forecast
+  // must BEGIN after it, and the planned value on that bucket must equal the canonical EV/PV state.
+  if (!cutOffDates.includes(effectiveDataDateTime)) {
+    cutOffDates.push(effectiveDataDateTime);
+  }
+  cutOffDates.sort((a, b) => a - b);
 
-  const totalBac = Math.max(
-    evm.bac,
-    activities.reduce((sum, act) => sum + (act.planned_quantity || 1) * 100, 0),
-  );
+  // The canonical EVM is the single evaluation path for the planned curve. Evaluating it at each
+  // cutoff reuses BOTH its cost allocation and its planned-value progression, so no second PV
+  // formula exists here. Earned value on the same call is evidence-only because the activities are
+  // passed with `percent_complete` zeroed: only approved progress updates dated on or before the
+  // cutoff can then contribute, which is exactly the GAP-024 rule.
+  const evidenceActivities = activities.map((act) => ({ ...act, percent_complete: 0 }));
+  const lateEvidenceActivities = evidenceActivities.map((act) => ({
+    ...act,
+    early_start: act.late_start || act.early_start,
+    early_finish: act.late_finish || act.early_finish,
+  }));
 
-  // Assign a planned cost weight to each activity
-  const actCostMap = new Map<string, number>();
-  const totalWeights = activities.reduce((s, a) => s + Math.max(1, a.planned_quantity || 1), 0);
-
-  activities.forEach((act) => {
-    const weight = Math.max(1, act.planned_quantity || 1) / totalWeights;
-    actCostMap.set(act.id, totalBac * weight);
-  });
-
-  // Calculate Cumulative PV (Early and Late) for each cutoff date
-  const points: SCurvePoint[] = [];
-  let lastValidEv = 0;
-  let lastValidAc = 0;
-
-  // Process approved progress updates sorted by date
-  const approvedUpdates = [...progressUpdates]
-    .filter((u) => u.status === 'approved')
-    .sort((a, b) => a.update_date.localeCompare(b.update_date));
-
-  // Process approved cost transactions sorted by date
   const approvedCosts = [...costTransactions]
     .filter((c) => c.status === 'approved')
     .sort((a, b) => a.transaction_date.localeCompare(b.transaction_date));
+
+  const points: SCurvePoint[] = [];
 
   for (let i = 0; i < cutOffDates.length; i++) {
     const cutoff = cutOffDates[i];
@@ -121,79 +198,54 @@ export function generateSCurveData(
     const d = new Date(cutoff);
     const label = d.toLocaleDateString('ar-SA', { month: 'short', day: 'numeric' });
 
-    // Early PV calculation
-    let pvEarly = 0;
-    let pvLate = 0;
+    const atCutoff = calculateProjectEvmAtDataDate(
+      canonicalProject,
+      evidenceActivities,
+      budgetLines,
+      boqItems,
+      [],
+      progressUpdates,
+      cutoffStr,
+    );
+    const atCutoffLate = calculateProjectEvmAtDataDate(
+      canonicalProject,
+      lateEvidenceActivities,
+      budgetLines,
+      boqItems,
+      [],
+      progressUpdates,
+      cutoffStr,
+    );
 
-    activities.forEach((act) => {
-      const cost = actCostMap.get(act.id) || 0;
-      const actStartEarly = act.early_start ? parseDate(act.early_start) : minTime;
-      const actFinishEarly = act.early_finish ? parseDate(act.early_finish) : maxTime;
-      const actStartLate = act.late_start ? parseDate(act.late_start) : actStartEarly;
-      const actFinishLate = act.late_finish ? parseDate(act.late_finish) : actFinishEarly;
+    const pvEarly = atCutoff.pv;
+    const pvLate = atCutoffLate.pv;
 
-      // Early progression
-      if (cutoff >= actFinishEarly) {
-        pvEarly += cost;
-      } else if (cutoff > actStartEarly && actFinishEarly > actStartEarly) {
-        const ratio = (cutoff - actStartEarly) / (actFinishEarly - actStartEarly);
-        pvEarly += cost * Math.max(0, Math.min(1, ratio));
-      }
+    // A bucket is actual iff it is on or before the Data Date (no half-step grace).
+    const isPastOrPresent = cutoff <= effectiveDataDateTime;
 
-      // Late progression
-      if (cutoff >= actFinishLate) {
-        pvLate += cost;
-      } else if (cutoff > actStartLate && actFinishLate > actStartLate) {
-        const ratio = (cutoff - actStartLate) / (actFinishLate - actStartLate);
-        pvLate += cost * Math.max(0, Math.min(1, ratio));
-      }
-    });
-
-    const isPastOrPresent = cutoff <= effectiveDataDateTime + stepMs / 2;
-
-    // EV up to this cutoff
     let evVal: number | null = null;
     let acVal: number | null = null;
     let forecastVal: number | null = null;
 
     if (isPastOrPresent) {
-      // Calculate EV from approved updates or EVM
-      const updatesToDate = approvedUpdates.filter((u) => parseDate(u.update_date) <= cutoff);
-      if (updatesToDate.length > 0) {
-        // Average progress to date
-        const latestPerAct = new Map<string, number>();
-        updatesToDate.forEach((u) => latestPerAct.set(u.activity_id, u.percent_complete));
-        let sumWeighted = 0;
-        activities.forEach((act) => {
-          const pct = latestPerAct.get(act.id) || (act.actual_start && parseDate(act.actual_start) <= cutoff ? act.percent_complete : 0);
-          const cost = actCostMap.get(act.id) || 0;
-          sumWeighted += cost * (pct / 100);
-        });
-        evVal = Math.round(sumWeighted);
-      } else {
-        // Proportional to current EV
-        const timeRatio = Math.max(0, Math.min(1, (cutoff - minTime) / Math.max(1, effectiveDataDateTime - minTime)));
-        evVal = Math.round(evm.ev * timeRatio);
-      }
-
-      // Calculate AC from cost transactions
-      const costsToDate = approvedCosts.filter((c) => parseDate(c.transaction_date) <= cutoff);
-      if (costsToDate.length > 0) {
-        acVal = Math.round(costsToDate.reduce((sum, c) => sum + Number(c.amount || 0), 0));
-      } else {
-        const timeRatio = Math.max(0, Math.min(1, (cutoff - minTime) / Math.max(1, effectiveDataDateTime - minTime)));
-        acVal = Math.round(evm.ac * timeRatio);
-      }
-
-      lastValidEv = evVal || lastValidEv;
-      lastValidAc = acVal || lastValidAc;
+      // Evidence-only earned value: approved progress updates dated <= cutoff, valued with the
+      // canonical cost allocation. No current `percent_complete`, no time interpolation.
+      evVal = Math.round(atCutoff.ev);
+      // Evidence-only actual cost: approved transactions dated <= cutoff. Zero when there are none,
+      // because the canonical current-state AC estimate must not be backcast into history.
+      acVal = Math.round(
+        approvedCosts
+          .filter((c) => c.transaction_date <= cutoffStr)
+          .reduce((sum, c) => sum + Number(c.amount || 0), 0),
+      );
     } else {
-      // Future Projection (Forecast EAC Curve)
+      // Forecast: canonical EAC less canonical AC at the Data Date, spread over the remaining
+      // planned span. It starts from the canonical current cost, never from fabricated history.
       const remainingTime = maxTime - effectiveDataDateTime;
       const currentOffset = cutoff - effectiveDataDateTime;
-      const progressFactor = remainingTime > 0 ? Math.min(1, currentOffset / remainingTime) : 1;
-      const remainingCost = Math.max(0, evm.eac - lastValidAc);
-      forecastVal = Math.round(lastValidAc + remainingCost * progressFactor);
+      const progressFactor = remainingTime > 0 ? Math.min(1, Math.max(0, currentOffset / remainingTime)) : 1;
+      const remainingCost = Math.max(0, Number(evm.eac || 0) - Number(evm.ac || 0));
+      forecastVal = Math.round(Number(evm.ac || 0) + remainingCost * progressFactor);
     }
 
     const prevPv = i > 0 ? points[i - 1].pvEarlyCumulative : 0;
@@ -208,6 +260,8 @@ export function generateSCurveData(
       evCumulative: evVal,
       acCumulative: acVal,
       forecastCumulative: forecastVal,
+      // Incremental periods are floored at zero so an approved downward correction in a cumulative
+      // series cannot render as negative work in a bar chart; the cumulative series still shows it.
       periodPv: Math.max(0, Math.round(pvEarly - prevPv)),
       periodEv: evVal !== null ? Math.max(0, Math.round(evVal - prevEv)) : null,
       periodAc: acVal !== null ? Math.max(0, Math.round(acVal - prevAc)) : null,
@@ -217,8 +271,10 @@ export function generateSCurveData(
   return {
     points,
     bac: totalBac,
-    currentEv: lastValidEv || evm.ev,
-    currentAc: lastValidAc || evm.ac,
+    // Canonical scalars at the Data Date (SSOT), not the evidence-only roll-up and not a fallback
+    // chain that would silently substitute one for the other.
+    currentEv: evm.ev,
+    currentAc: evm.ac,
     forecastEac: evm.eac,
     dataDate: effectiveDataDate,
   };

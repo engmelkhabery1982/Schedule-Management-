@@ -183,10 +183,17 @@ export default function ProgressView({ project }: ProgressViewProps) {
     return calculateSubcontractorLedger(subcontracts, activities, boqItems);
   }, [subcontracts, activities, boqItems]);
 
-  // Earned Schedule Calculation
+  // Earned Schedule Calculation — no synthetic cost ratio. The engine calls the canonical Wave-2
+  // EVM exactly once with the sources this view loads (activities, BOQ items, progress updates) and
+  // takes EV / AC / CPI / BAC from it (GAP-007).
   const earnedScheduleData = useMemo(() => {
-    return calculateEarnedSchedule(project, activities, 0.96);
-  }, [project, activities]);
+    return calculateEarnedSchedule({
+      project,
+      activities,
+      boqItems,
+      progressUpdates: updates,
+    });
+  }, [project, activities, boqItems, updates]);
 
   // Overall Financial & Physical Totals
   const overallMetrics = useMemo(() => {

@@ -1,6 +1,14 @@
-import type { Activity, Project } from '@/types';
+import type { Activity, BoqItem, CostTransaction, EvmMetrics, ProgressUpdate, Project } from '@/types';
+import { calculateProjectEvmAtDataDate, type EvmBudgetLineInput } from '@/lib/planningEngine';
+import { generateSCurveData, type SCurveData } from '@/lib/sCurveEngine';
+import { DEFAULT_DATA_DATE } from '@/lib/projectControlsConstants';
 
 export interface MonthlyDataPoint {
+  /**
+   * Bucket index on the shared S-Curve axis (0 = project start bucket). Named `monthIndex` for
+   * compatibility with existing consumers; buckets are 7 / 14 / 30 days apart depending on the
+   * project span, so this is a bucket sequence number rather than a calendar month.
+   */
   monthIndex: number;
   monthLabel: string;
   date: string;
@@ -21,7 +29,7 @@ export interface EarnedScheduleResult {
   scheduleVarianceTimeMonths: number; // SV(t) = ES - AT
   scheduleVarianceTimeDays: number;
   schedulePerformanceIndexTime: number; // SPI(t) = ES / AT
-  costPerformanceIndex: number; // CPI = EV / AC
+  costPerformanceIndex: number; // CPI = EV / AC (canonical EVM)
   estimatedDurationAtCompletionMonths: number; // IEAC(t) = PD / SPI(t)
   estimatedDurationAtCompletionDays: number;
   varianceAtCompletionTimeMonths: number; // VAC(t) = PD - IEAC(t)
@@ -41,14 +49,96 @@ export interface EarnedScheduleResult {
 }
 
 /**
- * Calculates Earned Schedule (ES) metrics from Project & Activities.
- * Maps EV against the baseline PV(t) curve to derive time-based performance indices.
+ * Everything Earned Schedule needs, and nothing it is allowed to invent (GAP-007).
+ *
+ * The engine derives NO economic value of its own. `evm` is the canonical Wave-2 project EVM
+ * (`calculateProjectEvmAtDataDate`); when the caller does not already hold it, the engine calls
+ * that same canonical function exactly once with the source data below. `sCurve` is the canonical
+ * financial S-Curve whose planned-value curve Earned Schedule maps EV onto; when absent it is
+ * generated once from the same sources, so both features always share ONE PV curve.
  */
-export function calculateEarnedSchedule(
-  project: Project | null,
-  activities: Activity[],
-  actualCostBudgetRatio: number = 0.95
-): EarnedScheduleResult {
+export interface EarnedScheduleSources {
+  project: Project | null;
+  activities: Activity[];
+  /** Canonical EVM at the governed Data Date. Preferred: computed once by the caller. */
+  evm?: EvmMetrics & { dataDate?: string };
+  /** Canonical S-Curve. Preferred: the same object rendered by the S-Curve chart. */
+  sCurve?: SCurveData;
+  /** Source data used only when `evm` / `sCurve` are not supplied (canonical EVM, called once). */
+  budgetLines?: EvmBudgetLineInput[];
+  boqItems?: BoqItem[];
+  costTransactions?: CostTransaction[];
+  progressUpdates?: ProgressUpdate[];
+  /** Explicit cutoff; otherwise `evm.dataDate` -> `project.data_date` -> governed DEFAULT_DATA_DATE. */
+  overrideDataDate?: string;
+}
+
+const DAY_MS = 86400000;
+/** Documented unit convention of this interface: one "month" = 30 calendar days. */
+const DAYS_PER_MONTH = 30;
+
+function parseDate(d: string): number {
+  return new Date(`${d}T00:00:00Z`).getTime();
+}
+
+function formatDate(timestamp: number): string {
+  return new Date(timestamp).toISOString().split('T')[0];
+}
+
+function daysBetween(fromIso: string, toIso: string): number {
+  return Math.round((parseDate(toIso) - parseDate(fromIso)) / DAY_MS);
+}
+
+/**
+ * Earned Schedule (ESM) — maps canonical EV onto the canonical planned-value curve to express
+ * schedule performance in TIME units instead of currency.
+ *
+ * FORMULAS AND UNITS (all time quantities are CALENDAR DAYS on the S-Curve date axis, measured
+ * from the project start; "months" fields are those days divided by 30):
+ *
+ *   PD    = planned duration            = project end date - project start date
+ *   AT    = actual time elapsed         = clamp(data date - project start date, 0, PD)
+ *   ES    = earned schedule             = the time at which the cumulative PV curve reaches EV
+ *   SV(t) = ES - AT                                          [days]
+ *   SPI(t)= ES / AT                                          [ratio, dimensionless]
+ *   IEAC(t)= PD / SPI(t)                                     [days]
+ *   VAC(t)= PD - IEAC(t)                                     [days]
+ *   CPI   = canonical EVM CPI (EV / AC)                       [ratio] — never re-derived here
+ *
+ * ES is obtained by inverting the cumulative PV curve, with EXPLICIT boundaries (GAP-023):
+ *
+ *   A. EV <= 0 (or non-finite)                     -> ES = 0. Nothing has been earned, so no
+ *      point of the planned curve has been reached. SPI(t) is then 0 whenever AT > 0.
+ *   B. 0 < EV < PV(last)                           -> take C = the last bucket with
+ *      PV(C) <= EV and PV(C+1) > PV(C), then
+ *         I  = (EV - PV(C)) / (PV(C+1) - PV(C))     in [0, 1)   [dimensionless]
+ *         ES = t(C) + I * (t(C+1) - t(C))                       [days]
+ *      i.e. linear interpolation in TIME between the two surrounding planned-value points. A flat
+ *      segment (PV(C+1) == PV(C)) is skipped, never divided by.
+ *   C. EV >= PV(last) (== canonical BAC)           -> ES = PD, clamped. Earned value at or beyond
+ *      the final planned value means the whole planned duration has been earned; the curve is NOT
+ *      extrapolated past its last point.
+ *
+ * The former implementation indexed one point beyond the end of the curve and substituted
+ * `PV(C) + 1` for the missing next point, which turned a currency difference (EV - BAC, in SAR)
+ * into a count of MONTHS: an EV of 1.2 x BAC on a 125M SAR project produced an earned schedule of
+ * 750,000,390 days and an SPI(t) of 2,941,178. Because ES is now clamped to [0, PD] by
+ * construction, no currency amount can enter a time quantity and no overflow is reachable.
+ *
+ * Degenerate boundary: when ES = 0 while AT > 0, SPI(t) = 0 and IEAC(t) = PD / SPI(t) is
+ * mathematically unbounded. Rather than emit Infinity (or a fabricated cap), the engine reports
+ * IEAC(t) = PD as an explicit NOT-COMPUTABLE floor with VAC(t) = 0, sets the forecast completion
+ * date to the planned completion date, and says so in `timeDivergenceNote` with a
+ * `critical_delay` status. For any ES > 0 the exact formula is used and is finite.
+ */
+export function calculateEarnedSchedule(sources: EarnedScheduleSources): EarnedScheduleResult {
+  const { project, activities } = sources;
+
+  // Governed Data Date: explicit override -> canonical EVM data date -> project -> constant.
+  // `new Date()` is never used as the cutoff and no date literal is repeated here (GAP-007).
+  const dataDate =
+    sources.overrideDataDate || sources.evm?.dataDate || project?.data_date || DEFAULT_DATA_DATE;
+
   if (!project || activities.length === 0) {
     return {
       actualTimeElapsedMonths: 0,
@@ -65,8 +155,8 @@ export function calculateEarnedSchedule(
       estimatedDurationAtCompletionDays: 0,
       varianceAtCompletionTimeMonths: 0,
       varianceAtCompletionTimeDays: 0,
-      forecastCompletionDate: new Date().toISOString().split('T')[0],
-      plannedCompletionDate: new Date().toISOString().split('T')[0],
+      forecastCompletionDate: dataDate,
+      plannedCompletionDate: project?.end_date || dataDate,
       status: 'on_track',
       timeDivergenceNote: 'لا توجد بيانات كافية للحساب.',
       comparisonWithTraditionalEvm: {
@@ -80,127 +170,143 @@ export function calculateEarnedSchedule(
     };
   }
 
-  const startDate = new Date(project.start_date || '2026-09-15');
-  const endDate = new Date(project.end_date || '2027-05-15');
-  const plannedDurationDays = Math.max(1, Math.round((endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24)));
-  const plannedDurationMonths = Math.max(1, plannedDurationDays / 30);
+  // Canonical EVM — consumed when supplied, otherwise computed here exactly once. There is no
+  // second EVM implementation in this engine: BAC, PV, EV, AC, CPI and SPI all come from it.
+  const evm =
+    sources.evm ||
+    calculateProjectEvmAtDataDate(
+      project,
+      activities,
+      sources.budgetLines || [],
+      sources.boqItems || [],
+      sources.costTransactions || [],
+      sources.progressUpdates || [],
+      dataDate,
+    );
 
-  // Determine current evaluation date (e.g. status date or demo cut-off)
-  const today = new Date(project.data_date || '2026-11-20');
-  const actualDaysElapsed = Math.max(1, Math.min(plannedDurationDays, Math.round((today.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24))));
-  const actualMonthsElapsed = actualDaysElapsed / 30;
+  // The SAME planned-value curve the S-Curve feature renders (shared, not duplicated).
+  const sCurve =
+    sources.sCurve ||
+    generateSCurveData(
+      activities,
+      [],
+      sources.progressUpdates || [],
+      sources.costTransactions || [],
+      evm,
+      project.start_date,
+      project.end_date,
+      dataDate,
+      { project, budgetLines: sources.budgetLines || [], boqItems: sources.boqItems || [] },
+    );
 
-  // Calculate Total Budget (BAC), Cumulative PV, and Cumulative EV
-  const bac = project.contract_value || activities.reduce((sum, a) => sum + (a.planned_quantity || 1) * 100, 0);
-  
-  // Calculate current average project progress
-  const currentProjectProgress = activities.length > 0
-    ? (activities.reduce((sum, a) => sum + (a.percent_complete || 0), 0) / activities.length) / 100
-    : 0.28;
+  const curvePoints = sCurve.points;
+  const curveStart = curvePoints.length > 0 ? curvePoints[0].date : project.start_date || dataDate;
+  const curveEnd =
+    curvePoints.length > 0 ? curvePoints[curvePoints.length - 1].date : project.end_date || dataDate;
 
-  // Build monthly cumulative PV curve
-  const totalMonthsCount = Math.max(6, Math.ceil(plannedDurationMonths));
-  const sCurvePoints: MonthlyDataPoint[] = [];
+  const startDateIso = project.start_date || curveStart;
+  const endDateIso = project.end_date || curveEnd;
 
-  for (let m = 0; m <= totalMonthsCount; m++) {
-    const pointDate = new Date(startDate.getTime() + m * 30 * 24 * 60 * 60 * 1000);
-    const progressFactor = m / totalMonthsCount;
-    // Sigmoid curve
-    const sVal = 1 / (1 + Math.exp(-6 * (progressFactor - 0.5)));
-    const sMin = 1 / (1 + Math.exp(-6 * (0 - 0.5)));
-    const sMax = 1 / (1 + Math.exp(-6 * (1 - 0.5)));
-    const normalizedPvFactor = Math.max(0, Math.min(1, (sVal - sMin) / (sMax - sMin)));
-    const pvCum = Math.round(bac * normalizedPvFactor);
+  // PD and AT in calendar days, both clamped to the planned span so no derived value can escape it.
+  const plannedDurationDays = Math.max(0, daysBetween(startDateIso, endDateIso));
+  const actualDaysElapsed = Math.max(
+    0,
+    Math.min(plannedDurationDays, daysBetween(startDateIso, dataDate)),
+  );
+  const plannedDurationMonths = plannedDurationDays / DAYS_PER_MONTH;
+  const actualMonthsElapsed = actualDaysElapsed / DAYS_PER_MONTH;
 
-    let evCum = 0;
-    let acCum = 0;
+  // ---- ES: read time back off the cumulative planned-value curve, with explicit boundaries ----
+  const pvFinal = curvePoints.length > 0 ? curvePoints[curvePoints.length - 1].pvEarlyCumulative : 0;
+  const earnedValue = Number(evm.ev || 0);
+  /** time of bucket i, in calendar days from the project start */
+  const timeAt = (i: number) => Math.max(0, daysBetween(startDateIso, curvePoints[i].date));
 
-    if (m <= Math.ceil(actualMonthsElapsed)) {
-      if (m === 0) {
-        evCum = 0;
-        acCum = 0;
-      } else {
-        const weight = Math.min(1, m / actualMonthsElapsed);
-        evCum = Math.round(bac * currentProjectProgress * weight);
-        acCum = Math.round(evCum * actualCostBudgetRatio);
+  let earnedScheduleDays = 0;
+  if (!Number.isFinite(earnedValue) || earnedValue <= 0) {
+    // Boundary A: nothing earned -> no planned time reached.
+    earnedScheduleDays = 0;
+  } else if (pvFinal <= 0 || earnedValue >= pvFinal || curvePoints.length < 2) {
+    // Boundary C: earned value at or beyond the final planned value (== canonical BAC) -> the whole
+    // planned duration is earned. No extrapolation beyond the last point of the curve.
+    earnedScheduleDays = plannedDurationDays;
+  } else {
+    // Boundary B: linear interpolation in time between the two surrounding planned-value points.
+    let segment = -1;
+    for (let i = 0; i < curvePoints.length - 1; i++) {
+      const pvI = curvePoints[i].pvEarlyCumulative;
+      const pvNext = curvePoints[i + 1].pvEarlyCumulative;
+      // A flat segment carries no planned value, so it cannot be inverted; skip it instead of
+      // dividing by zero.
+      if (pvNext > pvI && earnedValue >= pvI && earnedValue < pvNext) {
+        segment = i;
+        break;
       }
     }
-
-    const prevPv = m > 0 ? sCurvePoints[m - 1].pvCumulative : 0;
-    const prevEv = m > 0 ? sCurvePoints[m - 1].evCumulative : 0;
-
-    sCurvePoints.push({
-      monthIndex: m,
-      monthLabel: `شهر ${m}`,
-      date: pointDate.toISOString().split('T')[0],
-      pvCumulative: pvCum,
-      evCumulative: m <= Math.ceil(actualMonthsElapsed) ? evCum : 0,
-      acCumulative: m <= Math.ceil(actualMonthsElapsed) ? acCum : 0,
-      pvIncremental: Math.max(0, pvCum - prevPv),
-      evIncremental: m <= Math.ceil(actualMonthsElapsed) ? Math.max(0, evCum - prevEv) : 0,
-    });
-  }
-
-  // Current EV and PV at Actual Time
-  const currentEv = bac * currentProjectProgress;
-  const currentPvIndex = Math.min(Math.floor(actualMonthsElapsed), sCurvePoints.length - 1);
-  const currentPv = sCurvePoints[currentPvIndex]?.pvCumulative || (bac * (actualMonthsElapsed / plannedDurationMonths));
-  const currentAc = currentEv * actualCostBudgetRatio;
-
-  // === EARNED SCHEDULE (ES) ALGORITHM ===
-  let C = 0;
-  for (let i = 0; i < sCurvePoints.length - 1; i++) {
-    if (sCurvePoints[i].pvCumulative <= currentEv && currentEv <= sCurvePoints[i + 1].pvCumulative) {
-      C = i;
-      break;
-    }
-    if (currentEv > sCurvePoints[sCurvePoints.length - 1].pvCumulative) {
-      C = sCurvePoints.length - 1;
+    if (segment < 0) {
+      // EV is below the first positive planned value: the earned time is inside the first segment.
+      earnedScheduleDays = 0;
+    } else {
+      const pvC = curvePoints[segment].pvEarlyCumulative;
+      const pvC1 = curvePoints[segment + 1].pvEarlyCumulative;
+      const tC = timeAt(segment);
+      const tC1 = timeAt(segment + 1);
+      const fraction = (earnedValue - pvC) / (pvC1 - pvC); // in [0, 1)
+      earnedScheduleDays = tC + fraction * (tC1 - tC);
     }
   }
+  // ES can never leave the planned span: this single clamp is what makes the overflow unreachable.
+  earnedScheduleDays = Math.max(0, Math.min(plannedDurationDays, earnedScheduleDays));
 
-  const pvC = sCurvePoints[C]?.pvCumulative || 0;
-  const pvCPlus1 = sCurvePoints[C + 1]?.pvCumulative || (pvC + 1);
-  const I = (pvCPlus1 - pvC) > 0 ? (currentEv - pvC) / (pvCPlus1 - pvC) : 0;
-  
-  // Earned Schedule in Months and Days
-  const earnedScheduleMonths = Math.max(0, C + I);
-  const earnedScheduleDays = Math.round(earnedScheduleMonths * 30);
+  const earnedScheduleMonths = earnedScheduleDays / DAYS_PER_MONTH;
 
-  // Time-based variances & indices
-  const scheduleVarianceTimeMonths = earnedScheduleMonths - actualMonthsElapsed;
-  const scheduleVarianceTimeDays = Math.round(scheduleVarianceTimeMonths * 30);
-  const schedulePerformanceIndexTime = actualMonthsElapsed > 0 ? earnedScheduleMonths / actualMonthsElapsed : 1.0;
-  const costPerformanceIndex = currentAc > 0 ? currentEv / currentAc : 1.0;
+  // ---- Time-based variances and indices ----
+  const scheduleVarianceTimeDays = earnedScheduleDays - actualDaysElapsed;
+  const scheduleVarianceTimeMonths = scheduleVarianceTimeDays / DAYS_PER_MONTH;
+  // AT = 0 means no time has elapsed, so the ratio is undefined and reported as neutral 1.0.
+  const schedulePerformanceIndexTime =
+    actualDaysElapsed > 0 ? earnedScheduleDays / actualDaysElapsed : 1.0;
+  // CPI is the canonical EVM value. It is never re-derived here from a synthetic AC ratio.
+  const costPerformanceIndex = Number.isFinite(evm.cpi) ? evm.cpi : 1.0;
 
-  // Forecast Duration & Completion Date
-  const estimatedDurationAtCompletionMonths = schedulePerformanceIndexTime > 0 ? plannedDurationMonths / schedulePerformanceIndexTime : plannedDurationMonths;
-  const estimatedDurationAtCompletionDays = Math.round(estimatedDurationAtCompletionMonths * 30);
-  const varianceAtCompletionTimeMonths = plannedDurationMonths - estimatedDurationAtCompletionMonths;
-  const varianceAtCompletionTimeDays = Math.round(varianceAtCompletionTimeMonths * 30);
+  // IEAC(t) = PD / SPI(t), with the SPI(t) = 0 boundary handled explicitly (no Infinity).
+  const durationForecastComputable = schedulePerformanceIndexTime > 0 && plannedDurationDays > 0;
+  const estimatedDurationAtCompletionDays = durationForecastComputable
+    ? plannedDurationDays / schedulePerformanceIndexTime
+    : plannedDurationDays;
+  const estimatedDurationAtCompletionMonths = estimatedDurationAtCompletionDays / DAYS_PER_MONTH;
+  const varianceAtCompletionTimeDays = durationForecastComputable
+    ? plannedDurationDays - estimatedDurationAtCompletionDays
+    : 0;
+  const varianceAtCompletionTimeMonths = varianceAtCompletionTimeDays / DAYS_PER_MONTH;
 
-  const forecastEndDateObj = new Date(startDate.getTime() + estimatedDurationAtCompletionDays * 24 * 60 * 60 * 1000);
-  const forecastCompletionDate = forecastEndDateObj.toISOString().split('T')[0];
+  const forecastCompletionDate = durationForecastComputable
+    ? formatDate(parseDate(startDateIso) + Math.round(estimatedDurationAtCompletionDays) * DAY_MS)
+    : endDateIso;
+  const plannedCompletionDate = endDateIso;
 
-  // Traditional EVM comparison metrics
-  const evmSvAmount = currentEv - currentPv;
-  const evmSpi = currentPv > 0 ? currentEv / currentPv : 1.0;
+  // Traditional EVM comparison — canonical values, not recomputed ones.
+  const evmSvAmount = Number(evm.sv || 0);
+  const evmSpi = Number.isFinite(evm.spi) ? evm.spi : 1.0;
 
   let status: EarnedScheduleResult['status'] = 'on_track';
   let timeDivergenceNote = '';
 
-  if (scheduleVarianceTimeDays >= 0) {
+  if (!durationForecastComputable && actualDaysElapsed > 0) {
+    status = 'critical_delay';
+    timeDivergenceNote = `لم يتم تحقيق أي قيمة مكتسبة حتى تاريخ البيانات ${dataDate} رغم مضي ${actualDaysElapsed} يوماً من أصل ${plannedDurationDays} يوماً. لا يمكن حساب المدة المتوقعة للإنجاز (IEAC(t)) عند SPI(t) = 0، لذلك يُعرض الحد الأدنى المخطط ${plannedDurationDays} يوماً وليس تقديراً.`;
+  } else if (scheduleVarianceTimeDays >= 0) {
     status = 'ahead';
-    timeDivergenceNote = `المشروع متقدم زمنياً بمقدار +${scheduleVarianceTimeDays} يوماً عن المخطط (ES = ${earnedScheduleDays} يوم مقابل AT = ${actualDaysElapsed} يوم).`;
+    timeDivergenceNote = `المشروع متقدم زمنياً بمقدار +${Math.round(scheduleVarianceTimeDays)} يوماً عن المخطط (ES = ${Math.round(earnedScheduleDays)} يوم مقابل AT = ${actualDaysElapsed} يوم).`;
   } else if (scheduleVarianceTimeDays >= -7) {
     status = 'on_track';
-    timeDivergenceNote = `المشروع ضمن النطاق المقبول للتذبذب الزمني (تأخير طفيف قدره ${Math.abs(scheduleVarianceTimeDays)} يوماً).`;
+    timeDivergenceNote = `المشروع ضمن النطاق المقبول للتذبذب الزمني (تأخير طفيف قدره ${Math.abs(Math.round(scheduleVarianceTimeDays))} يوماً).`;
   } else if (scheduleVarianceTimeDays >= -21) {
     status = 'delayed';
-    timeDivergenceNote = `يوجد تأخير زمني قدره ${Math.abs(scheduleVarianceTimeDays)} يوماً بمعدل كفاءة زمنية SPI(t) = ${schedulePerformanceIndexTime.toFixed(2)}. يتطلب تدابير تصحيحية.`;
+    timeDivergenceNote = `يوجد تأخير زمني قدره ${Math.abs(Math.round(scheduleVarianceTimeDays))} يوماً بمعدل كفاءة زمنية SPI(t) = ${schedulePerformanceIndexTime.toFixed(2)}. يتطلب تدابير تصحيحية.`;
   } else {
     status = 'critical_delay';
-    timeDivergenceNote = `تأخير زمني حرج قدره ${Math.abs(scheduleVarianceTimeDays)} يوماً. التاريخ المتوقع لإنهاء المشروع سيتأخر حتى ${forecastCompletionDate}. يوصى بتفعيل خطة التعجيل الفوري (Schedule Crashing).`;
+    timeDivergenceNote = `تأخير زمني حرج قدره ${Math.abs(Math.round(scheduleVarianceTimeDays))} يوماً. التاريخ المتوقع لإنهاء المشروع سيتأخر حتى ${forecastCompletionDate}. يوصى بتفعيل خطة التعجيل الفوري (Schedule Crashing).`;
   }
 
   const paradoxExplanation =
@@ -214,26 +320,37 @@ export function calculateEarnedSchedule(
     plannedDurationMonths: Number(plannedDurationMonths.toFixed(2)),
     plannedDurationDays,
     earnedScheduleMonths: Number(earnedScheduleMonths.toFixed(2)),
-    earnedScheduleDays,
+    earnedScheduleDays: Math.round(earnedScheduleDays),
     scheduleVarianceTimeMonths: Number(scheduleVarianceTimeMonths.toFixed(2)),
-    scheduleVarianceTimeDays,
+    scheduleVarianceTimeDays: Math.round(scheduleVarianceTimeDays),
     schedulePerformanceIndexTime: Number(schedulePerformanceIndexTime.toFixed(3)),
     costPerformanceIndex: Number(costPerformanceIndex.toFixed(3)),
     estimatedDurationAtCompletionMonths: Number(estimatedDurationAtCompletionMonths.toFixed(2)),
-    estimatedDurationAtCompletionDays,
+    estimatedDurationAtCompletionDays: Math.round(estimatedDurationAtCompletionDays),
     varianceAtCompletionTimeMonths: Number(varianceAtCompletionTimeMonths.toFixed(2)),
-    varianceAtCompletionTimeDays,
+    varianceAtCompletionTimeDays: Math.round(varianceAtCompletionTimeDays),
     forecastCompletionDate,
-    plannedCompletionDate: project.end_date || '2027-05-15',
+    plannedCompletionDate,
     status,
     timeDivergenceNote,
     comparisonWithTraditionalEvm: {
       evmSvAmount: Math.round(evmSvAmount),
       evmSpi: Number(evmSpi.toFixed(3)),
-      esmSvDays: scheduleVarianceTimeDays,
+      esmSvDays: Math.round(scheduleVarianceTimeDays),
       esmSpi: Number(schedulePerformanceIndexTime.toFixed(3)),
       paradoxExplanation,
     },
-    sCurvePoints,
+    // The shared S-Curve buckets, projected onto this interface's point shape. Earned/actual values
+    // are null on forecast buckets, which map to 0 here because this series is "actual to date".
+    sCurvePoints: curvePoints.map((p, i) => ({
+      monthIndex: i,
+      monthLabel: p.label,
+      date: p.date,
+      pvCumulative: p.pvEarlyCumulative,
+      evCumulative: p.evCumulative ?? 0,
+      acCumulative: p.acCumulative ?? 0,
+      pvIncremental: p.periodPv,
+      evIncremental: p.periodEv ?? 0,
+    })),
   };
 }
