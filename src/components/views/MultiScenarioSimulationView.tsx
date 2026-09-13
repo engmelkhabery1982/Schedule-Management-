@@ -5,7 +5,11 @@ import type {
   Project,
   Activity,
   ActivityLink,
+  BoqItem,
   BudgetLine,
+  CostTransaction,
+  ForecastModelStatus,
+  ProgressUpdate,
   ComplexScenarioModel,
   ComplexScenarioResult,
   PrecisionWatchdogMetric,
@@ -15,7 +19,9 @@ import {
   simulateComplexProjectScenario,
   runPrecisionWatchdogAudit,
   calculateScenarioSensitivityTornado,
+  type ScenarioEvmBaseline,
 } from '@/lib/complexScenarioSimulator';
+import { calculateProjectEvmAtDataDate } from '@/lib/planningEngine';
 import {
   Sparkles,
   Sliders,
@@ -56,6 +62,11 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
   const [activities, setActivities] = useState<Activity[]>([]);
   const [links, setLinks] = useState<ActivityLink[]>([]);
   const [budgetLines, setBudgetLines] = useState<BudgetLine[]>([]);
+  // Canonical EVM sources (GAP-040): the simulator no longer invents EV/AC, so this view loads the
+  // records the canonical engine needs and hands it the measured baseline.
+  const [boqItems, setBoqItems] = useState<BoqItem[]>([]);
+  const [costTransactions, setCostTransactions] = useState<CostTransaction[]>([]);
+  const [progressUpdates, setProgressUpdates] = useState<ProgressUpdate[]>([]);
 
   // Custom Scenario Builder Parameters
   const [customParams, setCustomParams] = useState({
@@ -99,14 +110,20 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
   }
 
   async function loadProjectDetails(projId: string) {
-    const [{ data: actData }, { data: lnkData }, { data: bgtData }] = await Promise.all([
+    const [{ data: actData }, { data: lnkData }, { data: bgtData }, { data: boqData }, { data: txData }, { data: progressData }] = await Promise.all([
       supabase.from('activities').select('*').eq('project_id', projId).order('sort_order'),
       supabase.from('activity_links').select('*').eq('project_id', projId),
       supabase.from('budget_lines').select('*').eq('project_id', projId),
+      supabase.from('boq_items').select('*').eq('project_id', projId),
+      supabase.from('cost_transactions').select('*').eq('project_id', projId),
+      supabase.from('progress_updates').select('*').eq('project_id', projId),
     ]);
     setActivities(actData || []);
     setLinks(lnkData || []);
     setBudgetLines(bgtData || []);
+    setBoqItems((boqData || []) as BoqItem[]);
+    setCostTransactions((txData || []) as CostTransaction[]);
+    setProgressUpdates((progressData || []) as ProgressUpdate[]);
   }
 
   async function handleSwitchProject(p: Project) {
@@ -116,13 +133,44 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
 
   const isRtl = lang === 'ar';
 
+  // Canonical EVM baseline (SSOT) supplied to every scenario run, so simulated deltas are applied
+  // to measured facts instead of to a fabricated "35% spent" position.
+  const canonicalEvm: ScenarioEvmBaseline | null = useMemo(() => {
+    if (!activeProject) return null;
+    const evm = calculateProjectEvmAtDataDate(
+      activeProject,
+      activities,
+      budgetLines,
+      boqItems,
+      costTransactions,
+      progressUpdates,
+    );
+    return {
+      bac: evm.bac,
+      ev: evm.ev,
+      ac: evm.ac,
+      cpi: evm.cpi,
+      spi: evm.spi,
+      tcpi: evm.tcpi,
+      tcpiStatus: evm.tcpiStatus,
+    };
+  }, [activeProject, activities, budgetLines, boqItems, costTransactions, progressUpdates]);
+
+  /** A model whose denominator is not measurable is rendered as N/A, never as its placeholder. */
+  const renderEac = (value: number, status: ForecastModelStatus) =>
+    status === 'valid' || status === 'valid_estimated_etc'
+      ? `${value.toLocaleString()} ${isRtl ? 'ر.س' : 'SAR'}`
+      : isRtl
+        ? 'غير قابل للحساب (N/A)'
+        : 'Not computable (N/A)';
+
   // Compute Standard Scenarios Results
   const scenarioResults: ComplexScenarioResult[] = useMemo(() => {
     if (!activeProject) return [];
     return STANDARD_COMPLEX_SCENARIOS.map((sc) =>
-      simulateComplexProjectScenario(activeProject, activities, links, budgetLines, sc),
+      simulateComplexProjectScenario(activeProject, activities, links, budgetLines, sc, canonicalEvm),
     );
-  }, [activeProject, activities, links, budgetLines]);
+  }, [activeProject, activities, links, budgetLines, canonicalEvm]);
 
   // Compute Custom Scenario Result
   const customScenarioResult: ComplexScenarioResult | null = useMemo(() => {
@@ -136,8 +184,8 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
       descriptionEn: 'Custom scenario configured dynamically via productivity, inflation, delay, and crashing sliders.',
       parameters: customParams,
     };
-    return simulateComplexProjectScenario(activeProject, activities, links, budgetLines, customModel);
-  }, [activeProject, activities, links, budgetLines, customParams]);
+    return simulateComplexProjectScenario(activeProject, activities, links, budgetLines, customModel, canonicalEvm);
+  }, [activeProject, activities, links, budgetLines, customParams, canonicalEvm]);
 
   // Compute Precision Watchdog Metrics
   const watchdogMetrics: PrecisionWatchdogMetric[] = useMemo(() => {
@@ -454,7 +502,7 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
                         </td>
 
                         <td className="p-3 text-center font-mono font-bold text-slate-900 text-[11px]">
-                          {s.eacBottomUp.toLocaleString()}
+                          {renderEac(s.eacBottomUp, s.eacModelStatuses.bottomUp)}
                         </td>
 
                         <td className="p-3 text-center font-mono text-[11px]">
@@ -472,6 +520,12 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
                           <span className={s.spi < 1 ? 'text-rose-600' : 'text-emerald-600'}>{s.spi.toFixed(2)}</span>
                           <span className="text-slate-400 mx-1">/</span>
                           <span className={s.cpi < 1 ? 'text-amber-600' : 'text-emerald-600'}>{s.cpi.toFixed(2)}</span>
+                          {/* Scenario-adjusted indices: the measured canonical pair with the simulated delta applied. */}
+                          <span className="text-[9px] block text-slate-400 font-sans">
+                            {isRtl
+                              ? `القانوني: ${s.baselineSpi.toFixed(2)} / ${s.baselineCpi.toFixed(2)}`
+                              : `canonical: ${s.baselineSpi.toFixed(2)} / ${s.baselineCpi.toFixed(2)}`}
+                          </span>
                         </td>
 
                         <td className="p-3 text-center font-mono font-bold text-rose-700 text-[11px]">
@@ -528,20 +582,25 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
                   <p className="text-[10px] text-amber-400 font-bold uppercase">{isRtl ? 'نماذج EAC الأربعة' : '4-EAC Forecasting'}</p>
                   <div className="flex justify-between text-[11px]">
                     <span className="text-slate-400">1. Optimistic:</span>
-                    <span className="text-white font-bold">{selectedScenarioDetail.eacOptimistic.toLocaleString()} ر.س</span>
+                    <span className="text-white font-bold">{renderEac(selectedScenarioDetail.eacOptimistic, selectedScenarioDetail.eacModelStatuses.optimistic)}</span>
                   </div>
                   <div className="flex justify-between text-[11px]">
                     <span className="text-slate-400">2. Realistic (BAC/CPI):</span>
-                    <span className="text-emerald-400 font-bold">{selectedScenarioDetail.eacRealistic.toLocaleString()} ر.س</span>
+                    <span className="text-emerald-400 font-bold">{renderEac(selectedScenarioDetail.eacRealistic, selectedScenarioDetail.eacModelStatuses.realistic)}</span>
                   </div>
                   <div className="flex justify-between text-[11px]">
                     <span className="text-slate-400">3. Pessimistic (CPIxSPI):</span>
-                    <span className="text-amber-400 font-bold">{selectedScenarioDetail.eacPessimistic.toLocaleString()} ر.س</span>
+                    <span className="text-amber-400 font-bold">{renderEac(selectedScenarioDetail.eacPessimistic, selectedScenarioDetail.eacModelStatuses.pessimistic)}</span>
                   </div>
                   <div className="flex justify-between text-[11px]">
                     <span className="text-slate-400">4. Bottom-Up:</span>
-                    <span className="text-rose-400 font-bold">{selectedScenarioDetail.eacBottomUp.toLocaleString()} ر.س</span>
+                    <span className="text-rose-400 font-bold">{renderEac(selectedScenarioDetail.eacBottomUp, selectedScenarioDetail.eacModelStatuses.bottomUp)}</span>
                   </div>
+                  <p className="text-[9px] text-slate-500 font-sans pt-1 border-t border-slate-700">
+                    {isRtl
+                      ? `EV/AC مقاسان حتى تاريخ البيانات: ${selectedScenarioDetail.canonicalEvSar.toLocaleString()} / ${selectedScenarioDetail.canonicalAcSar.toLocaleString()} ر.س · التكلفة المحاكاة: ${selectedScenarioDetail.simulatedCostOutcomeSar.toLocaleString()} ر.س`
+                      : `Measured EV/AC at the Data Date: ${selectedScenarioDetail.canonicalEvSar.toLocaleString()} / ${selectedScenarioDetail.canonicalAcSar.toLocaleString()} SAR · simulated cost outcome: ${selectedScenarioDetail.simulatedCostOutcomeSar.toLocaleString()} SAR`}
+                  </p>
                 </div>
 
                 {/* 2. Critical Path & Float */}
@@ -791,10 +850,18 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
                   </div>
 
                   <div className="bg-slate-800/80 p-3 rounded-xl border border-slate-700">
-                    <p className="text-[10px] text-slate-400 uppercase font-bold">{isRtl ? 'التكلفة الإجمالية (Bottom-Up)' : 'Forecast Cost'}</p>
-                    <p className="text-base font-black text-amber-400 font-mono mt-1">{customScenarioResult.eacBottomUp.toLocaleString()} ر.س</p>
+                    <p className="text-[10px] text-slate-400 uppercase font-bold">{isRtl ? 'التكلفة المتوقعة (Bottom-Up EAC)' : 'Forecast Cost (Bottom-Up EAC)'}</p>
+                    <p className="text-base font-black text-amber-400 font-mono mt-1">
+                      {renderEac(customScenarioResult.eacBottomUp, customScenarioResult.eacModelStatuses.bottomUp)}
+                    </p>
                     <span className="text-[10px] text-amber-300 font-mono">
                       {customScenarioResult.costVarianceSar > 0 ? `+${customScenarioResult.costVarianceSar.toLocaleString()}` : customScenarioResult.costVarianceSar.toLocaleString()} ر.س
+                    </span>
+                    {/* The simulation's own cost outcome is reported next to the forecast, never as it. */}
+                    <span className="text-[9px] block text-slate-500 font-sans">
+                      {isRtl
+                        ? `نتيجة المحاكاة: ${customScenarioResult.simulatedCostOutcomeSar.toLocaleString()} ر.س`
+                        : `simulated outcome: ${customScenarioResult.simulatedCostOutcomeSar.toLocaleString()} SAR`}
                     </span>
                   </div>
 
@@ -803,7 +870,14 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
                     <p className="text-base font-black text-white font-mono mt-1">
                       {customScenarioResult.spi.toFixed(2)} / {customScenarioResult.cpi.toFixed(2)}
                     </p>
-                    <span className="text-[10px] text-slate-400 font-mono">EAC Realistic: {customScenarioResult.eacRealistic.toLocaleString()} ر.س</span>
+                    <span className="text-[10px] text-slate-400 font-mono">
+                      EAC Realistic: {renderEac(customScenarioResult.eacRealistic, customScenarioResult.eacModelStatuses.realistic)}
+                    </span>
+                    <span className="text-[9px] block text-slate-500 font-sans">
+                      {isRtl
+                        ? `القانوني المقاس: ${customScenarioResult.baselineSpi.toFixed(2)} / ${customScenarioResult.baselineCpi.toFixed(2)}`
+                        : `measured canonical: ${customScenarioResult.baselineSpi.toFixed(2)} / ${customScenarioResult.baselineCpi.toFixed(2)}`}
+                    </span>
                   </div>
 
                   <div className="bg-slate-800/80 p-3 rounded-xl border border-slate-700">

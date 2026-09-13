@@ -1,6 +1,7 @@
 import { useState, useMemo, useEffect } from 'react';
 import { supabase } from '@/lib/supabase';
 import { getLanguage, type Language } from '@/lib/i18n';
+import { resolveContractBaseline } from '@/lib/budgetForecastEngine';
 import type { Project, PaymentCertificate, VariationOrder } from '@/types';
 import {
   Receipt,
@@ -360,8 +361,24 @@ export default function PaymentCertificatesView({ project }: PaymentCertificates
   const totalVoApprovedCost = variationOrders.filter((v) => v.status === 'approved').reduce((sum, v) => sum + v.approvedCostSar, 0);
   const totalVoApprovedTimeDays = variationOrders.filter((v) => v.status === 'approved').reduce((sum, v) => sum + v.approvedTimeDays, 0);
 
-  const baseContractValue = project?.contract_value || 4500000;
+  // GAP-043: governed contract baseline precedence — `project.contract_value`, then a legitimate
+  // budget / BOQ total when the consumer has loaded one, then "not available". The former
+  // The former `|| <hardcoded SAR figure>` branch invented a contract that then fed the revised
+  // contract value and every certification percentage. This view loads no budget or BOQ records, so
+  // the precedence legitimately ends at N/A rather than at another arbitrary numeric fallback.
+  const contractBaseline = resolveContractBaseline({ project });
+  const baseContractValue = contractBaseline.value;
   const revisedContractValue = baseContractValue + totalVoApprovedCost;
+  const contractValueLabel = contractBaseline.isAvailable
+    ? `${baseContractValue.toLocaleString()} SAR`
+    : lang === 'ar'
+      ? 'غير متوفر (N/A) — لا توجد قيمة عقد مسجلة'
+      : 'Not available (N/A) — no recorded contract value';
+  const revisedContractValueLabel = contractBaseline.isAvailable
+    ? `${revisedContractValue.toLocaleString()} SAR`
+    : lang === 'ar'
+      ? `غير متوفر (N/A) — أوامر التغيير المعتمدة ${totalVoApprovedCost.toLocaleString()} SAR`
+      : `Not available (N/A) — approved VOs ${totalVoApprovedCost.toLocaleString()} SAR`;
 
   // Toggle VO Status dynamically (Approved vs Pending vs Rejected)
   const handleToggleVoStatus = (voId: string) => {
@@ -480,11 +497,11 @@ export default function PaymentCertificatesView({ project }: PaymentCertificates
       <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
         <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
           <span className="text-[11px] text-slate-400 block mb-1">{lang === 'ar' ? 'قيمة العقد الأصلية (Base Contract)' : 'Base Contract Value'}</span>
-          <div className="text-lg font-black text-slate-900">{baseContractValue.toLocaleString()} SAR</div>
+          <div className={`text-lg font-black ${contractBaseline.isAvailable ? 'text-slate-900' : 'text-slate-400'} text-xs leading-6`}>{contractValueLabel}</div>
         </div>
         <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
           <span className="text-[11px] text-slate-400 block mb-1">{lang === 'ar' ? 'قيمة العقد المعدلة (Revised BAC)' : 'Revised Contract (BAC)'}</span>
-          <div className="text-lg font-black text-emerald-700">{revisedContractValue.toLocaleString()} SAR</div>
+          <div className={`text-lg font-black ${contractBaseline.isAvailable ? 'text-emerald-700' : 'text-slate-400'} text-xs leading-6`}>{revisedContractValueLabel}</div>
           <span className="text-[10px] text-emerald-600 font-bold">+{totalVoApprovedCost.toLocaleString()} SAR VOs</span>
         </div>
         <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
@@ -888,7 +905,7 @@ export default function PaymentCertificatesView({ project }: PaymentCertificates
             </div>
             <div className="flex flex-wrap items-center gap-3 font-mono text-[11px]">
               <span className="bg-white px-2 py-0.5 rounded border border-blue-200">
-                📊 {lang === 'ar' ? 'الميزانية المعدلة (BAC):' : 'Revised BAC:'} {revisedContractValue.toLocaleString()} SAR
+                📊 {lang === 'ar' ? 'الميزانية المعدلة (BAC):' : 'Revised BAC:'} {revisedContractValueLabel}
               </span>
               <span className="bg-white px-2 py-0.5 rounded border border-blue-200">
                 ⏱ {lang === 'ar' ? 'التمديد الزمني:' : 'Total EOT:'} +{totalVoApprovedTimeDays} {lang === 'ar' ? 'يوم' : 'days'}

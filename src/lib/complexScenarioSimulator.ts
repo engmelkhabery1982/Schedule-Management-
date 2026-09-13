@@ -11,6 +11,42 @@ import type {
   PrecisionWatchdogMetric,
 } from '@/types';
 import { addWorkingDays, getCalendar } from '@/lib/calendarEngine';
+import { calculateProjectEvmAtDataDate, type TcpiStatus } from '@/lib/planningEngine';
+import { calculateMultiEacForecast } from '@/lib/budgetForecastEngine';
+
+/**
+ * Canonical EVM baseline a caller supplies to a scenario run (GAP-040).
+ *
+ * These five scalars plus the canonical TCPI reading are measured facts at the governed Data Date.
+ * A scenario simulates the FUTURE against them; it never invents them. When a caller cannot supply
+ * them, the simulator derives them by calling the canonical engine exactly once with the sources it
+ * was given — it no longer fabricates `AC = 35% of BAC` and `EV = AC x SPI`.
+ */
+export interface ScenarioEvmBaseline {
+  bac: number;
+  ev: number;
+  ac: number;
+  cpi: number;
+  spi: number;
+  tcpi: number;
+  tcpiStatus: TcpiStatus;
+}
+
+/**
+ * Cost-nature shares used ONLY to apply a scenario's differentiated inflation / escalation /
+ * prolongation factors. This is a simulation modelling assumption, NOT project CBS data: the
+ * financial schema carries no cost-nature classification (see UG-050 and
+ * `aggregateCbsCostCenters`), so a scenario that inflates "materials" by 22% has to assume some
+ * material share. Expressed in basis points so the neutral scenario reproduces the baseline
+ * exactly instead of accumulating binary rounding error.
+ */
+export const SCENARIO_COST_NATURE_SPLIT_BASIS_POINTS = {
+  materials: 3800,
+  labor: 2200,
+  equipment: 1200,
+  subcontractors: 2000,
+  overheads: 800,
+} as const;
 
 export const STANDARD_COMPLEX_SCENARIOS: ComplexScenarioModel[] = [
   {
@@ -157,11 +193,27 @@ export function simulateComplexProjectScenario(
   links: ActivityLink[],
   budgetLines: BudgetLine[],
   scenario: ComplexScenarioModel,
+  canonicalEvm?: ScenarioEvmBaseline | null,
 ): ComplexScenarioResult {
   const p = scenario.parameters;
   const calendar = getCalendar(project.calendar_type || '6_days');
-  const baseContractValue = Number(project.contract_value || 1000000);
-  const baseBudgetBac = budgetLines.reduce((s, l) => s + Number(l.planned_cost || 0), 0) || baseContractValue;
+  // Canonical baseline (SSOT). The former `contract_value || 1000000` and
+  // `sum(budget_lines.planned_cost) || contract_value` chain produced a BAC that could disagree
+  // with every other consumer; the canonical engine's BAC is now the only source.
+  const baseline: ScenarioEvmBaseline = canonicalEvm
+    ? canonicalEvm
+    : (() => {
+        const evm = calculateProjectEvmAtDataDate(project, activities, budgetLines, [], [], []);
+        return {
+          bac: evm.bac,
+          ev: evm.ev,
+          ac: evm.ac,
+          cpi: evm.cpi,
+          spi: evm.spi,
+          tcpi: evm.tcpi,
+          tcpiStatus: evm.tcpiStatus,
+        };
+      })();
   const baseDurationDays = Number(project.duration_days || 195);
   const startDate = project.start_date || '2026-09-15';
   const baseFinishDate = project.end_date || '2027-04-30';
@@ -178,50 +230,66 @@ export function simulateComplexProjectScenario(
   const totalSimulatedDurationDays = Math.max(90, baseDurationDays + netDurationVarianceDays);
   const simulatedFinishDate = addWorkingDays(startDate, totalSimulatedDurationDays, calendar);
 
-  // 2. Financial Simulation & Multi-EAC Models
-  // CBS Material (38% of BAC), Labor (22%), Equipment (12%), Subcontractors (20%), Overheads (8%)
-  const newBac = baseBudgetBac + p.variationOrderValueSar;
-  
-  const baseMaterialCost = newBac * 0.38;
-  const baseLaborCost = newBac * 0.22;
-  const baseEquipmentCost = newBac * 0.12;
-  const baseSubcontractorCost = newBac * 0.20;
-  const baseOverheadCost = newBac * 0.08;
+  // 2. Financial simulation: the scenario's budget change, its cost outcome, and the deterministic
+  //    multi-EAC family from the SHARED engine (GAP-009 / GAP-047).
+  const variationOrderValueSar = Math.round(Number(p.variationOrderValueSar || 0));
+  const newBac = Math.round(Number(baseline.bac || 0)) + variationOrderValueSar;
+
+  const shareOf = (basisPoints: number) => (newBac * basisPoints) / 10000;
+  const baseMaterialCost = shareOf(SCENARIO_COST_NATURE_SPLIT_BASIS_POINTS.materials);
+  const baseLaborCost = shareOf(SCENARIO_COST_NATURE_SPLIT_BASIS_POINTS.labor);
+  const baseEquipmentCost = shareOf(SCENARIO_COST_NATURE_SPLIT_BASIS_POINTS.equipment);
+  const baseSubcontractorCost = shareOf(SCENARIO_COST_NATURE_SPLIT_BASIS_POINTS.subcontractors);
+  const baseOverheadCost = shareOf(SCENARIO_COST_NATURE_SPLIT_BASIS_POINTS.overheads);
 
   // Apply inflation, escalation and crashing premiums
   const simMaterialCost = baseMaterialCost * (1 + p.materialInflationPercent / 100);
   const simLaborCost = baseLaborCost * (1 + p.laborRateEscalationPercent / 100) * Math.max(1.0, 1.0 + (p.crashingOvertimeFactor - 1.0) * 0.6);
   const simEquipmentCost = baseEquipmentCost * (1 + (p.materialInflationPercent * 0.3) / 100);
   const simSubcontractorCost = baseSubcontractorCost * (1 + (p.laborRateEscalationPercent * 0.5) / 100);
-  const simOverheadCost = baseOverheadCost * (totalSimulatedDurationDays / baseDurationDays);
+  const simOverheadCost = baseOverheadCost * (baseDurationDays > 0 ? totalSimulatedDurationDays / baseDurationDays : 1);
 
-  const totalSimulatedAC = Math.round(simMaterialCost + simLaborCost + simEquipmentCost + simSubcontractorCost + simOverheadCost);
-  const costVarianceSar = totalSimulatedAC - newBac;
-  const costVariancePercent = Number(((costVarianceSar / newBac) * 100).toFixed(2));
+  /** The simulation's own cost outcome. It is a scenario result, not an actual cost and not an EAC. */
+  const simulatedCostOutcomeSar = Math.round(simMaterialCost + simLaborCost + simEquipmentCost + simSubcontractorCost + simOverheadCost);
+  const costVarianceSar = simulatedCostOutcomeSar - newBac;
+  const costVariancePercent = newBac > 0 ? Number(((costVarianceSar / newBac) * 100).toFixed(2)) : 0;
 
-  // Simulated Performance Indices
-  const spi = Number((baseDurationDays / totalSimulatedDurationDays).toFixed(3));
-  const cpi = Number((newBac / Math.max(1, totalSimulatedAC)).toFixed(3));
+  // Scenario performance indices are the MEASURED canonical indices scaled by the simulated delta
+  // factors. A neutral scenario (no delay, no inflation, no VO) leaves both factors at exactly 1,
+  // so the baseline scenario reproduces the canonical indices — and therefore BudgetView's numbers.
+  const scheduleOutcomeFactor =
+    totalSimulatedDurationDays > 0 ? Number((baseDurationDays / totalSimulatedDurationDays).toFixed(6)) : 1;
+  const costOutcomeFactor =
+    simulatedCostOutcomeSar > 0 && newBac > 0 ? Number((newBac / simulatedCostOutcomeSar).toFixed(6)) : 1;
+  const spi = Number((Number(baseline.spi || 0) * scheduleOutcomeFactor).toFixed(3));
+  const cpi = Number((Number(baseline.cpi || 0) * costOutcomeFactor).toFixed(3));
 
-  // Multi-EAC Models
-  const currentActualCost = Math.round(newBac * 0.35); // 35% spent so far
-  const currentEarnedValue = Math.round(newBac * 0.35 * spi);
-  
-  const eacOptimistic = Math.round(currentActualCost + (newBac - currentEarnedValue));
-  const eacRealistic = Math.round(newBac / Math.max(0.1, cpi));
-  const eacPessimistic = Math.round(currentActualCost + (newBac - currentEarnedValue) / Math.max(0.1, cpi * spi));
-  const eacBottomUp = totalSimulatedAC;
+  // Multi-EAC Models — one shared implementation. Measured EV and AC are facts at the Data Date:
+  // nothing here fabricates a "35% spent so far" position to feed them.
+  const forecast = calculateMultiEacForecast({
+    bac: newBac,
+    ev: Number(baseline.ev || 0),
+    ac: Number(baseline.ac || 0),
+    cpi,
+    spi,
+    tcpi: Number(baseline.tcpi || 0),
+    tcpiStatus: baseline.tcpiStatus,
+  });
+  const eacOptimistic = forecast.optimistic.eac;
+  const eacRealistic = forecast.realistic.eac;
+  const eacPessimistic = forecast.pessimistic.eac;
+  const eacBottomUp = forecast.bottomUp.eac;
 
   // 3. Peak Cash Deficit Calculation (Working capital strain)
   // Monthly billing delays + material cost surges
-  const monthlyBurnRate = totalSimulatedAC / (totalSimulatedDurationDays / 30);
+  const monthlyBurnRate = simulatedCostOutcomeSar / (totalSimulatedDurationDays / 30);
   const cashInflowLagMonths = p.cashInflowDelayDays / 30;
   const peakCashDeficitSar = Math.round(monthlyBurnRate * (1.5 + cashInflowLagMonths) + (p.materialInflationPercent > 10 ? 250000 : 80000));
 
   // 4. Probabilistic P80 Estimates (Monte Carlo Envelope)
   const p80DurationDays = Math.round(totalSimulatedDurationDays * 1.08);
   const p80FinishDate = addWorkingDays(startDate, p80DurationDays, calendar);
-  const p80CostSar = Math.round(totalSimulatedAC * 1.06);
+  const p80CostSar = Math.round(simulatedCostOutcomeSar * 1.06);
 
   // 5. Feasibility Score & Risk Classification
   let feasibilityScore = 100;
@@ -287,10 +355,23 @@ export function simulateComplexProjectScenario(
     totalDurationDays: totalSimulatedDurationDays,
     criticalPathLength: totalSimulatedDurationDays,
     bac: newBac,
+    baselineBacSar: Math.round(Number(baseline.bac || 0)),
+    variationOrderValueSar,
+    canonicalEvSar: Math.round(Number(baseline.ev || 0)),
+    canonicalAcSar: Math.round(Number(baseline.ac || 0)),
+    baselineCpi: Number(baseline.cpi || 0),
+    baselineSpi: Number(baseline.spi || 0),
+    simulatedCostOutcomeSar,
     eacOptimistic,
     eacRealistic,
     eacPessimistic,
     eacBottomUp,
+    eacModelStatuses: {
+      optimistic: forecast.optimistic.status,
+      realistic: forecast.realistic.status,
+      pessimistic: forecast.pessimistic.status,
+      bottomUp: forecast.bottomUp.status,
+    },
     costVarianceSar,
     costVariancePercent,
     spi,
@@ -316,7 +397,9 @@ export function runPrecisionWatchdogAudit(
   results: ComplexScenarioResult[],
 ): PrecisionWatchdogMetric[] {
   const metrics: PrecisionWatchdogMetric[] = [];
-  const bac = Number(project.contract_value || 1000000);
+  // No local BAC here: the former `project.contract_value || 1000000` was an arbitrary fallback
+  // that no metric in this audit actually used. Every figure below comes from the scenario result,
+  // whose baseline is the canonical EVM (see `simulateComplexProjectScenario`).
 
   // 1. CPM Float Law Conservation
   const floatDriftActs = activities.filter((a) => {
@@ -338,21 +421,24 @@ export function runPrecisionWatchdogAudit(
     notesEn: 'Forward and backward pass equations hold with zero decimal drift across all 10 activities.',
   });
 
-  // 2. EVM Conservation Law
+  // 2. EVM Conservation Law — the deviation is measured, not asserted.
   results.forEach((res) => {
-    const svCalculated = res.bac * res.spi - res.bac;
+    // The shared realistic model is `CPI > 0 ? round(BAC / CPI) : BAC`; recompute it from the
+    // published scenario figures and report the true difference instead of a hardcoded 0.
+    const expectedRealisticEac = res.cpi > 0 ? Math.round(res.bac / res.cpi) : res.bac;
+    const deviation = Math.abs(expectedRealisticEac - res.eacRealistic);
     metrics.push({
       id: `WATCH-EVM-${res.scenarioId}`,
       category: 'evm_conservation',
       labelAr: `الدقة الرياضية لـ EVM: ${res.scenarioNameAr.slice(0, 30)}...`,
       labelEn: `EVM Precision: ${res.scenarioNameEn.slice(0, 30)}...`,
-      formula: 'SV = EV - PV | CV = EV - AC | EAC = BAC / CPI',
-      calculatedValue: `SPI: ${res.spi.toFixed(3)} | CPI: ${res.cpi.toFixed(3)} | EAC: ${res.eacRealistic.toLocaleString()} ر.س`,
-      expectedValue: 'تطابق المعادلات حتى الهللة',
-      deviation: 0,
-      precisionStatus: 'exact',
-      notesAr: `تم التحقق من اتساق مؤشرات الأداء وحسابات التكلفة المتوقعة عند الإنجاز لسيناريو (${res.scenarioNameAr}).`,
-      notesEn: `Mathematical verification passed for simulated scenario (${res.scenarioNameEn}).`,
+      formula: 'EAC(realistic) = BAC / CPI  |  BAC(scenario) = BAC(canonical) + VO',
+      calculatedValue: `SPI: ${res.spi.toFixed(3)} (canonical ${res.baselineSpi.toFixed(3)}) | CPI: ${res.cpi.toFixed(3)} (canonical ${res.baselineCpi.toFixed(3)}) | EAC: ${res.eacRealistic.toLocaleString()} ر.س | BAC: ${res.bac.toLocaleString()} = ${res.baselineBacSar.toLocaleString()} + VO ${res.variationOrderValueSar.toLocaleString()}`,
+      expectedValue: `EAC(realistic) == ${expectedRealisticEac.toLocaleString()} ر.س`,
+      deviation,
+      precisionStatus: deviation === 0 ? 'exact' : deviation <= 1 ? 'acceptable' : 'drift_detected',
+      notesAr: `EV/AC القانونيان حتى تاريخ البيانات: ${res.canonicalEvSar.toLocaleString()} / ${res.canonicalAcSar.toLocaleString()} ر.س (قيم مقاسة، لا تُحاكى). التكلفة المحاكاة للسيناريو: ${res.simulatedCostOutcomeSar.toLocaleString()} ر.س.`,
+      notesEn: `Canonical EV/AC at the Data Date: ${res.canonicalEvSar.toLocaleString()} / ${res.canonicalAcSar.toLocaleString()} SAR (measured, never simulated). Simulated scenario cost outcome: ${res.simulatedCostOutcomeSar.toLocaleString()} SAR.`,
     });
   });
 

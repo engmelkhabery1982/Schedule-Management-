@@ -772,13 +772,36 @@ export interface ComplexScenarioResult {
   varianceDays: number;
   totalDurationDays: number;
   criticalPathLength: number;
+  /** Scenario BAC = canonical BAC + the scenario's variation-order value. */
   bac: number;
+  /** Canonical BAC at the Data Date (SSOT) — never a `contract_value || 1000000` fallback. */
+  baselineBacSar: number;
+  /** Explicit scenario budget delta, so the simulated part is separable from the measured part. */
+  variationOrderValueSar: number;
+  /** Measured EV at the Data Date. A fact, not a simulation input (GAP-040). */
+  canonicalEvSar: number;
+  /** Measured AC at the Data Date. A fact, not a simulation input (GAP-040). */
+  canonicalAcSar: number;
+  /** Measured canonical indices the scenario deltas are applied to. */
+  baselineCpi: number;
+  baselineSpi: number;
+  /** The simulation's own cost outcome (formerly reported as `eacBottomUp`). */
+  simulatedCostOutcomeSar: number;
+  /** Deterministic multi-EAC family — identical to BudgetView for identical inputs (GAP-047). */
   eacOptimistic: number;
   eacRealistic: number;
   eacPessimistic: number;
   eacBottomUp: number;
+  /** Per-model validity, so a consumer renders "—" instead of a placeholder number. */
+  eacModelStatuses: {
+    optimistic: ForecastModelStatus;
+    realistic: ForecastModelStatus;
+    pessimistic: ForecastModelStatus;
+    bottomUp: ForecastModelStatus;
+  };
   costVarianceSar: number;
   costVariancePercent: number;
+  /** Scenario-adjusted indices = canonical index x the simulated delta factor (1.0 when neutral). */
   spi: number;
   cpi: number;
   peakCashDeficitSar: number;
@@ -985,18 +1008,66 @@ export interface SubcontractPackage {
 // Financial & Cost Control Advanced Types (AACE / PMI Standard)
 // -------------------------------------------------------------
 
-export type CbsCategory = 'labor' | 'materials' | 'equipment' | 'subcontractors' | 'overheads';
+/**
+ * Cost Breakdown Structure cost-nature categories.
+ *
+ * `unclassified` is a first-class category, not an error state (UG-050): the cost tables in this
+ * schema carry no cost-nature column (`budget_lines` has none at all; `cost_transactions.category`
+ * and `boq_items.category` hold BOQ trade names such as `Earthworks`), so an amount can only be
+ * attributed to a cost nature when a record explicitly names one. Every unmapped amount is
+ * reported here instead of being spread over the five named centers by a fixed percentage.
+ */
+export type CbsCategory = 'labor' | 'materials' | 'equipment' | 'subcontractors' | 'overheads' | 'unclassified';
+
+/**
+ * Provenance of a committed-cost figure (UG-051). Distinguishes "no commitment data exists" from
+ * "commitments are recorded and they total zero", so a consumer never has to invent an amount.
+ */
+export type CommittedCostStatus =
+  | 'recorded' // at least one budget line carries a committed_cost value
+  | 'zero_recorded' // budget lines exist and every committed_cost is exactly 0
+  | 'no_commitment_data'; // no budget lines, or every committed_cost is null/undefined
+
+/**
+ * Validity of one EAC model (GAP-009 / GAP-040 / GAP-047). A model whose denominator is not a
+ * measured value is reported as not computable instead of being silently clamped or returned as
+ * NaN / Infinity.
+ */
+export type ForecastModelStatus =
+  | 'valid' // every input the model needs is a measured value
+  | 'valid_estimated_etc' // bottom-up model used the documented contingency factor, not a real estimate
+  | 'empty_no_data' // BAC, EV and AC are all zero: nothing has been budgeted, earned or spent
+  | 'index_not_measured' // the model needs CPI/SPI but the supplied index is a canonical sentinel
+  | 'denominator_not_positive'; // the model's own denominator is <= 0
+
+/** Feasibility band of a TCPI reading (GAP-042). `not_assessable` replaces the old silent 1.0. */
+export type TcpiFeasibility = 'easy' | 'realistic' | 'hard' | 'unachievable' | 'not_assessable';
+
+/** Where a contract baseline figure came from (GAP-043). `none` means "not available". */
+export type ContractBaselineSource = 'contract_value' | 'budget_lines_total' | 'boq_total' | 'none';
 
 export interface CbsCostCenter {
   id: string;
   category: CbsCategory;
   nameAr: string;
   nameEn: string;
+  /** Planned cost attributed to this center from real budget lines (UG-050). */
   budgetAllocatedSar: number;
+  /** Committed cost attributed to this center from real `budget_lines.committed_cost`. */
   committedCostSar: number;
+  /** Actual cost attributed to this center from real approved cost transactions. */
   actualCostSar: number;
+  /** `budgetAllocatedSar - actualCostSar`, the same convention as `varianceSar`. */
+  remainingCostSar: number;
   varianceSar: number; // Budget - Actual
+  /** 0 when this center has no planned amount, so a percentage is never divided by zero. */
   variancePercent: number;
+  /** Provenance of `committedCostSar` (UG-051). */
+  committedCostStatus: CommittedCostStatus;
+  /** Number of real records attributed to this center (0 = nothing in the data maps here). */
+  mappedRecordCount: number;
+  /** True for the explicit Unclassified / Other bucket that absorbs every unmapped amount. */
+  isUnclassified: boolean;
   description: string;
 }
 
@@ -1026,24 +1097,12 @@ export interface ReserveBurnItem {
   status: 'healthy' | 'caution' | 'exhausted';
 }
 
-export interface MultiEacComparison {
-  bac: number;
-  ev: number;
-  ac: number;
-  cpi: number;
-  spi: number;
-  tcpiBac: number;
-  tcpiEac: number;
-  tcpiFeasibility: 'easy' | 'realistic' | 'hard' | 'unachievable';
-  eac1Optimistic: number; // AC + BAC - EV
-  vac1: number;
-  eac2Realistic: number;  // BAC / CPI
-  vac2: number;
-  eac3Pessimistic: number;// AC + (BAC - EV) / (CPI * SPI)
-  vac3: number;
-  eac4BottomUp: number;   // AC + Bottom-up ETC
-  vac4: number;
-}
+/**
+ * The multi-EAC comparison is produced by `calculateMultiEacForecast` in
+ * `@/lib/budgetForecastEngine` (SSOT for GAP-009 / GAP-040 / GAP-047 / GAP-042) and its result
+ * type `MultiEacForecast` lives with that engine. This view-model duplicate was removed in Wave 6:
+ * keeping a second shape here is what allowed BudgetView and the scenario simulator to drift.
+ */
 
 // -------------------------------------------------------------
 // Advanced Contractual & Commercial Risk Control Types (FIDIC)

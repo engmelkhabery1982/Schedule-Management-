@@ -2,6 +2,15 @@ import { useState, useEffect, useMemo } from 'react';
 import { supabase } from '@/lib/supabase';
 import { getLanguage, type Language } from '@/lib/i18n';
 import { calculateProjectEvmAtDataDate } from '@/lib/planningEngine';
+import {
+  aggregateCbsCostCenters,
+  calculateMultiEacForecast,
+  summarizeCommittedCost,
+  type CbsAggregation,
+  type EacModelResult,
+  type MultiEacForecast,
+  type TcpiReading,
+} from '@/lib/budgetForecastEngine';
 import type {
   Project,
   BudgetLine,
@@ -9,10 +18,8 @@ import type {
   BoqItem,
   Activity,
   ProgressUpdate,
-  CbsCostCenter,
   MonthlyCashFlowBucket,
   ReserveBurnItem,
-  MultiEacComparison,
 } from '@/types';
 import {
   Wallet,
@@ -176,84 +183,41 @@ export default function BudgetView({ project }: BudgetViewProps) {
     );
   }, [project, activities, budgetLines, boqItems, transactions, progressUpdates, project?.data_date]);
 
-  // Basic totals
+  // Committed cost provenance (UG-051): the stored `committed_cost` values, or an explicit
+  // "no commitment data" state. The former `|| Math.round(planned * 0.75)` fabricated a commitment
+  // of 75% of the budget whenever the real total was 0 or absent; nothing is synthesised here.
+  const committedSummary = useMemo(() => summarizeCommittedCost(budgetLines), [budgetLines]);
+
+  // Basic totals — planned and actual are the canonical EVM values, never local recomputations.
   const totals = useMemo(() => {
     const planned = evm.bac;
-    const committed = budgetLines.reduce((s, l) => s + (l.committed_cost || 0), 0) || Math.round(planned * 0.75);
     const actual = evm.ac;
     const remaining = planned - actual;
     const variance = planned - actual;
-    return { planned, committed, actual, remaining, variance };
-  }, [evm, budgetLines]);
+    return { planned, committed: committedSummary.total, actual, remaining, variance };
+  }, [evm, committedSummary]);
 
   // -------------------------------------------------------------
-  // 1. CBS 5-Cost Center Breakdown Structure
+  // 1. CBS Cost Centers — attributed from real records only (UG-050)
   // -------------------------------------------------------------
-  const cbsCenters: CbsCostCenter[] = useMemo(() => {
-    const bac = totals.planned;
-    return [
-      {
-        id: 'CBS-01',
-        category: 'labor',
-        nameAr: 'العمالة الذاتية المباشرة (Direct Labor & Payroll)',
-        nameEn: 'Direct Labor & Site Supervision',
-        budgetAllocatedSar: Math.round(bac * 0.22), // 22%
-        committedCostSar: Math.round(bac * 0.22 * 0.85),
-        actualCostSar: Math.round(totals.actual * 0.24),
-        varianceSar: Math.round(bac * 0.22) - Math.round(totals.actual * 0.24),
-        variancePercent: Number((((Math.round(bac * 0.22) - Math.round(totals.actual * 0.24)) / Math.round(bac * 0.22)) * 100).toFixed(1)),
-        description: 'رواتب المهندسين والمشرفين والعمالة الحرفية المباشرة والتأمينات.',
-      },
-      {
-        id: 'CBS-02',
-        category: 'materials',
-        nameAr: 'المواد والتوريدات الدائمة (Permanent Materials)',
-        nameEn: 'Permanent Construction Materials',
-        budgetAllocatedSar: Math.round(bac * 0.38), // 38%
-        committedCostSar: Math.round(bac * 0.38 * 0.90),
-        actualCostSar: Math.round(totals.actual * 0.40),
-        varianceSar: Math.round(bac * 0.38) - Math.round(totals.actual * 0.40),
-        variancePercent: Number((((Math.round(bac * 0.38) - Math.round(totals.actual * 0.40)) / Math.round(bac * 0.38)) * 100).toFixed(1)),
-        description: 'حديد التسليح، الخرسانة الجاهزة، البلك، المواد الكيميائية والعوازل.',
-      },
-      {
-        id: 'CBS-03',
-        category: 'equipment',
-        nameAr: 'المعدات والآليات (Equipment & Heavy Plant)',
-        nameEn: 'Equipment Rental & Plant Operations',
-        budgetAllocatedSar: Math.round(bac * 0.12), // 12%
-        committedCostSar: Math.round(bac * 0.12 * 0.70),
-        actualCostSar: Math.round(totals.actual * 0.11),
-        varianceSar: Math.round(bac * 0.12) - Math.round(totals.actual * 0.11),
-        variancePercent: Number((((Math.round(bac * 0.12) - Math.round(totals.actual * 0.11)) / Math.round(bac * 0.12)) * 100).toFixed(1)),
-        description: 'الرافعات البرجية، الحفارات، مضخات الخرسانة، والمولدات والديزل.',
-      },
-      {
-        id: 'CBS-04',
-        category: 'subcontractors',
-        nameAr: 'عقود مقاولي الباطن (Subcontractors Packages)',
-        nameEn: 'Specialized Subcontractors',
-        budgetAllocatedSar: Math.round(bac * 0.20), // 20%
-        committedCostSar: Math.round(bac * 0.20 * 0.88),
-        actualCostSar: Math.round(totals.actual * 0.18),
-        varianceSar: Math.round(bac * 0.20) - Math.round(totals.actual * 0.18),
-        variancePercent: Number((((Math.round(bac * 0.20) - Math.round(totals.actual * 0.18)) / Math.round(bac * 0.20)) * 100).toFixed(1)),
-        description: 'مقاول مصنعيات الخرسانة، مقاول أعمال الدكت والتكييف، ومقاول الواجهات.',
-      },
-      {
-        id: 'CBS-05',
-        category: 'overheads',
-        nameAr: 'المصاريف غير المباشرة للموقع (Site Overheads & Indirects)',
-        nameEn: 'Site Overheads & Administration',
-        budgetAllocatedSar: Math.round(bac * 0.08), // 8%
-        committedCostSar: Math.round(bac * 0.08 * 0.65),
-        actualCostSar: Math.round(totals.actual * 0.07),
-        varianceSar: Math.round(bac * 0.08) - Math.round(totals.actual * 0.07),
-        variancePercent: Number((((Math.round(bac * 0.08) - Math.round(totals.actual * 0.07)) / Math.round(bac * 0.08)) * 100).toFixed(1)),
-        description: 'إيجار المكاتب المؤقتة، سيارات الموقع، التأمينات، والمختبرات وضبط الجودة.',
-      },
-    ];
-  }, [totals]);
+  // The five centers used to be filled with fixed percentages of BAC (22 / 38 / 12 / 20 / 8%) and
+  // of AC (24 / 40 / 11 / 18 / 7%), i.e. with numbers that no record supports. Attribution now
+  // comes from `budget_lines` (planned / committed) and approved `cost_transactions` dated on or
+  // before the Data Date (actual). A record is only attributed to a cost nature when its own
+  // category text names one; everything else is reported in the explicit Unclassified / Other
+  // center, so the columns reconcile exactly to the canonical BAC and AC.
+  const cbs: CbsAggregation = useMemo(() => {
+    return aggregateCbsCostCenters({
+      budgetLines,
+      costTransactions: transactions,
+      boqItems,
+      totalPlanned: evm.bac,
+      totalActual: evm.ac,
+      dataDate: evm.dataDate,
+    });
+  }, [budgetLines, transactions, boqItems, evm]);
+
+  const cbsCenters = cbs.centers;
 
   // -------------------------------------------------------------
   // 2. Monthly Cash Flow S-Curve & Peak Working Capital
@@ -346,65 +310,41 @@ export default function BudgetView({ project }: BudgetViewProps) {
   const totalReservesUtilization = totalReservesAllocated > 0 ? (totalReservesSpent / totalReservesAllocated) * 100 : 0;
 
   // -------------------------------------------------------------
-  // 4. Multi-Formula EAC Forecast & TCPI Matrix
+  // 4. Multi-Formula EAC Forecast & TCPI Matrix (GAP-009 / GAP-042 / GAP-047)
   // -------------------------------------------------------------
-  const multiEacData: MultiEacComparison = useMemo(() => {
-    const bac = evm.bac;
-    const ac = evm.ac;
-    const ev = evm.ev;
-    const spi = evm.spi;
-    const cpi = evm.cpi;
-
-    // EAC Formulas
-    // 1. Optimistic: EAC = AC + (BAC - EV)
-    const eac1Optimistic = Math.round(ac + (bac - ev));
-    const vac1 = Math.round(bac - eac1Optimistic);
-
-    // 2. Realistic: EAC = BAC / CPI
-    const eac2Realistic = cpi > 0 ? Math.round(bac / cpi) : bac;
-    const vac2 = Math.round(bac - eac2Realistic);
-
-    // 3. Pessimistic / Composite: EAC = AC + (BAC - EV) / (CPI * SPI)
-    const compositeDenominator = Math.max(0.1, cpi * spi);
-    const eac3Pessimistic = Math.round(ac + (bac - ev) / compositeDenominator);
-    const vac3 = Math.round(bac - eac3Pessimistic);
-
-    // 4. Bottom-Up: EAC = AC + Bottom-up ETC
-    const bottomUpEtc = Math.round((bac - ev) * 1.02);
-    const eac4BottomUp = Math.round(ac + bottomUpEtc);
-    const vac4 = Math.round(bac - eac4BottomUp);
-
-    // TCPI Formulas
-    // TCPI(BAC) = (BAC - EV) / (BAC - AC)
-    const tcpiBac = (bac - ac) > 0 ? Number(((bac - ev) / (bac - ac)).toFixed(2)) : 1.0;
-    // TCPI(EAC) = (BAC - EV) / (EAC_realistic - AC)
-    const tcpiEac = (eac2Realistic - ac) > 0 ? Number(((bac - ev) / (eac2Realistic - ac)).toFixed(2)) : 1.0;
-
-    let tcpiFeasibility: 'easy' | 'realistic' | 'hard' | 'unachievable' = 'realistic';
-    if (tcpiBac <= 1.0) tcpiFeasibility = 'easy';
-    else if (tcpiBac <= 1.10) tcpiFeasibility = 'realistic';
-    else if (tcpiBac <= 1.25) tcpiFeasibility = 'hard';
-    else tcpiFeasibility = 'unachievable';
-
-    return {
-      bac,
-      ev,
-      ac,
-      cpi,
-      spi,
-      tcpiBac,
-      tcpiEac,
-      tcpiFeasibility,
-      eac1Optimistic,
-      vac1,
-      eac2Realistic,
-      vac2,
-      eac3Pessimistic,
-      vac3,
-      eac4BottomUp,
-      vac4,
-    };
+  // Single shared implementation in `@/lib/budgetForecastEngine`: no EAC or TCPI formula lives in
+  // this view any more. The canonical EVM scalars are the only inputs, and the canonical
+  // `evm.tcpi` / `evm.tcpiStatus` are passed through so `assessEvmRatios` stays the one producer
+  // of TCPI(BAC). The previous local pair fell back to `1.0` when the budget was exhausted or the
+  // denominator was zero, which rendered an overrun as "easy (TCPI <= 1.0)".
+  const multiEacData: MultiEacForecast = useMemo(() => {
+    return calculateMultiEacForecast({
+      bac: evm.bac,
+      ev: evm.ev,
+      ac: evm.ac,
+      cpi: evm.cpi,
+      spi: evm.spi,
+      tcpi: evm.tcpi,
+      tcpiStatus: evm.tcpiStatus,
+    });
   }, [evm]);
+
+  /** Renders an EAC model: the number when it is computable, an explicit N/A when it is not. */
+  const renderModelValue = (model: EacModelResult): string => {
+    if (model.isComputable) return `${model.eac.toLocaleString()} SAR`;
+    return lang === 'ar' ? 'غير قابل للحساب — لا يوجد تقدير (N/A)' : 'Not computable — no forecast (N/A)';
+  };
+
+  /** Renders a TCPI reading: a measured index, or the semantic state. Never the 9.99 sentinel. */
+  const renderTcpi = (reading: TcpiReading): string => {
+    if (reading.display === 'value') return reading.value.toFixed(2);
+    if (reading.display === 'not_available') {
+      return lang === 'ar' ? 'غير محدد (N/A) — لا توجد ميزانية متبقية' : 'Undefined (N/A) — no remaining budget';
+    }
+    return lang === 'ar' ? 'تجاوز / استنفاد الميزانية (Overrun)' : 'Budget exhausted (Overrun)';
+  };
+
+  const tcpiIsComputable = multiEacData.tcpiToBudget.isComputable;
 
   // Handle new reserve drawdown
   const handleAddReserveDraw = () => {
@@ -556,7 +496,31 @@ export default function BudgetView({ project }: BudgetViewProps) {
             <DollarSign size={16} />
             <span className="text-xs font-bold">ملتزم تعاقدياً</span>
           </div>
-          <p className="text-xl font-black text-blue-700 font-mono">{totals.committed.toLocaleString()} <span className="text-xs font-normal">SAR</span></p>
+          {/* UG-051: the stored committed_cost total, or an explicit "no data" state. Never 75% of BAC. */}
+          {committedSummary.status === 'no_commitment_data' ? (
+            <>
+              <p className="text-xl font-black text-slate-400 font-mono">
+                {lang === 'ar' ? 'لا توجد التزامات مسجلة' : 'No commitments recorded'}
+              </p>
+              <p className="text-[10px] text-slate-400 mt-0.5">
+                {lang === 'ar'
+                  ? 'لا يوجد أي بيان committed_cost في بنود الميزانية — لا يُعرض رقم مُقدَّر.'
+                  : 'No committed_cost value exists on any budget line — no estimated figure is shown.'}
+              </p>
+            </>
+          ) : (
+            <>
+              <p className="text-xl font-black text-blue-700 font-mono">{totals.committed.toLocaleString()} <span className="text-xs font-normal">SAR</span></p>
+              <p className="text-[10px] text-slate-400 mt-0.5">
+                {lang === 'ar'
+                  ? `${committedSummary.linesWithCommitment} من ${committedSummary.linesTotal} بند ميزانية تحمل قيمة التزام مسجلة`
+                  : `${committedSummary.linesWithCommitment} of ${committedSummary.linesTotal} budget lines carry a recorded commitment`}
+                {committedSummary.status === 'zero_recorded'
+                  ? (lang === 'ar' ? ' — الالتزام المسجل صفر' : ' — recorded commitment is zero')
+                  : ''}
+              </p>
+            </>
+          )}
         </div>
 
         <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-4">
@@ -608,14 +572,26 @@ export default function BudgetView({ project }: BudgetViewProps) {
 
               <div className="text-left">
                 <span className="text-[11px] text-slate-400 block font-semibold">مستوى الجدوى الهندسية:</span>
+                {/* GAP-042: feasibility is only assessable from a measurable TCPI. A budget that is
+                    exhausted or fully consumed reads as "not assessable", never as "easy". */}
                 <span className={`px-3 py-1 rounded-full text-xs font-black ${
-                  multiEacData.tcpiFeasibility === 'easy'
+                  multiEacData.feasibility === 'easy'
                     ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
-                    : multiEacData.tcpiFeasibility === 'realistic'
+                    : multiEacData.feasibility === 'realistic'
                     ? 'bg-blue-500/20 text-blue-300 border border-blue-500/40'
+                    : multiEacData.feasibility === 'not_assessable'
+                    ? 'bg-slate-500/20 text-slate-300 border border-slate-500/40'
                     : 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
                 }`}>
-                  {multiEacData.tcpiFeasibility === 'easy' ? '✓ مرن ومريح (TCPI ≤ 1.0)' : multiEacData.tcpiFeasibility === 'realistic' ? '✓ واقعي وممكن تحقيقه (1.0 < TCPI ≤ 1.1)' : '⚠️ يتطلب ترشيد تكاليف مشدد (TCPI > 1.1)'}
+                  {multiEacData.feasibility === 'easy'
+                    ? '✓ مرن ومريح (TCPI ≤ 1.0)'
+                    : multiEacData.feasibility === 'realistic'
+                    ? '✓ واقعي وممكن تحقيقه (1.0 < TCPI ≤ 1.1)'
+                    : multiEacData.feasibility === 'hard'
+                    ? '⚠️ يتطلب ترشيد تكاليف مشدد (1.1 < TCPI ≤ 1.25)'
+                    : multiEacData.feasibility === 'unachievable'
+                    ? '⛔ غير قابل للتحقيق (TCPI > 1.25)'
+                    : '— غير قابل للتقييم (لا يوجد مؤشر TCPI صالح)'}
                 </span>
               </div>
             </div>
@@ -623,31 +599,45 @@ export default function BudgetView({ project }: BudgetViewProps) {
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               <div className="bg-slate-800/80 p-4 rounded-xl border border-slate-700 space-y-1">
                 <span className="text-xs text-slate-400 block">مؤشر TCPI بالنسبة لميزانية العقد الأصلية (BAC):</span>
-                <div className="text-2xl font-black text-amber-400 font-mono">
-                  {multiEacData.tcpiBac}
+                {/* Canonical Wave-2 reading (evm.tcpi + evm.tcpiStatus). The 9.99 compatibility
+                    sentinel is never rendered as an index; the semantic state is shown instead. */}
+                <div className={`text-2xl font-black font-mono ${tcpiIsComputable ? 'text-amber-400' : 'text-rose-300'}`}>
+                  {renderTcpi(multiEacData.tcpiToBudget)}
                 </div>
                 <p className="text-[11px] text-slate-300">
-                  يجب تنفيذ كل 1 ريال متبقي بتكلفة فعلية لا تتجاوز 0.95 ريال للبقاء ضمن ميزانية BAC الأصلية.
+                  {tcpiIsComputable
+                    ? (lang === 'ar'
+                        ? `يلزم تنفيذ الأعمال المتبقية (${multiEacData.tcpiToBudget.workRemaining.toLocaleString()} ر.س) بكفاءة ${multiEacData.tcpiToBudget.value.toFixed(2)} ضمن المتبقي من الميزانية (${multiEacData.tcpiToBudget.fundsRemaining.toLocaleString()} ر.س).`
+                        : `Remaining work of ${multiEacData.tcpiToBudget.workRemaining.toLocaleString()} SAR must be delivered at ${multiEacData.tcpiToBudget.value.toFixed(2)} efficiency within the ${multiEacData.tcpiToBudget.fundsRemaining.toLocaleString()} SAR of budget left.`)
+                    : (lang === 'ar'
+                        ? `المتبقي من الميزانية (BAC − AC) = ${multiEacData.tcpiToBudget.fundsRemaining.toLocaleString()} ر.س، لذلك المؤشر غير معرَّف رياضياً أو غير قابل للتحقيق. لا يُعرض رقم بديل.`
+                        : `Remaining budget (BAC − AC) = ${multiEacData.tcpiToBudget.fundsRemaining.toLocaleString()} SAR, so the index is either mathematically undefined or unachievable. No substitute number is shown.`)}
                 </p>
               </div>
 
               <div className="bg-slate-800/80 p-4 rounded-xl border border-slate-700 space-y-1">
                 <span className="text-xs text-slate-400 block">مؤشر TCPI بالنسبة للتقدير الواقعي (EAC):</span>
-                <div className="text-2xl font-black text-emerald-400 font-mono">
-                  {multiEacData.tcpiEac}
+                <div className={`text-2xl font-black font-mono ${multiEacData.tcpiToEac.isComputable ? 'text-emerald-400' : 'text-rose-300'}`}>
+                  {renderTcpi(multiEacData.tcpiToEac)}
                 </div>
                 <p className="text-[11px] text-slate-300">
-                  الكفاءة المطلوبة لتحقيق التقدير النهائي المعدل وفق أداء المشروع الحالي.
+                  {lang === 'ar'
+                    ? 'الكفاءة المطلوبة لتحقيق التقدير النهائي المعدل وفق أداء المشروع الحالي (EAC الواقعي).'
+                    : 'Efficiency required to meet the realistic forecast (EAC) given current performance.'}
                 </p>
               </div>
 
               <div className="bg-slate-800/80 p-4 rounded-xl border border-slate-700 space-y-1">
                 <span className="text-xs text-slate-400 block">كفاءة التكلفة الحالية (Current CPI):</span>
-                <div className={`text-2xl font-black font-mono ${multiEacData.cpi >= 1.0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                  {multiEacData.cpi}
+                <div className={`text-2xl font-black font-mono ${evm.cpi >= 1.0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                  {evm.cpiStatus === 'valid'
+                    ? evm.cpi.toFixed(2)
+                    : (lang === 'ar' ? 'غير مقاس (N/A)' : 'Not measured (N/A)')}
                 </div>
                 <p className="text-[11px] text-slate-300">
-                  مؤشر الأداء التراكمي المحقق حتى تاريخ اليومية الميدانية.
+                  {lang === 'ar'
+                    ? 'مؤشر الأداء التراكمي المحقق حتى تاريخ البيانات — من المحرك القانوني الموحّد.'
+                    : 'Cumulative performance to the Data Date — from the canonical unified engine.'}
                 </p>
               </div>
             </div>
@@ -674,13 +664,20 @@ export default function BudgetView({ project }: BudgetViewProps) {
                   <span className="font-bold text-blue-900">1. السيناريو المتفائل (EAC₁)</span>
                   <span className="text-[10px] font-mono bg-blue-200 text-blue-950 px-1.5 py-0.5 rounded font-bold">Planned Rate</span>
                 </div>
-                <p className="text-[10px] text-slate-500 font-mono font-semibold">EAC = AC + (BAC - EV)</p>
+                <p className="text-[10px] text-slate-500 font-mono font-semibold">{multiEacData.optimistic.formula}</p>
                 <div className="text-lg font-black text-blue-950 font-mono">
-                  {multiEacData.eac1Optimistic.toLocaleString()} SAR
+                  {renderModelValue(multiEacData.optimistic)}
                 </div>
-                <div className={`text-[11px] font-bold font-mono ${multiEacData.vac1 >= 0 ? 'text-emerald-700' : 'text-rose-700'}`}>
-                  VAC = {multiEacData.vac1 > 0 ? `+${multiEacData.vac1.toLocaleString()}` : multiEacData.vac1.toLocaleString()} SAR
+                <div className={`text-[11px] font-bold font-mono ${multiEacData.optimistic.vac >= 0 ? 'text-emerald-700' : 'text-rose-700'}`}>
+                  VAC = {multiEacData.optimistic.vac > 0 ? `+${multiEacData.optimistic.vac.toLocaleString()}` : multiEacData.optimistic.vac.toLocaleString()} SAR
                 </div>
+                {multiEacData.optimistic.isComputable ? null : (
+                  <p className="text-[10px] font-bold text-rose-700">
+                    {lang === 'ar'
+                      ? 'المقام غير قابل للقياس — الرقم المعروض حد مرجعي (BAC) وليس تنبؤاً.'
+                      : 'The denominator is not a measured value — the figure shown is the BAC reference, not a forecast.'}
+                  </p>
+                )}
                 <p className="text-[10px] text-slate-600">بافتراض تنفيذ المتبقي بالمعدل المخطط الأصلي تماماً.</p>
               </div>
 
@@ -690,13 +687,20 @@ export default function BudgetView({ project }: BudgetViewProps) {
                   <span className="font-bold text-emerald-900">2. السيناريو الواقعي (EAC₂)</span>
                   <span className="text-[10px] font-mono bg-emerald-200 text-emerald-950 px-1.5 py-0.5 rounded font-bold">Current CPI</span>
                 </div>
-                <p className="text-[10px] text-slate-500 font-mono font-semibold">EAC = BAC / CPI</p>
+                <p className="text-[10px] text-slate-500 font-mono font-semibold">{multiEacData.realistic.formula}</p>
                 <div className="text-lg font-black text-emerald-950 font-mono">
-                  {multiEacData.eac2Realistic.toLocaleString()} SAR
+                  {renderModelValue(multiEacData.realistic)}
                 </div>
-                <div className={`text-[11px] font-bold font-mono ${multiEacData.vac2 >= 0 ? 'text-emerald-700' : 'text-rose-700'}`}>
-                  VAC = {multiEacData.vac2 > 0 ? `+${multiEacData.vac2.toLocaleString()}` : multiEacData.vac2.toLocaleString()} SAR
+                <div className={`text-[11px] font-bold font-mono ${multiEacData.realistic.vac >= 0 ? 'text-emerald-700' : 'text-rose-700'}`}>
+                  VAC = {multiEacData.realistic.vac > 0 ? `+${multiEacData.realistic.vac.toLocaleString()}` : multiEacData.realistic.vac.toLocaleString()} SAR
                 </div>
+                {multiEacData.realistic.isComputable ? null : (
+                  <p className="text-[10px] font-bold text-rose-700">
+                    {lang === 'ar'
+                      ? 'المقام غير قابل للقياس — الرقم المعروض حد مرجعي (BAC) وليس تنبؤاً.'
+                      : 'The denominator is not a measured value — the figure shown is the BAC reference, not a forecast.'}
+                  </p>
+                )}
                 <p className="text-[10px] text-slate-600">بافتراض استمرار نفس كفاءة التكلفة التاريخية الحالية.</p>
               </div>
 
@@ -706,13 +710,20 @@ export default function BudgetView({ project }: BudgetViewProps) {
                   <span className="font-bold text-amber-900">3. السيناريو المركب (EAC₃)</span>
                   <span className="text-[10px] font-mono bg-amber-200 text-amber-950 px-1.5 py-0.5 rounded font-bold">CPI × SPI</span>
                 </div>
-                <p className="text-[10px] text-slate-500 font-mono font-semibold">EAC = AC + (BAC - EV)/(CPI × SPI)</p>
+                <p className="text-[10px] text-slate-500 font-mono font-semibold">{multiEacData.pessimistic.formula}</p>
                 <div className="text-lg font-black text-amber-950 font-mono">
-                  {multiEacData.eac3Pessimistic.toLocaleString()} SAR
+                  {renderModelValue(multiEacData.pessimistic)}
                 </div>
-                <div className={`text-[11px] font-bold font-mono ${multiEacData.vac3 >= 0 ? 'text-emerald-700' : 'text-rose-700'}`}>
-                  VAC = {multiEacData.vac3 > 0 ? `+${multiEacData.vac3.toLocaleString()}` : multiEacData.vac3.toLocaleString()} SAR
+                <div className={`text-[11px] font-bold font-mono ${multiEacData.pessimistic.vac >= 0 ? 'text-emerald-700' : 'text-rose-700'}`}>
+                  VAC = {multiEacData.pessimistic.vac > 0 ? `+${multiEacData.pessimistic.vac.toLocaleString()}` : multiEacData.pessimistic.vac.toLocaleString()} SAR
                 </div>
+                {multiEacData.pessimistic.isComputable ? null : (
+                  <p className="text-[10px] font-bold text-rose-700">
+                    {lang === 'ar'
+                      ? 'المقام غير قابل للقياس — الرقم المعروض حد مرجعي (BAC) وليس تنبؤاً.'
+                      : 'The denominator is not a measured value — the figure shown is the BAC reference, not a forecast.'}
+                  </p>
+                )}
                 <p className="text-[10px] text-slate-600">يراعي أثر تأخير الجدول الزمني على زيادة التكلفة.</p>
               </div>
 
@@ -722,13 +733,20 @@ export default function BudgetView({ project }: BudgetViewProps) {
                   <span className="font-bold text-purple-900">4. التقدير التصاعدي (EAC₄)</span>
                   <span className="text-[10px] font-mono bg-purple-200 text-purple-950 px-1.5 py-0.5 rounded font-bold">Bottom-up ETC</span>
                 </div>
-                <p className="text-[10px] text-slate-500 font-mono font-semibold">EAC = AC + Bottom-Up ETC</p>
+                <p className="text-[10px] text-slate-500 font-mono font-semibold">{multiEacData.bottomUp.formula}</p>
                 <div className="text-lg font-black text-purple-950 font-mono">
-                  {multiEacData.eac4BottomUp.toLocaleString()} SAR
+                  {renderModelValue(multiEacData.bottomUp)}
                 </div>
-                <div className={`text-[11px] font-bold font-mono ${multiEacData.vac4 >= 0 ? 'text-emerald-700' : 'text-rose-700'}`}>
-                  VAC = {multiEacData.vac4 > 0 ? `+${multiEacData.vac4.toLocaleString()}` : multiEacData.vac4.toLocaleString()} SAR
+                <div className={`text-[11px] font-bold font-mono ${multiEacData.bottomUp.vac >= 0 ? 'text-emerald-700' : 'text-rose-700'}`}>
+                  VAC = {multiEacData.bottomUp.vac > 0 ? `+${multiEacData.bottomUp.vac.toLocaleString()}` : multiEacData.bottomUp.vac.toLocaleString()} SAR
                 </div>
+                {multiEacData.bottomUp.isComputable ? null : (
+                  <p className="text-[10px] font-bold text-rose-700">
+                    {lang === 'ar'
+                      ? 'المقام غير قابل للقياس — الرقم المعروض حد مرجعي (BAC) وليس تنبؤاً.'
+                      : 'The denominator is not a measured value — the figure shown is the BAC reference, not a forecast.'}
+                  </p>
+                )}
                 <p className="text-[10px] text-slate-600">مراجعة هندسية دقيقة لتكاليف وأسعار المواد المتبقية.</p>
               </div>
             </div>
@@ -869,7 +887,7 @@ export default function BudgetView({ project }: BudgetViewProps) {
       )}
 
       {/* -------------------------------------------------------------------------------- */}
-      {/* TAB 3: COST BREAKDOWN STRUCTURE (CBS 5-ELEMENT CENTERS)                          */}
+      {/* TAB 3: COST BREAKDOWN STRUCTURE (CBS) — attributed from real records (UG-050)      */}
       {/* -------------------------------------------------------------------------------- */}
       {activeTab === 'cbs_centers' && (
         <div className="space-y-6">
@@ -878,11 +896,47 @@ export default function BudgetView({ project }: BudgetViewProps) {
               <div>
                 <h3 className="text-sm font-black text-slate-900 flex items-center gap-2">
                   <PieChart className="text-amber-600" size={18} />
-                  <span>تصنيف التكاليف حسب مراكز التكلفة الخمسة (Cost Breakdown Structure - CBS)</span>
+                  <span>مراكز التكلفة حسب طبيعة التكلفة (Cost Breakdown Structure - CBS)</span>
                 </h3>
                 <p className="text-xs text-slate-500 mt-0.5">
-                  توزيع ومراقبة التكاليف المعتمدة مقابل المصروفات الفعلية والانحراف لكل عنصر إنشائي.
+                  {lang === 'ar'
+                    ? 'مبنية من السجلات المالية الفعلية فقط: بنود الميزانية (المخطط والالتزام) وحركات التكلفة المعتمدة حتى تاريخ البيانات (الفعلي). لا تُستخدم أي نسب ثابتة.'
+                    : 'Built only from real financial records: budget lines (planned and committed) and approved cost transactions up to the Data Date (actual). No fixed percentages are used.'}
                 </p>
+              </div>
+            </div>
+
+            {/* Provenance + reconciliation banner */}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-[11px]">
+              <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 space-y-1">
+                <span className="font-black text-slate-700 block">
+                  {lang === 'ar' ? 'مصدر التصنيف' : 'Classification source'}
+                </span>
+                <span className="text-slate-600">
+                  {lang === 'ar'
+                    ? `بنود الميزانية: ${cbs.classification.mappedBudgetLines} مصنَّف / ${cbs.classification.unmappedBudgetLines} غير مصنَّف · حركات التكلفة المعتمدة: ${cbs.classification.mappedTransactions} مصنَّفة / ${cbs.classification.unmappedTransactions} غير مصنَّفة`
+                    : `Budget lines: ${cbs.classification.mappedBudgetLines} mapped / ${cbs.classification.unmappedBudgetLines} unmapped · Approved transactions: ${cbs.classification.mappedTransactions} mapped / ${cbs.classification.unmappedTransactions} unmapped`}
+                </span>
+              </div>
+              <div className={`border rounded-lg p-3 space-y-1 ${cbs.reconciliation.plannedBalanced && cbs.reconciliation.actualBalanced ? 'bg-emerald-50 border-emerald-200' : 'bg-rose-50 border-rose-200'}`}>
+                <span className="font-black text-slate-700 block">
+                  {lang === 'ar' ? 'التسوية مع الإجماليات القانونية' : 'Reconciliation to canonical totals'}
+                </span>
+                <span className={cbs.reconciliation.plannedBalanced && cbs.reconciliation.actualBalanced ? 'text-emerald-700' : 'text-rose-700'}>
+                  {lang === 'ar'
+                    ? `المخطط: ${cbs.reconciliation.totalPlanned.toLocaleString()} ر.س (فارق ${cbs.reconciliation.plannedDelta.toLocaleString()}) · الفعلي: ${cbs.reconciliation.totalActual.toLocaleString()} ر.س (فارق ${cbs.reconciliation.actualDelta.toLocaleString()})`
+                    : `Planned: ${cbs.reconciliation.totalPlanned.toLocaleString()} SAR (delta ${cbs.reconciliation.plannedDelta.toLocaleString()}) · Actual: ${cbs.reconciliation.totalActual.toLocaleString()} SAR (delta ${cbs.reconciliation.actualDelta.toLocaleString()})`}
+                </span>
+              </div>
+              <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 space-y-1">
+                <span className="font-black text-slate-700 block">
+                  {lang === 'ar' ? 'غير المصنَّف صراحةً' : 'Explicitly unclassified'}
+                </span>
+                <span className="text-slate-600">
+                  {lang === 'ar'
+                    ? `مخطط ${cbs.reconciliation.unclassifiedPlanned.toLocaleString()} ر.س · فعلي ${cbs.reconciliation.unclassifiedActual.toLocaleString()} ر.س (منه ${cbs.reconciliation.unallocatedPlanned.toLocaleString()} ر.س خارج بنود الميزانية و${cbs.reconciliation.unrecordedActual.toLocaleString()} ر.س بلا حركة تكلفة معتمدة)`
+                    : `Planned ${cbs.reconciliation.unclassifiedPlanned.toLocaleString()} SAR · Actual ${cbs.reconciliation.unclassifiedActual.toLocaleString()} SAR (of which ${cbs.reconciliation.unallocatedPlanned.toLocaleString()} SAR sits outside budget lines and ${cbs.reconciliation.unrecordedActual.toLocaleString()} SAR has no approved transaction)`}
+                </span>
               </div>
             </div>
 
@@ -895,38 +949,69 @@ export default function BudgetView({ project }: BudgetViewProps) {
                     <th className="p-3 text-right">الميزانية المخصصة (Budget)</th>
                     <th className="p-3 text-right">الالتزام المالي (Committed)</th>
                     <th className="p-3 text-right">المصروف الفعلي (Actual)</th>
+                    <th className="p-3 text-right">المتبقي (Remaining)</th>
                     <th className="p-3 text-right">الانحراف المالي (Variance)</th>
                     <th className="p-3 text-center">نسبة الانحراف %</th>
-                    <th className="p-3 text-right">بيان التغطية والبنود</th>
+                    <th className="p-3 text-center">السجلات (Records)</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 font-medium">
                   {cbsCenters.map((center) => (
-                    <tr key={center.id} className="hover:bg-slate-50 transition-colors">
-                      <td className="p-3 font-bold text-slate-900">{center.nameAr}</td>
+                    <tr key={center.id} className={`hover:bg-slate-50 transition-colors ${center.isUnclassified ? 'bg-amber-50/40' : ''}`}>
+                      <td className="p-3 font-bold text-slate-900">
+                        {lang === 'ar' ? center.nameAr : center.nameEn}
+                        {center.isUnclassified && (
+                          <span className="block text-[10px] font-medium text-amber-700 max-w-xs">
+                            {center.description}
+                          </span>
+                        )}
+                      </td>
                       <td className="p-3 font-mono text-slate-800">{center.budgetAllocatedSar.toLocaleString()} SAR</td>
-                      <td className="p-3 font-mono text-blue-700">{center.committedCostSar.toLocaleString()} SAR</td>
+                      <td className="p-3 font-mono text-blue-700">
+                        {center.committedCostStatus === 'no_commitment_data'
+                          ? <span className="text-slate-400 font-sans">{lang === 'ar' ? 'لا توجد التزامات مسجلة' : 'No commitments recorded'}</span>
+                          : `${center.committedCostSar.toLocaleString()} SAR`}
+                      </td>
                       <td className="p-3 font-mono text-amber-800 font-bold">{center.actualCostSar.toLocaleString()} SAR</td>
+                      <td className="p-3 font-mono text-emerald-700">{center.remainingCostSar.toLocaleString()} SAR</td>
                       <td className={`p-3 font-mono font-black ${center.varianceSar >= 0 ? 'text-emerald-700' : 'text-rose-700'}`}>
                         {center.varianceSar >= 0 ? `+${center.varianceSar.toLocaleString()}` : center.varianceSar.toLocaleString()} SAR
                       </td>
                       <td className="p-3 text-center font-mono font-bold">
-                        <span className={`px-2 py-0.5 rounded text-[10px] ${center.variancePercent >= 0 ? 'bg-emerald-100 text-emerald-800' : 'bg-rose-100 text-rose-800'}`}>
-                          {center.variancePercent}%
-                        </span>
+                        {center.budgetAllocatedSar === 0 ? (
+                          <span className="px-2 py-0.5 rounded text-[10px] bg-slate-100 text-slate-500">
+                            {lang === 'ar' ? 'لا ينطبق' : 'N/A'}
+                          </span>
+                        ) : (
+                          <span className={`px-2 py-0.5 rounded text-[10px] ${center.variancePercent >= 0 ? 'bg-emerald-100 text-emerald-800' : 'bg-rose-100 text-rose-800'}`}>
+                            {center.variancePercent}%
+                          </span>
+                        )}
                       </td>
-                      <td className="p-3 text-slate-600 text-[11px] max-w-xs truncate">{center.description}</td>
+                      <td className="p-3 text-center font-mono text-slate-600">{center.mappedRecordCount}</td>
                     </tr>
                   ))}
                 </tbody>
                 <tfoot className="bg-slate-50 font-black text-slate-900 border-t">
                   <tr>
-                    <td className="p-3">الإجمالي العام لمراكز التكلفة:</td>
-                    <td className="p-3 font-mono">{cbsCenters.reduce((s, c) => s + c.budgetAllocatedSar, 0).toLocaleString()} SAR</td>
-                    <td className="p-3 font-mono text-blue-700">{cbsCenters.reduce((s, c) => s + c.committedCostSar, 0).toLocaleString()} SAR</td>
-                    <td className="p-3 font-mono text-amber-800">{cbsCenters.reduce((s, c) => s + c.actualCostSar, 0).toLocaleString()} SAR</td>
-                    <td className="p-3 font-mono text-emerald-700">{cbsCenters.reduce((s, c) => s + c.varianceSar, 0).toLocaleString()} SAR</td>
+                    <td className="p-3">{lang === 'ar' ? 'الإجمالي العام لمراكز التكلفة:' : 'Total across cost centers:'}</td>
+                    <td className="p-3 font-mono">{cbsCenters.reduce((sum, c) => sum + c.budgetAllocatedSar, 0).toLocaleString()} SAR</td>
+                    <td className="p-3 font-mono text-blue-700">
+                      {committedSummary.status === 'no_commitment_data'
+                        ? <span className="text-slate-400 font-sans">{lang === 'ar' ? 'لا توجد التزامات مسجلة' : 'No commitments recorded'}</span>
+                        : `${cbsCenters.reduce((sum, c) => sum + c.committedCostSar, 0).toLocaleString()} SAR`}
+                    </td>
+                    <td className="p-3 font-mono text-amber-800">{cbsCenters.reduce((sum, c) => sum + c.actualCostSar, 0).toLocaleString()} SAR</td>
+                    <td className="p-3 font-mono text-emerald-700">{cbsCenters.reduce((sum, c) => sum + c.remainingCostSar, 0).toLocaleString()} SAR</td>
+                    <td className="p-3 font-mono">{cbsCenters.reduce((sum, c) => sum + c.varianceSar, 0).toLocaleString()} SAR</td>
                     <td colSpan={2}></td>
+                  </tr>
+                  <tr>
+                    <td className="p-3 text-[11px] font-bold text-slate-600" colSpan={8}>
+                      {lang === 'ar'
+                        ? `التسوية: مجموع المخطط = BAC القانوني (${cbs.reconciliation.totalPlanned.toLocaleString()} ر.س) ومجموع الفعلي = AC القانوني (${cbs.reconciliation.totalActual.toLocaleString()} ر.س) — الفارق ${cbs.reconciliation.plannedDelta.toLocaleString()} / ${cbs.reconciliation.actualDelta.toLocaleString()} ر.س.`
+                        : `Reconciliation: planned sums to the canonical BAC (${cbs.reconciliation.totalPlanned.toLocaleString()} SAR) and actual to the canonical AC (${cbs.reconciliation.totalActual.toLocaleString()} SAR) — delta ${cbs.reconciliation.plannedDelta.toLocaleString()} / ${cbs.reconciliation.actualDelta.toLocaleString()} SAR.`}
+                    </td>
                   </tr>
                 </tfoot>
               </table>
