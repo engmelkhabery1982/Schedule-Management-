@@ -2,7 +2,13 @@ import { useState, useEffect, useMemo } from 'react';
 import { supabase } from '@/lib/supabase';
 import { getLanguage, type Language } from '@/lib/i18n';
 import type { Project, BoqItem, SubcontractPackage, SubcontractBoqItem } from '@/types';
-import { getSubcontractPackages, saveSubcontractPackages } from '@/lib/subcontractEngine';
+import {
+  getSubcontractPackages,
+  loadSubcontractPackages,
+  getSubcontractSource,
+  saveSubcontractPackages,
+  type SubcontractSource,
+} from '@/lib/subcontractEngine';
 import {
   Search,
   FileText,
@@ -35,16 +41,17 @@ export default function BoqView({ project }: BoqViewProps) {
   const [lang, setLang] = useState<Language>(getLanguage());
   const [activeTab, setActiveTab] = useState<'main_boq' | 'subcontract_boq'>('main_boq');
 
-  // Subcontract Packages & BOQs State
+  // Subcontract Packages & BOQs State.
+  // The synchronous read only seeds the first paint; `loadItems()` replaces it with the database
+  // rows from `subcontract_packages` / `subcontract_items`, which are the source of truth (GAP-019).
   const [subcontracts, setSubcontracts] = useState<SubcontractPackage[]>(() =>
     getSubcontractPackages(project?.id)
   );
+  const [subcontractSource, setSubcontractSource] = useState<SubcontractSource>('not_loaded');
 
-  useEffect(() => {
-    if (subcontracts && subcontracts.length > 0) {
-      saveSubcontractPackages(subcontracts, project?.id);
-    }
-  }, [subcontracts, project?.id]);
+  // NOTE: the former autosave effect rewrote every package on each state change. Writes are now
+  // explicit (create package / assign BOQ item) so the database stays the only writable store and
+  // the in-memory copy can never outrank it.
 
   const [selectedSubPkgId, setSelectedSubPkgId] = useState<string>('SUB-PKG-01');
   const [showAddSubModal, setShowAddSubModal] = useState(false);
@@ -93,6 +100,14 @@ export default function BoqView({ project }: BoqViewProps) {
       .eq('project_id', project.id)
       .order('sort_order', { ascending: true });
     setItems(data || []);
+
+    // Database-first load of the subcontract packages: on the first load for a project the legacy
+    // localStorage store (or the project-scoped demo packages) is imported once into the relational
+    // tables and the legacy key is dropped, so no stored work is discarded (GAP-019).
+    const loadedSubcontracts = await loadSubcontractPackages(project.id);
+    setSubcontracts(loadedSubcontracts);
+    setSubcontractSource(getSubcontractSource(project.id));
+
     setLoading(false);
   }
 
@@ -145,8 +160,24 @@ export default function BoqView({ project }: BoqViewProps) {
   // Create new subcontractor package
   const handleCreateSubcontractor = () => {
     if (!newSubForm.subcontractorName) return;
+
+    // The business code stays the application-facing identity and must be unique per project; the
+    // relational uuid is assigned by the database on save (GAP-019, strategy A).
+    const usedNumbers = subcontracts
+      .map((pkg) => Number(String(pkg.code || pkg.id).replace(/^SUB-PKG-/i, '')))
+      .filter((n) => Number.isFinite(n));
+    const nextNumber = (usedNumbers.length > 0 ? Math.max(...usedNumbers) : 0) + 1;
+    const newCode = `SUB-PKG-${String(nextNumber).padStart(2, '0')}`;
+
+    // 0% is a valid contractual retention and a blank field means "not specified"; neither may be
+    // silently turned into 10% (GAP-020).
+    const rawRetention = String(newSubForm.retentionPercent ?? '').trim();
+    const retentionPercent = rawRetention === '' || !Number.isFinite(Number(rawRetention)) ? null : Number(rawRetention);
+
     const newPkg: SubcontractPackage = {
-      id: `SUB-PKG-0${subcontracts.length + 1}`,
+      id: newCode,
+      code: newCode,
+      projectId: project?.id || null,
       subcontractNumber: newSubForm.subcontractNumber,
       subcontractorName: newSubForm.subcontractorName,
       contactPerson: newSubForm.contactPerson || 'المدير التنفيذي',
@@ -154,34 +185,47 @@ export default function BoqView({ project }: BoqViewProps) {
       trade: newSubForm.trade,
       contractDate: newSubForm.contractDate,
       scopeDescription: newSubForm.scopeDescription,
-      status: 'active',
+      // A new package starts as a planned commitment; it becomes an actual only when items are
+      // executed and dated on or before the Data Date (GAP-021).
+      status: 'planned',
       totalSubcontractValueSar: 0,
       totalClientEquivalentValueSar: 0,
       totalExpectedProfitSar: 0,
       profitMarginPercent: 0,
-      retentionPercent: Number(newSubForm.retentionPercent) || 10,
+      valueBasis: 'itemized',
+      retentionPercent,
       items: [],
     };
 
-    setSubcontracts([...subcontracts, newPkg]);
+    const nextPackages = [...subcontracts, newPkg];
+    setSubcontracts(nextPackages);
     setSelectedSubPkgId(newPkg.id);
     setShowAddSubModal(false);
+    void saveSubcontractPackages(nextPackages, project?.id);
   };
 
   // Add BOQ item to selected Subcontractor
   const handleAssignBoqItem = () => {
     if (!selectedSubPkg) return;
     const qty = Number(assignForm.assignedQuantity) || 1;
-    const subRate = Number(assignForm.subcontractRateSar) || 0;
-    const clientRate = Number(assignForm.clientRateSar) || 0;
+    // A rate the user did not enter stays unpriced (null) instead of becoming 0, so the ledger can
+    // report N/A rather than a free-of-charge item (GAP-020).
+    const rawSubRate = String(assignForm.subcontractRateSar ?? '').trim();
+    const rawClientRate = String(assignForm.clientRateSar ?? '').trim();
+    const subRate = rawSubRate !== '' && Number(rawSubRate) > 0 ? Number(rawSubRate) : null;
+    const clientRate = rawClientRate !== '' && Number(rawClientRate) > 0 ? Number(rawClientRate) : null;
 
-    const subTotal = qty * subRate;
-    const clientTotal = qty * clientRate;
-    const marginSar = clientTotal - subTotal;
-    const marginPct = clientTotal > 0 ? Number(((marginSar / clientTotal) * 100).toFixed(1)) : 0;
+    const subTotal = subRate === null ? 0 : Math.round(qty * subRate);
+    const clientTotal = clientRate === null ? 0 : Math.round(qty * clientRate);
+    // A margin only exists when both sides are priced.
+    const marginSar = subRate !== null && clientRate !== null ? clientTotal - subTotal : 0;
+    const marginPct = clientTotal > 0 && subRate !== null ? Number(((marginSar / clientTotal) * 100).toFixed(1)) : 0;
 
+    const itemCode = `SUB-ITM-${Date.now()}`;
     const newItem: SubcontractBoqItem = {
-      id: `SUB-ITM-${Date.now()}`,
+      id: itemCode,
+      code: itemCode,
+      project_id: project?.id || null,
       subcontractId: selectedSubPkg.id,
       boqCode: assignForm.boqCode,
       description: assignForm.description,
@@ -195,6 +239,8 @@ export default function BoqView({ project }: BoqViewProps) {
       expectedMarginPercent: marginPct,
       linkedActivityCode: assignForm.linkedActivityCode,
       executedQuantity: 0,
+      executionStatus: 'planned',
+      executionDate: null,
     };
 
     const updatedItems = [...selectedSubPkg.items, newItem];
@@ -203,22 +249,22 @@ export default function BoqView({ project }: BoqViewProps) {
     const newMargin = newClientTotal - newSubTotal;
     const newMarginPct = newClientTotal > 0 ? Number(((newMargin / newClientTotal) * 100).toFixed(1)) : 0;
 
-    setSubcontracts((prev) =>
-      prev.map((pkg) =>
-        pkg.id === selectedSubPkg.id
-          ? {
-              ...pkg,
-              items: updatedItems,
-              totalSubcontractValueSar: newSubTotal,
-              totalClientEquivalentValueSar: newClientTotal,
-              totalExpectedProfitSar: newMargin,
-              profitMarginPercent: newMarginPct,
-            }
-          : pkg
-      )
+    const nextPackages = subcontracts.map((pkg) =>
+      pkg.id === selectedSubPkg.id
+        ? {
+            ...pkg,
+            items: updatedItems,
+            totalSubcontractValueSar: newSubTotal,
+            totalClientEquivalentValueSar: newClientTotal,
+            totalExpectedProfitSar: newMargin,
+            profitMarginPercent: newMarginPct,
+          }
+        : pkg,
     );
-
+    setSubcontracts(nextPackages);
     setShowAssignBoqModal(false);
+    // Persist to the relational tables — the database is the single writable store (GAP-019).
+    void saveSubcontractPackages(nextPackages, project?.id);
   };
 
   if (loading) {
@@ -245,6 +291,25 @@ export default function BoqView({ project }: BoqViewProps) {
             </h1>
             <span className="px-2 py-0.5 rounded text-[10px] font-black bg-slate-900 text-amber-400">
               Two-Tier Cost Control
+            </span>
+            <span
+              className={`px-2 py-0.5 rounded text-[10px] font-black border ${
+                subcontractSource === 'database'
+                  ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                  : 'bg-amber-50 text-amber-900 border-amber-300'
+              }`}
+            >
+              {subcontractSource === 'database'
+                ? lang === 'ar'
+                  ? 'مصدر البيانات: قاعدة البيانات'
+                  : 'Source of truth: database'
+                : subcontractSource === 'legacy_localstorage_imported' || subcontractSource === 'seed_defaults_imported'
+                  ? lang === 'ar'
+                    ? 'مصدر البيانات: قاعدة البيانات (تم ترحيل السجلات المحلية مرة واحدة)'
+                    : 'Source of truth: database (legacy records imported once)'
+                  : lang === 'ar'
+                    ? 'مصدر البيانات: قراءة محلية - تعذر الوصول إلى قاعدة البيانات'
+                    : 'Source of truth: local read - database unavailable'}
             </span>
           </div>
           <p className="text-xs text-slate-500 mt-1">
@@ -531,13 +596,18 @@ export default function BoqView({ project }: BoqViewProps) {
                           <td className="p-3 text-center text-slate-500 font-mono">{item.unit}</td>
                           <td className="p-3 text-center font-mono font-bold text-slate-900">{item.assignedQuantity.toLocaleString()}</td>
                           <td className="p-3 text-center font-mono font-bold text-amber-800 bg-amber-50/40 border-x border-amber-100">
-                            {item.subcontractRateSar.toLocaleString()} ر.س
+                            {/* An unpriced item shows N/A instead of an estimated rate (GAP-020). */}
+                            {item.subcontractRateSar === null || item.subcontractRateSar === undefined
+                              ? 'غير مُسعّر (N/A)'
+                              : `${item.subcontractRateSar.toLocaleString()} ر.س`}
                           </td>
                           <td className="p-3 text-right font-mono font-black text-amber-950 bg-amber-50/40">
                             {item.subcontractTotalSar.toLocaleString()} ر.س
                           </td>
                           <td className="p-3 text-center font-mono font-bold text-blue-800 bg-blue-50/40 border-x border-blue-100">
-                            {item.clientRateSar.toLocaleString()} ر.س
+                            {item.clientRateSar === null || item.clientRateSar === undefined
+                              ? 'غير مُسعّر (N/A)'
+                              : `${item.clientRateSar.toLocaleString()} ر.س`}
                           </td>
                           <td className="p-3 text-right font-mono font-black text-blue-950 bg-blue-50/40">
                             {item.clientTotalSar.toLocaleString()} ر.س

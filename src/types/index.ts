@@ -215,15 +215,25 @@ export interface ProgressUpdate {
   // Execution Party & Subcontractor tracking
   executor_type?: 'self_direct' | 'subcontractor';
   subcontractor_id?: string | null;
+  /**
+   * Relational uuid of the owning `subcontract_packages` row (GAP-019, strategy A). The text
+   * `subcontractor_id` above keeps holding the business code ('SUB-PKG-01') for compatibility and is
+   * never parsed as a uuid.
+   */
+  subcontract_package_id?: string | null;
   subcontractor_name?: string | null;
   subcontract_item_id?: string | null;
   zone_or_scope?: string | null;
-  subcontract_unit_rate?: number;
-  client_unit_rate?: number;
-  subcontractor_cost?: number;
-  client_earned_value?: number;
-  profit_margin_sar?: number;
-  retention_deducted?: number;
+  /**
+   * The commercial values are nullable on purpose: when the subcontract package states no rate or no
+   * retention, the record keeps null and the UI reports N/A instead of carrying an estimate (GAP-020).
+   */
+  subcontract_unit_rate?: number | null;
+  client_unit_rate?: number | null;
+  subcontractor_cost?: number | null;
+  client_earned_value?: number | null;
+  profit_margin_sar?: number | null;
+  retention_deducted?: number | null;
 }
 
 export interface Risk {
@@ -410,13 +420,19 @@ export interface InspectionRequest {
   // Execution Party & Subcontractor tracking
   executor_type?: 'self_direct' | 'subcontractor';
   subcontractor_id?: string | null;
+  /**
+   * Relational uuid of the owning `subcontract_packages` row (GAP-019, strategy A); the text
+   * `subcontractor_id` keeps the business code and is never parsed as a uuid.
+   */
+  subcontract_package_id?: string | null;
   subcontractor_name?: string | null;
   zone_or_scope?: string | null;
-  subcontract_unit_rate?: number;
-  client_unit_rate?: number;
-  subcontractor_cost?: number;
-  client_earned_value?: number;
-  profit_margin_sar?: number;
+  /** Null when the covering package item is not priced — never an estimate (GAP-020). */
+  subcontract_unit_rate?: number | null;
+  client_unit_rate?: number | null;
+  subcontractor_cost?: number | null;
+  client_earned_value?: number | null;
+  profit_margin_sar?: number | null;
 }
 
 export interface AuditLog {
@@ -967,27 +983,71 @@ export interface VariationOrder {
 
 // Subcontractor Package & Subcontract BOQ Assignment Types
 export interface SubcontractBoqItem {
+  /**
+   * Application-facing identity: the subcontract item BUSINESS CODE ('SUB-ITM-01'). It is kept as
+   * `id` so existing selectors, payloads and stored progress_updates references keep working
+   * (GAP-019 compatibility strategy A); the relational uuid lives in `itemId`.
+   */
   id: string;
   subcontractId: string;
+  /** Internal uuid PK of `subcontract_items` (GAP-019). Absent for legacy in-memory records. */
+  itemId?: string | null;
+  /** Internal uuid of the owning `subcontract_packages` row. */
+  packageId?: string | null;
+  /** Owning project, denormalised on the row so project isolation can be queried and enforced. */
+  project_id?: string | null;
+  /** Business code column of `subcontract_items` (same value as `id` when loaded from the DB). */
+  code?: string | null;
   boqItemId?: string;
+  /** Relational link to `activities.id`; `linkedActivityCode` stays as the text business code. */
+  linkedActivityId?: string | null;
+  /**
+   * Commercial chronology (GAP-021): a quantity is only an actual when its status says it happened
+   * and its execution date is on or before the governed Data Date.
+   */
+  executionStatus?: 'planned' | 'submitted' | 'approved' | 'certified';
+  executionDate?: string | null;
   boqCode: string;
   description: string;
   unit: string;
   assignedQuantity: number;
-  subcontractRateSar: number; // سعر شراء مقاول الباطن
+  /**
+   * سعر شراء مقاول الباطن. `null` يعني أن البند غير مُسعّر: تُعرض التكلفة N/A ولا تُقدّر أبداً من
+   * سعر المالك (GAP-020).
+   */
+  subcontractRateSar: number | null;
   subcontractTotalSar: number;
-  clientRateSar: number;      // سعر بيع المالك للمقاول الرئيسي
+  /** سعر بيع المالك للمقاول الرئيسي؛ `null` عندما يكون جانب المالك غير مُسعّر. */
+  clientRateSar: number | null;
   clientTotalSar: number;
   expectedMarginSar: number;
   expectedMarginPercent: number;
   linkedActivityCode?: string;
   executedQuantity?: number;
   zoneOrScope?: string;       // نطاق العمل أو المنطقة الجغرافية (مثل: Zone A, مبنى 1, مرحلة التوريد)
-  quotaPercent?: number;      // النسبة المئوية من إجمالي كمية البند الرئيسي (مثل: 60%, 40%)
+  /** النسبة المئوية من إجمالي كمية البند الرئيسي (مثل: 60%, 40%)؛ `null` = غير مسجلة. */
+  quotaPercent?: number | null;
 }
 
 export interface SubcontractPackage {
+  /**
+   * Application-facing identity: the package BUSINESS CODE ('SUB-PKG-01'). Existing code matches on
+   * it (executor selectors, progress_updates.subcontractor_id, inspection payloads), so it is
+   * preserved as `id`; the relational uuid lives in `packageId` (GAP-019 strategy A).
+   */
   id: string;
+  /** Internal uuid PK of `subcontract_packages`. Absent for legacy in-memory records. */
+  packageId?: string | null;
+  /** Owning project. A package always belongs to exactly one project (GAP-019 / project isolation). */
+  projectId?: string | null;
+  /** Business code column of `subcontract_packages` (same value as `id` when loaded from the DB). */
+  code?: string | null;
+  /**
+   * How the package amount relates to its items (GAP-018 applied to subcontracts): 'itemized' means
+   * the package value must equal the sum of item contract amounts; 'lump_sum' means a documented
+   * lump sum overrides that sum. Defaults to 'itemized' when absent.
+   */
+  valueBasis?: 'itemized' | 'lump_sum';
   subcontractNumber: string; // e.g. "SUB-CON-001"
   subcontractorName: string;
   contactPerson: string;
@@ -995,12 +1055,21 @@ export interface SubcontractPackage {
   trade: string; // e.g. "أعمال الهيكل الإنشائي والخرسانات", "أعمال تمديدات التكييف والدكت"
   contractDate: string;
   scopeDescription: string;
-  status: 'active' | 'completed' | 'suspended';
+  /** 'planned' packages are future commercial commitments and never enter actual totals (GAP-021). */
+  status: 'planned' | 'active' | 'completed' | 'suspended' | 'terminated';
   totalSubcontractValueSar: number;
   totalClientEquivalentValueSar: number;
+  /**
+   * Derived from the items (client equivalent - subcontract value). Kept on the shape for existing
+   * consumers but never treated as an independent source of truth (GAP-018).
+   */
   totalExpectedProfitSar: number;
   profitMarginPercent: number;
-  retentionPercent: number; // 5% or 10%
+  /**
+   * Contractual retention of THIS package. `null` means the contract does not specify one, which is
+   * reported as N/A — it is never defaulted to 10% (GAP-020). 0 is a legitimate retention-free term.
+   */
+  retentionPercent: number | null;
   items: SubcontractBoqItem[];
 }
 

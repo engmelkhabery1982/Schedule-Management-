@@ -305,8 +305,19 @@ export async function runComprehensiveGovernanceAudit(
   const subLedger = calculateSubcontractorLedger(subPackages, activities, boqItems);
   const totalSubRetention = subLedger.totals.totalRetentionWithheld;
   const totalSubIncurred = subLedger.totals.totalSubcontractorIncurredAC;
-  const subRetentionRatio = totalSubIncurred > 0 ? (totalSubRetention / totalSubIncurred) * 100 : 10;
-  const isRetentionCorrect = Math.abs(subRetentionRatio - 10) < 1;
+  // GAP-020: retention is a CONTRACTUAL term of each package (10%, 5%, 0%, ...), so the control
+  // checks that every package was deducted at its own percent instead of assuming a flat 10%.
+  const billedPackages = subLedger.summaries.filter((s) => s.totalExecutedCostSar > 0);
+  const packagesWithUnknownRetention = subLedger.summaries.filter((s) => s.retentionPercent === null);
+  const retentionMismatches = billedPackages.filter(
+    (s) =>
+      s.retentionPercent === null ||
+      s.retentionWithheldSar === null ||
+      Math.abs(s.retentionWithheldSar - s.totalExecutedCostSar * (s.retentionPercent / 100)) > 0.5,
+  );
+  const subRetentionRatio =
+    totalSubIncurred > 0 && totalSubRetention !== null ? (totalSubRetention / totalSubIncurred) * 100 : null;
+  const isRetentionCorrect = retentionMismatches.length === 0 && packagesWithUnknownRetention.length === 0;
 
   checks.push({
     id: 'GOV-FID-01',
@@ -314,15 +325,18 @@ export async function runComprehensiveGovernanceAudit(
     pillarNameAr: 'الضوابط التعاقدية وعقود الباطن (FIDIC & Commercial)',
     pillarNameEn: 'FIDIC Contractual Controls & Subcontractor Ledger Parity',
     code: 'FID-01',
-    titleAr: 'انضباط استقطاعات ضمان حسن التنفيذ لمقاولي الباطن (Retention 10% Withholding)',
-    titleEn: 'Subcontractor Retention Withholding Parity (Strict 10% Deduction)',
-    descriptionAr: 'التحقق من حجز نسبة 10% من كافة دفعات مقاولي الباطن المعتمدة كضمان تعاقدي لحسن التنفيذ وفق شروط فيديك.',
-    descriptionEn: 'Verifies exact 10% retention withholding on all certified subcontractor progress billings.',
+    titleAr: 'انضباط استقطاعات ضمان حسن التنفيذ وفق النسبة التعاقدية لكل باقة (Contractual Retention)',
+    titleEn: 'Subcontractor Retention Withheld at Each Package\'s Contractual Percent',
+    descriptionAr: 'التحقق من حجز نسبة الضمان التعاقدية الخاصة بكل باقة باطن (10% أو 5% أو 0%) من دفعاتها المعتمدة، دون افتراض نسبة موحدة ودون احتساب نسبة غير منصوص عليها في العقد.',
+    descriptionEn: 'Verifies that every subcontract package is deducted at its own contractual retention percent (10%, 5%, 0%, ...) rather than an assumed flat rate, and that a package without a stated percent is reported as unspecified instead of being defaulted.',
     severity: 'high',
     status: isRetentionCorrect ? 'passed' : 'warning',
-    expectedValue: '10.00% استقطاع تعاقدي',
-    actualValue: `${subRetentionRatio.toFixed(2)}% محتجز فعلياً`,
-    variance: '0.00%',
+    expectedValue: `${billedPackages.length} باقة مفوترة تستقطع كلٌّ منها نسبتها التعاقدية`,
+    actualValue:
+      packagesWithUnknownRetention.length > 0
+        ? `${retentionMismatches.length} باقة غير مطابقة، و${packagesWithUnknownRetention.length} باقة نسبتها غير منصوص عليها (N/A)`
+        : `${retentionMismatches.length} باقة غير مطابقة · متوسط مرجح ${subRetentionRatio === null ? 'N/A' : `${subRetentionRatio.toFixed(2)}%`}`,
+    variance: `${retentionMismatches.length} باقة`,
     impactAr: 'حماية المقاول الرئيسي من المخاطر التشغيلية وضمان معالجة العيوب خلال فترة الصيانة.',
     impactEn: 'Protects main contractor from subcontractor default during Defect Notification Period.',
   });

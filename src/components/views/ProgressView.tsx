@@ -20,10 +20,14 @@ import {
 import { reconcileFinishForecasts } from '@/lib/forecastReconciliation';
 import {
   getSubcontractPackages,
+  loadSubcontractPackages,
+  getSubcontractSource,
   saveSubcontractPackages,
   calculateSubcontractorLedger,
   type SubcontractorPerformanceSummary,
+  type SubcontractSource,
 } from '@/lib/subcontractEngine';
+import { calculateRetentionAmount } from '@/lib/commercialControlsEngine';
 import {
   TrendingUp,
   Save,
@@ -61,6 +65,62 @@ interface ProgressViewProps {
   project: Project | null;
 }
 
+/** Commercial terms resolved from a subcontract package's contract (GAP-020). */
+interface SubcontractTerms {
+  /** Contractual subcontractor unit rate; null when the covering item is not priced. */
+  subRate: number | null;
+  /** Contractual subcontractor name; null when no package matches (never invented). */
+  subPkgName: string | null;
+  packageId: string | null;
+  /** Relational uuid of `subcontract_packages`; null until the package exists in the database. */
+  packageUuid: string | null;
+  itemId: string | null;
+  rateSource: 'package_item' | 'not_priced';
+  /** Contractual retention percent of the package; null when the contract does not state one. */
+  retentionPercent: number | null;
+  retentionAmount: number | null;
+  subCost: number | null;
+  clientRate: number | null;
+  clientEarned: number | null;
+  margin: number | null;
+  netPayable: number | null;
+}
+
+/** Shape of a Postgres uuid, used to keep business codes out of uuid columns (Case N discipline). */
+const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Resolve what the WIR form holds for a BOQ reference into something inspection_requests.boq_item_id
+ * can store: that column is a uuid foreign key to boq_items(id).
+ *
+ * A business code ('CW-003') or an activity code is looked up in the loaded BOQ rows and replaced by
+ * the row's real id. A value that matches nothing becomes null -- it is never written as text, which
+ * would raise "invalid input syntax for type uuid", and a code is never parsed as if it were a uuid.
+ */
+function resolveBoqItemReference(
+  value: string | null | undefined,
+  items: BoqItem[],
+): string | null {
+  const raw = String(value ?? '').trim();
+  if (!raw) return null;
+  if (UUID_SHAPE.test(raw)) return raw;
+  const match = items.find((b) => String(b.id) === raw || b.code === raw);
+  return match ? String(match.id) : null;
+}
+
+/** The commercial columns shared by progress_updates and inspection_requests records. */
+interface CommercialRecordFields {
+  executor_type?: string | null;
+  subcontractor_id?: string | null;
+  subcontractor_name?: string | null;
+  subcontract_unit_rate?: number | null;
+  subcontractor_cost?: number | null;
+  client_unit_rate?: number | null;
+  client_earned_value?: number | null;
+  profit_margin_sar?: number | null;
+  retention_deducted?: number | null;
+}
+
 type TabType =
   | 'daily_entry_sheet'
   | 'single_activity_log'
@@ -85,10 +145,14 @@ export default function ProgressView({ project }: ProgressViewProps) {
   const [message, setMessage] = useState('');
   const [saving, setSaving] = useState(false);
 
-  // Subcontract Packages & Ledger State
+  // Subcontract Packages & Ledger State.
+  // The synchronous read only seeds the first paint; `loadData()` replaces it with the database
+  // rows, which are the source of truth for subcontract packages (GAP-019).
   const [subcontracts, setSubcontracts] = useState<SubcontractPackage[]>(() =>
     getSubcontractPackages(project?.id)
   );
+  /** Which store answered the last read: database, one-time legacy import, or defaults. */
+  const [subcontractSource, setSubcontractSource] = useState<SubcontractSource>('not_loaded');
   const [selectedSubcontractorFilter, setSelectedSubcontractorFilter] = useState<string>('all');
   const [certModalData, setCertModalData] = useState<SubcontractorPerformanceSummary | null>(null);
 
@@ -143,11 +207,10 @@ export default function ProgressView({ project }: ProgressViewProps) {
     else setLoading(false);
   }, [project]);
 
-  useEffect(() => {
-    if (subcontracts && subcontracts.length > 0) {
-      saveSubcontractPackages(subcontracts, project?.id);
-    }
-  }, [subcontracts, project?.id]);
+  // NOTE: the former autosave effect wrote the whole package list back on every state change. It is
+  // gone on purpose: with the database as the single source of truth (GAP-019), writes happen
+  // explicitly where a package actually changes (the inspection approval path and BoqView), so the
+  // database and the in-memory state can never fight over who is authoritative.
 
   async function loadData() {
     if (!project) return;
@@ -177,6 +240,15 @@ export default function ProgressView({ project }: ProgressViewProps) {
     setBoqItems((boqRes.data || []) as BoqItem[]);
     setBudgetLines((budgetRes.data || []) as BudgetLine[]);
     setCostTransactions((costRes.data || []) as CostTransaction[]);
+
+    // Subcontract packages are loaded from `subcontract_packages` / `subcontract_items`. The first
+    // load for a project performs a one-time import of the legacy localStorage store (or of the
+    // project-scoped demo packages when there is none), writes it to the database and drops the
+    // legacy key, so nothing is silently discarded and only the database remains writable.
+    const loadedSubcontracts = await loadSubcontractPackages(project.id);
+    setSubcontracts(loadedSubcontracts);
+    setSubcontractSource(getSubcontractSource(project.id));
+
     setLoading(false);
   }
 
@@ -191,17 +263,113 @@ export default function ProgressView({ project }: ProgressViewProps) {
     return Math.round(defaultBac / plannedQty);
   };
 
-  // Get Subcontractor Unit Rate for an Activity if executed by subcontractor
-  const getSubcontractorRateForActivity = (act: Activity, subId: string): { subRate: number; subPkgName: string } => {
-    const pkg = subcontracts.find((s) => s.id === subId);
-    if (!pkg) return { subRate: Math.round(getActivityUnitRate(act) * 0.7), subPkgName: 'مقاول باطن' };
+  /**
+   * Retention label that names the package's CONTRACTUAL percent (10%, 5%, 0%, ...) instead of the
+   * fixed 10% this screen used to assume, and that says so when the contract states none (GAP-020).
+   */
+  const retentionLabel = (percent: number | null | undefined): string =>
+    percent === null || percent === undefined
+      ? 'مستقطع الضمان (غير منصوص عليه تعاقدياً - N/A)'
+      : `مستقطع الضمان (${percent}% تعاقدي)`;
 
-    const item = pkg.items.find((i) => i.linkedActivityCode === act.code || i.boqCode === act.code || i.description.includes(act.name));
-    if (item && item.subcontractRateSar > 0) {
-      return { subRate: item.subcontractRateSar, subPkgName: pkg.subcontractorName };
-    }
-    // Default estimated subcontract cost is ~70% of client unit price
-    return { subRate: Math.round(getActivityUnitRate(act) * 0.7), subPkgName: pkg.subcontractorName };
+  /** Formats a commercial amount, or states explicitly that it is not priced (GAP-020). */
+  const money = (value: number | null | undefined, suffix = 'ر.س'): string =>
+    value === null || value === undefined || !Number.isFinite(Number(value))
+      ? 'غير مُسعّر (N/A)'
+      : `${Number(value).toLocaleString()} ${suffix}`;
+
+  /**
+   * Resolve the CONTRACTUAL commercial terms of a quantity executed by a subcontract package
+   * (GAP-020). Nothing here is estimated: the subcontractor rate comes from the package item that
+   * covers the activity or BOQ line, the retention percent comes from that package's contract, and
+   * whatever is absent stays `null` so callers can render an explicit N/A. The former
+   * "70% of the client rate" estimate and the invented subcontractor name are gone.
+   */
+  const resolveSubcontractTerms = (
+    act: Activity | undefined,
+    subId: string | null | undefined,
+    qty: number,
+  ): SubcontractTerms => {
+    const pkg = subId
+      ? subcontracts.find((s) => s.id === subId || s.code === subId || s.subcontractNumber === subId || s.subcontractorName === subId)
+      : undefined;
+    const item = pkg?.items.find(
+      (i) =>
+        (act && (i.linkedActivityCode === act.code || i.boqCode === act.code)) ||
+        (act && !!i.description && (i.description.includes(act.name) || act.name.includes(i.description))) ||
+        (act && i.linkedActivityId === act.id),
+    );
+
+    const subRate =
+      item && Number.isFinite(Number(item.subcontractRateSar)) && Number(item.subcontractRateSar) > 0
+        ? Number(item.subcontractRateSar)
+        : null;
+    const clientRate =
+      item && Number.isFinite(Number(item.clientRateSar)) && Number(item.clientRateSar) > 0
+        ? Number(item.clientRateSar)
+        : act
+          ? getActivityUnitRate(act)
+          : null;
+    const subCost = subRate === null ? null : Math.round(qty * subRate);
+    const clientEarned = clientRate === null ? null : Math.round(qty * clientRate);
+    const retentionPercent = pkg ? pkg.retentionPercent ?? null : null;
+    const retentionAmount =
+      subCost !== null && retentionPercent !== null ? calculateRetentionAmount(subCost, retentionPercent) : null;
+
+    return {
+      subRate,
+      subPkgName: pkg ? pkg.subcontractorName : null,
+      packageId: pkg ? pkg.id : null,
+      packageUuid: pkg?.packageId || null,
+      itemId: item?.itemId || null,
+      rateSource: subRate === null ? 'not_priced' : 'package_item',
+      retentionPercent,
+      retentionAmount,
+      subCost,
+      clientRate,
+      clientEarned,
+      // A margin only exists when BOTH sides are priced (GAP-020).
+      margin: subCost !== null && clientEarned !== null ? clientEarned - subCost : null,
+      netPayable: subCost !== null && retentionAmount !== null ? subCost - retentionAmount : null,
+    };
+  };
+
+  /**
+   * Read-only projection of a stored progress/inspection record. The persisted columns win; a
+   * missing value is resolved from the package's contractual terms and otherwise stays null, so a
+   * historical row never shows an invented cost (GAP-020).
+   */
+  const projectRecordCommercials = (rec: CommercialRecordFields, act: Activity | undefined, qty: number) => {
+    const isSub = rec.executor_type === 'subcontractor' || !!rec.subcontractor_name || !!rec.subcontractor_id;
+    const terms = resolveSubcontractTerms(act, rec.subcontractor_id, qty);
+    const clientRate = rec.client_unit_rate ?? terms.clientRate;
+    const clientEarned =
+      rec.client_earned_value ?? (clientRate !== null && clientRate !== undefined ? Math.round(qty * Number(clientRate)) : null);
+    const subRate = isSub ? rec.subcontract_unit_rate ?? terms.subRate : null;
+    const subCost = isSub
+      ? rec.subcontractor_cost ?? (subRate !== null && subRate !== undefined ? Math.round(qty * Number(subRate)) : null)
+      : 0;
+    const retentionPercent = isSub ? terms.retentionPercent : null;
+    const retentionAmount = isSub
+      ? rec.retention_deducted ??
+        (subCost !== null && retentionPercent !== null ? calculateRetentionAmount(subCost, retentionPercent) : null)
+      : 0;
+    const margin =
+      rec.profit_margin_sar ?? (subCost !== null && clientEarned !== null ? Number(clientEarned) - Number(subCost) : null);
+    return {
+      isSub,
+      clientRate: clientRate === undefined || clientRate === null ? null : Number(clientRate),
+      clientEarned: clientEarned === null || clientEarned === undefined ? null : Number(clientEarned),
+      subRate: subRate === null || subRate === undefined ? null : Number(subRate),
+      subCost: subCost === null || subCost === undefined ? null : Number(subCost),
+      margin: margin === null || margin === undefined ? null : Number(margin),
+      retentionPercent,
+      retentionAmount: retentionAmount === null || retentionAmount === undefined ? null : Number(retentionAmount),
+      netPayable: subCost !== null && retentionAmount !== null ? Number(subCost) - Number(retentionAmount) : null,
+      subName: isSub ? rec.subcontractor_name || terms.subPkgName : null,
+      packageId: terms.packageId,
+      unpriced: isSub && (subRate === null || subRate === undefined),
+    };
   };
 
   // Subcontractor Ledger & Real-time EVM
@@ -300,23 +468,22 @@ export default function ProgressView({ project }: ProgressViewProps) {
     const headers = ['رقم الطلب', 'التاريخ', 'كود النشاط', 'اسم النشاط', 'جهة التنفيذ', 'اسم المقاول', 'الكمية', 'سعر المالك', 'إيراد المالك EV', 'سعر الباطن', 'تكلفة الباطن AC', 'هامش الربح', 'الحالة'];
     const rows = filteredInspections.map((req) => {
       const act = activities.find((a) => a.id === req.activity_id);
-      const isSub = req.executor_type === 'subcontractor' || !!req.subcontractor_name;
-      const clientEV = req.client_earned_value || (act ? Math.round(req.inspected_quantity * getActivityUnitRate(act)) : 0);
-      const subCost = req.subcontractor_cost || (isSub ? Math.round(clientEV * 0.7) : 0);
-      const margin = req.profit_margin_sar !== undefined ? req.profit_margin_sar : (clientEV - subCost);
+      // Projected from the stored columns and, where they are empty, from the package's contractual
+      // terms. An unpriced item exports as N/A rather than as an estimated 70% (GAP-020).
+      const projected = projectRecordCommercials(req, act, Number(req.inspected_quantity || 0));
       return [
         req.request_number,
         req.inspection_date,
         act?.code || '',
         act?.name || '',
-        isSub ? 'مقاول باطن' : 'تنفيذ ذاتي',
-        req.subcontractor_name || '',
+        projected.isSub ? 'مقاول باطن' : 'تنفيذ ذاتي',
+        projected.subName || '',
         req.inspected_quantity,
-        req.client_unit_rate || (act ? getActivityUnitRate(act) : 0),
-        clientEV,
-        req.subcontract_unit_rate || 0,
-        subCost,
-        margin,
+        projected.clientRate ?? 'N/A',
+        projected.clientEarned ?? 'N/A',
+        projected.subRate ?? 'N/A',
+        projected.subCost ?? 'N/A',
+        projected.margin ?? 'N/A',
         req.status,
       ];
     });
@@ -334,22 +501,19 @@ export default function ProgressView({ project }: ProgressViewProps) {
     const headers = ['التاريخ', 'كود النشاط', 'اسم النشاط', 'جهة التنفيذ', 'المقاول', 'الكمية المنفذة', 'التراكمي', 'نسبة الإنجاز %', 'إيراد المالك EV', 'تكلفة الباطن AC', 'هامش الربح', 'ملاحظات'];
     const rows = filteredUpdates.map((u) => {
       const act = activities.find((a) => a.id === u.activity_id);
-      const isSub = u.executor_type === 'subcontractor' || !!u.subcontractor_name;
-      const clientEV = u.client_earned_value || (act ? Math.round((u.actual_quantity || 0) * getActivityUnitRate(act)) : 0);
-      const subCost = u.subcontractor_cost || (isSub ? Math.round(clientEV * 0.7) : 0);
-      const margin = u.profit_margin_sar !== undefined ? u.profit_margin_sar : (clientEV - subCost);
+      const projected = projectRecordCommercials(u, act, Number(u.actual_quantity || 0));
       return [
         u.update_date,
         act?.code || '',
         act?.name || '',
-        isSub ? 'مقاول باطن' : 'تنفيذ ذاتي',
-        u.subcontractor_name || '',
+        projected.isSub ? 'مقاول باطن' : 'تنفيذ ذاتي',
+        projected.subName || '',
         u.actual_quantity,
         u.quantity_to_date,
         u.percent_complete,
-        clientEV,
-        subCost,
-        margin,
+        projected.clientEarned ?? 'N/A',
+        projected.subCost ?? 'N/A',
+        projected.margin ?? 'N/A',
         u.notes || '',
       ];
     });
@@ -388,20 +552,15 @@ export default function ProgressView({ project }: ProgressViewProps) {
     const clientUnitRate = getActivityUnitRate(act);
     const clientEarnedVal = Math.round(singleTodayQty * clientUnitRate);
 
-    let subRate = clientUnitRate;
-    let subCost = 0;
-    let profitMargin = clientEarnedVal;
-    let subName = '';
-    let retention = 0;
-
-    if (singleExecutorType === 'subcontractor') {
-      const subInfo = getSubcontractorRateForActivity(act, singleSubcontractorId);
-      subRate = subInfo.subRate;
-      subName = subInfo.subPkgName;
-      subCost = Math.round(singleTodayQty * subRate);
-      profitMargin = clientEarnedVal - subCost;
-      retention = Math.round(subCost * 0.1);
-    }
+    const isSubExecuted = singleExecutorType === 'subcontractor';
+    const terms = resolveSubcontractTerms(act, singleSubcontractorId, Number(singleTodayQty));
+    // Self-performed work carries no subcontractor cost. Subcontracted work carries the package's
+    // contractual rate, or nothing at all when that rate does not exist — never an estimate (GAP-020).
+    const subRate = isSubExecuted ? terms.subRate : null;
+    const subCost = isSubExecuted ? terms.subCost : 0;
+    const profitMargin = isSubExecuted ? terms.margin : clientEarnedVal;
+    const subName = isSubExecuted ? terms.subPkgName : null;
+    const retention = isSubExecuted ? terms.retentionAmount : 0;
 
     try {
       // 1. Log the daily update record
@@ -412,14 +571,17 @@ export default function ProgressView({ project }: ProgressViewProps) {
         percent_complete: newPercent,
         actual_quantity: Number(singleTodayQty),
         quantity_to_date: newCumulativeQty,
-        notes: singleNotes || (singleExecutorType === 'subcontractor'
-          ? `إنجاز باطن: +${singleTodayQty} ${act.unit || 'وحدة'} بواسطة [${subName}]`
+        notes: singleNotes || (isSubExecuted
+          ? `إنجاز باطن: +${singleTodayQty} ${act.unit || 'وحدة'} بواسطة [${subName || 'مقاول باطن غير محدد'}]`
           : `إنجاز ذاتي: +${singleTodayQty} ${act.unit || 'وحدة'}`),
         status: 'approved',
         executor_type: singleExecutorType,
-        subcontractor_id: singleExecutorType === 'subcontractor' ? singleSubcontractorId : null,
-        subcontractor_name: singleExecutorType === 'subcontractor' ? subName : null,
-        subcontract_unit_rate: singleExecutorType === 'subcontractor' ? subRate : undefined,
+        subcontractor_id: isSubExecuted ? singleSubcontractorId : null,
+        // Relational link to the package row; the text business code above stays for compatibility
+        // (GAP-019 strategy A) and is never parsed as a uuid.
+        subcontract_package_id: isSubExecuted ? terms.packageUuid : null,
+        subcontractor_name: isSubExecuted ? subName : null,
+        subcontract_unit_rate: isSubExecuted ? subRate : null,
         client_unit_rate: clientUnitRate,
         subcontractor_cost: subCost,
         client_earned_value: clientEarnedVal,
@@ -436,8 +598,8 @@ export default function ProgressView({ project }: ProgressViewProps) {
         actual_finish: actualFinish,
       }).eq('id', act.id);
 
-      const execLabel = singleExecutorType === 'subcontractor'
-        ? `بواسطة مقاول الباطن (${subName}) | تكلفة الباطن: ${subCost.toLocaleString()} ر.س | إيراد المالك: ${clientEarnedVal.toLocaleString()} ر.س (ربح: +${profitMargin.toLocaleString()} ر.س)`
+      const execLabel = isSubExecuted
+        ? `بواسطة مقاول الباطن (${subName || 'غير محدد'}) | تكلفة الباطن: ${money(subCost)} | إيراد المالك: ${clientEarnedVal.toLocaleString()} ر.س | الربح: ${money(profitMargin)} | ${retentionLabel(terms.retentionPercent)}: ${money(retention)}`
         : `تنفيذ ذاتي (المقاول الرئيسي) بقيمة مكتسبة ${clientEarnedVal.toLocaleString()} ر.س`;
 
       setMessage(`تم تسجيل منجز اليوم (+${singleTodayQty} ${act.unit || 'وحدة'}) للنشاط [${act.code}] - ${execLabel}`);
@@ -465,6 +627,8 @@ export default function ProgressView({ project }: ProgressViewProps) {
       let savedCount = 0;
       let totalEarnedToday = 0;
       let totalSubCostToday = 0;
+      // Entries whose package has no contractual rate: reported, never priced by estimate (GAP-020).
+      let unpricedSubEntries = 0;
 
       for (const [actId, todayQtyNum] of activeEntries) {
         const qty = Number(todayQtyNum);
@@ -483,26 +647,23 @@ export default function ProgressView({ project }: ProgressViewProps) {
         totalEarnedToday += clientEarnedToday;
 
         const execInfo = dailyExecutors[actId] || { executorType: 'self_direct' };
-        let subRate = clientUnitRate;
-        let subCost = 0;
-        let profitMargin = clientEarnedToday;
-        let subName = '';
-        let retention = 0;
+        const isSubEntry = execInfo.executorType === 'subcontractor';
+        const dailyTerms = resolveSubcontractTerms(act, execInfo.subcontractorId || 'SUB-PKG-01', qty);
+        const subRate = isSubEntry ? dailyTerms.subRate : null;
+        const subCost = isSubEntry ? dailyTerms.subCost : 0;
+        const profitMargin = isSubEntry ? dailyTerms.margin : clientEarnedToday;
+        const subName = isSubEntry ? dailyTerms.subPkgName : null;
+        const retention = isSubEntry ? dailyTerms.retentionAmount : 0;
 
-        if (execInfo.executorType === 'subcontractor') {
-          const subDetails = getSubcontractorRateForActivity(act, execInfo.subcontractorId || 'SUB-PKG-01');
-          subRate = subDetails.subRate;
-          subName = subDetails.subPkgName;
-          subCost = Math.round(qty * subRate);
-          profitMargin = clientEarnedToday - subCost;
-          retention = Math.round(subCost * 0.1);
-          totalSubCostToday += subCost;
+        if (isSubEntry) {
+          if (subCost !== null) totalSubCostToday += subCost;
+          else unpricedSubEntries++;
         }
 
         const actualStart = act.actual_start || entryDate;
         const actualFinish = newPercent >= 100 ? (act.actual_finish || entryDate) : null;
-        const defaultNote = execInfo.executorType === 'subcontractor'
-          ? `إدخال يومي ${entryDate}: +${qty} ${act.unit || 'وحدة'} (مقاول باطن: ${subName})`
+        const defaultNote = isSubEntry
+          ? `إدخال يومي ${entryDate}: +${qty} ${act.unit || 'وحدة'} (مقاول باطن: ${subName || 'غير محدد'})`
           : `إدخال يومي ${entryDate}: +${qty} ${act.unit || 'وحدة'} (تنفيذ ذاتي)`;
         const note = dailyNotes[actId] || defaultNote;
 
@@ -517,9 +678,10 @@ export default function ProgressView({ project }: ProgressViewProps) {
           notes: note,
           status: 'approved',
           executor_type: execInfo.executorType,
-          subcontractor_id: execInfo.executorType === 'subcontractor' ? execInfo.subcontractorId : null,
-          subcontractor_name: execInfo.executorType === 'subcontractor' ? subName : null,
-          subcontract_unit_rate: execInfo.executorType === 'subcontractor' ? subRate : undefined,
+          subcontractor_id: isSubEntry ? execInfo.subcontractorId : null,
+          subcontract_package_id: isSubEntry ? dailyTerms.packageUuid : null,
+          subcontractor_name: isSubEntry ? subName : null,
+          subcontract_unit_rate: isSubEntry ? subRate : null,
           client_unit_rate: clientUnitRate,
           subcontractor_cost: subCost,
           client_earned_value: clientEarnedToday,
@@ -540,7 +702,11 @@ export default function ProgressView({ project }: ProgressViewProps) {
       }
 
       setMessage(
-        `تم اعتماد اليومية لـ (${savedCount}) أنشطة | إيراد المالك المكتسب: ${totalEarnedToday.toLocaleString()} ر.س | تكلفة مقاولي الباطن: ${totalSubCostToday.toLocaleString()} ر.س | صافي الهامش: +${(totalEarnedToday - totalSubCostToday).toLocaleString()} ر.س`
+        `تم اعتماد اليومية لـ (${savedCount}) أنشطة | إيراد المالك المكتسب: ${totalEarnedToday.toLocaleString()} ر.س | تكلفة مقاولي الباطن: ${totalSubCostToday.toLocaleString()} ر.س | صافي الهامش: +${(totalEarnedToday - totalSubCostToday).toLocaleString()} ر.س${
+          unpricedSubEntries > 0
+            ? ` | تنبيه: ${unpricedSubEntries} إدخال باطن بدون سعر تعاقدي (N/A) ولم تُحتسب تكلفته`
+            : ''
+        }`
       );
       setDailyInputs({});
       setDailyNotes({});
@@ -560,27 +726,27 @@ export default function ProgressView({ project }: ProgressViewProps) {
     }
 
     const act = activities.find((a) => a.id === inspectionForm.activity_id);
-    const clientUnitRate = act ? getActivityUnitRate(act) : 100;
+    if (!act) {
+      setMessage('تعذر إرسال طلب الفحص: النشاط المحدد غير موجود في شبكة الأنشطة، لذا لا يمكن تسعير الأعمال.');
+      return;
+    }
+    const clientUnitRate = getActivityUnitRate(act);
     const clientEV = Math.round(inspectionForm.quantity * clientUnitRate);
 
-    let subRate = clientUnitRate;
-    let subCost = 0;
-    let profitMargin = clientEV;
-    let subName = '';
-
-    if (inspectionForm.executor_type === 'subcontractor' && act) {
-      const subInfo = getSubcontractorRateForActivity(act, inspectionForm.subcontractor_id);
-      subRate = subInfo.subRate;
-      subName = subInfo.subPkgName;
-      subCost = Math.round(inspectionForm.quantity * subRate);
-      profitMargin = clientEV - subCost;
-    }
+    const isSubInspection = inspectionForm.executor_type === 'subcontractor';
+    const inspTerms = resolveSubcontractTerms(act, inspectionForm.subcontractor_id, inspectionForm.quantity);
+    // The request records what the contract says. When the package item has no rate, the cost and
+    // the margin stay null so the consultant prices it at review instead of receiving an estimate.
+    const subRate = isSubInspection ? inspTerms.subRate : null;
+    const subCost = isSubInspection ? inspTerms.subCost : 0;
+    const profitMargin = isSubInspection ? inspTerms.margin : clientEV;
+    const subName = isSubInspection ? inspTerms.subPkgName : null;
 
     const { error } = await supabase.from('inspection_requests').insert({
       project_id: project.id,
       request_number: inspectionForm.request_number,
       activity_id: inspectionForm.activity_id,
-      boq_item_id: inspectionForm.boq_item_id || act?.code || null,
+      boq_item_id: resolveBoqItemReference(inspectionForm.boq_item_id || act?.code, boqItems),
       inspection_date: inspectionForm.inspection_date,
       inspected_quantity: inspectionForm.quantity,
       approved_quantity: 0,
@@ -589,9 +755,11 @@ export default function ProgressView({ project }: ProgressViewProps) {
       status: 'submitted',
       executor_type: inspectionForm.executor_type,
       subcontractor_id: inspectionForm.executor_type === 'subcontractor' ? inspectionForm.subcontractor_id : null,
+      // Relational uuid of the owning package (GAP-019 strategy A); the text code stays alongside it.
+      subcontract_package_id: isSubInspection ? inspTerms.packageUuid : null,
       subcontractor_name: inspectionForm.executor_type === 'subcontractor' ? subName : null,
       zone_or_scope: inspectionForm.zone_or_scope || null,
-      subcontract_unit_rate: inspectionForm.executor_type === 'subcontractor' ? subRate : undefined,
+      subcontract_unit_rate: isSubInspection ? subRate : null,
       client_unit_rate: clientUnitRate,
       subcontractor_cost: subCost,
       client_earned_value: clientEV,
@@ -615,7 +783,11 @@ export default function ProgressView({ project }: ProgressViewProps) {
       subcontractor_id: 'SUB-PKG-01',
       zone_or_scope: 'القطاع A',
     });
-    setMessage(`تم تقديم طلب الفحص [${inspectionForm.request_number}] بنجاح وهو الآن بانتظار استلام واعتماد الاستشاري المشرف.`);
+    setMessage(
+      isSubInspection && subRate === null
+        ? `تم تقديم طلب الفحص [${inspectionForm.request_number}] بنجاح وهو بانتظار اعتماد الاستشاري. تنبيه: بند الباطن غير مُسعّر تعاقدياً (N/A) لذا سُجلت التكلفة والهامش فارغين ولم تُقدّر.`
+        : `تم تقديم طلب الفحص [${inspectionForm.request_number}] بنجاح وهو الآن بانتظار استلام واعتماد الاستشاري المشرف.`,
+    );
     await loadData();
   }
 
@@ -639,7 +811,13 @@ export default function ProgressView({ project }: ProgressViewProps) {
     const act = activities.find((a) => a.id === req.activity_id);
     if (!act) return;
 
-    const qty = req.inspected_quantity || 1;
+    // A quantity is only propagated when the request actually carries one: approving an unmeasured
+    // request must not invent a unit of work (GAP-020 discipline applied to quantities).
+    const qty = Number(req.approved_quantity || req.inspected_quantity || 0);
+    if (qty <= 0) {
+      setMessage(`تعذر اعتماد طلب الفحص [${req.request_number}]: لا توجد كمية مفحوصة أو معتمدة مسجلة.`);
+      return;
+    }
     const prevQty = act.actual_quantity || 0;
     const newCumulativeQty = prevQty + qty;
     const plannedQty = Math.max(1, act.planned_quantity || 1);
@@ -648,12 +826,24 @@ export default function ProgressView({ project }: ProgressViewProps) {
     const clientUnitRate = req.client_unit_rate || getActivityUnitRate(act);
     const clientEarnedVal = Math.round(qty * clientUnitRate);
 
-    const isSub = req.executor_type === 'subcontractor' || !!req.subcontractor_name;
-    const subRate = req.subcontract_unit_rate || (isSub ? Math.round(clientUnitRate * 0.7) : clientUnitRate);
-    const subCost = req.subcontractor_cost || (isSub ? Math.round(qty * subRate) : 0);
-    const profitMargin = clientEarnedVal - subCost;
-    const retention = Math.round(subCost * 0.1);
-    const subName = req.subcontractor_name || (isSub ? 'شركة البنيان لأعمال الخرسانات والهياكل' : '');
+    const isSub = req.executor_type === 'subcontractor' || !!req.subcontractor_name || !!req.subcontractor_id;
+    const terms = resolveSubcontractTerms(act, req.subcontractor_id, qty);
+    // The values recorded on the request win; anything absent is resolved from the package's
+    // contractual terms. What cannot be resolved stays null — no 70%-of-client-rate estimate and no
+    // invented subcontractor name (GAP-020).
+    const subRate = isSub ? req.subcontract_unit_rate ?? terms.subRate : null;
+    const subCost = isSub
+      ? req.subcontractor_cost ?? (subRate !== null && subRate !== undefined ? Math.round(qty * Number(subRate)) : null)
+      : 0;
+    const profitMargin = subCost !== null ? clientEarnedVal - Number(subCost) : null;
+    const retentionPercent = isSub ? terms.retentionPercent : null;
+    const retention =
+      isSub && subCost !== null && retentionPercent !== null
+        ? calculateRetentionAmount(Number(subCost), retentionPercent)
+        : isSub
+          ? null
+          : 0;
+    const subName = isSub ? req.subcontractor_name || terms.subPkgName : null;
 
     try {
       // 1. Update inspection request record
@@ -681,14 +871,15 @@ export default function ProgressView({ project }: ProgressViewProps) {
         percent_complete: newPercent,
         actual_quantity: qty,
         quantity_to_date: newCumulativeQty,
-        notes: `إنجاز معتمد بموجب طلب فحص واستلام استشاري [${req.request_number}] (${isSub ? `مقاول باطن: ${subName}` : 'تنفيذ ذاتي'})`,
+        notes: `إنجاز معتمد بموجب طلب فحص واستلام استشاري [${req.request_number}] (${isSub ? `مقاول باطن: ${subName || 'غير محدد'}` : 'تنفيذ ذاتي'})`,
         status: 'approved',
         approved_at: new Date().toISOString(),
         executor_type: req.executor_type || (isSub ? 'subcontractor' : 'self_direct'),
         subcontractor_id: req.subcontractor_id,
+        subcontract_package_id: req.subcontract_package_id || (isSub ? terms.packageUuid : null),
         subcontractor_name: subName || null,
         zone_or_scope: req.zone_or_scope || null,
-        subcontract_unit_rate: isSub ? subRate : undefined,
+        subcontract_unit_rate: isSub ? subRate : null,
         client_unit_rate: clientUnitRate,
         subcontractor_cost: subCost,
         client_earned_value: clientEarnedVal,
@@ -698,42 +889,59 @@ export default function ProgressView({ project }: ProgressViewProps) {
 
       // 4. If Subcontractor: Update subcontract package executedQuantity & log cost transaction
       if (isSub) {
-        // Update subcontracts state & localStorage
+        // Add the approved quantity to the package item and date it, so the ledger can tell an
+        // actual from a plan (GAP-021). The database is where this lands (GAP-019).
         const updatedSubs = subcontracts.map((pkg) => {
-          if (pkg.id === req.subcontractor_id || pkg.subcontractorName === subName) {
-            const updatedItems = pkg.items.map((itm) => {
-              if (itm.linkedActivityCode === act.code || itm.boqCode === act.code || itm.description.includes(act.name)) {
-                return { ...itm, executedQuantity: (itm.executedQuantity || 0) + qty };
-              }
-              return itm;
-            });
-            return { ...pkg, items: updatedItems };
-          }
-          return pkg;
+          const isTargetPackage =
+            (!!req.subcontractor_id && (pkg.id === req.subcontractor_id || pkg.code === req.subcontractor_id)) ||
+            (!!req.subcontract_package_id && pkg.packageId === req.subcontract_package_id) ||
+            (!!terms.packageId && pkg.id === terms.packageId) ||
+            (!!subName && pkg.subcontractorName === subName);
+          if (!isTargetPackage) return pkg;
+          const updatedItems = pkg.items.map((itm) => {
+            const isTargetItem =
+              (!!terms.itemId && itm.itemId === terms.itemId) ||
+              itm.linkedActivityCode === act.code ||
+              itm.boqCode === act.code ||
+              (!!act && !!itm.description && itm.description.includes(act.name));
+            if (!isTargetItem) return itm;
+            return {
+              ...itm,
+              executedQuantity: (itm.executedQuantity || 0) + qty,
+              executionStatus: 'approved' as const,
+              executionDate: req.inspection_date,
+            };
+          });
+          return { ...pkg, items: updatedItems };
         });
         setSubcontracts(updatedSubs);
-        saveSubcontractPackages(updatedSubs, project.id);
+        await saveSubcontractPackages(updatedSubs, project.id);
 
-        // Insert formal cost transaction
-        await supabase.from('cost_transactions').insert({
-          project_id: project.id,
-          activity_id: act.id,
-          boq_item_id: req.boq_item_id || null,
-          category: 'Subcontractors',
-          transaction_date: req.inspection_date,
-          description: `استحقاق باطن معتمد بموجب طلب فحص [${req.request_number}] - ${subName}`,
-          cost_type: 'direct',
-          amount: subCost,
-          source: 'invoice',
-          status: 'approved',
-          approved_at: new Date().toISOString(),
-          invoice_number: `IPC-${req.request_number}`,
-          vendor: subName,
-        });
+        // Insert formal cost transaction — only when the amount is contractual. An unpriced package
+        // produces no cost entry rather than a zero or estimated one (GAP-020).
+        if (subCost !== null) {
+          await supabase.from('cost_transactions').insert({
+            project_id: project.id,
+            activity_id: act.id,
+            boq_item_id: req.boq_item_id || null,
+            category: 'Subcontractors',
+            transaction_date: req.inspection_date,
+            description: `استحقاق باطن معتمد بموجب طلب فحص [${req.request_number}] - ${subName || 'مقاول باطن غير محدد'}`,
+            cost_type: 'direct',
+            amount: Number(subCost),
+            source: 'invoice',
+            status: 'approved',
+            approved_at: new Date().toISOString(),
+            invoice_number: `IPC-${req.request_number}`,
+            vendor: subName || undefined,
+          });
+        }
       }
 
       const summaryText = isSub
-        ? `تم اعتماد طلب الفحص [${req.request_number}] بنجاح! تم تحويل (+${qty} ${act.unit || 'وحدة'}) إلى إنجاز فعلي للنشاط (${newPercent}%)، وتسجيل إيراد مكتسب للمالك قدره ${clientEarnedVal.toLocaleString()} ر.س، واستحقاق لمقاول الباطن (${subName}) قدره ${subCost.toLocaleString()} ر.س بربح محقق +${profitMargin.toLocaleString()} ر.س، وترحيل التكلفة إلى الميزانية!`
+        ? `تم اعتماد طلب الفحص [${req.request_number}] بنجاح! تم تحويل (+${qty} ${act.unit || 'وحدة'}) إلى إنجاز فعلي للنشاط (${newPercent}%) بتاريخ ${req.inspection_date}، وتسجيل إيراد مكتسب للمالك قدره ${clientEarnedVal.toLocaleString()} ر.س، واستحقاق لمقاول الباطن (${subName || 'غير محدد'}) قدره ${money(subCost)}${
+            retention !== null ? ` بعد ${retentionLabel(retentionPercent)} بمبلغ ${money(retention)}` : ' (نسبة الضمان التعاقدية غير منصوص عليها - N/A)'
+          } بربح محقق ${money(profitMargin)}${subCost !== null ? '، وترحيل التكلفة إلى الميزانية!' : ' — لم تُرحّل التكلفة لأن البند غير مُسعّر تعاقدياً.'}`
         : `تم اعتماد طلب الفحص [${req.request_number}] بنجاح! تم تحويل (+${qty} ${act.unit || 'وحدة'}) إلى إنجاز فعلي للنشاط (${newPercent}%) بقيمة مكتسبة ${clientEarnedVal.toLocaleString()} ر.س.`;
 
       setMessage(summaryText);
@@ -955,7 +1163,11 @@ export default function ProgressView({ project }: ProgressViewProps) {
             <span className="text-xs text-slate-500 font-normal">ر.س</span>
           </p>
           <p className="text-[10px] text-emerald-600 font-bold mt-1">
-            أرباح متحققة: +{subcontractorLedger.totals.totalRealizedGrossProfit.toLocaleString()} ر.س ({subcontractorLedger.totals.overallMarginPercent}%)
+            أرباح متحققة: {money(subcontractorLedger.totals.totalRealizedGrossProfit)} (
+            {subcontractorLedger.totals.overallMarginPercent === null
+              ? 'N/A'
+              : `${subcontractorLedger.totals.overallMarginPercent}%`}
+            )
           </p>
         </div>
 
@@ -1043,9 +1255,9 @@ export default function ProgressView({ project }: ProgressViewProps) {
 
                   const execState = dailyExecutors[act.id] || { executorType: 'self_direct', subcontractorId: 'SUB-PKG-01' };
                   const isSub = execState.executorType === 'subcontractor';
-                  const subInfo = getSubcontractorRateForActivity(act, execState.subcontractorId || 'SUB-PKG-01');
-                  const subCostToday = isSub ? Math.round(enteredToday * subInfo.subRate) : 0;
-                  const profitMarginToday = clientEarnedToday - subCostToday;
+                  const subInfo = resolveSubcontractTerms(act, execState.subcontractorId || 'SUB-PKG-01', enteredToday);
+                  const subCostToday = isSub ? subInfo.subCost : 0;
+                  const profitMarginToday = isSub ? subInfo.margin : clientEarnedToday;
 
                   return (
                     <tr
@@ -1125,7 +1337,7 @@ export default function ProgressView({ project }: ProgressViewProps) {
                                 ))}
                               </select>
                               <div className="text-[9px] text-indigo-700 flex justify-between font-mono">
-                                <span>سعر الباطن: {subInfo.subRate.toLocaleString()} ر.س</span>
+                                <span>سعر الباطن: {money(subInfo.subRate)}</span>
                                 <span>سعر المالك: {clientUnitRate.toLocaleString()} ر.س</span>
                               </div>
                             </div>
@@ -1187,9 +1399,9 @@ export default function ProgressView({ project }: ProgressViewProps) {
                           isSub ? (
                             <div className="space-y-0.5">
                               <div className="text-emerald-700 font-black">إيراد مالك: +{clientEarnedToday.toLocaleString()} ر.س</div>
-                              <div className="text-rose-700 font-bold text-[10px]">تكلفة باطن: {subCostToday.toLocaleString()} ر.س</div>
+                              <div className="text-rose-700 font-bold text-[10px]">تكلفة باطن: {money(subCostToday)}</div>
                               <div className="text-indigo-700 font-black text-[10px] bg-indigo-50 px-1 py-0.5 rounded">
-                                صافي الربح: +{profitMarginToday.toLocaleString()} ر.س
+                                صافي الربح: {money(profitMarginToday)}
                               </div>
                             </div>
                           ) : (
@@ -1304,13 +1516,13 @@ export default function ProgressView({ project }: ProgressViewProps) {
                 const clientEarnedToday = Math.round(Number(singleTodayQty || 0) * clientUnitRate);
                 const clientTotalEarned = Math.round(newCumulative * clientUnitRate);
 
-                const subDetails = getSubcontractorRateForActivity(act, singleSubcontractorId);
                 const isSub = singleExecutorType === 'subcontractor';
+                const subDetails = resolveSubcontractTerms(act, singleSubcontractorId, Number(singleTodayQty || 0));
                 const subRate = isSub ? subDetails.subRate : clientUnitRate;
-                const subCostToday = isSub ? Math.round(Number(singleTodayQty || 0) * subRate) : 0;
-                const profitMarginToday = isSub ? clientEarnedToday - subCostToday : clientEarnedToday;
-                const retentionToday = isSub ? Math.round(subCostToday * 0.1) : 0;
-                const netPayableToday = subCostToday - retentionToday;
+                const subCostToday = isSub ? subDetails.subCost : 0;
+                const profitMarginToday = isSub ? subDetails.margin : clientEarnedToday;
+                const retentionToday = isSub ? subDetails.retentionAmount : 0;
+                const netPayableToday = isSub ? subDetails.netPayable : subCostToday;
 
                 return (
                   <div className="space-y-4">
@@ -1386,9 +1598,14 @@ export default function ProgressView({ project }: ProgressViewProps) {
                             ))}
                           </select>
                           <div className="flex items-center justify-between text-[11px] font-mono bg-white p-2 rounded-lg border border-indigo-100">
-                            <span className="text-slate-600">سعر شراء الباطن: <strong className="text-rose-700">{subRate.toLocaleString()} SAR</strong></span>
+                            <span className="text-slate-600">سعر شراء الباطن: <strong className="text-rose-700">{money(subRate, 'SAR')}</strong></span>
                             <span className="text-slate-600">سعر بيع المالك: <strong className="text-emerald-700">{clientUnitRate.toLocaleString()} SAR</strong></span>
-                            <span className="text-indigo-800 font-bold">فارق السعر: +{(clientUnitRate - subRate).toLocaleString()} SAR/وحدة</span>
+                            <span className="text-indigo-800 font-bold">
+                              فارق السعر:{' '}
+                              {subRate === null
+                                ? 'غير مُسعّر (N/A)'
+                                : `+${(clientUnitRate - subRate).toLocaleString()} SAR/وحدة`}
+                            </span>
                           </div>
                         </div>
                       )}
@@ -1448,19 +1665,23 @@ export default function ProgressView({ project }: ProgressViewProps) {
                           <>
                             <div className="p-2 bg-white rounded-lg border border-rose-100">
                               <span className="text-[10px] text-slate-500 block">تكلفة مقاول الباطن (AC):</span>
-                              <span className="font-mono font-black text-rose-700">{subCostToday.toLocaleString()} ر.س</span>
+                              <span className="font-mono font-black text-rose-700">{money(subCostToday)}</span>
                             </div>
                             <div className="p-2 bg-white rounded-lg border border-indigo-100">
                               <span className="text-[10px] text-slate-500 block">هامش الربح المحقق:</span>
-                              <span className="font-mono font-black text-indigo-700">+{profitMarginToday.toLocaleString()} ر.س</span>
+                              <span className="font-mono font-black text-indigo-700">{money(profitMarginToday)}</span>
                             </div>
                             <div className="p-2 bg-white rounded-lg border border-amber-100">
-                              <span className="text-[10px] text-slate-500 block">مستقطع الضمان (10%):</span>
-                              <span className="font-mono font-black text-amber-800">-{retentionToday.toLocaleString()} ر.س</span>
+                              <span className="text-[10px] text-slate-500 block">
+                                {retentionLabel(isSub ? subDetails.retentionPercent : null)}:
+                              </span>
+                              <span className="font-mono font-black text-amber-800">
+                                {retentionToday === null ? 'غير مُحدد (N/A)' : `-${retentionToday.toLocaleString()} ر.س`}
+                              </span>
                             </div>
                             <div className="p-2 bg-white rounded-lg border border-emerald-100">
                               <span className="text-[10px] text-slate-500 block">صافي مستحق الباطن:</span>
-                              <span className="font-mono font-black text-emerald-800">{netPayableToday.toLocaleString()} ر.س</span>
+                              <span className="font-mono font-black text-emerald-800">{money(netPayableToday)}</span>
                             </div>
                           </>
                         ) : (
@@ -1518,6 +1739,16 @@ export default function ProgressView({ project }: ProgressViewProps) {
                   <h3 className="text-base font-black text-amber-300">
                     منظومة احتساب إنجاز وتكاليف مقاولي الباطن والبنود المشتركة (Multi-Subcontractor & EVM Ledger)
                   </h3>
+                  {/* GAP-019: which store answered — the database is the source of truth. */}
+                  <p className="text-[10px] mt-1 font-bold text-indigo-200">
+                    {subcontractSource === 'database'
+                      ? 'مصدر بيانات باقات الباطن: قاعدة البيانات (subcontract_packages / subcontract_items)'
+                      : subcontractSource === 'legacy_localstorage_imported' || subcontractSource === 'seed_defaults_imported'
+                        ? 'مصدر بيانات باقات الباطن: قاعدة البيانات — تم ترحيل السجلات المحلية/التجريبية إليها مرة واحدة'
+                        : subcontractSource === 'legacy_localstorage' || subcontractSource === 'defaults'
+                          ? 'مصدر بيانات باقات الباطن: قراءة محلية مؤقتة — تعذّر الوصول إلى قاعدة البيانات'
+                          : 'مصدر بيانات باقات الباطن: لم يُحمّل بعد'}
+                  </p>
                   <p className="text-xs text-slate-300 mt-1 leading-relaxed">
                     <strong>ما العمل إذا وُجد أكثر من مقاول باطن على نفس البند؟</strong> يُقسّم البند إلى <strong>حصص جغرافية أو مرحلية (Spatial / Quota Allocations)</strong> مثل (Zone A / Zone B أو توريد / تركيب). يُحسب استحقاق كل مقاول بسعر وحدته الفعلي، بينما تُجمع الكميات المنجزة في بند المالك الموحد بسعر بيع المالك لاحتساب القيمة المكتسبة الإجمالية وهامش الربح المرجح.
                   </p>
@@ -1541,7 +1772,7 @@ export default function ProgressView({ project }: ProgressViewProps) {
               <div className="bg-white/5 p-2.5 rounded-xl border border-white/10">
                 <span className="text-blue-400 font-bold block mb-1">3. مستخلصات مستقلة وضمانات منفصلة (Individual IPCs):</span>
                 <span className="text-slate-300 text-[11px]">
-                  إصدار شهادة دفع ومستخلص مستقل لكل مقاول بناءً على كميته المنفذة ومحاضر استلامه الموقعية (WIRs) مع حسم 10% ضمان.
+                  إصدار شهادة دفع ومستخلص مستقل لكل مقاول بناءً على كميته المنفذة ومحاضر استلامه الموقعية (WIRs) مع حسم نسبة الضمان التعاقدية الخاصة بكل باقة.
                 </span>
               </div>
             </div>
@@ -1573,21 +1804,44 @@ export default function ProgressView({ project }: ProgressViewProps) {
             <div className="bg-white p-3.5 rounded-xl border border-indigo-200 bg-indigo-50/40 shadow-sm">
               <span className="text-[10px] font-bold text-indigo-900 block mb-1">هامش الربح المحقق (Spread)</span>
               <div className="text-base font-black text-indigo-900 font-mono">
-                +{subcontractorLedger.totals.totalRealizedGrossProfit.toLocaleString()} <span className="text-[10px] text-indigo-600">({subcontractorLedger.totals.overallMarginPercent}%)</span>
+                {subcontractorLedger.totals.totalRealizedGrossProfit === null
+                  ? 'غير مُسعّر (N/A)'
+                  : `+${subcontractorLedger.totals.totalRealizedGrossProfit.toLocaleString()}`}{' '}
+                <span className="text-[10px] text-indigo-600">
+                  ({subcontractorLedger.totals.overallMarginPercent === null ? 'N/A' : `${subcontractorLedger.totals.overallMarginPercent}%`})
+                </span>
               </div>
             </div>
 
             <div className="bg-white p-3.5 rounded-xl border border-amber-200 bg-amber-50/30 shadow-sm">
-              <span className="text-[10px] font-bold text-amber-900 block mb-1">مستقطعات الضمان (10% Retention)</span>
+              <span className="text-[10px] font-bold text-amber-900 block mb-1">
+                مستقطعات الضمان التعاقدية (Contractual Retention)
+              </span>
               <div className="text-base font-black text-amber-900 font-mono">
-                {subcontractorLedger.totals.totalRetentionWithheld.toLocaleString()} <span className="text-[10px] text-slate-500">SAR</span>
+                {subcontractorLedger.totals.totalRetentionWithheld === null ? (
+                  <span className="text-[11px]">
+                    غير محدد - {subcontractorLedger.totals.packagesWithUnknownRetention} باقة بلا نسبة تعاقدية
+                  </span>
+                ) : (
+                  <>
+                    {subcontractorLedger.totals.totalRetentionWithheld.toLocaleString()}{' '}
+                    <span className="text-[10px] text-slate-500">SAR</span>
+                  </>
+                )}
               </div>
             </div>
 
             <div className="bg-white p-3.5 rounded-xl border border-emerald-200 bg-emerald-50/40 shadow-sm">
               <span className="text-[10px] font-bold text-emerald-900 block mb-1">صافي المستحق للصرف</span>
               <div className="text-base font-black text-emerald-800 font-mono">
-                {subcontractorLedger.totals.totalNetPayable.toLocaleString()} <span className="text-[10px] text-slate-500">SAR</span>
+                {subcontractorLedger.totals.totalNetPayable === null ? (
+                  <span className="text-[11px]">غير محدد (N/A)</span>
+                ) : (
+                  <>
+                    {subcontractorLedger.totals.totalNetPayable.toLocaleString()}{' '}
+                    <span className="text-[10px] text-slate-500">SAR</span>
+                  </>
+                )}
               </div>
             </div>
           </div>
@@ -1630,10 +1884,14 @@ export default function ProgressView({ project }: ProgressViewProps) {
                         المنجز الكلي للبند: <strong className="text-emerald-700 font-bold">{shared.totalExecutedBySubs.toLocaleString()} {shared.unit} ({shared.overallItemProgressPct}%)</strong>
                       </span>
                       <span className="text-indigo-900 bg-indigo-100 px-2 py-0.5 rounded font-bold">
-                        متوسط سعر الشراء المرجح: {shared.weightedSubcontractRate.toLocaleString()} SAR/{shared.unit}
+                        متوسط سعر الشراء المرجح:{' '}
+                        {shared.weightedSubcontractRate === null ? 'غير مُسعّر (N/A)' : `${shared.weightedSubcontractRate.toLocaleString()} SAR/${shared.unit}`}
                       </span>
                       <span className="text-emerald-800 bg-emerald-100 px-2 py-0.5 rounded font-bold">
-                        إجمالي ربح البند: +{shared.totalRealizedMarginSar.toLocaleString()} SAR ({shared.marginPercent}%)
+                        إجمالي ربح البند:{' '}
+                        {shared.totalRealizedMarginSar === null
+                          ? 'غير مُسعّر (N/A)'
+                          : `+${shared.totalRealizedMarginSar.toLocaleString()} SAR (${shared.marginPercent}%)`}
                       </span>
                     </div>
                   </div>
@@ -1664,7 +1922,9 @@ export default function ProgressView({ project }: ProgressViewProps) {
                               <span>{alloc.subcontractorName}</span>
                             </td>
                             <td className="p-2 font-semibold text-slate-800">{alloc.zoneOrScope}</td>
-                            <td className="p-2 font-mono font-bold text-indigo-700">{alloc.quotaPercent}%</td>
+                            <td className="p-2 font-mono font-bold text-indigo-700">
+                              {alloc.quotaSource === 'unknown' ? 'غير مسجلة (N/A)' : `${alloc.quotaPercent}%`}
+                            </td>
                             <td className="p-2 font-mono text-slate-700">
                               {alloc.assignedQty.toLocaleString()} {shared.unit}
                             </td>
@@ -1679,16 +1939,16 @@ export default function ProgressView({ project }: ProgressViewProps) {
                                 <span className="font-mono font-bold text-slate-800">{alloc.progressPct}%</span>
                               </div>
                             </td>
-                            <td className="p-2 font-mono font-bold text-rose-700">{alloc.subcontractRate.toLocaleString()} SAR</td>
-                            <td className="p-2 font-mono font-bold text-emerald-700">{alloc.clientRate.toLocaleString()} SAR</td>
+                            <td className="p-2 font-mono font-bold text-rose-700">{money(alloc.subcontractRate, 'SAR')}</td>
+                            <td className="p-2 font-mono font-bold text-emerald-700">{money(alloc.clientRate, 'SAR')}</td>
                             <td className="p-2 font-mono font-black text-rose-700 bg-rose-50/30">
-                              {alloc.subcontractCostSar.toLocaleString()} SAR
+                              {money(alloc.subcontractCostSar, 'SAR')}
                             </td>
                             <td className="p-2 font-mono font-black text-emerald-700 bg-emerald-50/30">
-                              {alloc.clientEarnedSar.toLocaleString()} SAR
+                              {money(alloc.clientEarnedSar, 'SAR')}
                             </td>
                             <td className="p-2 font-mono font-black text-indigo-900 bg-indigo-50/30">
-                              +{alloc.marginSar.toLocaleString()} SAR
+                              {money(alloc.marginSar, 'SAR')}
                             </td>
                           </tr>
                         ))}
@@ -1807,16 +2067,16 @@ export default function ProgressView({ project }: ProgressViewProps) {
                                 <span className="font-mono font-bold text-slate-800">{itm.progressPct}%</span>
                               </div>
                             </td>
-                            <td className="p-2.5 font-mono text-rose-800 font-bold">{itm.subcontractRate.toLocaleString()}</td>
-                            <td className="p-2.5 font-mono text-emerald-800 font-bold">{itm.clientRate.toLocaleString()}</td>
+                            <td className="p-2.5 font-mono text-rose-800 font-bold">{money(itm.subcontractRate, '')}</td>
+                            <td className="p-2.5 font-mono text-emerald-800 font-bold">{money(itm.clientRate, '')}</td>
                             <td className="p-2.5 font-mono font-black text-rose-700 bg-rose-50/40">
-                              {itm.subcontractCostSar.toLocaleString()} ر.س
+                              {money(itm.subcontractCostSar)}
                             </td>
                             <td className="p-2.5 font-mono font-black text-emerald-700 bg-emerald-50/40">
-                              {itm.clientEarnedSar.toLocaleString()} ر.س
+                              {money(itm.clientEarnedSar)}
                             </td>
                             <td className="p-2.5 font-mono font-black text-indigo-800 bg-indigo-50/40">
-                              +{itm.marginSar.toLocaleString()} ر.س
+                              {money(itm.marginSar)}
                             </td>
                           </tr>
                         ))}
@@ -1828,12 +2088,21 @@ export default function ProgressView({ project }: ProgressViewProps) {
                   <div className="p-3.5 bg-slate-50 border-t border-slate-200 flex flex-wrap items-center justify-between gap-4 text-xs">
                     <div className="flex items-center gap-4">
                       <span>إجمالي استحقاق الباطن: <strong className="font-mono text-rose-700">{pkg.totalExecutedCostSar.toLocaleString()} SAR</strong></span>
-                      <span>مستقطع الضمان (10%): <strong className="font-mono text-amber-800">{pkg.retentionWithheldSar.toLocaleString()} SAR</strong></span>
-                      <span>صافي المستحق للدفع: <strong className="font-mono text-emerald-700 font-black">{pkg.netPayableSar.toLocaleString()} SAR</strong></span>
+                      <span>
+                        {retentionLabel(pkg.retentionPercent)}:{' '}
+                        <strong className="font-mono text-amber-800">{money(pkg.retentionWithheldSar, 'SAR')}</strong>
+                      </span>
+                      <span>
+                        صافي المستحق للدفع: <strong className="font-mono text-emerald-700 font-black">{money(pkg.netPayableSar, 'SAR')}</strong>
+                      </span>
                     </div>
                     <div className="flex items-center gap-2 bg-white px-3 py-1.5 rounded-xl border border-indigo-200">
                       <span className="text-indigo-950 font-bold">إجمالي أرباح المقاول الرئيسي من الباقة:</span>
-                      <strong className="font-mono text-indigo-900 font-black text-sm">+{pkg.grossProfitSar.toLocaleString()} SAR ({pkg.marginPercent}%)</strong>
+                      <strong className="font-mono text-indigo-900 font-black text-sm">
+                        {pkg.grossProfitSar === null
+                          ? 'غير مُسعّر (N/A)'
+                          : `+${pkg.grossProfitSar.toLocaleString()} SAR (${pkg.marginPercent}%)`}
+                      </strong>
                     </div>
                   </div>
                 </div>
@@ -2330,15 +2599,19 @@ export default function ProgressView({ project }: ProgressViewProps) {
             {(() => {
               const selectedAct = activities.find((a) => a.id === inspectionForm.activity_id);
               const qty = Number(inspectionForm.quantity) || 0;
-              const clientRate = selectedAct ? getActivityUnitRate(selectedAct) : 100;
-              const clientEV = qty * clientRate;
+              // No activity selected means no contract rate is known: the preview shows N/A rather
+              // than valuing the work at an invented rate.
+              const clientRate = selectedAct ? getActivityUnitRate(selectedAct) : null;
+              const clientEV = clientRate === null ? null : qty * clientRate;
               const isSub = inspectionForm.executor_type === 'subcontractor';
-              const subDetails = selectedAct ? getSubcontractorRateForActivity(selectedAct, inspectionForm.subcontractor_id) : { subRate: Math.round(clientRate * 0.7), subPkgName: 'مقاول باطن' };
+              // Preview from the package's contractual terms only: no estimated rate, no assumed
+              // retention percent (GAP-020).
+              const subDetails = resolveSubcontractTerms(selectedAct, inspectionForm.subcontractor_id, qty);
               const subRate = isSub ? subDetails.subRate : clientRate;
-              const subCost = isSub ? qty * subRate : 0;
-              const margin = isSub ? clientEV - subCost : clientEV;
-              const retention = isSub ? Math.round(subCost * 0.1) : 0;
-              const netPayable = subCost - retention;
+              const subCost = isSub ? subDetails.subCost : 0;
+              const margin = isSub ? subDetails.margin : clientEV;
+              const retention = isSub ? subDetails.retentionAmount : 0;
+              const netPayable = isSub ? subDetails.netPayable : subCost;
 
               return (
                 <div className="p-3.5 bg-gradient-to-br from-emerald-50 via-teal-50 to-indigo-50 border border-emerald-200 rounded-xl space-y-2">
@@ -2353,25 +2626,32 @@ export default function ProgressView({ project }: ProgressViewProps) {
                   <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 text-xs">
                     <div className="p-2 bg-white rounded-lg border border-emerald-100">
                       <span className="text-[10px] text-slate-400 block">إيراد المالك (EV):</span>
-                      <span className="font-mono font-black text-emerald-700">+{clientEV.toLocaleString()} SAR</span>
+                      <span className="font-mono font-black text-emerald-700">{money(clientEV, 'SAR')}</span>
                     </div>
                     {isSub ? (
                       <>
                         <div className="p-2 bg-white rounded-lg border border-rose-100">
                           <span className="text-[10px] text-slate-400 block">تكلفة الباطن (AC):</span>
-                          <span className="font-mono font-black text-rose-700">{subCost.toLocaleString()} SAR</span>
+                          <span className="font-mono font-black text-rose-700">{money(subCost, 'SAR')}</span>
+                          <span className="text-[9px] text-slate-500 block">
+                            سعر الباطن التعاقدي: {money(subRate, 'SAR')}/{selectedAct?.unit || 'وحدة'}
+                          </span>
                         </div>
                         <div className="p-2 bg-white rounded-lg border border-indigo-100">
                           <span className="text-[10px] text-slate-400 block">هامش الربح المحقق:</span>
-                          <span className="font-mono font-black text-indigo-900">+{margin.toLocaleString()} SAR</span>
+                          <span className="font-mono font-black text-indigo-900">{money(margin, 'SAR')}</span>
                         </div>
                         <div className="p-2 bg-white rounded-lg border border-amber-100">
-                          <span className="text-[10px] text-slate-400 block">مستقطع الضمان (10%):</span>
-                          <span className="font-mono font-black text-amber-800">-{retention.toLocaleString()} SAR</span>
+                          <span className="text-[10px] text-slate-400 block">
+                            {retentionLabel(isSub ? subDetails.retentionPercent : null)}:
+                          </span>
+                          <span className="font-mono font-black text-amber-800">
+                            {retention === null ? 'غير مُحدد (N/A)' : `-${retention.toLocaleString()} SAR`}
+                          </span>
                         </div>
                         <div className="p-2 bg-white rounded-lg border border-emerald-100">
                           <span className="text-[10px] text-slate-400 block">صافي مستحق الباطن:</span>
-                          <span className="font-mono font-black text-emerald-800">{netPayable.toLocaleString()} SAR</span>
+                          <span className="font-mono font-black text-emerald-800">{money(netPayable, 'SAR')}</span>
                         </div>
                       </>
                     ) : (
@@ -2469,10 +2749,11 @@ export default function ProgressView({ project }: ProgressViewProps) {
                 <tbody className="divide-y divide-slate-100 font-medium">
                   {filteredInspections.map((req) => {
                     const act = activities.find((a) => a.id === req.activity_id);
-                    const isSub = req.executor_type === 'subcontractor' || !!req.subcontractor_name;
-                    const clientEV = req.client_earned_value || (act ? Math.round(req.inspected_quantity * getActivityUnitRate(act)) : 0);
-                    const subCost = req.subcontractor_cost || (isSub ? Math.round(clientEV * 0.7) : 0);
-                    const margin = req.profit_margin_sar !== undefined ? req.profit_margin_sar : (clientEV - subCost);
+                    const projected = projectRecordCommercials(req, act, Number(req.inspected_quantity || 0));
+                    const isSub = projected.isSub;
+                    const clientEV = projected.clientEarned;
+                    const subCost = projected.subCost;
+                    const margin = projected.margin;
 
                     return (
                       <tr key={req.id} className="hover:bg-slate-50 transition-colors">
@@ -2498,13 +2779,13 @@ export default function ProgressView({ project }: ProgressViewProps) {
                           {req.inspected_quantity.toLocaleString()} {act?.unit || 'وحدة'}
                         </td>
                         <td className="p-2.5 font-mono font-black text-emerald-700 whitespace-nowrap">
-                          +{clientEV.toLocaleString()} SAR
+                          {clientEV === null ? 'غير مُسعّر (N/A)' : `+${clientEV.toLocaleString()} SAR`}
                         </td>
                         <td className="p-2.5 font-mono font-bold text-rose-700 whitespace-nowrap">
-                          {isSub ? `${subCost.toLocaleString()} SAR` : '-'}
+                          {isSub ? (subCost === null ? 'غير مُسعّر (N/A)' : `${subCost.toLocaleString()} SAR`) : '-'}
                         </td>
                         <td className="p-2.5 font-mono font-black text-indigo-900 whitespace-nowrap">
-                          +{margin.toLocaleString()} SAR
+                          {margin === null ? 'غير مُسعّر (N/A)' : `+${margin.toLocaleString()} SAR`}
                         </td>
                         <td className="p-2.5 text-center whitespace-nowrap">
                           <span
@@ -2755,10 +3036,11 @@ export default function ProgressView({ project }: ProgressViewProps) {
               <tbody className="divide-y divide-slate-100 font-medium">
                 {filteredUpdates.map((u) => {
                   const act = activities.find((a) => a.id === u.activity_id);
-                  const isSub = u.executor_type === 'subcontractor' || !!u.subcontractor_name;
-                  const clientEV = u.client_earned_value || (act ? Math.round((u.actual_quantity || 0) * getActivityUnitRate(act)) : 0);
-                  const subCost = u.subcontractor_cost || (isSub ? Math.round(clientEV * 0.7) : 0);
-                  const margin = u.profit_margin_sar !== undefined ? u.profit_margin_sar : (clientEV - subCost);
+                  const projected = projectRecordCommercials(u, act, Number(u.actual_quantity || 0));
+                  const isSub = projected.isSub;
+                  const clientEV = projected.clientEarned;
+                  const subCost = projected.subCost;
+                  const margin = projected.margin;
 
                   return (
                     <tr key={u.id} className="hover:bg-slate-50">
@@ -2770,7 +3052,8 @@ export default function ProgressView({ project }: ProgressViewProps) {
                         {isSub ? (
                           <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-indigo-100 text-indigo-900 border border-indigo-200 flex items-center gap-1 w-fit">
                             <Briefcase size={11} />
-                            <span>باطن: {u.subcontractor_name || 'شركة البنيان'}</span>
+                            {/* No invented subcontractor name: an unrecorded one stays unnamed. */}
+                            <span>باطن: {projected.subName || 'غير محدد'}</span>
                           </span>
                         ) : (
                           <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-slate-100 text-slate-700 border border-slate-200 flex items-center gap-1 w-fit">
@@ -2789,13 +3072,13 @@ export default function ProgressView({ project }: ProgressViewProps) {
                         {u.percent_complete}%
                       </td>
                       <td className="p-3 font-mono font-black text-emerald-800 whitespace-nowrap">
-                        +{clientEV.toLocaleString()} SAR
+                        {clientEV === null ? 'غير مُسعّر (N/A)' : `+${clientEV.toLocaleString()} SAR`}
                       </td>
                       <td className="p-3 font-mono font-bold text-rose-700 whitespace-nowrap">
-                        {isSub ? `${subCost.toLocaleString()} SAR` : '-'}
+                        {isSub ? (subCost === null ? 'غير مُسعّر (N/A)' : `${subCost.toLocaleString()} SAR`) : '-'}
                       </td>
                       <td className="p-3 font-mono font-black text-indigo-900 whitespace-nowrap">
-                        +{margin.toLocaleString()} SAR
+                        {margin === null ? 'غير مُسعّر (N/A)' : `+${margin.toLocaleString()} SAR`}
                       </td>
                       <td className="p-3 text-center">
                         <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800">
@@ -2878,8 +3161,8 @@ export default function ProgressView({ project }: ProgressViewProps) {
                           <td className="p-2.5 font-bold text-slate-800">{item.description}</td>
                           <td className="p-2.5 font-mono">{item.assignedQuantity.toLocaleString()} {item.unit}</td>
                           <td className="p-2.5 font-mono font-bold text-indigo-900">{item.executedQuantity.toLocaleString()} {item.unit}</td>
-                          <td className="p-2.5 font-mono">{item.subcontractRate.toLocaleString()} SAR</td>
-                          <td className="p-2.5 font-mono font-black text-slate-900">{item.subcontractCostSar.toLocaleString()} SAR</td>
+                          <td className="p-2.5 font-mono">{money(item.subcontractRate, 'SAR')}</td>
+                          <td className="p-2.5 font-mono font-black text-slate-900">{money(item.subcontractCostSar, 'SAR')}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -2896,16 +3179,22 @@ export default function ProgressView({ project }: ProgressViewProps) {
                     <span className="font-mono font-black text-slate-900">{certModalData.totalExecutedCostSar.toLocaleString()} SAR</span>
                   </div>
                   <div className="flex justify-between py-1.5 border-b border-slate-200 text-rose-700">
-                    <span>2. مستقطع ضمان الأعمال (10% Retention Withheld):</span>
-                    <span className="font-mono font-black">-{certModalData.retentionWithheldSar.toLocaleString()} SAR</span>
+                    <span>2. {retentionLabel(certModalData.retentionPercent)} (Retention Withheld):</span>
+                    <span className="font-mono font-black">
+                      {certModalData.retentionWithheldSar === null
+                        ? 'غير مُحدد (N/A)'
+                        : `-${certModalData.retentionWithheldSar.toLocaleString()} SAR`}
+                    </span>
                   </div>
                   <div className="flex justify-between py-1.5 border-b border-slate-200 text-slate-600">
                     <span>3. استرداد الدفعة المقدمة والخصومات العكسية (Contra / Back-charges):</span>
-                    <span className="font-mono font-bold">0.00 SAR</span>
+                    {/* No advance-payment or back-charge model exists in the data, so this line is
+                        reported as not recorded instead of asserting a fabricated 0.00 deduction. */}
+                    <span className="font-mono font-bold text-slate-500">غير مُسجلة (لا يوجد نموذج دفعة مقدمة)</span>
                   </div>
                   <div className="flex justify-between py-2 bg-emerald-100/60 p-3 rounded-xl text-emerald-950 font-black text-sm">
                     <span>صافي المبلغ المستحق للصرف بموجب هذه الشهادة (Net Payable):</span>
-                    <span className="font-mono">{certModalData.netPayableSar.toLocaleString()} SAR</span>
+                    <span className="font-mono">{money(certModalData.netPayableSar, 'SAR')}</span>
                   </div>
                 </div>
               </div>
