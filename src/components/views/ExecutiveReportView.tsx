@@ -91,13 +91,19 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
       // separate (later-wave) null-safety item, not part of the compilation baseline.
       project!,
       activities,
-      baselineActivities,
+      // GAP-036 correction: this parameter is the CBS budget-line input of the EVM engine.
+      // It previously received `baselineActivities` (baseline activity snapshots, which carry
+      // no project_id/wbs_node_id/approved_budget/actual_cost), which is not a legitimate
+      // budget-line relationship. `budgetLines` is already loaded by this view from the
+      // `budget_lines` table (see loadData), so the correct source is passed instead.
+      // No EVM formula, fallback, or ordering is changed.
+      budgetLines,
       boqItems,
       transactions,
       progressUpdates,
       project?.data_date || '2026-11-15',
     );
-  }, [project, activities, baselineActivities, boqItems, transactions, progressUpdates]);
+  }, [project, activities, budgetLines, boqItems, transactions, progressUpdates]);
 
   const totalBac = evmMetrics.bac;
 

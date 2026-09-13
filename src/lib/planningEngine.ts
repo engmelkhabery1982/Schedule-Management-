@@ -5,6 +5,7 @@ import type {
   Risk,
   BoqItem,
   BudgetLine,
+  BaselineActivity,
   CostTransaction,
   ProgressUpdate,
 } from '@/types';
@@ -116,19 +117,44 @@ export interface ComprehensiveProjectEvm {
 }
 
 /**
- * Structural subset of `BudgetLine` — exactly the four fields `calculateProjectEvmAtDataDate`
- * reads (`planned_cost`, `approved_budget`, `wbs_node_id`, `actual_cost`).
+ * Minimum legitimate budget-line structure required by `calculateProjectEvmAtDataDate`.
  *
- * Accepting the subset instead of the full row lets callers pass baseline-derived cost rows
- * (e.g. `BaselineActivity[]` from `ExecutiveReportView`) the same way the runtime code already
- * does. Purely a type-position change: no formula, fallback, or ordering is altered.
+ * These are exactly the fields the engine reads: `planned_cost` and `approved_budget`
+ * (BAC from CBS budget lines), `wbs_node_id` (matching an activity to its budget line) and
+ * `actual_cost` (AC cross-check).
+ *
+ * The identity fields `project_id` and `wbs_node_id` are REQUIRED on purpose. They are what a
+ * genuine CBS budget line always has and what a baseline activity snapshot never has, so an
+ * invalid business-data relationship — passing `BaselineActivity[]` where budget lines are
+ * expected (GAP-036) — is a compile error instead of silently computing BAC/AC from the wrong
+ * table. `BudgetLine` satisfies this contract structurally; no caller has to change.
+ *
+ * Type-position only: no formula, fallback, or ordering inside the engine is altered.
  */
 export type EvmBudgetLineInput = {
-  planned_cost?: number | null;
-  approved_budget?: number | null;
-  actual_cost?: number | null;
-  wbs_node_id?: string | null;
+  /** Row identity — a CBS budget line always belongs to a project. */
+  project_id: string;
+  /** CBS/WBS anchor used by the engine to match an activity to its budget line. */
+  wbs_node_id: string | null;
+  planned_cost: number;
+  approved_budget?: number;
+  actual_cost?: number;
 };
+
+/** Internal helper for compile-time assertions; emits no JavaScript. */
+type AssertTrue<T extends true> = T;
+
+/**
+ * Compile-time regression guard for GAP-036.
+ *
+ * Resolves to `true` as long as a `BaselineActivity` cannot masquerade as an EVM budget line.
+ * If `EvmBudgetLineInput` is ever loosened again (e.g. by making `project_id`/`wbs_node_id`
+ * optional), this alias becomes `AssertTrue<false>` and compilation fails with
+ * "Type 'false' does not satisfy the constraint 'true'".
+ */
+export type EvmBudgetInputExcludesBaselineActivity = AssertTrue<
+  BaselineActivity extends EvmBudgetLineInput ? false : true
+>;
 
 export function calculateProjectEvmAtDataDate(
   // Structural subset of `Project`. The date/value fields accept `null` because `Project`
