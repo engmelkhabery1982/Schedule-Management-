@@ -461,13 +461,10 @@ export async function harmonizeAndReconcileAllProjectData(projectId: string): Pr
 
     if (!project) return { success: false, repairedItems: ['لم يتم العثور على المشروع المستهدف'] };
 
-    const targetBac = 2345150; // Master SSOT BAC
+    const targetBac = Number(project.contract_value || 2345150); // Master SSOT BAC from Project Contract Value
 
     // 2. Harmonize Project Contract Value
-    if (project.contract_value !== targetBac) {
-      await supabase.from('projects').update({ contract_value: targetBac }).eq('id', projectId);
-      repairedItems.push(`تمت مطابقة القيمة التعاقدية للمشروع لتصبح ${targetBac.toLocaleString()} ر.س بدقة.`);
-    }
+    repairedItems.push(`تم اعتماد القيمة التعاقدية للمشروع (${targetBac.toLocaleString()} ر.س) كمرجع أساسي موحد (SSOT).`);
 
     // 3. Ensure BOQ items match target BAC
     if (boqItems && boqItems.length > 0) {

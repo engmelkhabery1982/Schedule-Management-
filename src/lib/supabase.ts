@@ -15,7 +15,7 @@ const hasValidSupabaseEnv = Boolean(
 export const isDemoMode = !hasValidSupabaseEnv;
 
 // In-memory + LocalStorage reactive mock database
-const LOCAL_STORAGE_KEY = 'schedule_mgmt_db_v4';
+const LOCAL_STORAGE_KEY = 'schedule_mgmt_db_v5';
 
 type DbState = Record<string, Record<string, any>[]>;
 

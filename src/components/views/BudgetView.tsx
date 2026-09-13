@@ -1,12 +1,14 @@
 import { useState, useEffect, useMemo } from 'react';
 import { supabase } from '@/lib/supabase';
 import { getLanguage, type Language } from '@/lib/i18n';
+import { calculateProjectEvmAtDataDate } from '@/lib/planningEngine';
 import type {
   Project,
   BudgetLine,
   CostTransaction,
   BoqItem,
   Activity,
+  ProgressUpdate,
   CbsCostCenter,
   MonthlyCashFlowBucket,
   ReserveBurnItem,
@@ -52,6 +54,7 @@ export default function BudgetView({ project }: BudgetViewProps) {
   const [transactions, setTransactions] = useState<CostTransaction[]>([]);
   const [boqItems, setBoqItems] = useState<BoqItem[]>([]);
   const [activities, setActivities] = useState<Activity[]>([]);
+  const [progressUpdates, setProgressUpdates] = useState<ProgressUpdate[]>([]);
   const [lang, setLang] = useState<Language>(getLanguage());
 
   // Cost Transaction Input Form
@@ -89,16 +92,18 @@ export default function BudgetView({ project }: BudgetViewProps) {
   async function loadData() {
     if (!project) return;
     setLoading(true);
-    const [{ data }, { data: transactionData }, { data: boqData }, { data: activityData }] = await Promise.all([
+    const [{ data }, { data: transactionData }, { data: boqData }, { data: activityData }, { data: progressData }] = await Promise.all([
       supabase.from('budget_lines').select('*').eq('project_id', project.id),
       supabase.from('cost_transactions').select('*').eq('project_id', project.id).order('transaction_date', { ascending: false }),
       supabase.from('boq_items').select('*').eq('project_id', project.id).order('sort_order'),
       supabase.from('activities').select('*').eq('project_id', project.id).order('sort_order'),
+      supabase.from('progress_updates').select('*').eq('project_id', project.id),
     ]);
     setBudgetLines(data || []);
     setTransactions((transactionData || []) as CostTransaction[]);
     setBoqItems((boqData || []) as BoqItem[]);
     setActivities((activityData || []) as Activity[]);
+    setProgressUpdates((progressData || []) as ProgressUpdate[]);
     setLoading(false);
   }
 
@@ -155,19 +160,28 @@ export default function BudgetView({ project }: BudgetViewProps) {
     await loadData();
   }
 
+  // Unified EVM metrics from single source of truth engine
+  const evm = useMemo(() => {
+    return calculateProjectEvmAtDataDate(
+      project,
+      activities,
+      budgetLines,
+      boqItems,
+      transactions,
+      progressUpdates,
+      project?.data_date || '2026-09-13',
+    );
+  }, [project, activities, budgetLines, boqItems, transactions, progressUpdates, project?.data_date]);
+
   // Basic totals
   const totals = useMemo(() => {
-    const planned = budgetLines.reduce((s, l) => s + (l.planned_cost || 0), 0) || project?.contract_value || 4850000;
+    const planned = evm.bac;
     const committed = budgetLines.reduce((s, l) => s + (l.committed_cost || 0), 0) || Math.round(planned * 0.75);
-    const lineActual = budgetLines.reduce((s, l) => s + (l.actual_cost || 0), 0);
-    const transactionActual = transactions
-      .filter((transaction) => transaction.status === 'approved')
-      .reduce((s, t) => s + (t.amount || 0), 0);
-    const actual = transactionActual > 0 ? transactionActual : (lineActual > 0 ? lineActual : 2180000);
+    const actual = evm.ac;
     const remaining = planned - actual;
     const variance = planned - actual;
     return { planned, committed, actual, remaining, variance };
-  }, [budgetLines, transactions, project]);
+  }, [evm, budgetLines]);
 
   // -------------------------------------------------------------
   // 1. CBS 5-Cost Center Breakdown Structure
@@ -233,7 +247,7 @@ export default function BudgetView({ project }: BudgetViewProps) {
         actualCostSar: Math.round(totals.actual * 0.07),
         varianceSar: Math.round(bac * 0.08) - Math.round(totals.actual * 0.07),
         variancePercent: Number((((Math.round(bac * 0.08) - Math.round(totals.actual * 0.07)) / Math.round(bac * 0.08)) * 100).toFixed(1)),
-        description: 'مكاتب الموقع، تصاريح البلدية، الأمن والسلامة، والضيافة والمختبرات.',
+        description: 'إيجار المكاتب المؤقتة، سيارات الموقع، التأمينات، والمختبرات وضبط الجودة.',
       },
     ];
   }, [totals]);
@@ -332,12 +346,11 @@ export default function BudgetView({ project }: BudgetViewProps) {
   // 4. Multi-Formula EAC Forecast & TCPI Matrix
   // -------------------------------------------------------------
   const multiEacData: MultiEacComparison = useMemo(() => {
-    const bac = totals.planned;
-    const ac = totals.actual;
-    const progressRatio = 0.48; // 48% progress
-    const ev = Math.round(bac * progressRatio);
-    const spi = 0.94;
-    const cpi = Number((ev / Math.max(1, ac)).toFixed(2)) || 1.05;
+    const bac = evm.bac;
+    const ac = evm.ac;
+    const ev = evm.ev;
+    const spi = evm.spi;
+    const cpi = evm.cpi;
 
     // EAC Formulas
     // 1. Optimistic: EAC = AC + (BAC - EV)
@@ -345,11 +358,12 @@ export default function BudgetView({ project }: BudgetViewProps) {
     const vac1 = Math.round(bac - eac1Optimistic);
 
     // 2. Realistic: EAC = BAC / CPI
-    const eac2Realistic = Math.round(bac / cpi);
+    const eac2Realistic = cpi > 0 ? Math.round(bac / cpi) : bac;
     const vac2 = Math.round(bac - eac2Realistic);
 
     // 3. Pessimistic / Composite: EAC = AC + (BAC - EV) / (CPI * SPI)
-    const eac3Pessimistic = Math.round(ac + (bac - ev) / (cpi * spi));
+    const compositeDenominator = Math.max(0.1, cpi * spi);
+    const eac3Pessimistic = Math.round(ac + (bac - ev) / compositeDenominator);
     const vac3 = Math.round(bac - eac3Pessimistic);
 
     // 4. Bottom-Up: EAC = AC + Bottom-up ETC
@@ -359,9 +373,9 @@ export default function BudgetView({ project }: BudgetViewProps) {
 
     // TCPI Formulas
     // TCPI(BAC) = (BAC - EV) / (BAC - AC)
-    const tcpiBac = (bac - ac) > 0 ? Number(((bac - ev) / (bac - ac)).toFixed(2)) : 1.20;
+    const tcpiBac = (bac - ac) > 0 ? Number(((bac - ev) / (bac - ac)).toFixed(2)) : 1.0;
     // TCPI(EAC) = (BAC - EV) / (EAC_realistic - AC)
-    const tcpiEac = (eac2Realistic - ac) > 0 ? Number(((bac - ev) / (eac2Realistic - ac)).toFixed(2)) : 1.00;
+    const tcpiEac = (eac2Realistic - ac) > 0 ? Number(((bac - ev) / (eac2Realistic - ac)).toFixed(2)) : 1.0;
 
     let tcpiFeasibility: 'easy' | 'realistic' | 'hard' | 'unachievable' = 'realistic';
     if (tcpiBac <= 1.0) tcpiFeasibility = 'easy';
@@ -387,7 +401,7 @@ export default function BudgetView({ project }: BudgetViewProps) {
       eac4BottomUp,
       vac4,
     };
-  }, [totals]);
+  }, [evm]);
 
   // Handle new reserve drawdown
   const handleAddReserveDraw = () => {

@@ -204,7 +204,7 @@ export default function FinancialControlsView({ project }: FinancialControlsView
       dailyOverheadRates.insuranceAndFeesSar;
 
     const totalProlongationClaim = dailyRate * eotCompensableDays;
-    const contractVal = project?.contract_value || 4850000;
+    const contractVal = project?.contract_value || 0;
     const dailyLdRate = Math.round(contractVal / 1000); // 0.1% per day per standard tender contract
     const unconstrainedLd = dailyLdRate * unexcusedDelayDays;
     const maxLdCap = Math.round(contractVal * 0.10); // 10% maximum statutory cap

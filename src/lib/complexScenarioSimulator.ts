@@ -160,7 +160,7 @@ export function simulateComplexProjectScenario(
 ): ComplexScenarioResult {
   const p = scenario.parameters;
   const calendar = getCalendar(project.calendar_type || '6_days');
-  const baseContractValue = Number(project.contract_value || 2345150);
+  const baseContractValue = Number(project.contract_value || 1000000);
   const baseBudgetBac = budgetLines.reduce((s, l) => s + Number(l.planned_cost || 0), 0) || baseContractValue;
   const baseDurationDays = Number(project.duration_days || 195);
   const startDate = project.start_date || '2026-09-15';
@@ -316,7 +316,7 @@ export function runPrecisionWatchdogAudit(
   results: ComplexScenarioResult[],
 ): PrecisionWatchdogMetric[] {
   const metrics: PrecisionWatchdogMetric[] = [];
-  const bac = Number(project.contract_value || 2345150);
+  const bac = Number(project.contract_value || 1000000);
 
   // 1. CPM Float Law Conservation
   const floatDriftActs = activities.filter((a) => {
