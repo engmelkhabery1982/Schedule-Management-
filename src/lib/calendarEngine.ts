@@ -146,8 +146,49 @@ export function countWorkingDays(startDateStr: string, endDateStr: string, calen
 }
 
 /**
+ * Shift a date by a SIGNED number of working days, preserving the sign of the offset (GAP-012).
+ *
+ *   offsetWorkingDays(d,  0) -> d unchanged (no snapping: the caller owns calendar alignment)
+ *   offsetWorkingDays(d, +n) -> the nth working day AFTER d
+ *   offsetWorkingDays(d, -n) -> the nth working day BEFORE d
+ *
+ * This is a thin signed wrapper around the two inclusive primitives above — NOT a second
+ * calendar implementation. Because `addWorkingDays` / `subtractWorkingDays` count the anchor day
+ * as day 1, a shift of n working days is expressed as n + 1.
+ *
+ * Relationship lags must always travel through this helper so a lead (negative lag) can never be
+ * clipped by a `Math.max(...)` guard: a positive lag pushes a successor later / pulls a
+ * predecessor earlier, and a negative lag does exactly the mirror image.
+ *
+ * A non-finite or zero offset resolves to the anchor date unchanged, so a malformed lag can
+ * neither fabricate a shift nor leak NaN into a date.
+ */
+export function offsetWorkingDays(dateStr: string, offsetDays: number, calendar: ProjectCalendar): string {
+  if (!Number.isFinite(offsetDays) || offsetDays === 0) {
+    return dateStr;
+  }
+  if (offsetDays > 0) {
+    return addWorkingDays(dateStr, offsetDays + 1, calendar);
+  }
+  return subtractWorkingDays(dateStr, Math.abs(offsetDays) + 1, calendar);
+}
+
+/**
  * Calculate the successor early start based on predecessor early finish for an FS link.
  * For FS with Lag = 0: Next working day after predecessor early finish.
+ *
+ * Event pairs and lag convention per relationship type (GAP-012 / GAP-013). `lag` is a SIGNED
+ * number of WORKING days and its sign is always preserved — a negative lag is a lead:
+ *
+ *   FS  predecessor FINISH -> successor START   ES_succ = (EF_pred + 1 working day) + lag
+ *   SS  predecessor START  -> successor START   ES_succ = ES_pred + lag
+ *   FF  predecessor FINISH -> successor FINISH  EF_succ = EF_pred + lag
+ *   SF  predecessor START  -> successor FINISH  EF_succ = ES_pred + lag
+ *
+ * For FF and SF the function returns the successor START implied by that finish, using the
+ * engine's inclusive duration convention (an activity of n working days occupies exactly n
+ * working days, counting its start day as day 1, so start = finish - (n - 1) working days).
+ * A zero-duration successor (milestone) starts on its finish day.
  */
 export function calculateLinkDate(
   predStart: string,
@@ -159,34 +200,33 @@ export function calculateLinkDate(
 ): string {
   switch (linkType) {
     case 'SS': {
-      // Start-to-Start: Successor Start = Predecessor Start + Lag
+      // Start-to-Start: Successor Start = Predecessor Start + Lag.
+      // Zero lag keeps the accepted behaviour of snapping a predecessor start that falls on a
+      // non-working day onto the calendar; any non-zero lag shifts by exactly `lag` working days.
       if (lagDays === 0) return getNextWorkingDay(predStart, calendar);
-      if (lagDays > 0) return addWorkingDays(predStart, lagDays + 1, calendar);
-      return subtractWorkingDays(predStart, Math.abs(lagDays) + 1, calendar);
+      return offsetWorkingDays(predStart, lagDays, calendar);
     }
     case 'FF': {
       // Finish-to-Finish: Successor Finish = Predecessor Finish + Lag
-      let targetFinish = predFinish;
-      if (lagDays > 0) targetFinish = addWorkingDays(predFinish, lagDays + 1, calendar);
-      else if (lagDays < 0) targetFinish = subtractWorkingDays(predFinish, Math.abs(lagDays) + 1, calendar);
-      // Successor Start = targetFinish - succDuration
+      const targetFinish = offsetWorkingDays(predFinish, lagDays, calendar);
+      // Successor Start = targetFinish - (duration - 1) working days
       return subtractWorkingDays(targetFinish, Math.max(1, succDuration), calendar);
     }
     case 'SF': {
       // Start-to-Finish: Successor Finish = Predecessor Start + Lag
-      let targetFinish = predStart;
-      if (lagDays > 0) targetFinish = addWorkingDays(predStart, lagDays + 1, calendar);
-      else if (lagDays < 0) targetFinish = subtractWorkingDays(predStart, Math.abs(lagDays) + 1, calendar);
+      const targetFinish = offsetWorkingDays(predStart, lagDays, calendar);
       return subtractWorkingDays(targetFinish, Math.max(1, succDuration), calendar);
     }
     case 'FS':
     default: {
-      // Finish-to-Start: Successor Start = (Predecessor Finish + 1 working day) + Lag
+      // Finish-to-Start: Successor Start = (Predecessor Finish + 1 working day) + Lag.
+      // A negative lag (lead) pulls the successor start back from that zero-lag date, so it may
+      // legitimately fall before the predecessor finish. The engine's data-date floor still
+      // applies downstream, which is the only clamp a lead is subject to.
       const nextDay = new Date(`${predFinish}T00:00:00Z`);
       nextDay.setUTCDate(nextDay.getUTCDate() + 1);
       const firstValidDay = getNextWorkingDay(nextDay, calendar);
-      if (lagDays <= 0) return firstValidDay;
-      return addWorkingDays(firstValidDay, lagDays + 1, calendar);
+      return offsetWorkingDays(firstValidDay, lagDays, calendar);
     }
   }
 }

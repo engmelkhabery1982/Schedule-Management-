@@ -1,5 +1,6 @@
-import type { ParsedBoqRow } from '@/types';
+import type { CalendarType, ParsedBoqRow } from '@/types';
 import { categorizeBoqItem } from './boqParser';
+import { addWorkingDays, getCalendar, getNextWorkingDay } from './calendarEngine';
 import { calculateProductionDuration, type ProductivityRule } from './planningEngine';
 
 export interface GenWbsNode {
@@ -144,22 +145,18 @@ const CATEGORY_RESOURCES: Record<string, { name: string; type: string; unit: str
   ],
 };
 
-function addDays(date: Date, days: number): Date {
-  const d = new Date(date);
-  d.setDate(d.getDate() + days);
-  return d;
-}
-
-function formatDate(date: Date): string {
-  return date.toISOString().split('T')[0];
-}
-
 export function generateSchedule(
   boqItems: ParsedBoqRow[],
   startDate: string,
   productivityRules: ProductivityRule[] = [],
+  calendarType: CalendarType = '6_days',
 ): GeneratedSchedule {
-  const projectStart = new Date(startDate);
+  // GAP-016: generated dates are WORKING days under the project calendar, not raw calendar days.
+  // The helpers come from calendarEngine — the single calendar implementation shared with the CPM
+  // engine — so a generated schedule and a recalculated one agree on weekends and holidays, and
+  // on the inclusive duration convention (a 1-day activity occupies exactly one working day,
+  // i.e. start == finish; a 0-duration milestone stays a milestone).
+  const calendar = getCalendar(calendarType);
 
   const categorized: Record<string, ParsedBoqRow[]> = {};
   for (const item of boqItems) {
@@ -197,7 +194,7 @@ export function generateSchedule(
   const resourceList: GenResource[] = [];
   const resourceCodeMap: Record<string, string> = {};
   let activitySort = 0;
-  let currentDate = new Date(projectStart);
+  let currentDate = getNextWorkingDay(startDate, calendar);
 
   for (const cat of wbsCatMap) {
     const catResources = CATEGORY_RESOURCES[cat.name] || CATEGORY_RESOURCES['General'];
@@ -214,17 +211,19 @@ export function generateSchedule(
       const item = cat.items[i];
       const wbsCode = cat.childCodes[i];
       const duration = calculateProductionDuration(item.quantity, cat.name, productivityRules);
-      const actStart = new Date(currentDate);
-      const actFinish = addDays(actStart, duration);
+      const actStart = currentDate;
+      // Inclusive working-day span: duration 1 -> finish == start; duration n -> the nth working
+      // day from the start, skipping every non-working day in between.
+      const actFinish = addWorkingDays(actStart, duration, calendar);
 
       activities.push({
         wbs_node_code: wbsCode,
         code: `ACT-${String(activitySort + 1).padStart(3, '0')}`,
         name: item.description.substring(0, 100),
-        early_start: formatDate(actStart),
-        early_finish: formatDate(actFinish),
-        late_start: formatDate(actStart),
-        late_finish: formatDate(actFinish),
+        early_start: actStart,
+        early_finish: actFinish,
+        late_start: actStart,
+        late_finish: actFinish,
         duration_days: duration,
         planned_quantity: item.quantity,
         actual_quantity: 0,
@@ -237,7 +236,9 @@ export function generateSchedule(
         sort_order: activitySort,
       });
       activitySort++;
-      currentDate = addDays(actFinish, 1);
+      // FS+0 chaining under the same inclusive convention: the next activity starts on the first
+      // working day AFTER this finish (addWorkingDays counts the anchor as day 1, so 2 => +1 day).
+      currentDate = addWorkingDays(actFinish, 2, calendar);
     }
   }
 
@@ -245,10 +246,10 @@ export function generateSchedule(
     wbs_node_code: null,
     code: `ACT-${String(activitySort + 1).padStart(3, '0')}`,
     name: 'Project Completion Milestone',
-    early_start: formatDate(currentDate),
-    early_finish: formatDate(currentDate),
-    late_start: formatDate(currentDate),
-    late_finish: formatDate(currentDate),
+    early_start: currentDate,
+    early_finish: currentDate,
+    late_start: currentDate,
+    late_finish: currentDate,
     duration_days: 0,
     planned_quantity: 0,
     actual_quantity: 0,

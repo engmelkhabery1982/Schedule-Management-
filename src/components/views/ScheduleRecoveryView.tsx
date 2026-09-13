@@ -9,6 +9,7 @@ import type {
 } from '@/types';
 import { generateScheduleRecoveryPlan } from '@/lib/recoveryOptimizerEngine';
 import { calculateCpm } from '@/lib/cpmEngine';
+import { DEFAULT_DATA_DATE } from '@/lib/projectControlsConstants';
 import {
   Zap,
   FastForward,
@@ -110,10 +111,18 @@ export default function ScheduleRecoveryView({ project }: ScheduleRecoveryViewPr
       }
     }
 
-    // Recalculate CPM network
+    // Recalculate CPM network (GAP-046): use the canonical calculateCpm options shape so the
+    // recovery recalculation runs on the same calendar, Data Date and status logic as
+    // ScheduleView. Passing only a calendar type made the engine fall back to a clock-derived
+    // data date and to retained_logic, and those dates were then persisted onto activities.
+    // The governed DEFAULT_DATA_DATE is the only fallback — no second hardcoded date literal.
     const actRes = await supabase.from('activities').select('*').eq('project_id', project.id);
     const updatedActs = actRes.data || [];
-    const cpm = calculateCpm(updatedActs, links, project.calendar_type || '6_days');
+    const cpm = calculateCpm(updatedActs, links, {
+      calendarType: project.calendar_type || '6_days',
+      dataDate: project.data_date || DEFAULT_DATA_DATE,
+      statusLogic: project.status_logic || 'retained_logic',
+    });
 
     for (const r of cpm.results) {
       await supabase.from('activities').update({

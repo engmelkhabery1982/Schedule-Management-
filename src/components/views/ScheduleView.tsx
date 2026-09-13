@@ -16,6 +16,7 @@ import type {
 } from '@/types';
 import { calculateCpm, type LinkDrivingResult } from '@/lib/cpmEngine';
 import { addWorkingDays, subtractWorkingDays, getCalendar, countWorkingDays } from '@/lib/calendarEngine';
+import { DEFAULT_DATA_DATE } from '@/lib/projectControlsConstants';
 import {
   Zap,
   Flag,
@@ -126,7 +127,10 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
   const [filterLongestPathOnly, setFilterLongestPathOnly] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedCalendar, setSelectedCalendar] = useState<CalendarType>(project?.calendar_type || '6_days');
-  const [currentDataDate, setCurrentDataDate] = useState<string>(project?.data_date || '2026-11-15');
+  // GAP-017: the governed default Data Date is imported, never re-hardcoded. Both the UI state
+  // default and the CPM invocation default resolve through the same constant so the displayed
+  // status line and the calculated schedule can never disagree.
+  const [currentDataDate, setCurrentDataDate] = useState<string>(project?.data_date || DEFAULT_DATA_DATE);
   const [statusLogic, setStatusLogic] = useState<'retained_logic' | 'progress_override'>(project?.status_logic || 'retained_logic');
   const [isRecalculating, setIsRecalculating] = useState(false);
 
@@ -209,7 +213,7 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
     // Calculate CPM & driving links
     const cpm = calculateCpm(acts, linksData, {
       calendarType: project.calendar_type || '6_days',
-      dataDate: project.data_date || '2026-11-15',
+      dataDate: project.data_date || DEFAULT_DATA_DATE,
       statusLogic: project.status_logic || 'retained_logic',
       calculateDrag: true,
     });

@@ -318,7 +318,7 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
 
       // 3. Generate schedule
       setParseProgress('جاري إنشاء WBS والجدول الزمني عبر محرك التخطيط...');
-      const schedule = generateSchedule(parsedRows, projectInfo.start_date, []);
+      const schedule = generateSchedule(parsedRows, projectInfo.start_date, [], project.calendar_type);
 
       // 4. Insert WBS nodes
       const wbsInserts = schedule.wbsNodes.map((w) => ({

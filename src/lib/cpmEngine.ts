@@ -8,6 +8,7 @@ import {
   subtractWorkingDays,
   countWorkingDays,
   calculateLinkDate,
+  offsetWorkingDays,
 } from './calendarEngine';
 
 export interface CpmOptions {
@@ -365,23 +366,35 @@ export function calculateCpm(
           const succCal = getActivityCalendar(succAct);
           const linkType = (link.link_type as 'FS' | 'SS' | 'FF' | 'SF') || 'FS';
           const lag = link.lag_days || 0;
-          let constraintFinish = succDates.start;
 
-          if (linkType === 'FS') {
-            constraintFinish = subtractWorkingDays(succDates.start, Math.max(1, lag + 1), succCal);
-          } else if (linkType === 'FF') {
-            constraintFinish = lag > 0
-              ? subtractWorkingDays(succDates.finish, lag + 1, succCal)
-              : addWorkingDays(succDates.finish, Math.abs(lag) + 1, succCal);
-          } else if (linkType === 'SS') {
-            const predStartLim = lag > 0
-              ? subtractWorkingDays(succDates.start, lag + 1, succCal)
-              : addWorkingDays(succDates.start, Math.abs(lag) + 1, succCal);
-            constraintFinish = duration === 0 ? predStartLim : addWorkingDays(predStartLim, duration, cal);
-          } else if (linkType === 'SF') {
-            const predStartLim = subtractWorkingDays(succDates.finish, Math.max(1, lag + 1), succCal);
-            constraintFinish = duration === 0 ? predStartLim : addWorkingDays(predStartLim, duration, cal);
-          }
+          // Backward pass, uniform for all four relationship types (GAP-012).
+          //
+          // Each type constrains one predecessor event from one successor event, and the lag
+          // always enters with the SAME sign convention as the forward pass, mirrored:
+          //
+          //   FS  pred FINISH <- succ START    LF_pred = LS_succ - lag
+          //   SS  pred START  <- succ START    LS_pred = LS_succ - lag
+          //   FF  pred FINISH <- succ FINISH   LF_pred = LF_succ - lag
+          //   SF  pred START  <- succ FINISH   LS_pred = LF_succ - lag
+          //
+          // Shifting by `-lag` through offsetWorkingDays means a positive lag pulls the
+          // predecessor earlier and a negative lag (lead) pushes it later, exactly mirroring the
+          // forward pass. The previous per-type branches used `Math.max(1, lag + 1)`, which
+          // silently flattened every lead on FS and SF into a zero lag.
+          const constrainedBySuccFinish = linkType === 'FF' || linkType === 'SF';
+          const predecessorEventIsStart = linkType === 'SS' || linkType === 'SF';
+
+          const predecessorAnchor = offsetWorkingDays(
+            constrainedBySuccFinish ? succDates.finish : succDates.start,
+            -lag,
+            succCal,
+          );
+
+          // When the constrained predecessor event is its START, convert to a late FINISH with
+          // the inclusive duration convention (a milestone keeps start == finish).
+          const constraintFinish = predecessorEventIsStart && duration !== 0
+            ? addWorkingDays(predecessorAnchor, duration, cal)
+            : predecessorAnchor;
 
           if (!minLateFinish || constraintFinish < minLateFinish) {
             minLateFinish = constraintFinish;
@@ -438,13 +451,36 @@ export function calculateCpm(
         if (succEarly && succAct) {
           const succCal = getActivityCalendar(succAct);
           const lag = link.lag_days || 0;
+          const linkType = (link.link_type as 'FS' | 'SS' | 'FF' | 'SF') || 'FS';
+
+          // Free float per relationship type (GAP-013): the working-day slack between the
+          // predecessor event that drives the link and the successor event that link constrains,
+          // less the lag. countWorkingDays is INCLUSIVE (same day = 1), hence the -1; FS also
+          // consumes the mandatory one-working-day gap between a predecessor finish and a
+          // successor start, hence its -2.
+          //
+          //   FS  EF_pred vs ES_succ   SS  ES_pred vs ES_succ
+          //   FF  EF_pred vs EF_succ   SF  ES_pred vs EF_succ
+          //
+          // SF previously fell through to the FS branch, which measured the wrong event pair
+          // (EF_pred vs ES_succ). Under the inclusive convention that understated SF free float by
+          // (predecessor duration + successor duration - 1) working days — 9 days for two 5-day
+          // activities — so a genuinely float-free SF link was reported as slack.
           let availableDays = 0;
-          if (link.link_type === 'SS') {
-            availableDays = countWorkingDays(e.start, succEarly.start, succCal) - 1 - lag;
-          } else if (link.link_type === 'FF') {
-            availableDays = countWorkingDays(e.finish, succEarly.finish, succCal) - 1 - lag;
-          } else {
-            availableDays = countWorkingDays(e.finish, succEarly.start, succCal) - 2 - lag;
+          switch (linkType) {
+            case 'SS':
+              availableDays = countWorkingDays(e.start, succEarly.start, succCal) - 1 - lag;
+              break;
+            case 'FF':
+              availableDays = countWorkingDays(e.finish, succEarly.finish, succCal) - 1 - lag;
+              break;
+            case 'SF':
+              availableDays = countWorkingDays(e.start, succEarly.finish, succCal) - 1 - lag;
+              break;
+            case 'FS':
+            default:
+              availableDays = countWorkingDays(e.finish, succEarly.start, succCal) - 2 - lag;
+              break;
           }
           if (availableDays < minFF) minFF = availableDays;
         }
