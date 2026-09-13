@@ -1,14 +1,16 @@
+// `EvmMetrics` and `BudgetLine` are no longer imported: Wave 2 removed the two functions that
+// used them (`calculateEvmMetrics`, `calculateQuantityBasedEvm`). The canonical engine types its
+// budget input as `EvmBudgetLineInput` and returns `ComprehensiveProjectEvm`.
 import type {
   ParsedBoqRow,
-  EvmMetrics,
   Activity,
   Risk,
   BoqItem,
-  BudgetLine,
   BaselineActivity,
   CostTransaction,
   ProgressUpdate,
 } from '@/types';
+import { DEFAULT_DATA_DATE } from '@/lib/projectControlsConstants';
 
 export interface ProductivityRule {
   category: string;
@@ -98,22 +100,185 @@ export function generateSmartActivityPlans(
   });
 }
 
+/**
+ * Canonical result of the project-control EVM engine (SSOT — GAP-044).
+ *
+ * Every derived index in this shape is produced by `assessEvmRatios`; no other module may
+ * re-implement these formulas. Fields marked as compatibility aliases keep existing consumers
+ * compiling and are scheduled for migration in a later wave.
+ */
 export interface ComprehensiveProjectEvm {
   bac: number;
   dataDate: string;
-  plannedProgressPercent: number; // 0 to 100
-  actualProgressPercent: number;  // 0 to 100
+  /**
+   * Canonical earned project progress (GAP-045): `EV / BAC * 100` when `BAC > 0`, otherwise 0.
+   * This — not an activity `percent_complete` average — is the project-control progress metric.
+   */
+  earnedProgressPercent: number;
+  /**
+   * @deprecated Compatibility alias of `earnedProgressPercent` (identical value, kept so current
+   * consumers keep compiling). Migrate reads to `earnedProgressPercent`.
+   */
+  actualProgressPercent: number;
+  /** Planned progress: `PV / BAC * 100` when `BAC > 0`, otherwise 0. */
+  plannedProgressPercent: number;
   pv: number;
   ev: number;
   ac: number;
   sv: number;
   cv: number;
   spi: number;
+  /** Data-quality status of `spi` (UG-049). Read this before presenting `spi`. */
+  spiStatus: EvmRatioStatus;
   cpi: number;
+  /** Data-quality status of `cpi` (UG-049). Read this before presenting `cpi`. */
+  cpiStatus: EvmRatioStatus;
   eac: number;
   etc: number;
   vac: number;
   tcpi: number;
+  /** Boundary status of `tcpi` (GAP-042). Read this before presenting `tcpi`. */
+  tcpiStatus: TcpiStatus;
+}
+
+/**
+ * Status of a performance ratio whose denominator can legitimately be zero (UG-049).
+ *
+ * The distinction that matters: an empty project (nothing earned, nothing planned/spent) is a
+ * normal state, whereas earned value existing with no planned value or no actual cost is a
+ * data-quality anomaly that must never be presented as healthy `1.0` performance.
+ */
+export type EvmRatioStatus =
+  | 'valid' // denominator > 0 — the ratio is a measured value
+  | 'empty_no_data' // numerator === 0 and denominator <= 0 — legitimate empty state
+  | 'anomalous_zero_denominator'; // numerator > 0 and denominator <= 0 — data-quality anomaly
+
+/**
+ * Status of the To-Complete Performance Index (GAP-042).
+ *
+ * `BAC - AC` is the funds remaining; when it is zero the index is mathematically undefined, and
+ * when it is negative the budget is already exhausted so the remaining-work target is
+ * unachievable. Neither case may be reported as `1.0`, which would falsely communicate that
+ * normal planned efficiency is still sufficient.
+ */
+export type TcpiStatus =
+  | 'valid' // BAC - AC > 0
+  | 'undefined_zero_denominator' // BAC - AC === 0
+  | 'overrun_budget_exhausted'; // BAC - AC < 0
+
+/**
+ * Compatibility value used when a ratio is undefined in a legitimate EMPTY state (0/0).
+ * Neutral by convention and always paired with `spiStatus`/`cpiStatus === 'empty_no_data'`, so a
+ * consumer can render "—" instead. Preserves the pre-Wave-2 numeric behaviour of empty states.
+ */
+export const RATIO_EMPTY_STATE_VALUE = 1;
+
+/**
+ * Compatibility value used when earned value exists but the denominator does not (UG-049).
+ * Deliberately not a healthy-looking `1.0`: an anomaly must never read as "on plan / on budget".
+ * Finite by design — NaN and Infinity are never exposed to UI-facing values.
+ */
+export const RATIO_ANOMALY_VALUE = 0;
+
+/**
+ * Compatibility value for a TCPI that is undefined (no remaining budget) or unachievable
+ * (overrun). The required efficiency is unbounded there, so a finite, unmistakably non-healthy
+ * ceiling is reported instead of `1.0`, `NaN` or `Infinity`. The authoritative signal is
+ * `tcpiStatus`; UI must render "—" / "Overrun" from it.
+ *
+ * Transitional: no consumer currently reads the engine's `tcpi` field (BudgetView computes its
+ * own local TCPI, tracked as a deferred consumer migration), so this sentinel is safe to adopt.
+ */
+export const TCPI_UNACHIEVABLE_SENTINEL = 9.99;
+
+/** Derived EVM indices produced by the single shared formula set. */
+export interface EvmAssessment {
+  sv: number;
+  cv: number;
+  spi: number;
+  spiStatus: EvmRatioStatus;
+  cpi: number;
+  cpiStatus: EvmRatioStatus;
+  eac: number;
+  etc: number;
+  vac: number;
+  tcpi: number;
+  tcpiStatus: TcpiStatus;
+  /** Canonical earned progress (GAP-045): `EV / BAC * 100` when `BAC > 0`, else 0. */
+  earnedProgressPercent: number;
+  /** Planned progress: `PV / BAC * 100` when `BAC > 0`, else 0. */
+  plannedProgressPercent: number;
+}
+
+/**
+ * The single formula set for derived EVM indices — SSOT for GAP-044, GAP-042, GAP-045, UG-049.
+ *
+ * Every EVM producer in this module delegates here; no other function may re-implement SPI, CPI,
+ * EAC, ETC, VAC, TCPI or the progress percentages. Rounding policy is the canonical engine's
+ * existing one and is unchanged: SPI/CPI/TCPI to 2 decimals, progress percentages to 1 decimal,
+ * EAC/ETC to whole currency units.
+ *
+ * Zero-denominator policy (the point of this wave):
+ * - denominator > 0                      -> measured value, status `valid`
+ * - numerator === 0 and denominator <= 0 -> `RATIO_EMPTY_STATE_VALUE`, status `empty_no_data`
+ * - numerator > 0 and denominator <= 0   -> `RATIO_ANOMALY_VALUE`, status
+ *                                           `anomalous_zero_denominator` (never a silent 1.0)
+ * - TCPI with BAC - AC <= 0              -> `TCPI_UNACHIEVABLE_SENTINEL` plus an explicit status
+ *
+ * For every input where PV, EV, AC and BAC are all positive the returned numbers are identical to
+ * the previous implementation (CASE E); only the undefined/anomalous boundaries changed.
+ */
+export function assessEvmRatios(bac: number, pv: number, ev: number, ac: number): EvmAssessment {
+  const sv = ev - pv;
+  const cv = ev - ac;
+
+  const spiStatus: EvmRatioStatus = pv > 0 ? 'valid' : ev > 0 ? 'anomalous_zero_denominator' : 'empty_no_data';
+  const cpiStatus: EvmRatioStatus = ac > 0 ? 'valid' : ev > 0 ? 'anomalous_zero_denominator' : 'empty_no_data';
+
+  const spi =
+    spiStatus === 'valid'
+      ? Number((ev / pv).toFixed(2))
+      : spiStatus === 'empty_no_data'
+        ? RATIO_EMPTY_STATE_VALUE
+        : RATIO_ANOMALY_VALUE;
+
+  const cpi =
+    cpiStatus === 'valid'
+      ? Number((ev / ac).toFixed(2))
+      : cpiStatus === 'empty_no_data'
+        ? RATIO_EMPTY_STATE_VALUE
+        : RATIO_ANOMALY_VALUE;
+
+  // EAC = BAC / CPI (unchanged formula). When CPI is not a measured value the sentinel keeps the
+  // pre-existing outcome: EAC falls back to BAC rather than dividing by a non-measured index.
+  const eac = cpi > 0 ? Math.round(bac / cpi) : bac;
+  const etc = Math.max(0, eac - ac);
+  const vac = bac - eac;
+
+  const remainingBudget = bac - ac;
+  const tcpiStatus: TcpiStatus =
+    remainingBudget > 0 ? 'valid' : remainingBudget === 0 ? 'undefined_zero_denominator' : 'overrun_budget_exhausted';
+  const tcpi =
+    tcpiStatus === 'valid' ? Number(((bac - ev) / remainingBudget).toFixed(2)) : TCPI_UNACHIEVABLE_SENTINEL;
+
+  const earnedProgressPercent = bac > 0 ? Number(((ev / bac) * 100).toFixed(1)) : 0;
+  const plannedProgressPercent = bac > 0 ? Number(((pv / bac) * 100).toFixed(1)) : 0;
+
+  return {
+    sv,
+    cv,
+    spi,
+    spiStatus,
+    cpi,
+    cpiStatus,
+    eac,
+    etc,
+    vac,
+    tcpi,
+    tcpiStatus,
+    earnedProgressPercent,
+    plannedProgressPercent,
+  };
 }
 
 /**
@@ -156,6 +321,36 @@ export type EvmBudgetInputExcludesBaselineActivity = AssertTrue<
   BaselineActivity extends EvmBudgetLineInput ? false : true
 >;
 
+/**
+ * Percent-complete sanitizer for the earned-value path (GAP-005).
+ *
+ * A recorded `0` stays `0` — it is real evidence of "nothing earned". `null`, `undefined` and any
+ * non-finite value resolve to `0`, which is the legitimate business default: no earned value is
+ * claimed without evidence, progress is never fabricated, and a malformed row can never leak
+ * `NaN` into SPI/CPI/TCPI or into a UI-facing value.
+ */
+function finiteOrZero(percent: number | null | undefined): number {
+  const value = Number(percent ?? 0);
+  return Number.isFinite(value) ? value : 0;
+}
+
+/**
+ * CANONICAL project-control EVM engine — the single source of truth (GAP-044).
+ *
+ * This is the only function that assembles project EVM from operational data: it derives BAC,
+ * computes PV and EV at the governed data date from the CPM activities, budget lines, BOQ items,
+ * approved cost transactions and approved progress updates, then delegates every derived index
+ * (SPI, CPI, EAC, ETC, VAC, TCPI, progress percentages and their statuses) to `assessEvmRatios`.
+ *
+ * Do not add a second EVM implementation. Views and engines that need project EVM must call this
+ * function; helpers that only reshape already-known scalars must delegate to `assessEvmRatios`.
+ *
+ * Earned-value precedence per activity (GAP-005):
+ *   1. the latest approved `ProgressUpdate` dated on or before the data date; otherwise
+ *   2. the activity's own recorded `percent_complete`, where a recorded 0% stays 0% and a
+ *      missing value resolves to 0% — progress is never fabricated from elapsed time or from a
+ *      falsy-to-100 fallback.
+ */
 export function calculateProjectEvmAtDataDate(
   // Structural subset of `Project`. The date/value fields accept `null` because `Project`
   // declares them as `string | null` / nullable numbers; every use below already guards with
@@ -173,7 +368,10 @@ export function calculateProjectEvmAtDataDate(
   progressUpdates: ProgressUpdate[] = [],
   overrideDataDate?: string,
 ): ComprehensiveProjectEvm {
-  const dataDateStr = overrideDataDate || project.data_date || '2026-11-15';
+  // Governed data-date resolution (GAP-004): explicit override -> project data date -> the
+  // single governed default. The previously hardcoded '2026-11-15' literal is removed from the
+  // central EVM path; view-level literals are separate consumer GAPs and are untouched here.
+  const dataDateStr = overrideDataDate || project.data_date || DEFAULT_DATA_DATE;
   const dataDateMs = new Date(dataDateStr).getTime();
 
   // 1. Calculate BAC
@@ -244,16 +442,26 @@ export function calculateProjectEvmAtDataDate(
     let actPct = 0;
     const update = updatesByAct.get(act.id);
     if (update) {
-      actPct = Number(update.percent_complete || 0);
+      // An approved progress record is the authoritative earned source for this activity.
+      actPct = finiteOrZero(update.percent_complete);
     } else if (dataDateMs >= startMs) {
-      // If no discrete log on date, check if started before cutoff
+      // No approved progress record: fall back to the activity's own recorded physical percent.
+      //
+      // GAP-005 (Critical): explicit nullish handling replaces the former `|| 100` fallback,
+      // which turned a genuine 0% activity into 100% and fabricated earned value out of elapsed
+      // time. `Activity.percent_complete` is typed as a required number, so the null branch is
+      // purely defensive against untyped runtime rows.
+      //   - recorded 0%            -> 0% earned (invariant: no evidence, no earned value)
+      //   - recorded null/undefined -> 0% earned (legitimate default; never 100% by accident)
+      //   - recorded N%            -> N% earned (unchanged)
+      const recordedPct = finiteOrZero(act.percent_complete);
       const finishMs = new Date(act.early_finish || project.end_date || '2027-04-30').getTime();
       if (dataDateMs >= finishMs) {
-        actPct = Number(act.percent_complete || 100);
+        actPct = recordedPct;
       } else {
         const dur = Math.max(86400000, finishMs - startMs);
         const elp = Math.max(0, dataDateMs - startMs);
-        actPct = Math.min(100, Math.round((elp / dur) * Number(act.percent_complete || 100)));
+        actPct = Math.min(100, Math.round((elp / dur) * recordedPct));
       }
     }
 
@@ -272,107 +480,104 @@ export function calculateProjectEvmAtDataDate(
     totalAc = bgtAc > 0 ? Math.round(bgtAc * Math.min(1, totalEv / Math.max(1, bac))) : Math.round(totalEv * 0.95);
   }
 
-  // 5. Final Metrics & Variances
+  // 5. Final Metrics & Variances — delegated to the single shared formula set (GAP-044).
+  // The aggregates are rounded exactly as before, so for any project where BAC, PV, EV and AC are
+  // all positive every derived number is unchanged (CASE E). Only the undefined / anomalous
+  // boundaries behave differently, and they now carry an explicit status instead of a silent 1.0.
   const pv = Math.round(totalPv);
   const ev = Math.round(totalEv);
   const ac = Math.round(totalAc);
 
-  const plannedProgressPercent = bac > 0 ? Number(((pv / bac) * 100).toFixed(1)) : 0;
-  const actualProgressPercent = bac > 0 ? Number(((ev / bac) * 100).toFixed(1)) : 0;
-
-  const sv = ev - pv;
-  const cv = ev - ac;
-
-  const spi = pv > 0 ? Number((ev / pv).toFixed(2)) : (ev > 0 ? 1.0 : 1.0);
-  const cpi = ac > 0 ? Number((ev / ac).toFixed(2)) : (ev > 0 ? 1.0 : 1.0);
-
-  const eac = cpi > 0 ? Math.round(bac / cpi) : bac;
-  const etc = Math.max(0, eac - ac);
-  const vac = bac - eac;
-  const tcpi = (bac - ac) > 0 ? Number(((bac - ev) / (bac - ac)).toFixed(2)) : 1.0;
+  const assessment = assessEvmRatios(bac, pv, ev, ac);
 
   return {
     bac,
     dataDate: dataDateStr,
-    plannedProgressPercent,
-    actualProgressPercent,
+    earnedProgressPercent: assessment.earnedProgressPercent,
+    // Compatibility alias carrying the same canonical value (GAP-045); consumers migrate later.
+    actualProgressPercent: assessment.earnedProgressPercent,
+    plannedProgressPercent: assessment.plannedProgressPercent,
     pv,
     ev,
     ac,
-    sv,
-    cv,
-    spi,
-    cpi,
-    eac,
-    etc,
-    vac,
-    tcpi,
+    sv: assessment.sv,
+    cv: assessment.cv,
+    spi: assessment.spi,
+    spiStatus: assessment.spiStatus,
+    cpi: assessment.cpi,
+    cpiStatus: assessment.cpiStatus,
+    eac: assessment.eac,
+    etc: assessment.etc,
+    vac: assessment.vac,
+    tcpi: assessment.tcpi,
+    tcpiStatus: assessment.tcpiStatus,
   };
 }
 
-export function calculateEvmMetrics(
+/**
+ * Low-level helper for callers that already hold EVM scalars — NOT a project EVM engine.
+ *
+ * Scope (GAP-044): it performs no data-date filtering, no BAC derivation and no traversal of
+ * activities, budget lines, transactions or progress updates. It converts a BAC plus two 0..1
+ * progress ratios and an actual cost into PV/EV, then delegates every derived index to
+ * `assessEvmRatios` — the same single formula set used by the canonical
+ * `calculateProjectEvmAtDataDate`. It therefore implements no divergent business formula and must
+ * never acquire one.
+ *
+ * Intended for empty-state / demo / fallback paths that have no project data yet (e.g. the
+ * Dashboard before a project is selected). Replaces the former `calculateEvmMetrics`, which was a
+ * competing mini-engine: it duplicated SPI/CPI/EAC with a different zero-denominator policy
+ * (silent `1`) and no rounding, and it returned no progress or status information.
+ */
+export function deriveEvmFromScalars(
   bac: number,
   plannedProgress: number,
   actualProgress: number,
   actualCost: number,
-): EvmMetrics {
+  dataDate: string = DEFAULT_DATA_DATE,
+): ComprehensiveProjectEvm {
   const pv = bac * Math.max(0, Math.min(plannedProgress, 1));
   const ev = bac * Math.max(0, Math.min(actualProgress, 1));
-  const sv = ev - pv;
-  const cv = ev - actualCost;
-  const spi = pv > 0 ? ev / pv : 1;
-  const cpi = actualCost > 0 ? ev / actualCost : 1;
-  const eac = cpi > 0 ? bac / cpi : bac;
+  const assessment = assessEvmRatios(bac, pv, ev, actualCost);
+
   return {
     bac,
+    dataDate,
+    earnedProgressPercent: assessment.earnedProgressPercent,
+    actualProgressPercent: assessment.earnedProgressPercent,
+    plannedProgressPercent: assessment.plannedProgressPercent,
     pv,
     ev,
     ac: actualCost,
-    sv,
-    cv,
-    spi,
-    cpi,
-    eac,
-    etc: Math.max(0, eac - actualCost),
-    vac: bac - eac,
+    sv: assessment.sv,
+    cv: assessment.cv,
+    spi: assessment.spi,
+    spiStatus: assessment.spiStatus,
+    cpi: assessment.cpi,
+    cpiStatus: assessment.cpiStatus,
+    eac: assessment.eac,
+    etc: assessment.etc,
+    vac: assessment.vac,
+    tcpi: assessment.tcpi,
+    tcpiStatus: assessment.tcpiStatus,
   };
 }
 
-export function calculateQuantityBasedEvm(
-  activities: Activity[],
-  boqItems: BoqItem[],
-  budgetLines: BudgetLine[],
-  plannedProgress: number,
-  actualCost: number,
-): EvmMetrics {
-  const boqById = new Map(boqItems.map((item) => [item.id, item]));
-  const bac = budgetLines.reduce((sum, line) => sum + Number(line.approved_budget ?? line.estimated_cost ?? line.planned_cost ?? 0), 0);
-  
-  const quantityEv = activities.reduce((sum, activity) => {
-    const boqId = activity.wbs_node?.boq_item_id;
-    const item = boqId ? boqById.get(boqId) : undefined;
-    const value = item ? Number(item.unit_price || 0) * Math.min(Number(item.quantity || 0), Math.max(0, Number(activity.actual_quantity || 0))) : 0;
-    return sum + value;
-  }, 0);
+/**
+ * Activity/task completion average — NOT earned project progress (GAP-045).
+ *
+ * Returns a cost-weighted (or, when no weights are supplied, unweighted arithmetic) average of
+ * activity `percent_complete` as a 0..1 fraction. That is a task-completion statistic: it ignores
+ * budget distribution across the schedule and therefore must never be presented as the project
+ * progress metric. The canonical project-control progress is
+ * `ComprehensiveProjectEvm.earnedProgressPercent` (EV / BAC * 100) produced by
+ * `calculateProjectEvmAtDataDate`.
+ *
+ * Formerly exported as `calculateWeightedProgress`; renamed so the name cannot masquerade as
+ * earned progress. Formula unchanged.
+ */
+export function calculateActivityCompletionAverage(
 
-  // Fallback to progress-weighted EV if BOQ unit link is not mapped
-  const totalActCount = Math.max(1, activities.length);
-  const weightedEv = activities.reduce((sum, act) => {
-    return sum + (Math.max(0, Math.min(100, Number(act.percent_complete || 0))) / 100) * (bac / totalActCount);
-  }, 0);
-
-  const ev = quantityEv > 0 ? quantityEv : (weightedEv > 0 ? weightedEv : bac * 0.405);
-  const pv = bac * Math.max(0, Math.min(plannedProgress || 0.40, 1));
-  const effectiveAc = actualCost > 0 ? actualCost : Math.round(ev * 0.96);
-  const sv = ev - pv;
-  const cv = ev - effectiveAc;
-  const spi = pv > 0 ? Math.max(0.1, ev / pv) : 1;
-  const cpi = effectiveAc > 0 ? Math.max(0.1, ev / effectiveAc) : 1;
-  const eac = cpi > 0 ? bac / cpi : bac;
-  return { bac, pv, ev, ac: effectiveAc, sv, cv, spi, cpi, eac, etc: Math.max(0, eac - effectiveAc), vac: bac - eac };
-}
-
-export function calculateWeightedProgress(
   activities: Activity[],
   weights: Map<string, number>,
 ): number {

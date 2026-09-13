@@ -18,11 +18,9 @@ import type {
 } from '@/types';
 import {
   analyzeForecast,
-  calculateQuantityBasedEvm,
-  calculateWeightedProgress,
+  calculateActivityCompletionAverage,
   calculateProjectEvmAtDataDate,
-  calculateEvmMetrics,
-  type ComprehensiveProjectEvm,
+  deriveEvmFromScalars,
 } from '@/lib/planningEngine';
 import { generateScheduleAlerts } from '@/lib/alertEngine';
 import { generateResourceConflictAlerts } from '@/lib/resourceConflictEngine';
@@ -246,13 +244,14 @@ ${noticeForm.contractorName}`;
 
   const recentUpdates = useMemo(() => progressUpdates.slice(0, 5), [progressUpdates]);
 
-  // `evm` is a union of the lightweight fallback (`EvmMetrics`, returned when no project is
-  // selected) and the comprehensive engine result. This view reads only the comprehensive
-  // fields, exactly as it did before; the assertion below is type-level only and emits
-  // identical JavaScript. Giving the no-project fallback real progress values is a
-  // behaviour change and therefore belongs to a later wave, not to this compilation baseline.
-  const evm = useMemo((): ComprehensiveProjectEvm => {
-    if (!project) return calculateEvmMetrics(0, 0.40, 0.40, 0) as ComprehensiveProjectEvm;
+  // Empty state (no project selected): the scoped low-level helper `deriveEvmFromScalars`
+  // delegates to the same canonical primitives as the engine, so no second EVM formula set is
+  // involved and nothing is fabricated (BAC 0 -> all-zero metrics, ratios flagged
+  // 'empty_no_data'). Both branches now return the canonical `ComprehensiveProjectEvm`, so the
+  // transitional Wave-1 union cast is gone and the progress fields are defined numbers (0)
+  // instead of undefined/NaN.
+  const evm = useMemo(() => {
+    if (!project) return deriveEvmFromScalars(0, 0.40, 0.40, 0);
     return calculateProjectEvmAtDataDate(
       project,
       activities,
@@ -260,6 +259,9 @@ ${noticeForm.contractorName}`;
       boqItems,
       costTransactions,
       progressUpdates,
+      // Deferred consumer GAP: this view still passes its own '2026-11-15' literal as an explicit
+      // override, which pre-empts the governed DEFAULT_DATA_DATE. View-level date fallbacks are
+      // out of Wave 2 scope (GAP-004 covers the central EVM path only).
       project.data_date || '2026-11-15',
     );
   }, [project, activities, budgetLines, boqItems, costTransactions, progressUpdates, project?.data_date]);
