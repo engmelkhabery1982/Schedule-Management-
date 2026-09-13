@@ -13,6 +13,7 @@ import type {
   ComplexScenarioModel,
   ComplexScenarioResult,
   PrecisionWatchdogMetric,
+  Risk,
 } from '@/types';
 import {
   STANDARD_COMPLEX_SCENARIOS,
@@ -67,6 +68,9 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
   const [boqItems, setBoqItems] = useState<BoqItem[]>([]);
   const [costTransactions, setCostTransactions] = useState<CostTransaction[]>([]);
   const [progressUpdates, setProgressUpdates] = useState<ProgressUpdate[]>([]);
+  // Open risks widen the pessimistic bound of the scenario's probabilistic envelope (GAP-029): the
+  // simulator samples a real distribution instead of applying a static P80 multiplier.
+  const [risks, setRisks] = useState<Risk[]>([]);
 
   // Custom Scenario Builder Parameters
   const [customParams, setCustomParams] = useState({
@@ -110,13 +114,14 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
   }
 
   async function loadProjectDetails(projId: string) {
-    const [{ data: actData }, { data: lnkData }, { data: bgtData }, { data: boqData }, { data: txData }, { data: progressData }] = await Promise.all([
+    const [{ data: actData }, { data: lnkData }, { data: bgtData }, { data: boqData }, { data: txData }, { data: progressData }, { data: riskData }] = await Promise.all([
       supabase.from('activities').select('*').eq('project_id', projId).order('sort_order'),
       supabase.from('activity_links').select('*').eq('project_id', projId),
       supabase.from('budget_lines').select('*').eq('project_id', projId),
       supabase.from('boq_items').select('*').eq('project_id', projId),
       supabase.from('cost_transactions').select('*').eq('project_id', projId),
       supabase.from('progress_updates').select('*').eq('project_id', projId),
+      supabase.from('risks').select('*').eq('project_id', projId).order('severity', { ascending: false }),
     ]);
     setActivities(actData || []);
     setLinks(lnkData || []);
@@ -124,6 +129,7 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
     setBoqItems((boqData || []) as BoqItem[]);
     setCostTransactions((txData || []) as CostTransaction[]);
     setProgressUpdates((progressData || []) as ProgressUpdate[]);
+    setRisks((riskData || []) as Risk[]);
   }
 
   async function handleSwitchProject(p: Project) {
@@ -168,9 +174,9 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
   const scenarioResults: ComplexScenarioResult[] = useMemo(() => {
     if (!activeProject) return [];
     return STANDARD_COMPLEX_SCENARIOS.map((sc) =>
-      simulateComplexProjectScenario(activeProject, activities, links, budgetLines, sc, canonicalEvm),
+      simulateComplexProjectScenario(activeProject, activities, links, budgetLines, sc, canonicalEvm, { risks }),
     );
-  }, [activeProject, activities, links, budgetLines, canonicalEvm]);
+  }, [activeProject, activities, links, budgetLines, canonicalEvm, risks]);
 
   // Compute Custom Scenario Result
   const customScenarioResult: ComplexScenarioResult | null = useMemo(() => {
@@ -184,8 +190,10 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
       descriptionEn: 'Custom scenario configured dynamically via productivity, inflation, delay, and crashing sliders.',
       parameters: customParams,
     };
-    return simulateComplexProjectScenario(activeProject, activities, links, budgetLines, customModel, canonicalEvm);
-  }, [activeProject, activities, links, budgetLines, customParams, canonicalEvm]);
+    return simulateComplexProjectScenario(activeProject, activities, links, budgetLines, customModel, canonicalEvm, {
+      risks,
+    });
+  }, [activeProject, activities, links, budgetLines, customParams, canonicalEvm, risks]);
 
   // Compute Precision Watchdog Metrics
   const watchdogMetrics: PrecisionWatchdogMetric[] = useMemo(() => {
@@ -423,8 +431,8 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
                 </h3>
                 <p className="text-xs text-slate-500 mt-0.5">
                   {isRtl
-                    ? 'نتائج فورية محسوبة عبر محرك CPM و 4 نماذج EAC مع تقديرات P80 لمونت كارلو.'
-                    : 'Real-time CPM schedule calculation, 4-EAC models, peak liquidity strain, and P80 boundaries.'}
+                    ? 'نتائج فورية محسوبة عبر محرك CPM و 4 نماذج EAC، مع غلاف احتمالي P50/P80/P90 مستخرج من توزيع محاكاة مونت كارلو الفعلية وليس من معامل ثابت.'
+                    : 'Real-time CPM schedule calculation, 4-EAC models, peak liquidity strain, and a P50/P80/P90 envelope sampled from an actual Monte Carlo distribution.'}
                 </p>
               </div>
               <span className="text-xs font-mono font-bold bg-slate-100 px-3 py-1 rounded-lg text-slate-700">
@@ -444,7 +452,7 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
                     <th className="p-3 text-center">{isRtl ? 'انحراف التكلفة' : 'Cost Var (SAR / %)'}</th>
                     <th className="p-3 text-center">{isRtl ? 'مؤشرات الأداء (SPI / CPI)' : 'SPI / CPI'}</th>
                     <th className="p-3 text-center">{isRtl ? 'عجز السيولة الأقصى' : 'Peak Cash Deficit'}</th>
-                    <th className="p-3 text-center">{isRtl ? 'تقدير P80' : 'P80 Boundary'}</th>
+                    <th className="p-3 text-center">{isRtl ? 'الغلاف الاحتمالي P80 (محاكاة)' : 'P80 Envelope (simulated)'}</th>
                     <th className="p-3 text-center">{isRtl ? 'درجة المخاطرة' : 'Risk Grade'}</th>
                   </tr>
                 </thead>
@@ -535,6 +543,18 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
                         <td className="p-3 text-center font-mono text-[10px] text-slate-600">
                           <div>{s.p80FinishDate}</div>
                           <div className="text-slate-400">{s.p80CostSar.toLocaleString()} ر.س</div>
+                          {/* GAP-029: the sampled envelope is labelled as sampled; a deterministic fallback says so. */}
+                          {s.probabilisticEnvelope.valid ? (
+                            <div className="text-[9px] text-slate-400 font-sans mt-0.5" title={s.probabilisticEnvelope.noteEn || undefined}>
+                              {isRtl
+                                ? `محاكاة ${s.probabilisticEnvelope.iterations.toLocaleString()} دورة · P50 ${s.probabilisticEnvelope.p50DurationDays?.toLocaleString() ?? '—'} يوم · P90 ${s.probabilisticEnvelope.p90DurationDays?.toLocaleString() ?? '—'} يوم`
+                                : `${s.probabilisticEnvelope.iterations.toLocaleString()} iterations · P50 ${s.probabilisticEnvelope.p50DurationDays?.toLocaleString() ?? '—'}d · P90 ${s.probabilisticEnvelope.p90DurationDays?.toLocaleString() ?? '—'}d`}
+                            </div>
+                          ) : (
+                            <div className="text-[9px] text-rose-600 font-sans font-bold mt-0.5" title={s.probabilisticEnvelope.noteEn || undefined}>
+                              {isRtl ? 'قيمة حتمية — تعذّرت المحاكاة الاحتمالية' : 'deterministic value — simulation unavailable'}
+                            </div>
+                          )}
                         </td>
 
                         <td className="p-3 text-center">

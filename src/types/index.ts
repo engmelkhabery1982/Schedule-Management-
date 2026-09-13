@@ -779,6 +779,54 @@ export interface ComplexScenarioModel {
   };
 }
 
+/**
+ * Probabilistic percentile envelope of a complex scenario run (GAP-029).
+ *
+ * Structurally separate from the deterministic scenario result on purpose: the deterministic
+ * figures are the scenario's explicitly modelled deltas (productivity, inflation, VO days, crashing),
+ * while these values are percentiles read off an actual Monte Carlo distribution sampled around
+ * those deltas. A deterministic multiplier is never presented as a percentile, and when no valid
+ * simulation exists the envelope says so instead of inventing P80.
+ */
+export interface ScenarioProbabilisticEnvelope {
+  /** True only when every percentile below was sampled from a valid simulation. */
+  valid: boolean;
+  source: 'monte_carlo' | 'unavailable';
+  /** Valid iterations behind the percentiles. */
+  iterations: number;
+  /** Working-day duration percentiles; monotonic (P50 <= P80 <= P90) or null when unavailable. */
+  p50DurationDays: number | null;
+  p80DurationDays: number | null;
+  p90DurationDays: number | null;
+  /** SAR cost percentiles of the distribution centred on the deterministic scenario cost outcome. */
+  p50CostSar: number | null;
+  p80CostSar: number | null;
+  p90CostSar: number | null;
+  /** Simulated finish dates per percentile, so a consumer never recomputes them differently. */
+  p50FinishDate: string | null;
+  p90FinishDate: string | null;
+  /**
+   * Observed simulated range behind the percentiles. The deterministic scenario outcome is the
+   * MODE (most likely value) of these distributions, not their median, so it sits inside the range
+   * rather than at its centre -- a risk-loaded distribution is right-skewed by design.
+   */
+  minDurationDays: number | null;
+  maxDurationDays: number | null;
+  minCostSar: number | null;
+  maxCostSar: number | null;
+  /** Deterministic most-likely network length (working days) the envelope was anchored to. */
+  deterministicNetworkDurationDays: number;
+  /** Factor applied to activity durations so the sampled centre matches the scenario duration. */
+  durationScaleFactor: number;
+  /** Open risks that widened the pessimistic bound; 0 => dispersion is optimistic-side only. */
+  openRiskCount: number;
+  /** Reproducibility seed when the caller supplied one; null means a stochastic run. */
+  seed: number | string | null;
+  /** Validation failure or modelling caveat, bilingual. Null when there is nothing to qualify. */
+  noteAr: string | null;
+  noteEn: string | null;
+}
+
 export interface ComplexScenarioResult {
   scenarioId: string;
   scenarioNameAr: string;
@@ -821,8 +869,17 @@ export interface ComplexScenarioResult {
   spi: number;
   cpi: number;
   peakCashDeficitSar: number;
+  /**
+   * P80 finish date read from the SIMULATED duration distribution (GAP-029) -- never the former
+   * `deterministic duration x 1.08`. When no valid simulation exists it falls back to the
+   * deterministic scenario finish date and `probabilisticEnvelope.valid` is false, so a consumer can
+   * always tell a sampled percentile from a deterministic outcome.
+   */
   p80FinishDate: string;
+  /** P80 cost read from the simulated cost distribution -- never `deterministic cost x 1.06`. */
   p80CostSar: number;
+  /** The sampled envelope behind the two P80 fields, separated from the deterministic deltas. */
+  probabilisticEnvelope: ScenarioProbabilisticEnvelope;
   feasibilityScore: number; // 0-100
   contractualClaimClause: string;
   riskRating: 'low' | 'medium' | 'high' | 'critical';

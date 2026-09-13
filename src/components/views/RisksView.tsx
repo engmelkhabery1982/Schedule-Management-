@@ -53,7 +53,9 @@ export default function RisksView({ project }: RisksViewProps) {
 
     // Initial simulation
     if (acts.length > 0) {
-      const res = runMonteCarloSimulation(acts, lnks, rsk, project.contract_value || 1000000, 500);
+      const res = runMonteCarloSimulation(acts, lnks, rsk, project.contract_value || 1000000, 500, undefined, {
+        dataDate: project.data_date || null,
+      });
       setSimulationResult(res);
     }
 
@@ -64,7 +66,9 @@ export default function RisksView({ project }: RisksViewProps) {
     if (!project) return;
     setIsSimulating(true);
     setTimeout(() => {
-      const res = runMonteCarloSimulation(activities, links, risks, project.contract_value || 1000000, 1000);
+      const res = runMonteCarloSimulation(activities, links, risks, project.contract_value || 1000000, 1000, undefined, {
+        dataDate: project.data_date || null,
+      });
       setSimulationResult(res);
       setIsSimulating(false);
     }, 400);
@@ -448,7 +452,7 @@ export default function RisksView({ project }: RisksViewProps) {
                 محاكاة مونت كارلو الاحتمالية (Monte Carlo Quantitative Schedule & Cost Risk Analysis)
               </h3>
               <p className="text-xs text-slate-500 mt-1">
-                تشغيل 1,000 تكرار احتمالي مع توزيع PERT للأزمنة وتأثير المخاطر المفتوحة لحساب نسب الثقة (P50, P80, P90).
+                تشغيل حتى 1,000 تكرار احتمالي بتوزيع مثلثي (Triangular) للمدد مع تأثير المخاطر المفتوحة، بعد ترتيب شبكة الأنشطة ترتيباً طوبولوجياً وكشف أي دورة منطقية، لحساب نسب الثقة (P50, P80, P90) وتوزيع مدد المشروع الفعلي.
               </p>
             </div>
 
@@ -462,7 +466,25 @@ export default function RisksView({ project }: RisksViewProps) {
             </button>
           </div>
 
-          {simulationResult && (
+          {simulationResult && !simulationResult.valid && (
+            <div className="bg-rose-50 border border-rose-300 rounded-xl p-5 flex items-start gap-3">
+              <AlertTriangle size={20} className="text-rose-600 flex-shrink-0 mt-0.5" />
+              <div className="text-xs space-y-1.5">
+                <p className="font-bold text-rose-900">
+                  تعذّر تشغيل المحاكاة الاحتمالية ({simulationResult.validation.status}) — لم يتم توليد أي مدة أو تاريخ أو تكلفة.
+                </p>
+                <p className="text-rose-800 leading-relaxed">{simulationResult.validation.messageAr}</p>
+                <p className="text-rose-600 leading-relaxed" dir="ltr">{simulationResult.validation.messageEn}</p>
+                {simulationResult.validation.cycleCodes && simulationResult.validation.cycleCodes.length > 0 && (
+                  <p className="font-mono font-bold text-rose-900">
+                    الدورة المنطقية المغلقة: {simulationResult.validation.cycleCodes.join(' ← ')}
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
+
+          {simulationResult && simulationResult.valid && (
             <div className="space-y-5">
               {/* Confidence Percentiles Cards */}
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -475,6 +497,7 @@ export default function RisksView({ project }: RisksViewProps) {
                   <div className="mt-2">
                     <span className="text-xs text-slate-400 block">تاريخ التسليم المتوقع</span>
                     <span className="text-lg font-bold text-slate-800">{simulationResult.p50Finish}</span>
+                    <span className="text-[10px] text-slate-400 block">{simulationResult.p50Days.toLocaleString()} يوم عمل</span>
                   </div>
                   <div className="mt-3 pt-3 border-t border-slate-100">
                     <span className="text-xs text-slate-400 block">التكلفة المتوقعة (P50)</span>
@@ -491,6 +514,7 @@ export default function RisksView({ project }: RisksViewProps) {
                   <div className="mt-2">
                     <span className="text-xs text-slate-400 block">تاريخ التسليم الموثوق</span>
                     <span className="text-lg font-bold text-purple-900">{simulationResult.p80Finish}</span>
+                    <span className="text-[10px] text-slate-400 block">{simulationResult.p80Days.toLocaleString()} يوم عمل</span>
                   </div>
                   <div className="mt-3 pt-3 border-t border-slate-100">
                     <span className="text-xs text-slate-400 block">التكلفة مع الاحتياطي المالي</span>
@@ -507,6 +531,7 @@ export default function RisksView({ project }: RisksViewProps) {
                   <div className="mt-2">
                     <span className="text-xs text-slate-400 block">أسوأ سيناريو متوقع</span>
                     <span className="text-lg font-bold text-slate-800">{simulationResult.p90Finish}</span>
+                    <span className="text-[10px] text-slate-400 block">{simulationResult.p90Days.toLocaleString()} يوم عمل</span>
                   </div>
                   <div className="mt-3 pt-3 border-t border-slate-100">
                     <span className="text-xs text-slate-400 block">التكلفة القصوى مع الطوارئ</span>
@@ -522,7 +547,7 @@ export default function RisksView({ project }: RisksViewProps) {
                   مؤشر حرجيّة الأنشطة (Activity Criticality Index - CI)
                 </h4>
                 <p className="text-xs text-slate-500 mb-4">
-                  نسبة ظهور كل نشاط على المسار الحرج عبر الـ 1,000 سيناريو المحاكي. الأنشطة ذات النسبة العالية تتطلب رقابة مكثفة.
+                  نسبة الدورات التي ظهر فيها النشاط على المسار القائد (هامش كلي صفري) من إجمالي الدورات الصالحة — تُحتسب لكل أنشطة المسار الحرج في كل دورة، لا للنشاط الأخير وحده، وتشمل المسارات الحرجة المتوازية. الأنشطة ذات النسبة العالية تتطلب رقابة مكثفة.
                 </p>
 
                 <div className="space-y-2.5">
@@ -541,6 +566,43 @@ export default function RisksView({ project }: RisksViewProps) {
                       <span className="font-bold w-12 text-left">{item.probability}%</span>
                     </div>
                   ))}
+                </div>
+              </div>
+
+              {/* Simulated duration distribution: real bins over the simulation output (GAP-031) */}
+              <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
+                <h4 className="font-semibold text-slate-800 text-sm mb-1 flex items-center gap-2">
+                  <BarChart3 size={18} className="text-blue-600" />
+                  توزيع مدد المشروع المحاكاة (Simulated Project Duration Distribution)
+                </h4>
+                <p className="text-xs text-slate-500 mb-4">
+                  {simulationResult.validIterations.toLocaleString()} دورة صالحة موزعة على {simulationResult.scheduleDistribution.length} فئة متساوية العرض من {simulationResult.minDurationDays.toLocaleString()} إلى {simulationResult.maxDurationDays.toLocaleString()} يوم عمل. كل دورة تقع في فئة واحدة تماماً، ومجموع التكرارات يساوي عدد الدورات، ومجموع الاحتمالات 100%. العمود البنفسجي يحوي P80.
+                </p>
+                <div className="flex gap-1.5 h-40 border-b border-slate-200">
+                  {simulationResult.scheduleDistribution.map((bin) => {
+                    const maxCount = Math.max(1, ...simulationResult.scheduleDistribution.map((b) => b.count));
+                    const heightPercent = Math.round((bin.count / maxCount) * 100);
+                    const holdsP80 = bin.binStart <= simulationResult.p80Days && simulationResult.p80Days <= bin.binEnd;
+                    return (
+                      <div key={`${bin.binStart}-${bin.binEnd}`} className="flex-1 min-w-0 flex flex-col items-center justify-end gap-1">
+                        <span className="text-[9px] font-mono text-slate-500">
+                          {bin.count > 0 ? `${bin.percent.toFixed(1)}%` : ''}
+                        </span>
+                        <div
+                          className={`w-full rounded-t ${holdsP80 ? 'bg-purple-600' : bin.count > 0 ? 'bg-blue-400' : 'bg-slate-100'}`}
+                          style={{ height: `${Math.max(2, heightPercent)}%` }}
+                          title={`${bin.binStart}–${bin.binEnd} يوم: ${bin.count} دورة (${bin.percent.toFixed(2)}%) — تراكمي ${bin.cumulativePercent.toFixed(2)}% — إنهاء ${bin.finishDate}`}
+                        />
+                        <span className="text-[9px] font-mono text-slate-400 w-full text-center truncate">{bin.binStart}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mt-4 text-[10px] text-slate-500">
+                  <div>متوسط المدة: <span className="font-mono font-bold text-slate-700">{simulationResult.meanDurationDays.toLocaleString()}</span> يوم</div>
+                  <div>أقصر مدة: <span className="font-mono font-bold text-slate-700">{simulationResult.minDurationDays.toLocaleString()}</span> يوم</div>
+                  <div>أطول مدة: <span className="font-mono font-bold text-slate-700">{simulationResult.maxDurationDays.toLocaleString()}</span> يوم</div>
+                  <div>مصدر العشوائية: <span className="font-mono font-bold text-slate-700">{simulationResult.randomSource === 'seeded' ? `بذرة ${String(simulationResult.seed)}` : 'عشوائي (غير مبذر)'}</span></div>
                 </div>
               </div>
             </div>

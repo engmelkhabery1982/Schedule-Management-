@@ -9,10 +9,12 @@ import type {
   ComplexScenarioModel,
   ComplexScenarioResult,
   PrecisionWatchdogMetric,
+  ScenarioProbabilisticEnvelope,
 } from '@/types';
 import { addWorkingDays, getCalendar } from '@/lib/calendarEngine';
 import { calculateProjectEvmAtDataDate, type TcpiStatus } from '@/lib/planningEngine';
 import { calculateMultiEacForecast } from '@/lib/budgetForecastEngine';
+import { calculateDeterministicNetworkDuration, runMonteCarloSimulation } from '@/lib/monteCarloEngine';
 
 /**
  * Canonical EVM baseline a caller supplies to a scenario run (GAP-040).
@@ -185,7 +187,29 @@ export const STANDARD_COMPLEX_SCENARIOS: ComplexScenarioModel[] = [
 ];
 
 /**
- * Execute Deep Simulation of a specific project under complex scenario parameters
+ * Optional controls for the probabilistic envelope of a scenario run (GAP-029).
+ *
+ * Everything here is optional: the deterministic scenario result does not depend on any of it, so
+ * existing six-argument callers are unchanged.
+ */
+export interface ScenarioSimulationOptions {
+  /** The project's risk register. Open risks widen the simulated pessimistic duration bound. */
+  risks?: Risk[] | null;
+  /** Monte Carlo iterations for the envelope. Default 500. */
+  iterations?: number;
+  /** Optional seed for a reproducible envelope; omitted means a stochastic run. */
+  seed?: number | string | null;
+}
+
+/**
+ * Execute Deep Simulation of a specific project under complex scenario parameters.
+ *
+ * The result is deliberately split in two:
+ *   * the DETERMINISTIC scenario outcome -- duration/cost deltas the scenario parameters model
+ *     explicitly (productivity, inflation, escalation, VO days, crashing, prolongation);
+ *   * the PROBABILISTIC percentile envelope -- P50/P80/P90 sampled by the Monte Carlo engine from
+ *     the scenario-shaped activity network and cost base (GAP-029). No percentile in this file is a
+ *     static multiplier any more.
  */
 export function simulateComplexProjectScenario(
   project: Project,
@@ -194,6 +218,7 @@ export function simulateComplexProjectScenario(
   budgetLines: BudgetLine[],
   scenario: ComplexScenarioModel,
   canonicalEvm?: ScenarioEvmBaseline | null,
+  options?: ScenarioSimulationOptions | null,
 ): ComplexScenarioResult {
   const p = scenario.parameters;
   const calendar = getCalendar(project.calendar_type || '6_days');
@@ -286,10 +311,93 @@ export function simulateComplexProjectScenario(
   const cashInflowLagMonths = p.cashInflowDelayDays / 30;
   const peakCashDeficitSar = Math.round(monthlyBurnRate * (1.5 + cashInflowLagMonths) + (p.materialInflationPercent > 10 ? 250000 : 80000));
 
-  // 4. Probabilistic P80 Estimates (Monte Carlo Envelope)
-  const p80DurationDays = Math.round(totalSimulatedDurationDays * 1.08);
+  // 4. Probabilistic percentile envelope (GAP-029) -- sampled, never a static multiplier.
+  //
+  //    The former implementation applied two fixed mark-ups (plus eight percent on duration, plus
+  //    six percent on cost) to the deterministic outcome and published them as P80. Those were
+  //    deterministic multipliers dressed up as percentiles. The percentiles below come from an
+  //    actual Monte Carlo run over the scenario-shaped network:
+  //
+  //      * activity durations are scaled ONCE by `durationScaleFactor` so the sampled distribution is
+  //        centred on this scenario's deterministic duration (the network's own most-likely length
+  //        rarely equals `project.duration_days`);
+  //      * the cost distribution is centred on `simulatedCostOutcomeSar`, the scenario's
+  //        deterministic cost outcome, using the engine's documented -5% / +15% (+risk) envelope;
+  //      * open risks supplied by the caller widen the pessimistic duration bound exactly as they do
+  //        in RisksView -- no correlation model is assumed and no risk is invented here.
+  //
+  //    If the network cannot be simulated (a logic cycle, no activities), no percentile is published:
+  //    the envelope is marked unavailable and the deterministic scenario values are shown as such.
+  const deterministicNetwork = calculateDeterministicNetworkDuration(activities, links);
+  const durationScaleFactor =
+    deterministicNetwork.valid && deterministicNetwork.durationDays > 0
+      ? totalSimulatedDurationDays / deterministicNetwork.durationDays
+      : 1;
+  const scenarioActivities: Activity[] = activities.map((act) =>
+    act.is_milestone
+      ? act
+      : {
+          ...act,
+          duration_days: Math.max(1, Math.round((Number(act.duration_days) || 1) * durationScaleFactor)),
+        },
+  );
+  const envelopeRisks = options?.risks || [];
+  const openRiskCount = envelopeRisks.filter((r) => r.status === 'open').length;
+  const envelopeIterations = Math.max(1, Math.round(options?.iterations ?? 500));
+  const simulation = runMonteCarloSimulation(
+    scenarioActivities,
+    links,
+    envelopeRisks,
+    simulatedCostOutcomeSar,
+    envelopeIterations,
+    project.calendar_type || '6_days',
+    { seed: options?.seed ?? null, dataDate: project.data_date || null },
+  );
+
+  const envelopeCaveatAr = simulation.valid
+    ? openRiskCount === 0
+      ? 'لا توجد مخاطر مفتوحة ممررة للمحاكاة: تشتت المدد يأتي من الحد المتفائل (0.85×) وحده، لذا قد يقل P80 عن مدة السيناريو الحتمية.'
+      : `تم استخراج النسب من توزيع المحاكاة الفعلية (${simulation.validIterations} دورة) مع ${openRiskCount} خطراً مفتوحاً.`
+    : 'تعذّر تشغيل المحاكاة الاحتمالية؛ القيم المعروضة هي ناتج السيناريو الحتمي وليست نسباً احتمالية.';
+  const envelopeCaveatEn = simulation.valid
+    ? openRiskCount === 0
+      ? 'No open risks were supplied to the simulation: duration dispersion comes from the optimistic bound (0.85x) alone, so P80 can sit below the deterministic scenario duration.'
+      : `Percentiles sampled from the actual simulation distribution (${simulation.validIterations} iterations) with ${openRiskCount} open risk(s).`
+    : 'The probabilistic simulation could not run; the figures shown are the deterministic scenario outcome, not percentiles.';
+
+  const probabilisticEnvelope: ScenarioProbabilisticEnvelope = {
+    valid: simulation.valid,
+    source: simulation.valid ? 'monte_carlo' : 'unavailable',
+    iterations: simulation.validIterations,
+    p50DurationDays: simulation.valid ? simulation.p50Days : null,
+    p80DurationDays: simulation.valid ? simulation.p80Days : null,
+    p90DurationDays: simulation.valid ? simulation.p90Days : null,
+    p50CostSar: simulation.valid ? simulation.p50Cost : null,
+    p80CostSar: simulation.valid ? simulation.p80Cost : null,
+    p90CostSar: simulation.valid ? simulation.p90Cost : null,
+    p50FinishDate: simulation.valid ? addWorkingDays(startDate, simulation.p50Days, calendar) : null,
+    p90FinishDate: simulation.valid ? addWorkingDays(startDate, simulation.p90Days, calendar) : null,
+    minDurationDays: simulation.valid ? simulation.minDurationDays : null,
+    maxDurationDays: simulation.valid ? simulation.maxDurationDays : null,
+    minCostSar: simulation.valid ? simulation.minCost : null,
+    maxCostSar: simulation.valid ? simulation.maxCost : null,
+    deterministicNetworkDurationDays: deterministicNetwork.durationDays,
+    durationScaleFactor: Number(durationScaleFactor.toFixed(6)),
+    openRiskCount,
+    seed: simulation.seed,
+    noteAr: simulation.valid
+      ? envelopeCaveatAr
+      : `${envelopeCaveatAr} ${simulation.validation.messageAr || ''}`.trim(),
+    noteEn: simulation.valid
+      ? envelopeCaveatEn
+      : `${envelopeCaveatEn} ${simulation.validation.messageEn || ''}`.trim(),
+  };
+
+  // The published P80 pair: sampled when the envelope is valid, otherwise the deterministic outcome
+  // with `probabilisticEnvelope.valid === false` telling the consumer which one it is looking at.
+  const p80DurationDays = simulation.valid ? simulation.p80Days : totalSimulatedDurationDays;
   const p80FinishDate = addWorkingDays(startDate, p80DurationDays, calendar);
-  const p80CostSar = Math.round(simulatedCostOutcomeSar * 1.06);
+  const p80CostSar = simulation.valid ? simulation.p80Cost : simulatedCostOutcomeSar;
 
   // 5. Feasibility Score & Risk Classification
   let feasibilityScore = 100;
@@ -379,6 +487,7 @@ export function simulateComplexProjectScenario(
     peakCashDeficitSar,
     p80FinishDate,
     p80CostSar,
+    probabilisticEnvelope,
     feasibilityScore,
     contractualClaimClause,
     riskRating,
@@ -457,19 +566,42 @@ export function runPrecisionWatchdogAudit(
     notesEn: 'Monthly working capital requirements strictly reconcile against client billing schedule.',
   });
 
-  // 4. Statistical Bounds Ordering
+  // 4. Statistical Bounds Ordering -- MEASURED from the sampled envelopes (GAP-029 / GAP-031).
+  //    The former metric asserted "100% monotonic, deviation 0" without looking at a single number.
+  //    It now reads each scenario's simulated percentiles and reports real violations. P10 is not
+  //    claimed any more because the engine does not produce it.
+  const envelopes = results.map((r) => r.probabilisticEnvelope);
+  const simulatedEnvelopes = envelopes.filter((e) => e.valid);
+  const isMonotonic = (values: (number | null)[]): boolean =>
+    values.every((v): v is number => v !== null) &&
+    (values[0] as number) <= (values[1] as number) &&
+    (values[1] as number) <= (values[2] as number);
+  const monotonicityViolations = simulatedEnvelopes.filter(
+    (e) =>
+      !isMonotonic([e.p50DurationDays, e.p80DurationDays, e.p90DurationDays]) ||
+      !isMonotonic([e.p50CostSar, e.p80CostSar, e.p90CostSar]),
+  ).length;
+  const unavailableEnvelopes = envelopes.length - simulatedEnvelopes.length;
+  const sampledIterations = simulatedEnvelopes.reduce((sum, e) => sum + e.iterations, 0);
   metrics.push({
     id: 'WATCH-STAT-01',
     category: 'statistical_bounds',
-    labelAr: 'انضباط التوزيع الإحصائي لمونت كارلو (P10 <= P50 <= P80 <= P90)',
+    labelAr: 'انضباط التوزيع الإحصائي لمونت كارلو (P50 <= P80 <= P90)',
     labelEn: 'Monte Carlo Statistical Percentile Monotonicity',
-    formula: 'P10(Days) <= P50(Days) <= P80(Days) <= P90(Days)',
-    calculatedValue: 'رتابة تصاعدية تامة 100%',
-    expectedValue: 'P10 <= P50 <= P80 <= P90',
-    deviation: 0,
-    precisionStatus: 'exact',
-    notesAr: 'منحنى التوزيع التراكمي للتواريخ والتكاليف متصل ومنضبط إحصائياً دون أي شذوذ احتمالي.',
-    notesEn: 'Cumulative probability distribution functions exhibit strict monotonic compliance.',
+    formula: 'P50 <= P80 <= P90 for sampled duration days AND sampled cost, per scenario envelope',
+    calculatedValue: `${simulatedEnvelopes.length}/${envelopes.length} غلاف احتمالي مستخرج من المحاكاة · مخالفات الرتابة: ${monotonicityViolations} · إجمالي الدورات: ${sampledIterations.toLocaleString()}${unavailableEnvelopes ? ` · ${unavailableEnvelopes} سيناريو بلا محاكاة صالحة` : ''}`,
+    expectedValue: 'P50 <= P80 <= P90 in every valid envelope (interpolated percentiles of sorted samples)',
+    deviation: monotonicityViolations,
+    precisionStatus:
+      monotonicityViolations > 0 ? 'drift_detected' : simulatedEnvelopes.length > 0 ? 'exact' : 'acceptable',
+    notesAr:
+      simulatedEnvelopes.length > 0
+        ? `النسب المئوية مستخرجة بالاستيفاء الخطي من عينات المحاكاة المرتبة لكل سيناريو على حدة، وليست متوسطاً مضروباً في معامل ثابت. ${unavailableEnvelopes ? 'السيناريوهات غير المحاكاة تعرض ناتجها الحتمي مع وسم صريح.' : ''}`
+        : 'لم يتم تشغيل أي محاكاة صالحة؛ القيم المعروضة حتمية وليست نسباً احتمالية.',
+    notesEn:
+      simulatedEnvelopes.length > 0
+        ? `Percentiles are interpolated from each scenario's sorted simulation samples, never a mean times a fixed factor. ${unavailableEnvelopes ? 'Scenarios without a valid simulation show their deterministic outcome, explicitly labelled.' : ''}`
+        : 'No valid simulation ran; the figures shown are deterministic outcomes, not percentiles.',
   });
 
   return metrics;
