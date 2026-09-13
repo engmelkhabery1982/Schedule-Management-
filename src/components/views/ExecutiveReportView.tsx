@@ -10,12 +10,16 @@ import type {
   ProgressUpdate,
   Risk,
   BoqItem,
-  EvmMetrics,
 } from '@/types';
 import { runDcma14PointAudit } from '@/lib/scheduleQualityEngine';
 import { generateSCurveData, type SCurveData } from '@/lib/sCurveEngine';
 import { calculateEarnedSchedule } from '@/lib/earnedScheduleEngine';
-import { calculateProjectEvmAtDataDate } from '@/lib/planningEngine';
+import {
+  calculateProjectEvmAtDataDate,
+  deriveEvmFromScalars,
+  type ComprehensiveProjectEvm,
+} from '@/lib/planningEngine';
+import { reconcileFinishForecasts } from '@/lib/forecastReconciliation';
 import SCurveChart from '@/components/views/SCurveChart';
 import {
   Printer,
@@ -64,7 +68,14 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
     ]);
     setActivities(actRes.data || []);
     setLinks((linkRes.data || []) as ActivityLink[]);
-    setBaselineActivities((baselineRes.data || []) as BaselineActivity[]);
+    // Cross-project leak: `baseline_activities` has no `project_id` column (it hangs off
+    // `baselines`), so the unfiltered fetch above pulled every project's baseline snapshots into
+    // this report's DCMA audit and baseline S-Curve. Scope them to the activities of the project
+    // being reported — client-side, no query or migration change.
+    const projectActivityIds = new Set(((actRes.data || []) as Activity[]).map((a) => a.id));
+    setBaselineActivities(
+      ((baselineRes.data || []) as BaselineActivity[]).filter((b) => projectActivityIds.has(b.activity_id)),
+    );
     setBudgetLines(bgtRes.data || []);
     setTransactions((cstRes.data || []) as CostTransaction[]);
     setProgressUpdates((prgRes.data || []) as ProgressUpdate[]);
@@ -83,13 +94,17 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
     );
   }, [activities, links, baselineActivities, project?.data_date]);
 
-  // Compute EVM metrics using unified engine
-  const evmMetrics: EvmMetrics = useMemo(() => {
+  // Compute EVM metrics using the unified engine.
+  // Typed as the canonical `ComprehensiveProjectEvm` (it always was one at runtime): the legacy
+  // `EvmMetrics` annotation hid `earnedProgressPercent`, the ratio statuses and `dataDate` from this
+  // report, so the progress and data-quality semantics could not be shown (GAP-039 / GAP-036).
+  const evmMetrics: ComprehensiveProjectEvm = useMemo(() => {
+    // Null safety (no project selected yet): return the canonical all-zero empty state instead of
+    // dereferencing `project!`. Same pattern as Dashboard — no fabricated Project, no conditional
+    // hook, and the ratios come back flagged 'empty_no_data' rather than as fake performance.
+    if (!project) return deriveEvmFromScalars(0, 0, 0, 0);
     return calculateProjectEvmAtDataDate(
-      // Non-null assertion only: the engine already dereferences `project` at runtime, so the
-      // emitted JavaScript is unchanged. Proper null handling for this view is tracked as a
-      // separate (later-wave) null-safety item, not part of the compilation baseline.
-      project!,
+      project,
       activities,
       // GAP-036 correction: this parameter is the CBS budget-line input of the EVM engine.
       // It previously received `baselineActivities` (baseline activity snapshots, which carry
@@ -140,6 +155,12 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
       progressUpdates,
     });
   }, [project, activities, evmMetrics, sCurveData, budgetLines, boqItems, transactions, progressUpdates]);
+
+  // GAP-041: name both finish methods and their delta instead of showing one ambiguous date.
+  const finishReconciliation = useMemo(
+    () => reconcileFinishForecasts(activities, earnedScheduleData),
+    [activities, earnedScheduleData],
+  );
 
   // Lookahead activities (next 3 weeks from data date)
   const lookaheadActivities = useMemo(() => {
@@ -212,7 +233,10 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
           <div className="text-left space-y-1">
             <div className="bg-amber-50 border border-amber-200 px-3 py-1.5 rounded-lg text-right">
               <div className="text-[10px] text-amber-800 font-bold uppercase">تاريخ خط الحالة (Data Date)</div>
-              <div className="text-sm font-black font-mono text-slate-900">{project?.data_date || '2026-11-15'}</div>
+              {/* The Data Date every figure below was computed at, read from the canonical result —
+                  not a view-level literal, which disagreed with the engine whenever data_date was
+                  null and made this report unreconcilable against the other screens. */}
+              <div className="text-sm font-black font-mono text-slate-900">{evmMetrics.dataDate}</div>
             </div>
             <div className="text-[10px] text-slate-400 font-mono text-left">Generated: 2026-09-09</div>
           </div>
@@ -239,19 +263,135 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
           </div>
 
           <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-xl">
-            <span className="text-[11px] text-slate-500 font-semibold">الإنجاز المتوقع IEAC(t)</span>
-            <div className="text-base font-black text-purple-900 mt-1.5">
-              {earnedScheduleData.forecastCompletionDate}
-            </div>
-            <span className="text-[10px] text-rose-600 font-bold">
-              تأخير متوقع: {Math.abs(earnedScheduleData.varianceAtCompletionTimeDays)} يوم
+            <span className="text-[11px] text-slate-500 font-semibold">
+              {finishReconciliation.labels.earned_schedule_trend.nameAr}
             </span>
+            <div className="text-base font-black text-purple-900 mt-1.5">
+              {finishReconciliation.esTrendFinish || 'غير قابل للحساب (N/A)'}
+            </div>
+            {/* GAP-041: this is a performance trend forecast (IEAC(t) = PD / SPI(t)), NOT the CPM
+                deterministic finish. When SPI(t) is 0 it is not computable and no date is shown. */}
+            {finishReconciliation.esComputable ? (
+              <span className="text-[10px] text-rose-600 font-bold">
+                تأخير متوقع مقابل النهاية المخططة: {Math.abs(earnedScheduleData.varianceAtCompletionTimeDays)} يوم
+              </span>
+            ) : (
+              <span className="text-[10px] text-slate-500 font-bold">
+                IEAC(t) غير قابل للحساب ({finishReconciliation.esAvailability === 'spi_t_zero' ? 'SPI(t) = 0' : finishReconciliation.esAvailability === 'no_planned_duration' ? 'لا توجد مدة مخططة' : 'لا توجد نتائج جدول مكتسب'}) — لا يُعرض تاريخ بديل.
+              </span>
+            )}
           </div>
 
           <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-xl">
             <span className="text-[11px] text-slate-500 font-semibold">جودة وسلامة الجدول (DCMA)</span>
             <div className="text-2xl font-black text-emerald-700 mt-1">{dcma.score}%</div>
             <span className="text-[10px] text-emerald-600 font-bold">{dcma.totalPassed}/14 معايير معتمدة</span>
+          </div>
+        </div>
+
+        {/* Canonical project-control EVM (GAP-036 / GAP-039).
+            Every number here is a direct field read of the single canonical engine result — no
+            second formula and no view-level rounding policy — so this report reconciles with
+            Dashboard, BudgetView, ProgressView and PortfolioView for the same project and the same
+            Data Date (`evmMetrics.dataDate`). */}
+        <div className="border border-slate-200 rounded-xl p-4 space-y-3">
+          <h3 className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+            <Scale size={15} className="text-emerald-600" />
+            مؤشرات التحكم بالمشروع المعتمدة (Canonical Project Controls — EVM @ Data Date {evmMetrics.dataDate})
+          </h3>
+
+          <div className="grid grid-cols-2 sm:grid-cols-5 gap-2.5">
+            <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg">
+              <span className="text-[10px] text-slate-500 font-semibold block">الإنجاز المكتسب للمشروع (EV / BAC)</span>
+              <span className="text-lg font-black text-amber-700 font-mono">{evmMetrics.earnedProgressPercent}%</span>
+              <span className="text-[9px] text-slate-400 block">المخطط (PV / BAC): {evmMetrics.plannedProgressPercent}%</span>
+            </div>
+            <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg">
+              <span className="text-[10px] text-slate-500 font-semibold block">ميزانية العقد BAC</span>
+              <span className="text-lg font-black text-slate-800 font-mono">{evmMetrics.bac.toLocaleString()}</span>
+            </div>
+            <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg">
+              <span className="text-[10px] text-slate-500 font-semibold block">القيمة المخططة PV</span>
+              <span className="text-lg font-black text-slate-800 font-mono">{evmMetrics.pv.toLocaleString()}</span>
+            </div>
+            <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg">
+              <span className="text-[10px] text-slate-500 font-semibold block">القيمة المكتسبة EV</span>
+              <span className="text-lg font-black text-emerald-700 font-mono">{evmMetrics.ev.toLocaleString()}</span>
+            </div>
+            <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg">
+              <span className="text-[10px] text-slate-500 font-semibold block">التكلفة الفعلية AC</span>
+              <span className="text-lg font-black text-slate-800 font-mono">{evmMetrics.ac.toLocaleString()}</span>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 sm:grid-cols-5 gap-2.5">
+            <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg">
+              <span className="text-[10px] text-slate-500 font-semibold block">كفاءة التكلفة CPI</span>
+              <span className={`text-lg font-black font-mono ${evmMetrics.cpiStatus === 'valid' ? (evmMetrics.cpi >= 1 ? 'text-emerald-700' : 'text-rose-700') : 'text-slate-500'}`}>
+                {evmMetrics.cpiStatus === 'valid' ? evmMetrics.cpi.toFixed(3) : 'غير مقاس (N/A)'}
+              </span>
+              {evmMetrics.cpiStatus !== 'valid' && (
+                <span className="text-[9px] text-rose-600 block">
+                  {evmMetrics.cpiStatus === 'empty_no_data' ? 'لا توجد بيانات (حالة فارغة)' : 'مقام صفري مع وجود قيمة مكتسبة — خلل بيانات'}
+                </span>
+              )}
+            </div>
+            <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg">
+              <span className="text-[10px] text-slate-500 font-semibold block">كفاءة الجدول SPI</span>
+              <span className={`text-lg font-black font-mono ${evmMetrics.spiStatus === 'valid' ? (evmMetrics.spi >= 1 ? 'text-emerald-700' : 'text-rose-700') : 'text-slate-500'}`}>
+                {evmMetrics.spiStatus === 'valid' ? evmMetrics.spi.toFixed(3) : 'غير مقاس (N/A)'}
+              </span>
+              {evmMetrics.spiStatus !== 'valid' && (
+                <span className="text-[9px] text-rose-600 block">
+                  {evmMetrics.spiStatus === 'empty_no_data' ? 'لا توجد بيانات (حالة فارغة)' : 'مقام صفري مع وجود قيمة مكتسبة — خلل بيانات'}
+                </span>
+              )}
+            </div>
+            <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg">
+              <span className="text-[10px] text-slate-500 font-semibold block">التقدير عند الإنجاز EAC</span>
+              <span className="text-lg font-black text-amber-700 font-mono">{evmMetrics.eac.toLocaleString()}</span>
+            </div>
+            <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg">
+              <span className="text-[10px] text-slate-500 font-semibold block">التكلفة المتبقية ETC</span>
+              <span className="text-lg font-black text-slate-800 font-mono">{evmMetrics.etc.toLocaleString()}</span>
+            </div>
+            <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg">
+              <span className="text-[10px] text-slate-500 font-semibold block">الانحراف عند الإنجاز VAC</span>
+              <span className={`text-lg font-black font-mono ${evmMetrics.vac >= 0 ? 'text-emerald-700' : 'text-rose-700'}`}>
+                {evmMetrics.vac >= 0 ? '+' : ''}{evmMetrics.vac.toLocaleString()}
+              </span>
+            </div>
+          </div>
+
+          {/* GAP-041: the two finish methods, both named, with the delta in days. */}
+          <div className="p-3 bg-amber-50/60 border border-amber-200 rounded-lg space-y-1.5">
+            <p className="text-[11px] font-black text-slate-700">
+              تاريخ الإنجاز المتوقع — طريقتان مختلفتان (وليستا تاريخاً واحداً متعارضاً)
+            </p>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-[11px]">
+              <div className="p-2 bg-white border border-slate-200 rounded-lg">
+                <span className="text-slate-500 font-bold block">{finishReconciliation.labels.cpm_deterministic.nameAr}</span>
+                <span className="font-mono font-black text-slate-800">{finishReconciliation.cpmEarlyFinish || 'غير متوفر (N/A)'}</span>
+              </div>
+              <div className="p-2 bg-white border border-slate-200 rounded-lg">
+                <span className="text-slate-500 font-bold block">{finishReconciliation.labels.earned_schedule_trend.nameAr}</span>
+                <span className="font-mono font-black text-purple-900">{finishReconciliation.esTrendFinish || 'غير قابل للحساب (N/A)'}</span>
+              </div>
+              <div className="p-2 bg-white border border-slate-200 rounded-lg">
+                <span className="text-slate-500 font-bold block">الفرق بين الطريقتين (Delta)</span>
+                <span className={`font-mono font-black ${finishReconciliation.deltaDays === null ? 'text-slate-400' : finishReconciliation.deltaDays > 0 ? 'text-rose-700' : finishReconciliation.deltaDays < 0 ? 'text-emerald-700' : 'text-slate-700'}`}>
+                  {finishReconciliation.deltaDays === null
+                    ? 'N/A'
+                    : `${finishReconciliation.deltaDays > 0 ? '+' : ''}${finishReconciliation.deltaDays} يوم`}
+                </span>
+              </div>
+            </div>
+            <p className="text-[10px] text-slate-500 leading-relaxed">
+              {finishReconciliation.labels.cpm_deterministic.basisAr}
+            </p>
+            <p className="text-[10px] text-slate-500 leading-relaxed">
+              {finishReconciliation.labels.earned_schedule_trend.basisAr}
+            </p>
           </div>
         </div>
 

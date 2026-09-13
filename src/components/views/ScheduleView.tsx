@@ -65,7 +65,9 @@ const AVAILABLE_COLUMNS: ColumnOption[] = [
   { key: 'calendar_type', labelAr: 'التقويم', labelEn: 'Calendar', defaultVisible: false },
   { key: 'constraint', labelAr: 'القيد الزمني', labelEn: 'Constraint', defaultVisible: true },
   { key: 'early_start', labelAr: 'البداية المبكرة', labelEn: 'Early Start', defaultVisible: true },
-  { key: 'early_finish', labelAr: 'النهاية المبكرة', labelEn: 'Early Finish', defaultVisible: true },
+  // GAP-041: this screen reports the deterministic CPM finish. It is labelled as such so it is
+  // never read as the Earned Schedule trend forecast (IEAC(t)) shown in Progress / Executive Report.
+  { key: 'early_finish', labelAr: 'النهاية المبكرة (CPM حتمية)', labelEn: 'Early Finish (CPM deterministic)', defaultVisible: true },
   { key: 'late_start', labelAr: 'البداية المتأخرة', labelEn: 'Late Start', defaultVisible: false },
   { key: 'late_finish', labelAr: 'النهاية المتأخرة', labelEn: 'Late Finish', defaultVisible: false },
   { key: 'duration_days', labelAr: 'المدة الأصلية', labelEn: 'Duration', defaultVisible: true },
@@ -77,7 +79,7 @@ const AVAILABLE_COLUMNS: ColumnOption[] = [
   { key: 'free_float', labelAr: 'الهامش الحر (FF)', labelEn: 'Free Float', defaultVisible: true },
   { key: 'activity_drag', labelAr: 'كبح المسار (Drag)', labelEn: 'Drag', defaultVisible: true },
   { key: 'longest_path', labelAr: 'المسار الأطول', labelEn: 'Longest Path', defaultVisible: false },
-  { key: 'expected_finish', labelAr: 'النهاية المتوقعة', labelEn: 'Expected Finish', defaultVisible: false },
+  { key: 'expected_finish', labelAr: 'النهاية المتوقعة (تاريخ مُدخل)', labelEn: 'Expected Finish (entered date)', defaultVisible: false },
   { key: 'baseline_var', labelAr: 'انحراف خط الأساس', labelEn: 'Baseline Var', defaultVisible: true },
   { key: 'critical', labelAr: 'حرج', labelEn: 'Critical', defaultVisible: true },
   { key: 'actions', labelAr: 'إجراءات', labelEn: 'Actions', defaultVisible: true },
@@ -1529,7 +1531,12 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
                         </div>
                         <div className="flex items-center gap-2 flex-shrink-0 font-mono text-[11px]">
                           <span className="text-amber-800">{item.rollup?.totalDuration || 0}{lang === 'ar' ? 'د' : 'd'}</span>
-                          <span className="bg-amber-200/80 px-1.5 py-0.5 rounded text-[10px] font-black">{item.rollup?.percentComplete || 0}%</span>
+                          <span
+                            className="bg-amber-200/80 px-1.5 py-0.5 rounded text-[10px] font-black"
+                            title={lang === 'ar' ? 'متوسط إنجاز الأنشطة (غير مرجّح) — ليس الإنجاز المكتسب للمشروع' : 'Activity Completion Average (unweighted) — not earned project progress'}
+                          >
+                            {item.rollup?.percentComplete || 0}%
+                          </span>
                         </div>
                       </div>
                     );
@@ -1675,7 +1682,7 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
                             <div
                               className="absolute h-4 top-4 bg-slate-900 border border-slate-800 rounded-sm shadow-sm flex items-center px-1.5 text-[9px] text-amber-300 font-bold overflow-hidden"
                               style={{ left: `${coords.left}px`, width: `${coords.width}px` }}
-                              title={`WBS Summary: ${item.wbsNode?.name}\nStart: ${item.rollup?.earlyStart}\nFinish: ${item.rollup?.earlyFinish}\nProgress: ${item.rollup?.percentComplete}%`}
+                              title={`WBS Summary: ${item.wbsNode?.name}\nCPM Early Start (deterministic): ${item.rollup?.earlyStart}\nCPM Early Finish (deterministic): ${item.rollup?.earlyFinish}\nActivity Completion Average (unweighted mean of % Complete, NOT earned progress): ${item.rollup?.percentComplete}%`}
                             >
                               <div
                                 className="absolute top-0 bottom-0 left-0 bg-amber-500/50"
@@ -1817,7 +1824,7 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
             <div className="p-4 border-b border-slate-100 flex items-center justify-between">
               <div>
                 <h3 className="font-bold text-slate-900 text-sm">{lang === 'ar' ? 'جدول الأنشطة التفصيلي وهيكل WBS (Primavera P6 Columns Table)' : 'Detailed Activity & Float Schedule (Primavera P6 Format)'}</h3>
-                <p className="text-xs text-slate-400">{lang === 'ar' ? 'عرض شامل لكافة الحقول الحسابية لشبكة المسار الحرج والتقاويم المخصصة' : 'Multi-attribute scheduling grid with CPM float analysis'}</p>
+                <p className="text-xs text-slate-400">{lang === 'ar' ? 'عرض شامل لكافة الحقول الحسابية لشبكة المسار الحرج والتقاويم المخصصة — تواريخ البداية/النهاية هنا حتمية من حساب CPM وليست تنبؤ الجدول المكتسب IEAC(t)' : 'Multi-attribute scheduling grid with CPM float analysis — start/finish dates here are the deterministic CPM result, not the earned-schedule IEAC(t) forecast'}</p>
               </div>
               <div className="flex items-center gap-2">
                 <button
@@ -1875,9 +1882,16 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
                                 <span className="text-slate-500 font-normal text-[11px]">({item.rollup?.activitiesCount || 0} أنشطة)</span>
                               </div>
                               <div className="flex items-center gap-4 text-xs font-mono">
-                                <span>{item.rollup?.earlyStart || '-'} ← {item.rollup?.earlyFinish || '-'}</span>
+                                <span title={lang === 'ar' ? 'البداية ← النهاية المبكرة من حساب CPM (تواريخ حتمية، ليست تنبؤ الجدول المكتسب)' : 'CPM early start ← early finish (deterministic, not an earned-schedule forecast)'}>
+                                  {item.rollup?.earlyStart || '-'} ← {item.rollup?.earlyFinish || '-'}
+                                </span>
                                 <span className="text-amber-800 font-bold">{item.rollup?.totalDuration || 0} يوم</span>
-                                <span className="bg-amber-300 text-slate-950 px-2 py-0.5 rounded font-black">{item.rollup?.percentComplete || 0}%</span>
+                                <span
+                                  className="bg-amber-300 text-slate-950 px-2 py-0.5 rounded font-black"
+                                  title={lang === 'ar' ? 'متوسط إنجاز الأنشطة (غير مرجّح) — ليس الإنجاز المكتسب للمشروع' : 'Activity Completion Average (unweighted) — not earned project progress'}
+                                >
+                                  {item.rollup?.percentComplete || 0}%
+                                </span>
                               </div>
                             </div>
                           </td>

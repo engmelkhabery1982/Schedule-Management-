@@ -1,7 +1,23 @@
 import { useState, useEffect, useMemo } from 'react';
 import { supabase } from '@/lib/supabase';
-import type { Project, Activity, ProgressUpdate, InspectionRequest, BoqItem, ActivityLink, SubcontractPackage } from '@/types';
+import type {
+  Project,
+  Activity,
+  ProgressUpdate,
+  InspectionRequest,
+  BoqItem,
+  ActivityLink,
+  SubcontractPackage,
+  BudgetLine,
+  CostTransaction,
+} from '@/types';
 import { calculateEarnedSchedule } from '@/lib/earnedScheduleEngine';
+import {
+  calculateActivityCompletionAverage,
+  calculateProjectEvmAtDataDate,
+  deriveEvmFromScalars,
+} from '@/lib/planningEngine';
+import { reconcileFinishForecasts } from '@/lib/forecastReconciliation';
 import {
   getSubcontractPackages,
   saveSubcontractPackages,
@@ -60,6 +76,11 @@ export default function ProgressView({ project }: ProgressViewProps) {
   const [updates, setUpdates] = useState<ProgressUpdate[]>([]);
   const [inspections, setInspections] = useState<InspectionRequest[]>([]);
   const [boqItems, setBoqItems] = useState<BoqItem[]>([]);
+  // Canonical project-control sources (GAP-008). The EVM engine allocates BAC from `budget_lines`
+  // and rolls actual cost up from `cost_transactions`; this view loaded neither, so every consumer
+  // of its numbers saw an equal share of contract value and a synthetic AC instead of real data.
+  const [budgetLines, setBudgetLines] = useState<BudgetLine[]>([]);
+  const [costTransactions, setCostTransactions] = useState<CostTransaction[]>([]);
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState('');
   const [saving, setSaving] = useState(false);
@@ -131,12 +152,15 @@ export default function ProgressView({ project }: ProgressViewProps) {
   async function loadData() {
     if (!project) return;
     setLoading(true);
-    const [actRes, updRes, inspectionRes, boqRes, linksRes] = await Promise.all([
+    const [actRes, updRes, inspectionRes, boqRes, linksRes, budgetRes, costRes] = await Promise.all([
       supabase.from('activities').select('*').eq('project_id', project.id).order('sort_order', { ascending: true }),
       supabase.from('progress_updates').select('*').eq('project_id', project.id).order('update_date', { ascending: false }),
       supabase.from('inspection_requests').select('*').eq('project_id', project.id).order('inspection_date', { ascending: false }),
       supabase.from('boq_items').select('*').eq('project_id', project.id).order('sort_order', { ascending: true }),
       supabase.from('activity_links').select('*').eq('project_id', project.id),
+      // Project-scoped, same tables BudgetView/Dashboard feed the canonical EVM with (GAP-008).
+      supabase.from('budget_lines').select('*').eq('project_id', project.id),
+      supabase.from('cost_transactions').select('*').eq('project_id', project.id).order('transaction_date', { ascending: false }),
     ]);
     
     const actList = (actRes.data || []) as Activity[];
@@ -151,6 +175,8 @@ export default function ProgressView({ project }: ProgressViewProps) {
     setUpdates(updRes.data || []);
     setInspections((inspectionRes.data || []) as InspectionRequest[]);
     setBoqItems((boqRes.data || []) as BoqItem[]);
+    setBudgetLines((budgetRes.data || []) as BudgetLine[]);
+    setCostTransactions((costRes.data || []) as CostTransaction[]);
     setLoading(false);
   }
 
@@ -183,42 +209,63 @@ export default function ProgressView({ project }: ProgressViewProps) {
     return calculateSubcontractorLedger(subcontracts, activities, boqItems);
   }, [subcontracts, activities, boqItems]);
 
-  // Earned Schedule Calculation — no synthetic cost ratio. The engine calls the canonical Wave-2
-  // EVM exactly once with the sources this view loads (activities, BOQ items, progress updates) and
-  // takes EV / AC / CPI / BAC from it (GAP-007).
+  // Canonical project-control EVM (GAP-008 / GAP-039). This view used to derive BAC, EV and project
+  // progress itself: BAC from fuzzy BOQ-description unit rates (with an equal-share fallback), EV as
+  // Σ(activity BAC × percent_complete) and progress as the unweighted arithmetic mean of
+  // percent_complete. Those local paths are gone; the same engine that Dashboard, BudgetView,
+  // ExecutiveReportView and PortfolioView use is now the single source, fed with the same real
+  // sources (activities, budget_lines, boq_items, cost_transactions, progress_updates).
+  // Null safety: with no project selected the canonical low-level helper produces an all-zero empty
+  // state — no Project object is fabricated and no hook becomes conditional.
+  const evm = useMemo(() => {
+    if (!project) return deriveEvmFromScalars(0, 0, 0, 0);
+    return calculateProjectEvmAtDataDate(
+      project,
+      activities,
+      budgetLines,
+      boqItems,
+      costTransactions,
+      updates,
+    );
+  }, [project, activities, budgetLines, boqItems, costTransactions, updates]);
+
+  // Earned Schedule — consumes the canonical EVM above (GAP-007) and the same real sources, so the
+  // engine does not recompute it and this view computes nothing twice (GAP-008).
   const earnedScheduleData = useMemo(() => {
     return calculateEarnedSchedule({
       project,
       activities,
+      evm,
+      budgetLines,
       boqItems,
+      costTransactions,
       progressUpdates: updates,
     });
-  }, [project, activities, boqItems, updates]);
+  }, [project, activities, evm, budgetLines, boqItems, costTransactions, updates]);
 
-  // Overall Financial & Physical Totals
+  // GAP-041: the CPM deterministic finish and the Earned Schedule trend forecast are different
+  // methods. Both are named, both are shown, and the delta is reported; a non-computable trend
+  // forecast surfaces as N/A rather than as a fabricated date.
+  const finishReconciliation = useMemo(
+    () => reconcileFinishForecasts(activities, earnedScheduleData),
+    [activities, earnedScheduleData],
+  );
+
+  // Project-control totals. Every money/progress figure here is a field read of the canonical EVM —
+  // this view no longer owns a second formula. The one statistic still computed locally is the task
+  // average, kept only under an explicit name: it is the unweighted arithmetic mean of
+  // percent_complete and it is NOT project / physical / earned progress (GAP-039).
   const overallMetrics = useMemo(() => {
-    let totalBac = project?.contract_value || 0;
-    let totalEarnedValue = 0;
-    let totalWeightProgress = 0;
-
-    activities.forEach((act) => {
-      const unitRate = getActivityUnitRate(act);
-      const actPlannedQty = act.planned_quantity || 1;
-      const actBac = unitRate * actPlannedQty;
-      const pct = (act.percent_complete || 0) / 100;
-      totalEarnedValue += actBac * pct;
-    });
-
-    if (activities.length > 0) {
-      totalWeightProgress = activities.reduce((s, a) => s + (a.percent_complete || 0), 0) / activities.length;
-    }
-
     return {
-      totalBac: totalBac > 0 ? totalBac : activities.reduce((s, a) => s + getActivityUnitRate(a) * (a.planned_quantity || 1), 0),
-      totalEarnedValue: Math.round(totalEarnedValue),
-      overallProgress: Number(totalWeightProgress.toFixed(1)),
+      totalBac: evm.bac,
+      totalEarnedValue: Math.round(evm.ev),
+      earnedProgressPercent: evm.earnedProgressPercent,
+      plannedProgressPercent: evm.plannedProgressPercent,
+      activityCompletionAveragePercent: Number(
+        (calculateActivityCompletionAverage(activities, new Map()) * 100).toFixed(1),
+      ),
     };
-  }, [activities, project, boqItems]);
+  }, [evm, activities]);
 
   // Filtered Inspections for Archive & Historical Audit
   const filteredInspections = useMemo(() => {
@@ -719,7 +766,10 @@ export default function ProgressView({ project }: ProgressViewProps) {
         dataDate: cutoffDate,
         outOfSequenceMode,
         activitiesCount: activities.length,
-        overallProgress: overallMetrics.overallProgress,
+        // Canonical earned progress of the revision's data date (GAP-039); the unweighted task
+        // average is stored next to it, separately named, so neither can be mistaken for the other.
+        overallProgress: overallMetrics.earnedProgressPercent,
+        activityCompletionAverage: overallMetrics.activityCompletionAveragePercent,
         spiTime: earnedScheduleData.schedulePerformanceIndexTime,
         activitiesSnapshot: activities.map((a) => ({
           id: a.id,
@@ -872,13 +922,16 @@ export default function ProgressView({ project }: ProgressViewProps) {
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3.5">
         <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-4">
           <div className="flex items-center justify-between text-slate-500 mb-1">
-            <span className="text-xs font-bold">نسبة الإنجاز التراكمية</span>
+            <span className="text-xs font-bold">الإنجاز المكتسب للمشروع (EV / BAC)</span>
             <TrendingUp size={16} className="text-amber-500" />
           </div>
-          <p className="text-2xl font-black text-slate-900">{overallMetrics.overallProgress}%</p>
+          <p className="text-2xl font-black text-slate-900">{overallMetrics.earnedProgressPercent}%</p>
           <div className="h-1.5 bg-slate-100 rounded-full mt-2 overflow-hidden">
-            <div className="h-full bg-amber-500 rounded-full transition-all" style={{ width: `${overallMetrics.overallProgress}%` }} />
+            <div className="h-full bg-amber-500 rounded-full transition-all" style={{ width: `${Math.min(100, Math.max(0, overallMetrics.earnedProgressPercent))}%` }} />
           </div>
+          <p className="text-[10px] text-slate-400 mt-1.5 leading-relaxed">
+            المخطط (PV / BAC): {overallMetrics.plannedProgressPercent}% · متوسط إنجاز الأنشطة (Activity Completion Average): {overallMetrics.activityCompletionAveragePercent}%
+          </p>
         </div>
 
         <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-4">
@@ -2085,10 +2138,46 @@ export default function ProgressView({ project }: ProgressViewProps) {
                   </span>
                 </div>
                 <div className="flex justify-between py-2">
-                  <span className="text-slate-600">المدة المتوقعة المستقلة للإنجاز IEAC(t):</span>
+                  <span className="text-slate-600">المدة المتوقعة المستقلة للإنجاز IEAC(t) — تنبؤ الجدول المكتسب الاتجاهي:</span>
                   <span className="font-mono font-black text-purple-900">
-                    {earnedScheduleData.estimatedDurationAtCompletionDays} يوم ({earnedScheduleData.forecastCompletionDate})
+                    {finishReconciliation.esComputable
+                      ? `${earnedScheduleData.estimatedDurationAtCompletionDays} يوم (${earnedScheduleData.forecastCompletionDate})`
+                      : 'غير قابل للحساب (N/A)'}
                   </span>
+                </div>
+                {!finishReconciliation.esComputable && (
+                  <p className="text-[11px] text-rose-700 pt-1">
+                    لا يمكن حساب IEAC(t) ({finishReconciliation.esAvailability === 'spi_t_zero' ? 'SPI(t) = 0' : finishReconciliation.esAvailability === 'no_planned_duration' ? 'لا توجد مدة مخططة PD' : 'لا توجد نتائج جدول مكتسب'})؛ لا يُعرض أي تاريخ بديل.
+                  </p>
+                )}
+
+                {/* GAP-041: two different finish methods, both labelled, plus the delta in days. */}
+                <div className="mt-3 p-3 bg-slate-50 border border-slate-200 rounded-lg">
+                  <p className="text-[11px] font-black text-slate-700 mb-2">تواريخ الإنجاز المتوقعة — طريقتان مختلفتان وليستا تاريخاً واحداً متعارضاً</p>
+                  <div className="space-y-1.5 text-[11px]">
+                    <div className="flex justify-between gap-2">
+                      <span className="text-slate-500 font-bold">{finishReconciliation.labels.cpm_deterministic.nameAr}</span>
+                      <span className="font-mono font-black text-slate-800">{finishReconciliation.cpmEarlyFinish || 'غير متوفر (N/A)'}</span>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <span className="text-slate-500 font-bold">{finishReconciliation.labels.earned_schedule_trend.nameAr}</span>
+                      <span className="font-mono font-black text-purple-900">{finishReconciliation.esTrendFinish || 'غير قابل للحساب (N/A)'}</span>
+                    </div>
+                    <div className="flex justify-between gap-2 border-t border-slate-200 pt-1.5">
+                      <span className="text-slate-500 font-bold">الفرق بين الطريقتين (Delta)</span>
+                      <span className={`font-mono font-black ${finishReconciliation.deltaDays === null ? 'text-slate-400' : finishReconciliation.deltaDays > 0 ? 'text-rose-700' : finishReconciliation.deltaDays < 0 ? 'text-emerald-700' : 'text-slate-700'}`}>
+                        {finishReconciliation.deltaDays === null
+                          ? 'N/A'
+                          : `${finishReconciliation.deltaDays > 0 ? '+' : ''}${finishReconciliation.deltaDays} يوم`}
+                      </span>
+                    </div>
+                  </div>
+                  <p className="text-[10px] text-slate-400 mt-2 leading-relaxed">
+                    {finishReconciliation.labels.cpm_deterministic.basisAr}
+                  </p>
+                  <p className="text-[10px] text-slate-400 mt-1 leading-relaxed">
+                    {finishReconciliation.labels.earned_schedule_trend.basisAr}
+                  </p>
                 </div>
               </div>
             </div>

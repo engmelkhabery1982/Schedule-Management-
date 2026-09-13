@@ -128,11 +128,15 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
         pBoqs,
         pTxns,
         pPrgs,
-        p.data_date || '2026-11-15',
+        // GAP-039 cross-screen consistency: the view-level '2026-11-15' override is dropped so the
+        // canonical engine resolves `project.data_date || DEFAULT_DATA_DATE` itself. With the
+        // override a project whose data_date is null was evaluated at a different Data Date here
+        // than on Dashboard / ProgressView / BudgetView / ExecutiveReportView, so the "same" earned
+        // progress KPI could legitimately differ between screens.
       );
 
       const contractVal = evm.bac;
-      const progress = evm.actualProgressPercent;
+      const progress = evm.earnedProgressPercent;
       const pv = evm.pv;
       const ev = evm.ev;
       const ac = evm.ac;
@@ -420,11 +424,11 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
               <div className="space-y-3 bg-slate-50/80 p-3.5 rounded-xl border border-slate-200 text-xs">
                 <div>
                   <div className="flex items-center justify-between text-xs font-bold mb-1">
-                    <span className="text-slate-600">{lang === 'ar' ? 'نسبة الإنجاز الفعلية' : 'Physical Progress'}</span>
+                    <span className="text-slate-600">{lang === 'ar' ? 'الإنجاز المكتسب (EV / BAC)' : 'Earned Progress (EV / BAC)'}</span>
                     <span className="font-mono text-amber-900">{p.progress}%</span>
                   </div>
                   <div className="w-full h-2.5 bg-slate-200 rounded-full overflow-hidden">
-                    <div className="h-full bg-gradient-to-r from-amber-500 to-amber-400 rounded-full" style={{ width: `${p.progress}%` }} />
+                    <div className="h-full bg-gradient-to-r from-amber-500 to-amber-400 rounded-full" style={{ width: `${Math.min(100, Math.max(0, p.progress))}%` }} />
                   </div>
                 </div>
 

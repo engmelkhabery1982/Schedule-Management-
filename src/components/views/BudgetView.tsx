@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo } from 'react';
 import { supabase } from '@/lib/supabase';
 import { getLanguage, type Language } from '@/lib/i18n';
-import { calculateProjectEvmAtDataDate } from '@/lib/planningEngine';
+import { calculateProjectEvmAtDataDate, deriveEvmFromScalars } from '@/lib/planningEngine';
 import {
   aggregateCbsCostCenters,
   calculateMultiEacForecast,
@@ -169,19 +169,25 @@ export default function BudgetView({ project }: BudgetViewProps) {
 
   // Unified EVM metrics from single source of truth engine
   const evm = useMemo(() => {
+    // Null safety (no project selected yet): the canonical all-zero empty state instead of
+    // dereferencing `project!`, which threw on the first render before a project was loaded.
+    // Same pattern as Dashboard / ExecutiveReportView — no fabricated Project, no conditional hook.
+    if (!project) return deriveEvmFromScalars(0, 0, 0, 0);
     return calculateProjectEvmAtDataDate(
-      // Non-null assertion only: the engine already dereferences `project` at runtime, so the
-      // emitted JavaScript is unchanged. Proper null handling for this view is tracked as a
-      // separate (later-wave) null-safety item, not part of the compilation baseline.
-      project!,
+      project,
       activities,
       budgetLines,
       boqItems,
       transactions,
       progressUpdates,
-      project?.data_date || '2026-09-13',
+      // No view-level Data Date override: the local '2026-09-13' literal duplicated the governed
+      // DEFAULT_DATA_DATE and would silently diverge from Dashboard / ProgressView /
+      // ExecutiveReportView if that constant ever moved. The engine resolves
+      // `project.data_date || DEFAULT_DATA_DATE` itself.
     );
-  }, [project, activities, budgetLines, boqItems, transactions, progressUpdates, project?.data_date]);
+    // `project` alone covers the resolved Data Date; the previous `project?.data_date` entry was an
+    // unnecessary dependency once the local literal override was dropped.
+  }, [project, activities, budgetLines, boqItems, transactions, progressUpdates]);
 
   // Committed cost provenance (UG-051): the stored `committed_cost` values, or an explicit
   // "no commitment data" state. The former `|| Math.round(planned * 0.75)` fabricated a commitment
@@ -763,6 +769,16 @@ export default function BudgetView({ project }: BudgetViewProps) {
                 <p className="text-xs text-slate-500 mt-0.5">
                   قياس كفاءة الوقت بالأشهر والأيام بدلاً من العملة لتفادي وهم مؤشر $SPI$ النقدي في نهاية المشروع.
                 </p>
+                {/* GAP-041: the four values below are a FIXED illustrative sample, not this
+                    project's Earned Schedule. They are labelled as such so this card cannot be read
+                    as a live IEAC(t) forecast competing with the computed one in the Executive
+                    Report and Progress screens. Replacing the card with the canonical engine result
+                    is a separate mock/demo cleanup item, deliberately not part of this wave. */}
+                <p className="text-[11px] text-rose-600 font-bold mt-1">
+                  {lang === 'ar'
+                    ? 'قيم هذه البطاقة عينة توضيحية ثابتة (Demo) وليست محسوبة من بيانات المشروع — التنبؤ الحي للجدول المكتسب معروض في التقرير التنفيذي وشاشة التقدم.'
+                    : 'The values in this card are a fixed illustrative sample (demo), not computed from this project. The live Earned Schedule forecast is shown in the Executive Report and Progress screens.'}
+                </p>
               </div>
             </div>
 
@@ -780,7 +796,7 @@ export default function BudgetView({ project }: BudgetViewProps) {
                 <span className="font-mono font-black text-amber-700 text-base">0.94 (SV_t = -3.6d)</span>
               </div>
               <div className="p-3 bg-slate-50 rounded-xl border border-slate-200">
-                <span className="text-slate-500 block text-[11px]">التسليم المتوقع زمنياً (IEAC_t):</span>
+                <span className="text-slate-500 block text-[11px]">التسليم المتوقع زمنياً (IEAC_t) — عينة ثابتة (Demo):</span>
                 <span className="font-mono font-black text-purple-900 text-base">2027-05-12 (+12d)</span>
               </div>
             </div>
