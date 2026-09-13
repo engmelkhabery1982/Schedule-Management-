@@ -367,26 +367,37 @@ export function calculateCpm(
           const linkType = (link.link_type as 'FS' | 'SS' | 'FF' | 'SF') || 'FS';
           const lag = link.lag_days || 0;
 
-          // Backward pass, uniform for all four relationship types (GAP-012).
+          // Backward pass: the exact inverse of the forward relationship rules.
           //
-          // Each type constrains one predecessor event from one successor event, and the lag
-          // always enters with the SAME sign convention as the forward pass, mirrored:
+          // Under this engine's inclusive working-day convention a duration of n puts the finish
+          // n - 1 working-day STEPS after the start. Writing D(x, y) for the signed number of
+          // working-day steps from x to y (so D(x, x) = 0), calculateLinkDate implements:
           //
-          //   FS  pred FINISH <- succ START    LF_pred = LS_succ - lag
-          //   SS  pred START  <- succ START    LS_pred = LS_succ - lag
-          //   FF  pred FINISH <- succ FINISH   LF_pred = LF_succ - lag
-          //   SF  pred START  <- succ FINISH   LS_pred = LF_succ - lag
+          //   forward rule                            backward rule (its inverse)
+          //   FS  D(EF_pred, ES_succ) = 1 + lag  =>   LF_pred = LS_succ offset by -(1 + lag)
+          //   SS  D(ES_pred, ES_succ) = lag      =>   LS_pred = LS_succ offset by -lag
+          //   FF  D(EF_pred, EF_succ) = lag      =>   LF_pred = LF_succ offset by -lag
+          //   SF  D(ES_pred, EF_succ) = lag      =>   LS_pred = LF_succ offset by -lag
           //
-          // Shifting by `-lag` through offsetWorkingDays means a positive lag pulls the
-          // predecessor earlier and a negative lag (lead) pushes it later, exactly mirroring the
-          // forward pass. The previous per-type branches used `Math.max(1, lag + 1)`, which
-          // silently flattened every lead on FS and SF into a zero lag.
+          // FS alone carries the extra step because the forward pass makes the successor start on
+          // the NEXT working day after the predecessor finish — the same one-step gap the FS free
+          // float formula already accounts for with its `- 2`. Inverting FS with only `-lag` left
+          // the backward pass one working day looser than the forward pass at every FS hop, which
+          // injected one phantom day of total float per hop: a 3 x 5-day FS+0 chain reported total
+          // float 2/1/0 and marked only the last activity critical, so a fully driving chain was
+          // presented as two thirds float.
+          //
+          // FS with lag -1 is the fixed point of the corrected rule (offset 0, LF_pred = LS_succ),
+          // matching the forward pass where a one-day lead starts the successor exactly on the
+          // predecessor finish. Leads of any other size keep their sign, so the negative-lag
+          // behaviour established for FS and SF is preserved.
           const constrainedBySuccFinish = linkType === 'FF' || linkType === 'SF';
           const predecessorEventIsStart = linkType === 'SS' || linkType === 'SF';
+          const backwardOffset = linkType === 'FS' ? -lag - 1 : -lag;
 
           const predecessorAnchor = offsetWorkingDays(
             constrainedBySuccFinish ? succDates.finish : succDates.start,
-            -lag,
+            backwardOffset,
             succCal,
           );
 
