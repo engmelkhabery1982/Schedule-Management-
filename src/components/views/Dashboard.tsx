@@ -21,9 +21,10 @@ import {
   calculateQuantityBasedEvm,
   calculateWeightedProgress,
   calculateProjectEvmAtDataDate,
+  calculateEvmMetrics,
+  type ComprehensiveProjectEvm,
 } from '@/lib/planningEngine';
 import { generateScheduleAlerts } from '@/lib/alertEngine';
-import { generateScheduleQualityAlerts } from '@/lib/scheduleQualityEngine';
 import { generateResourceConflictAlerts } from '@/lib/resourceConflictEngine';
 import { calculateBaselineVariances, calculatePerformanceTrend, generateTrendAlerts } from '@/lib/trendEngine';
 import { calculateControlHealth } from '@/lib/controlHealthEngine';
@@ -245,8 +246,13 @@ ${noticeForm.contractorName}`;
 
   const recentUpdates = useMemo(() => progressUpdates.slice(0, 5), [progressUpdates]);
 
-  const evm = useMemo(() => {
-    if (!project) return calculateEvmMetrics(0, 0.40, 0.40, 0);
+  // `evm` is a union of the lightweight fallback (`EvmMetrics`, returned when no project is
+  // selected) and the comprehensive engine result. This view reads only the comprehensive
+  // fields, exactly as it did before; the assertion below is type-level only and emits
+  // identical JavaScript. Giving the no-project fallback real progress values is a
+  // behaviour change and therefore belongs to a later wave, not to this compilation baseline.
+  const evm = useMemo((): ComprehensiveProjectEvm => {
+    if (!project) return calculateEvmMetrics(0, 0.40, 0.40, 0) as ComprehensiveProjectEvm;
     return calculateProjectEvmAtDataDate(
       project,
       activities,

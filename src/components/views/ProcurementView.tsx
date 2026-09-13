@@ -78,7 +78,9 @@ export default function ProcurementView({ project }: ProcurementViewProps) {
     if (filterType !== 'all' && s.type !== filterType) return false;
     if (searchQuery) {
       const q = searchQuery.toLowerCase();
-      return s.title.toLowerCase().includes(q) || s.code.toLowerCase().includes(q);
+      // `code` is optional on the type (seed rows carry `submittal_code` instead); the
+      // assertion keeps the emitted JavaScript identical to before.
+      return s.title.toLowerCase().includes(q) || s.code!.toLowerCase().includes(q);
     }
     return true;
   });
@@ -269,7 +271,7 @@ export default function ProcurementView({ project }: ProcurementViewProps) {
                       </div>
                       {sub.notes && <p className="text-[10px] text-slate-400 mt-0.5">{sub.notes}</p>}
                     </td>
-                    <td className="p-3 text-slate-600">{getTypeLabel(sub.type)}</td>
+                    <td className="p-3 text-slate-600">{getTypeLabel(sub.type!)}</td>
                     <td className="p-3 text-slate-600">{sub.supplier_or_subcontractor || '-'}</td>
                     <td className="p-3 text-slate-600 font-mono">{act ? `${act.code} - ${act.name}` : '-'}</td>
                     <td className="p-3 text-slate-600">{sub.lead_time_days} يوم</td>

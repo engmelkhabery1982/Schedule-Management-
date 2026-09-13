@@ -468,7 +468,7 @@ export async function harmonizeAndReconcileAllProjectData(projectId: string): Pr
 
     // 3. Ensure BOQ items match target BAC
     if (boqItems && boqItems.length > 0) {
-      const currentBoqSum = boqItems.reduce((s, b) => s + Number(b.total_price || 0), 0);
+      const currentBoqSum = boqItems.reduce((s: number, b: BoqItem) => s + Number(b.total_price || 0), 0);
       if (Math.abs(currentBoqSum - targetBac) > 1) {
         // Find last item to adjust
         const lastItem = boqItems[boqItems.length - 1];
@@ -485,7 +485,7 @@ export async function harmonizeAndReconcileAllProjectData(projectId: string): Pr
 
     // 4. Harmonize CBS Budget Lines
     if (budgetLines && budgetLines.length > 0) {
-      const budgetSum = budgetLines.reduce((s, b) => s + Number(b.planned_cost || 0), 0);
+      const budgetSum = budgetLines.reduce((s: number, b: BudgetLine) => s + Number(b.planned_cost || 0), 0);
       if (Math.abs(budgetSum - targetBac) > 1) {
         // Adjust last budget line
         const lastLine = budgetLines[budgetLines.length - 1];
@@ -499,10 +499,10 @@ export async function harmonizeAndReconcileAllProjectData(projectId: string): Pr
 
     // 5. Cleanse any invalid progress records
     if (activities) {
-      const actMap = new Set(activities.map((a) => a.id));
+      const actMap = new Set(activities.map((a: Activity) => a.id));
       const { data: rawProgress } = await supabase.from('progress_updates').select('*').eq('project_id', projectId);
       if (rawProgress) {
-        const invalid = rawProgress.filter((p) => !actMap.has(p.activity_id));
+        const invalid = rawProgress.filter((p: ProgressUpdate) => !actMap.has(p.activity_id));
         if (invalid.length > 0) {
           for (const inv of invalid) {
             await supabase.from('progress_updates').delete().eq('id', inv.id);

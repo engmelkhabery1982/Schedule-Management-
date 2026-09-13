@@ -88,7 +88,7 @@ export default function ScheduleDiffView({ project }: ScheduleDiffViewProps) {
           id: 'rev_oct_2026',
           name: 'Rev 01 - تحديث شهر أكتوبر 2026 (Cut-off M1)',
           createdAt: '2026-10-31',
-          activitiesSnapshot: acts.map((a, idx) => ({
+          activitiesSnapshot: acts.map((a: Activity, idx: number) => ({
             id: a.id,
             code: a.code,
             name: a.name,
@@ -104,7 +104,7 @@ export default function ScheduleDiffView({ project }: ScheduleDiffViewProps) {
           id: 'rev_nov_2026',
           name: 'Rev 02 - تحديث شهر نوفمبر 2026 (Cut-off M2)',
           createdAt: '2026-11-30',
-          activitiesSnapshot: acts.map((a, idx) => ({
+          activitiesSnapshot: acts.map((a: Activity, idx: number) => ({
             id: a.id,
             code: a.code,
             name: a.name,

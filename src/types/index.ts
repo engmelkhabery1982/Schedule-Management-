@@ -105,6 +105,13 @@ export interface Activity {
   name: string;
   activity_type?: ActivityType;
   calendar_type?: CalendarType;
+  /**
+   * Optional reference to a ProjectCalendar id.
+   * Compatibility field: used by the seed data (`src/lib/mockSeed.ts`) and by import paths,
+   * but there is no `calendar_id` column in `supabase/migrations` for `activities`.
+   * Kept optional so records that only carry `calendar_type` stay valid.
+   */
+  calendar_id?: string;
   early_start: string | null;
   early_finish: string | null;
   late_start: string | null;
@@ -151,6 +158,14 @@ export interface ActivityLink {
   successor_id: string;
   link_type: 'FS' | 'SS' | 'FF' | 'SF' | string;
   lag_days: number;
+  /**
+   * Optional audit timestamp.
+   * Compatibility field: the auto-fix routines in `src/lib/scheduleQualityEngine.ts` stamp
+   * newly created links with `created_at`, while the `activity_links` table in
+   * `supabase/migrations/20260907050112_create_construction_pm_schema.sql` does not define
+   * that column. Optional so links loaded from the database remain valid without it.
+   */
+  created_at?: string;
   is_driving?: boolean;
   driving_float?: number;
   predecessor?: Activity;
@@ -266,18 +281,56 @@ export interface ProductivityRate {
   created_at: string;
 }
 
+/**
+ * Baseline header row, aligned with the SQL table `project_baselines`
+ * (`supabase/migrations/20260907220000_add_planning_control_schema.sql`):
+ *
+ *   id uuid PK · project_id uuid NOT NULL · version int NOT NULL DEFAULT 1 ·
+ *   name text NOT NULL DEFAULT 'Initial Baseline' ·
+ *   status text NOT NULL DEFAULT 'draft' CHECK (draft|submitted|approved|rejected) ·
+ *   approved_at timestamptz (nullable) · is_active boolean NOT NULL DEFAULT true ·
+ *   created_at timestamptz DEFAULT now() · UNIQUE(project_id, version)
+ *
+ * `version` and `name` are NOT NULL in SQL but optional here on purpose: writes rely on the
+ * database defaults (`DEFAULT 1` / `DEFAULT 'Initial Baseline'`, see the insert in
+ * `src/components/views/ImportView.tsx`) and the seed records in `src/lib/mockSeed.ts` omit
+ * both. Declaring them required would force a mock-data change, which is out of scope for the
+ * compilation-baseline wave.
+ */
 export interface ProjectBaseline {
   id: string;
   project_id: string;
-  name: string;
-  code: string;
-  description: string | null;
-  snapshot_date: string;
+  /** SQL `version int NOT NULL DEFAULT 1`; part of `UNIQUE(project_id, version)`. */
+  version?: number;
+  /** SQL `name text NOT NULL DEFAULT 'Initial Baseline'`. */
+  name?: string;
+  /** SQL `status text NOT NULL DEFAULT 'draft'` with a CHECK constraint. */
+  status: BaselineStatus;
+  /** SQL `approved_at timestamptz`, nullable — stamped when the baseline is approved. */
+  approved_at?: string | null;
+  /** SQL `is_active boolean NOT NULL DEFAULT true`. */
   is_active: boolean;
-  status: 'draft' | 'submitted' | 'approved' | 'rejected';
-  total_duration_days?: number;
-  planned_cost?: number;
+  /** SQL `created_at timestamptz DEFAULT now()`. */
   created_at: string;
+
+  // ---------------------------------------------------------------------------------------
+  // Temporary compatibility fields — these are NOT columns of `project_baselines`.
+  // They are kept optional (instead of being deleted) so current consumers and seed data keep
+  // compiling. Each one must be migrated to a real schema column or dropped in a dedicated
+  // later wave; do not add new code that depends on them.
+  // ---------------------------------------------------------------------------------------
+  /** @deprecated compatibility field — seed data labels baselines with `baseline_name`; SQL stores the label in `name`. */
+  baseline_name?: string;
+  /** @deprecated compatibility field — no `code` column exists on `project_baselines`. */
+  code?: string;
+  /** @deprecated compatibility field — no `description` column exists on `project_baselines`. */
+  description?: string | null;
+  /** @deprecated compatibility field — no `snapshot_date` column exists; the data date lives on `Project.data_date`. */
+  snapshot_date?: string;
+  /** Derived aggregate (computed from `baseline_activities`), not persisted on `project_baselines`. */
+  total_duration_days?: number;
+  /** Derived aggregate (computed from `baseline_activities`), not persisted on `project_baselines`. */
+  planned_cost?: number;
 }
 
 export interface BaselineActivity {
@@ -442,6 +495,27 @@ export interface ParsedBoqRow {
 }
 
 // DCMA 14-Point Types
+/**
+ * Every automated repair action the DCMA 14-Point engine can emit.
+ *
+ * Kept in sync with the `fixType` parameter of `applyDcmaAutoFix` in
+ * `src/lib/scheduleQualityEngine.ts`, which is the single place that implements these actions.
+ * Widening this union only describes actions the engine already performs — it does not add,
+ * remove, or alter any DCMA check or repair logic.
+ */
+export type DcmaAutoFixType =
+  | 'all'
+  | 'fix_missing_logic'
+  | 'fix_negative_lags'
+  | 'fix_hard_constraints'
+  | 'fix_relationship_types'
+  | 'fix_negative_float'
+  | 'fix_high_float'
+  | 'fix_invalid_dates'
+  | 'fix_resource_loading'
+  | 'fix_bei_execution'
+  | 'fix_milestones';
+
 export interface DcmaPointResult {
   id: number;
   name: string;
@@ -453,7 +527,7 @@ export interface DcmaPointResult {
   status: 'pass' | 'warning' | 'fail';
   details: string[];
   recommendation?: string;
-  autoFixType?: 'fix_missing_logic' | 'fix_negative_lags' | 'fix_hard_constraints' | 'fix_relationship_types' | 'fix_negative_float' | 'all';
+  autoFixType?: DcmaAutoFixType;
   weight: number;
 }
 
@@ -505,22 +579,54 @@ export interface ResourceHistogramData {
 }
 
 // Procurement & Submittal Item
+/**
+ * Procurement / material submittal row.
+ *
+ * Two shapes coexist in the codebase today, so the interface accepts both:
+ *  1. The application form shape written by `src/components/views/ProcurementView.tsx`
+ *     (`code`, `type`, `submittal_date`, `required_approval_date`, `lead_time_days`, ...).
+ *  2. The seed shape produced by `src/lib/mockSeed.ts` (`submittal_code`, `submittal_type`,
+ *     `revision`, `submitted_date`, `reviewed_date`, `review_comments`, `consultant_reviewer`).
+ *
+ * There is no `procurement_submittals` table in `supabase/migrations`, so neither shape is
+ * pinned by SQL yet. Fields that only one of the two shapes supplies are optional; the seed
+ * compatibility fields are marked `@deprecated` and must be consolidated into the canonical
+ * names in a later, dedicated wave (no seed value or calculation is changed here).
+ */
 export interface ProcurementSubmittal {
   id: string;
   project_id: string;
   activity_id: string | null;
-  code: string;
+  /** Canonical submittal code. Optional because seed records carry `submittal_code` instead. */
+  code?: string;
   title: string;
-  type: 'shop_drawing' | 'material_submittal' | 'long_lead_item' | 'inspection_mir';
-  supplier_or_subcontractor: string | null;
-  submittal_date: string | null;
-  required_approval_date: string | null;
-  actual_approval_date: string | null;
-  lead_time_days: number;
+  /** Canonical submittal category. Optional because seed records carry `submittal_type` instead. */
+  type?: 'shop_drawing' | 'material_submittal' | 'long_lead_item' | 'inspection_mir';
+  supplier_or_subcontractor?: string | null;
+  submittal_date?: string | null;
+  required_approval_date?: string | null;
+  actual_approval_date?: string | null;
+  lead_time_days?: number;
   status: 'draft' | 'submitted' | 'under_review' | 'approved' | 'approved_with_notes' | 'rejected' | 'delivered';
-  is_critical_path: boolean;
-  notes: string | null;
+  is_critical_path?: boolean;
+  notes?: string | null;
   created_at: string;
+
+  // --- Seed compatibility fields (used by src/lib/mockSeed.ts only) -----------------------
+  /** @deprecated compatibility field — consolidate into `type`. */
+  submittal_type?: string;
+  /** @deprecated compatibility field — consolidate into `code`. */
+  submittal_code?: string;
+  /** @deprecated compatibility field — submittal revision label, e.g. `'0'`, `'1'`. */
+  revision?: string;
+  /** @deprecated compatibility field — consolidate into `submittal_date`. */
+  submitted_date?: string | null;
+  /** @deprecated compatibility field — consolidate into `actual_approval_date`. */
+  reviewed_date?: string | null;
+  /** @deprecated compatibility field — consolidate into `notes`. */
+  review_comments?: string | null;
+  /** @deprecated compatibility field — consolidate into `supplier_or_subcontractor`. */
+  consultant_reviewer?: string | null;
 }
 
 // Time Impact Analysis (TIA) & Delay Claim Types

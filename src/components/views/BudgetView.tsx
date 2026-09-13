@@ -163,7 +163,10 @@ export default function BudgetView({ project }: BudgetViewProps) {
   // Unified EVM metrics from single source of truth engine
   const evm = useMemo(() => {
     return calculateProjectEvmAtDataDate(
-      project,
+      // Non-null assertion only: the engine already dereferences `project` at runtime, so the
+      // emitted JavaScript is unchanged. Proper null handling for this view is tracked as a
+      // separate (later-wave) null-safety item, not part of the compilation baseline.
+      project!,
       activities,
       budgetLines,
       boqItems,

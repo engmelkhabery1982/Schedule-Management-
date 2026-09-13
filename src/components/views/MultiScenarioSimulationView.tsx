@@ -87,7 +87,7 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
       const { data: projList } = await supabase.from('projects').select('*').order('created_at', { ascending: false });
       if (projList && projList.length > 0) {
         setAllProjects(projList);
-        const current = projList.find((p) => p.id === (activeProject?.id || project?.id)) || projList[0];
+        const current = projList.find((p: Project) => p.id === (activeProject?.id || project?.id)) || projList[0];
         setActiveProject(current);
         await loadProjectDetails(current.id);
       }

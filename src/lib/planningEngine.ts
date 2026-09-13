@@ -1,4 +1,13 @@
-import type { ParsedBoqRow, EvmMetrics, Activity, Risk, BoqItem, BudgetLine } from '@/types';
+import type {
+  ParsedBoqRow,
+  EvmMetrics,
+  Activity,
+  Risk,
+  BoqItem,
+  BudgetLine,
+  CostTransaction,
+  ProgressUpdate,
+} from '@/types';
 
 export interface ProductivityRule {
   category: string;
@@ -106,10 +115,33 @@ export interface ComprehensiveProjectEvm {
   tcpi: number;
 }
 
+/**
+ * Structural subset of `BudgetLine` — exactly the four fields `calculateProjectEvmAtDataDate`
+ * reads (`planned_cost`, `approved_budget`, `wbs_node_id`, `actual_cost`).
+ *
+ * Accepting the subset instead of the full row lets callers pass baseline-derived cost rows
+ * (e.g. `BaselineActivity[]` from `ExecutiveReportView`) the same way the runtime code already
+ * does. Purely a type-position change: no formula, fallback, or ordering is altered.
+ */
+export type EvmBudgetLineInput = {
+  planned_cost?: number | null;
+  approved_budget?: number | null;
+  actual_cost?: number | null;
+  wbs_node_id?: string | null;
+};
+
 export function calculateProjectEvmAtDataDate(
-  project: { contract_value?: number; start_date?: string; end_date?: string; data_date?: string | null },
+  // Structural subset of `Project`. The date/value fields accept `null` because `Project`
+  // declares them as `string | null` / nullable numbers; every use below already guards with
+  // `||` fallbacks, so no calculation changes.
+  project: {
+    contract_value?: number | null;
+    start_date?: string | null;
+    end_date?: string | null;
+    data_date?: string | null;
+  },
   activities: Activity[],
-  budgetLines: BudgetLine[] = [],
+  budgetLines: EvmBudgetLineInput[] = [],
   boqItems: BoqItem[] = [],
   costTransactions: CostTransaction[] = [],
   progressUpdates: ProgressUpdate[] = [],

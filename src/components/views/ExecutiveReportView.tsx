@@ -86,7 +86,10 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
   // Compute EVM metrics using unified engine
   const evmMetrics: EvmMetrics = useMemo(() => {
     return calculateProjectEvmAtDataDate(
-      project,
+      // Non-null assertion only: the engine already dereferences `project` at runtime, so the
+      // emitted JavaScript is unchanged. Proper null handling for this view is tracked as a
+      // separate (later-wave) null-safety item, not part of the compilation baseline.
+      project!,
       activities,
       baselineActivities,
       boqItems,
