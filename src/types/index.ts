@@ -396,6 +396,7 @@ export interface CostTransaction {
   unit?: string | null;
   unit_rate?: number | null;
   wbs_node_id?: string | null;
+  budget_line_id?: string | null;
   approval_level?: number;
   submitted_by?: string | null;
 }

@@ -324,7 +324,7 @@ export function getInitialSeedData(): Record<string, any[]> {
     { id: 'bgt-p2-04', project_id: p2Id, wbs_node_id: 'wbs-p2-04', boq_item_id: 'boq-p2-08', description: 'السلامة المرورية والإنارة واللوحات', planned_cost: 4980000, committed_cost: 2500000, actual_cost: 0, remaining_cost: 4980000, created_at: now },
 
     // Project 3 Budget Lines (Total = 125,000,000 SAR)
-    { id: 'bgt-p3-01', project_id: p3Id, wbs_node_id: 'wbs-p3-01', boq_item_id: 'boq-p3-01', description: 'الأساسات العميقة والخوازيق واللبشة المسلحة', planned_cost: 21900000, committed_cost: 21900000, actual_cost: 24320000, remaining_cost: 0, created_at: now },
+    { id: 'bgt-p3-01', project_id: p3Id, wbs_node_id: 'wbs-p3-01', boq_item_id: 'boq-p3-01', description: 'الأساسات العميقة والخوازيق واللبشة المسلحة', planned_cost: 21900000, committed_cost: 21900000, actual_cost: 24320000, remaining_cost: -2420000, created_at: now },
     { id: 'bgt-p3-02', project_id: p3Id, wbs_node_id: 'wbs-p3-02', boq_item_id: 'boq-p3-03', description: 'الهيكل الخرساني ومقاومة الزلازل', planned_cost: 25760000, committed_cost: 25000000, actual_cost: 0, remaining_cost: 25760000, created_at: now },
     { id: 'bgt-p3-03', project_id: p3Id, wbs_node_id: 'wbs-p3-03', boq_item_id: 'boq-p3-05', description: 'غرف العمليات المعقمة والتشطيبات الطبية', planned_cost: 33060000, committed_cost: 15000000, actual_cost: 0, remaining_cost: 33060000, created_at: now },
     { id: 'bgt-p3-04', project_id: p3Id, wbs_node_id: 'wbs-p3-04', boq_item_id: 'boq-p3-07', description: 'الغازات الطبية والتكييف HEPA و BMS', planned_cost: 44280000, committed_cost: 20000000, actual_cost: 0, remaining_cost: 44280000, created_at: now },

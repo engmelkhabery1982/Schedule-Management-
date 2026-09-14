@@ -86,6 +86,7 @@ export default function BudgetView({ project }: BudgetViewProps) {
     cost_type: 'direct',
     boq_item_id: '',
     activity_id: '',
+    budget_line_id: '',
     vendor: '',
     invoice_number: '',
   });
@@ -141,11 +142,12 @@ export default function BudgetView({ project }: BudgetViewProps) {
       status: 'submitted',
       boq_item_id: transactionForm.boq_item_id || null,
       activity_id: transactionForm.activity_id || null,
+      budget_line_id: transactionForm.budget_line_id || null,
       vendor: transactionForm.vendor || null,
       invoice_number: transactionForm.invoice_number || null,
     });
     if (error) return;
-    setTransactionForm({ description: '', amount: 0, cost_type: 'direct', boq_item_id: '', activity_id: '', vendor: '', invoice_number: '' });
+    setTransactionForm({ description: '', amount: 0, cost_type: 'direct', boq_item_id: '', activity_id: '', budget_line_id: '', vendor: '', invoice_number: '' });
     await loadData();
   }
 
@@ -172,7 +174,11 @@ export default function BudgetView({ project }: BudgetViewProps) {
   async function saveActual(id: string) {
     const line = budgetLines.find((l) => l.id === id);
     if (!line) return;
-    const remaining = line.planned_cost - editActual;
+    // PA-13: unified remaining basis COALESCE(approved_budget, planned_cost, 0) - actual,
+    // shared with recompute_budget_line_actuals() / recompute_resource_budget(). A negative
+    // result is a real overrun signal and is stored as-is (never clamped to zero).
+    const basis = line.approved_budget ?? line.planned_cost ?? 0;
+    const remaining = basis - editActual;
     const { error } = await supabase.from('budget_lines').update({
       actual_cost: editActual,
       remaining_cost: remaining,
@@ -1361,6 +1367,26 @@ export default function BudgetView({ project }: BudgetViewProps) {
                     <Plus size={15} />
                     <span>تسجيل وإدراج المصروف</span>
                   </button>
+                </div>
+              </div>
+
+              {/* Row 3: Explicit Budget Line allocation (PA-14). Optional: when several lines
+                  share the same BOQ/WBS reference, picking one here allocates the transaction
+                  to that line only; otherwise allocation is automatic only for a unique match,
+                  and ambiguous transactions stay Unallocated. */}
+              <div className="grid grid-cols-1 md:grid-cols-12 gap-3">
+                <div className="md:col-span-12">
+                  <label className="block text-[11px] font-bold text-slate-700 mb-1">تخصيص صريح لبند ميزانية CBS (اختياري — يلزم عند تشابه البنود):</label>
+                  <select
+                    value={transactionForm.budget_line_id}
+                    onChange={(e) => setTransactionForm({ ...transactionForm, budget_line_id: e.target.value })}
+                    className="w-full px-3 py-2 border border-slate-300 rounded-xl text-xs bg-white text-slate-700"
+                  >
+                    <option value="">تلقائي - حسب المرجعية (BOQ / WBS / نشاط CPM)</option>
+                    {budgetLines.map((line) => (
+                      <option key={line.id} value={line.id}>{(line.description || line.id).slice(0, 45)} - {(line.approved_budget ?? line.planned_cost ?? 0).toLocaleString()} SAR</option>
+                    ))}
+                  </select>
                 </div>
               </div>
             </div>
