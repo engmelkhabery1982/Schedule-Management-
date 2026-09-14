@@ -394,6 +394,43 @@ export interface BaselineActivity {
   early_finish: string;
   duration_days: number;
   planned_cost: number;
+  /** F5: total float (working days) at baseline approval; null for legacy baselines. */
+  total_float?: number | null;
+}
+
+/**
+ * F5: one deterministic control row per (project, data_date).
+ * Aggregates are columns; per-activity evidence is the versioned `details` blob.
+ * Missing inputs persist as null, never as defaults.
+ */
+export interface ScheduleUpdateSnapshot {
+  id: string;
+  project_id: string;
+  data_date: string;
+  forecast_finish: string | null;
+  progress_pct: number | null;
+  critical_count: number;
+  near_critical_count: number;
+  total_delay_days: number | null;
+  delay_vs_previous_days: number | null;
+  milestones_slipped: number;
+  details: ScheduleSnapshotDetails;
+  created_at: string;
+}
+
+/** F5: versioned per-activity evidence inside a schedule update snapshot. */
+export interface ScheduleSnapshotDetails {
+  version: 1;
+  activities: Record<string, {
+    ef: string | null;
+    tf: number | null;
+    critical: boolean;
+    ct: string | null;
+    cid: string | null;
+    linkSig: string;
+    pct: number;
+  }>;
+  drivingLinkIds: string[];
 }
 
 export type BaselineStatus = 'draft' | 'submitted' | 'approved' | 'rejected';

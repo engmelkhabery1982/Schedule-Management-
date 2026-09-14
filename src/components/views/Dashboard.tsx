@@ -15,6 +15,7 @@ import type {
   ActivityLink,
   ActivityResource,
   Resource,
+  ScheduleUpdateSnapshot,
 } from '@/types';
 import {
   analyzeForecast,
@@ -29,6 +30,7 @@ import { calculateControlHealth } from '@/lib/controlHealthEngine';
 import { calculateRecoveryPlan } from '@/lib/recoveryEngine';
 import { simulateScenario } from '@/lib/scenarioEngine';
 import { generateSCurveData } from '@/lib/sCurveEngine';
+import { analyzeScheduleControl } from '@/lib/scheduleControlEngine';
 // GAP-010: the FIDIC 20.1 notice generator works on the governed Data Date, not on a literal clock.
 import { calendarDaysBetween, isAfterDataDate, isIsoDate, resolveDataDate } from '@/lib/chronologyGuard';
 import { getLanguage, translations, type Language } from '@/lib/i18n';
@@ -72,6 +74,9 @@ export default function Dashboard({ project, onNavigate }: DashboardProps) {
   const [progressUpdates, setProgressUpdates] = useState<ProgressUpdate[]>([]);
   const [costTransactions, setCostTransactions] = useState<CostTransaction[]>([]);
   const [baselineActivities, setBaselineActivities] = useState<BaselineActivity[]>([]);
+  // F5: control inputs — the links fetch already existed; snapshots are new.
+  const [links, setLinks] = useState<ActivityLink[]>([]);
+  const [snapshots, setSnapshots] = useState<ScheduleUpdateSnapshot[]>([]);
   const [approvedActualCost, setApprovedActualCost] = useState(0);
   const [boqItems, setBoqItems] = useState<BoqItem[]>([]);
   const [loading, setLoading] = useState(true);
@@ -130,7 +135,7 @@ export default function Dashboard({ project, onNavigate }: DashboardProps) {
     setError('');
 
     try {
-      const [actRes, riskRes, issueRes, budgetRes, progRes, costRes, baselineRes, alertsRes, linksRes, assignmentsRes, resourcesRes, boqRes] = await Promise.all([
+      const [actRes, riskRes, issueRes, budgetRes, progRes, costRes, baselineRes, alertsRes, linksRes, assignmentsRes, resourcesRes, boqRes, snapRes] = await Promise.all([
         supabase.from('activities').select('*, wbs_node:wbs_nodes(*)').eq('project_id', project.id),
         supabase.from('risks').select('*').eq('project_id', project.id),
         supabase.from('issues').select('*').eq('project_id', project.id),
@@ -143,6 +148,7 @@ export default function Dashboard({ project, onNavigate }: DashboardProps) {
         supabase.from('activity_resources').select('*').eq('project_id', project.id),
         supabase.from('resources').select('*').eq('project_id', project.id),
         supabase.from('boq_items').select('*').eq('project_id', project.id),
+        supabase.from('schedule_update_snapshots').select('*').eq('project_id', project.id).order('data_date', { ascending: false }).limit(10),
       ]);
 
       const activityData = (actRes.data || []) as Activity[];
@@ -160,6 +166,8 @@ export default function Dashboard({ project, onNavigate }: DashboardProps) {
       setApprovedActualCost(costData.reduce((sum: number, item: CostTransaction) => sum + Number(item.amount || 0), 0));
       setBoqItems((boqRes.data || []) as BoqItem[]);
       setBaselineActivities(baselineData);
+      setLinks(((linksRes as { data?: unknown }).data || []) as ActivityLink[]);
+      setSnapshots(((snapRes as { data?: unknown }).data || []) as ScheduleUpdateSnapshot[]);
       setAlerts((alertsRes.data || []) as ProjectAlert[]);
     } catch (err: any) {
       console.error('Error loading dashboard:', err);
@@ -345,6 +353,24 @@ ${noticeForm.contractorName}`;
     );
   }, [activities, baselineActivities, progressUpdates, costTransactions, evm, project, startDate, endDate, budgetLines, boqItems]);
 
+  // F5: schedule-control summary (forecast vs baseline) derived from the canonical statused CPM.
+  const control = useMemo(() => {
+    if (!project) return null;
+    const ordered = [...snapshots].sort((a, b) => (a.data_date < b.data_date ? 1 : -1));
+    return analyzeScheduleControl({
+      activities,
+      links,
+      baselines: baselineActivities,
+      progressUpdates,
+      previousSnapshot: ordered.find((x) => x.data_date < governedDataDate) || null,
+      dataDate: governedDataDate,
+      calendarType: project.calendar_type || '6_days',
+      statusLogic: project.status_logic || 'retained_logic',
+    });
+  }, [project, activities, links, baselineActivities, progressUpdates, snapshots, governedDataDate]);
+  const controlDelay = control ? control.project.totalDelayWd : null;
+  const controlSlipped = control ? control.milestones.filter((m) => m.state === 'slipped').length : 0;
+
   const kpis = [
     {
       label: t.total_progress,
@@ -378,6 +404,16 @@ ${noticeForm.contractorName}`;
       bg: 'bg-red-50',
       text: 'text-red-600',
       subtext: lang === 'ar' ? 'على المسار الحرج' : 'On Critical Path',
+    },
+    {
+      label: lang === 'ar' ? 'تأخير النهاية المتوقعة' : 'Forecast delay',
+      value: controlDelay !== null ? `${controlDelay > 0 ? '+' : ''}${controlDelay}d` : 'N/A',
+      icon: Clock,
+      bg: controlDelay !== null && controlDelay > 0 ? 'bg-red-50' : 'bg-emerald-50',
+      text: controlDelay !== null && controlDelay > 0 ? 'text-red-600' : 'text-emerald-600',
+      subtext: control && control.project.forecastFinish
+        ? `${control.project.forecastFinish} · ${controlSlipped} ${lang === 'ar' ? 'معالم متأخرة' : 'milestones slipped'}`
+        : (lang === 'ar' ? 'لا خط أساس للمقارنة' : 'No baseline to compare'),
     },
     {
       label: t.open_risks,

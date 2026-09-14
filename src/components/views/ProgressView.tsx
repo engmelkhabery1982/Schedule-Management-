@@ -229,10 +229,8 @@ export default function ProgressView({ project }: ProgressViewProps) {
   const [selectedSubcontractorFilter, setSelectedSubcontractorFilter] = useState<string>('all');
   const [certModalData, setCertModalData] = useState<SubcontractorPerformanceSummary | null>(null);
 
-  // Daily Entry Date
-  const [entryDate, setEntryDate] = useState<string>(
-    new Date().toISOString().split('T')[0]
-  );
+  // Daily Entry Date (F5 §1: opens ON the governed Data Date, never the machine clock).
+  const [entryDate, setEntryDate] = useState<string>(() => resolveDataDate(project));
 
   // Multi-activity daily input state: map activityId -> daily quantity entered today
   const [dailyInputs, setDailyInputs] = useState<Record<string, number>>({});
@@ -642,6 +640,11 @@ export default function ProgressView({ project }: ProgressViewProps) {
       setMessage('يرجى اختيار النشاط وإدخال كمية إنجاز اليوم.');
       return;
     }
+    // F5 §1: an entry after the Data Date would plant a future actual — blocked.
+    if (isAfterDataDate(entryDate, governedDataDate)) {
+      setMessage(`تعذر الحفظ: تاريخ اليومية (${entryDate}) بعد تاريخ التحديث المعتمد (${governedDataDate}).`);
+      return;
+    }
     setSaving(true);
     const act = activities.find((a) => a.id === selectedActivityId);
     if (!act) {
@@ -728,6 +731,11 @@ export default function ProgressView({ project }: ProgressViewProps) {
     const activeEntries = Object.entries(dailyInputs).filter(([_, qty]) => Number(qty) > 0);
     if (activeEntries.length === 0) {
       setMessage('لم تقم بإدخال كميات لأي نشاط في يومية اليوم.');
+      return;
+    }
+    // F5 §1: an entry after the Data Date would plant a future actual — blocked.
+    if (isAfterDataDate(entryDate, governedDataDate)) {
+      setMessage(`تعذر الحفظ: تاريخ اليومية (${entryDate}) بعد تاريخ التحديث المعتمد (${governedDataDate}).`);
       return;
     }
 
@@ -904,6 +912,12 @@ export default function ProgressView({ project }: ProgressViewProps) {
     if (!project) return;
     const req = inspections.find((i) => i.id === id);
     if (!req) return;
+
+    // F5 §1: approving an inspection dated after the Data Date would plant a future actual.
+    if (status === 'approved' && isAfterDataDate(req.inspection_date, governedDataDate)) {
+      setMessage(`تعذر الاعتماد: تاريخ الفحص (${req.inspection_date}) بعد تاريخ التحديث المعتمد (${governedDataDate}).`);
+      return;
+    }
 
     if (status === 'rejected') {
       await supabase.from('inspection_requests').update({
@@ -1313,6 +1327,7 @@ export default function ProgressView({ project }: ProgressViewProps) {
                 <input
                   type="date"
                   value={entryDate}
+                  max={governedDataDate}
                   onChange={(e) => setEntryDate(e.target.value)}
                   className="bg-transparent font-bold text-slate-900 outline-none cursor-pointer text-xs"
                 />
@@ -1727,6 +1742,7 @@ export default function ProgressView({ project }: ProgressViewProps) {
                         <input
                           type="date"
                           value={entryDate}
+                          max={governedDataDate}
                           onChange={(e) => setEntryDate(e.target.value)}
                           className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs font-mono font-bold outline-none focus:ring-2 focus:ring-amber-500"
                         />

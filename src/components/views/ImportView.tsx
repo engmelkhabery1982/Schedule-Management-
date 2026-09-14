@@ -310,6 +310,8 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
           planned_finish: typeof r.early_finish === 'string' ? r.early_finish : null,
           duration_days: Number(r.duration_days) || 0,
           planned_cost: 0,
+          // F5 additive: capture baseline float for float-change analysis (null when absent).
+          total_float_days: typeof r.total_float === 'number' ? (r.total_float as number) : null,
         };
       });
       // Planned cost per activity comes from the persisted budget lines in the plan.

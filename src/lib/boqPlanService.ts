@@ -315,7 +315,8 @@ export interface BoqBaselineEligibility {
 export async function approveBoqBaseline(
   client: BoqDbClient,
   projectId: string,
-  activities: Array<{ activity_id: string; planned_start: string | null; planned_finish: string | null; duration_days: number; planned_cost: number }>,
+  activities: Array<{ activity_id: string; planned_start: string | null; planned_finish: string | null; duration_days: number; planned_cost: number; total_float_days?: number | null }>,
+  // F5: optional per-activity total float captured at approval for float-change analysis.
   eligibility: BoqBaselineEligibility,
   version = 1,
   name = "Initial Baseline"
@@ -347,6 +348,8 @@ export async function approveBoqBaseline(
       early_finish: a.planned_finish,
       duration_days: a.duration_days,
       planned_cost: a.planned_cost,
+      // F5 additive: baseline float capture; absent (legacy callers) persists as NULL.
+      total_float: typeof a.total_float_days === 'number' && Number.isFinite(a.total_float_days) ? a.total_float_days : null,
     }));
     if (rows.length > 0) {
       const { error: rErr } = await client.from("baseline_activities").insert(rows);

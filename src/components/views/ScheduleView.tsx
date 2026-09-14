@@ -14,8 +14,11 @@ import type {
   ActivityType,
   ActivityConstraintType,
   PercentCompleteType,
+  ProgressUpdate,
+  ScheduleUpdateSnapshot,
 } from '@/types';
 import { calculateCpm, type LinkDrivingResult } from '@/lib/cpmEngine';
+import { analyzeScheduleControl, buildUpdateSnapshot, type ScheduleControlReport } from '@/lib/scheduleControlEngine';
 import { addWorkingDays, subtractWorkingDays, getCalendar, countWorkingDays, resolveActivityExecutionCalendar } from '@/lib/calendarEngine';
 import { DEFAULT_DATA_DATE } from '@/lib/projectControlsConstants';
 import {
@@ -91,6 +94,10 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
   const [wbsNodes, setWbsNodes] = useState<WbsNode[]>([]);
   const [baselineActivities, setBaselineActivities] = useState<BaselineActivity[]>([]);
   const [links, setLinks] = useState<ActivityLink[]>([]);
+  // F5: control inputs — approved progress evidence + prior update snapshots.
+  const [progressUpdates, setProgressUpdates] = useState<ProgressUpdate[]>([]);
+  const [snapshots, setSnapshots] = useState<ScheduleUpdateSnapshot[]>([]);
+  const [savingSnapshot, setSavingSnapshot] = useState(false);
   // F1.1: P6 calendars for per-activity CPM execution + diagnostics (empty = legacy path).
   const [calendars, setCalendars] = useState<P6Calendar[]>([]);
   const [linkDrivingMap, setLinkDrivingMap] = useState<Map<string, boolean>>(new Map());
@@ -112,8 +119,8 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
 
   // Column Customizer State
   const [showColumnChooser, setShowColumnChooser] = useState(false);
-  const [scheduleTab, setScheduleTab] = useState<'gantt' | 'lookahead' | 'pert' | 'float_velocity'>('gantt');
-  const [lookaheadWeeks, setLookaheadWeeks] = useState<3 | 6>(3);
+  const [scheduleTab, setScheduleTab] = useState<'gantt' | 'lookahead' | 'pert' | 'float_velocity' | 'control'>('gantt');
+  const [lookaheadWeeks, setLookaheadWeeks] = useState<2 | 4 | 6>(2);
   const [visibleColumns, setVisibleColumns] = useState<Record<string, boolean>>(() => {
     const initial: Record<string, boolean> = {};
     AVAILABLE_COLUMNS.forEach((c) => {
@@ -204,7 +211,7 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
   async function loadData() {
     if (!project) return;
     setLoading(true);
-    const [actRes, wbsRes, baselineRes, linkRes, resourceRes, assignmentRes, calRes] = await Promise.all([
+    const [actRes, wbsRes, baselineRes, linkRes, resourceRes, assignmentRes, calRes, snapRes, progRes] = await Promise.all([
       supabase.from('activities').select('*, wbs_node:wbs_nodes(*)').eq('project_id', project.id).order('sort_order', { ascending: true }),
       supabase.from('wbs_nodes').select('*').eq('project_id', project.id).order('sort_order', { ascending: true }),
       supabase.from('baseline_activities').select('*'),
@@ -212,6 +219,8 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
       supabase.from('resources').select('*').eq('project_id', project.id).order('name'),
       supabase.from('activity_resources').select('*, resource:resources(*)').eq('project_id', project.id),
       supabase.from('calendars').select('*').eq('project_id', project.id),
+      supabase.from('schedule_update_snapshots').select('*').eq('project_id', project.id).order('data_date', { ascending: false }).limit(10),
+      supabase.from('progress_updates').select('*').eq('project_id', project.id).eq('status', 'approved'),
     ]);
     const acts = (actRes.data || []) as Activity[];
     const linksData = (linkRes.data || []) as ActivityLink[];
@@ -239,8 +248,61 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
     setResources((resourceRes.data || []) as Resource[]);
     setAssignments((assignmentRes.data || []) as ActivityResource[]);
     setCalendars(calendarsData);
+    setSnapshots((snapRes.data || []) as ScheduleUpdateSnapshot[]);
+    setProgressUpdates((progRes.data || []) as ProgressUpdate[]);
     setLoading(false);
   }
+
+  // F5: the control report is a pure derivation of stored data at the current Data Date.
+  // The engine runs the canonical CPM on the project calendar; per-activity P6 execution
+  // calendars still govern the persisted schedule above.
+  const previousSnapshot = useMemo(() => {
+    const ordered = [...snapshots].sort((a, b) => (a.data_date < b.data_date ? 1 : -1));
+    return ordered.find((x) => x.data_date < currentDataDate) || null;
+  }, [snapshots, currentDataDate]);
+
+  const control: ScheduleControlReport | null = useMemo(() => {
+    if (!project) return null;
+    return analyzeScheduleControl({
+      activities,
+      links,
+      baselines: baselineActivities,
+      progressUpdates,
+      previousSnapshot,
+      dataDate: currentDataDate,
+      calendarType: selectedCalendar,
+      statusLogic,
+    });
+  }, [project, activities, links, baselineActivities, progressUpdates, previousSnapshot, currentDataDate, selectedCalendar, statusLogic]);
+
+  async function handleSaveControlSnapshot() {
+    if (!project || !control) return;
+    setSavingSnapshot(true);
+    try {
+      const payload = buildUpdateSnapshot(project.id, control, activities, links);
+      const { error } = await supabase
+        .from('schedule_update_snapshots')
+        .upsert(payload, { onConflict: 'project_id,data_date' });
+      if (error) throw error;
+      setMessage(lang === 'ar'
+        ? `تم حفظ لقطة التحديث (Data Date ${control.dataDate}): النهاية المتوقعة ${control.project.forecastFinish || 'N/A'}.`
+        : `Update snapshot saved (Data Date ${control.dataDate}): forecast finish ${control.project.forecastFinish || 'N/A'}.`);
+      const snapRes = await supabase.from('schedule_update_snapshots').select('*').eq('project_id', project.id).order('data_date', { ascending: false }).limit(10);
+      setSnapshots((snapRes.data || []) as ScheduleUpdateSnapshot[]);
+    } catch (err: unknown) {
+      setMessage(lang === 'ar' ? `تعذر حفظ اللقطة: ${(err as Error).message}` : `Snapshot save failed: ${(err as Error).message}`);
+    } finally {
+      setSavingSnapshot(false);
+    }
+  }
+
+  // F5: derived lookahead + float-erosion views over the control report (all computed, no demos).
+  const laKey = lookaheadWeeks === 2 ? 'w14' : lookaheadWeeks === 4 ? 'w28' : 'w42';
+  const laRows = control ? control.lookahead[laKey] : [];
+  const stById = useMemo(() => new Map((control?.statused || []).map((x) => [x.id, x])), [control]);
+  const ncById = useMemo(() => new Map((control?.nearCritical || []).map((x) => [x.id, x])), [control]);
+  const erosionById = useMemo(() => new Map((control?.migration.floatErosion || []).map((x) => [x.id, x])), [control]);
+  const topErosion = useMemo(() => (control?.migration.floatErosion || []).find((x) => x.erosion > 0) || null, [control]);
 
   async function recalculatePersistedSchedule(
     nextActivities?: Activity[],
@@ -942,6 +1004,15 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
                 <Zap size={13} className={scheduleTab === 'float_velocity' ? 'text-slate-950' : 'text-amber-500'} />
                 <span>{lang === 'ar' ? 'سرعة تآكل الهوامش (Float Velocity)' : 'Float Erosion Velocity'}</span>
               </button>
+              <button
+                onClick={() => setScheduleTab('control')}
+                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer ${
+                  scheduleTab === 'control' ? 'bg-slate-900 text-amber-400 shadow-sm' : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                <ShieldAlert size={13} className={scheduleTab === 'control' ? 'text-amber-400' : 'text-slate-500'} />
+                <span>{lang === 'ar' ? 'التحكم بالتحديث (Control)' : 'Update Control'}</span>
+              </button>
             </div>
 
             {/* Data Date Selector */}
@@ -1004,132 +1075,124 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
         </div>
       )}
 
-      {/* Lookahead Schedule Tab */}
+      {/* Lookahead Schedule Tab — F5: computed 2/4/6-week windows from the statused CPM. */}
       {scheduleTab === 'lookahead' && (
         <div className="space-y-4">
           <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-sm space-y-4">
-            <div className="flex flex-wrap items-center justify-between gap-4">
+            <div className="flex flex-wrap items-center justify-between gap-4 border-b pb-3">
               <div>
                 <h3 className="text-base font-black text-slate-900 flex items-center gap-2">
-                  <span>{lang === 'ar' ? 'الجدول التطلعي والمحددات الميدانية (Lookahead Schedule & Site Constraints)' : 'Lookahead Schedule & Site Readiness'}</span>
+                  <span>{lang === 'ar' ? 'الجدول التطلعي (Lookahead)' : 'Lookahead Schedule'}</span>
                   <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-900 border border-amber-200">
-                    {lookaheadWeeks} {lang === 'ar' ? 'أسابيع قادمة' : 'Weeks'}
+                    {lookaheadWeeks} {lang === 'ar' ? 'أسابيع من تاريخ التحديث' : 'Weeks from Data Date'}
                   </span>
                 </h3>
                 <p className="text-xs text-slate-500 mt-1">
                   {lang === 'ar'
-                    ? 'جدولة الأعمال القريبة مع فحص جاهزية المخططات التنفيذية، توريد المواد، وتصاريح العمل لمنع تعطل المسار الحرج.'
-                    : 'Short-interval scheduling with 4-point constraint readiness checking (Shop drawings, Materials, Permits, Crews).'}
+                    ? `أنشطة مخطط بدؤها أو انتهاؤها خلال النافذة من التواريخ المحسوبة (CPM) عند Data Date ${currentDataDate}.`
+                    : `Activities starting or finishing inside the window, from statused CPM dates at Data Date ${currentDataDate}.`}
                 </p>
               </div>
 
               {/* Lookahead Window Switcher */}
               <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-xl border border-slate-200">
-                <button
-                  onClick={() => setLookaheadWeeks(3)}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer transition-all ${
-                    lookaheadWeeks === 3 ? 'bg-amber-500 text-slate-950 shadow-sm' : 'text-slate-600 hover:text-slate-900'
-                  }`}
-                >
-                  {lang === 'ar' ? 'تطلعي 3 أسابيع (21 يوم)' : '3-Week Lookahead'}
-                </button>
-                <button
-                  onClick={() => setLookaheadWeeks(6)}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer transition-all ${
-                    lookaheadWeeks === 6 ? 'bg-amber-500 text-slate-950 shadow-sm' : 'text-slate-600 hover:text-slate-900'
-                  }`}
-                >
-                  {lang === 'ar' ? 'تطلعي 6 أسابيع (42 يوم)' : '6-Week Lookahead'}
-                </button>
+                {([2, 4, 6] as const).map((w) => (
+                  <button
+                    key={w}
+                    onClick={() => setLookaheadWeeks(w)}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer transition-all ${
+                      lookaheadWeeks === w ? 'bg-amber-500 text-slate-950 shadow-sm' : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    {lang === 'ar' ? `تطلعي ${w} أسابيع` : `${w}-Week Lookahead`}
+                  </button>
+                ))}
               </div>
             </div>
 
-            {/* Lookahead Summary Metrics */}
+            {/* Lookahead Summary Metrics (computed) */}
             <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
               <div className="p-3 bg-blue-50/70 rounded-xl border border-blue-200">
-                <span className="text-[11px] text-blue-900 font-bold block mb-0.5">أنشطة النافذة التطلعية</span>
-                <div className="text-lg font-black text-blue-950">
-                  {activities.filter((a) => (a.percent_complete || 0) < 100).slice(0, lookaheadWeeks === 3 ? 6 : 10).length} نشاط
-                </div>
+                <span className="text-[11px] text-blue-900 font-bold block mb-0.5">{lang === 'ar' ? 'أنشطة النافذة' : 'Window activities'}</span>
+                <div className="text-lg font-black text-blue-950">{laRows.length}</div>
               </div>
-
               <div className="p-3 bg-rose-50/70 rounded-xl border border-rose-200">
-                <span className="text-[11px] text-rose-900 font-bold block mb-0.5">أنشطة حرجة وشديدة الحساسية</span>
-                <div className="text-lg font-black text-rose-900">
-                  {activities.filter((a) => a.is_critical && (a.percent_complete || 0) < 100).slice(0, lookaheadWeeks === 3 ? 3 : 5).length} نشاط حرج
-                </div>
+                <span className="text-[11px] text-rose-900 font-bold block mb-0.5">{lang === 'ar' ? 'حرجة داخل النافذة' : 'Critical in window'}</span>
+                <div className="text-lg font-black text-rose-900">{laRows.filter((r) => r.critical).length}</div>
               </div>
-
-              <div className="p-3 bg-emerald-50/70 rounded-xl border border-emerald-200">
-                <span className="text-[11px] text-emerald-900 font-bold block mb-0.5">معدل الجاهزية الميدانية (Readiness)</span>
-                <div className="text-lg font-black text-emerald-950 font-mono">92%</div>
-              </div>
-
               <div className="p-3 bg-amber-50/70 rounded-xl border border-amber-200">
-                <span className="text-[11px] text-amber-900 font-bold block mb-0.5">محددات ومخاطر تحتاج إجراء سريع</span>
-                <div className="text-lg font-black text-amber-900">2 محددات نشطة</div>
+                <span className="text-[11px] text-amber-900 font-bold block mb-0.5">{lang === 'ar' ? 'شبه حرجة (TF≤5)' : 'Near-critical (TF≤5)'}</span>
+                <div className="text-lg font-black text-amber-900">{laRows.filter((r) => r.nearCritical).length}</div>
+              </div>
+              <div className="p-3 bg-emerald-50/70 rounded-xl border border-emerald-200">
+                <span className="text-[11px] text-emerald-900 font-bold block mb-0.5">{lang === 'ar' ? 'لها عوائق سابقة' : 'With blockers'}</span>
+                <div className="text-lg font-black text-emerald-950">{laRows.filter((r) => r.blockers.length > 0).length}</div>
               </div>
             </div>
 
-            {/* Lookahead Activities Table with Site Constraints */}
+            {/* Lookahead Activities Table */}
             <div className="overflow-x-auto border border-slate-200 rounded-xl">
               <table className="w-full text-xs">
                 <thead className="bg-slate-50 text-slate-700 font-bold border-b">
                   <tr>
-                    <th className="p-3 text-right">كود واسم النشاط</th>
-                    <th className="p-3 text-right">البداية - النهاية</th>
-                    <th className="p-3 text-center">المدة المتبقية</th>
-                    <th className="p-3 text-center">المخططات التنفيذية (Shop Drawings)</th>
-                    <th className="p-3 text-center">توريد المواد (Materials)</th>
-                    <th className="p-3 text-center">تصاريح العمل (Permits)</th>
-                    <th className="p-3 text-center">جاهزية العمالة والمقاول</th>
+                    <th className="p-3 text-right">{lang === 'ar' ? 'كود واسم النشاط' : 'Activity'}</th>
+                    <th className="p-3 text-right">{lang === 'ar' ? 'البداية - النهاية' : 'Start - Finish'}</th>
+                    <th className="p-3 text-center">{lang === 'ar' ? 'المتبقي' : 'Remaining'}</th>
+                    <th className="p-3 text-center">TF</th>
+                    <th className="p-3 text-center">{lang === 'ar' ? 'الحساسية' : 'Sensitivity'}</th>
+                    <th className="p-3 text-right">{lang === 'ar' ? 'العوائق (سوابق غير منجزة)' : 'Blockers'}</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {activities.filter((a) => (a.percent_complete || 0) < 100).slice(0, lookaheadWeeks === 3 ? 6 : 10).map((act, idx) => (
-                    <tr key={act.id} className="hover:bg-slate-50">
+                  {laRows.map((row) => (
+                    <tr key={row.id} className="hover:bg-slate-50">
                       <td className="p-3">
-                        <div className="font-mono font-bold text-slate-900 flex items-center gap-1.5">
-                          {act.code}
-                          {act.is_critical && <span className="px-1.5 py-0.2 rounded text-[9px] bg-rose-100 text-rose-700 font-black">CRITICAL</span>}
-                        </div>
-                        <div className="text-slate-600 font-medium">{act.name}</div>
+                        <div className="font-mono font-bold text-slate-900">{row.code}</div>
+                        <div className="text-slate-600 font-medium">{row.name}</div>
                       </td>
                       <td className="p-3 font-mono text-[11px] text-slate-600">
-                        {act.early_start} ← {act.early_finish}
-                      </td>
-                      <td className="p-3 text-center font-bold text-slate-800">
-                        {act.remaining_duration_days || act.duration_days} يوم
-                      </td>
-                      <td className="p-3 text-center">
-                        <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${idx % 3 === 0 ? 'bg-amber-100 text-amber-800' : 'bg-emerald-100 text-emerald-800'}`}>
-                          {idx % 3 === 0 ? 'مطلوب اعتماد نهائي' : 'معتمد (Approved)'}
+                        {row.earlyStart} ← {row.earlyFinish}
+                        <span className="block text-[10px] text-slate-400">
+                          {row.startsInWindow ? (lang === 'ar' ? '• يبدأ بالنافذة ' : '• starts ') : ''}
+                          {row.finishesInWindow ? (lang === 'ar' ? '• ينتهي بالنافذة' : '• finishes') : ''}
                         </span>
                       </td>
+                      <td className="p-3 text-center font-bold text-slate-800">{row.remaining} {lang === 'ar' ? 'يوم' : 'd'}</td>
+                      <td className="p-3 text-center font-mono font-bold text-slate-700">{row.tf}</td>
                       <td className="p-3 text-center">
-                        <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${idx === 1 ? 'bg-blue-100 text-blue-800' : 'bg-emerald-100 text-emerald-800'}`}>
-                          {idx === 1 ? 'في الطريق للموقع' : 'متوفر بالموقع (On Site)'}
-                        </span>
+                        {row.critical ? (
+                          <span className="px-2 py-0.5 rounded-full text-[10px] font-black bg-rose-100 text-rose-800">CRITICAL</span>
+                        ) : row.nearCritical ? (
+                          <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-800">{lang === 'ar' ? 'شبه حرج' : 'Near-critical'}</span>
+                        ) : (
+                          <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-slate-100 text-slate-600">{lang === 'ar' ? 'عادي' : 'Normal'}</span>
+                        )}
                       </td>
-                      <td className="p-3 text-center">
-                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800">
-                          مصرح وساري
-                        </span>
-                      </td>
-                      <td className="p-3 text-center">
-                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-slate-900 text-amber-400">
-                          جاهز 100%
-                        </span>
+                      <td className="p-3 text-slate-600 font-medium">
+                        {row.blockers.length === 0 ? (
+                          <span className="text-slate-400">—</span>
+                        ) : (
+                          <ul className="space-y-0.5">
+                            {row.blockers.map((b) => (
+                              <li key={b.code} className={`font-mono text-[11px] ${b.delaysSuccessorStart ? 'text-rose-700 font-black' : ''}`}>
+                                {b.code} → {b.forecastFinish || 'N/A'}
+                                {b.delaysSuccessorStart ? (lang === 'ar' ? ' (يؤخر البداية)' : ' (delays start)') : ''}
+                              </li>
+                            ))}
+                          </ul>
+                        )}
                       </td>
                     </tr>
                   ))}
+                  {laRows.length === 0 && (
+                    <tr><td colSpan={6} className="p-4 text-center text-slate-400">{lang === 'ar' ? 'لا أنشطة تبدأ أو تنتهي داخل هذه النافذة.' : 'No activities start or finish inside this window.'}</td></tr>
+                  )}
                 </tbody>
               </table>
             </div>
           </div>
         </div>
       )}
-
       {/* PERT / Activity-on-Node (AON) Network Diagram Tab */}
       {scheduleTab === 'pert' && (
         <div className="space-y-4">
@@ -1222,51 +1285,55 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
               <div>
                 <h3 className="text-base font-black text-slate-900 flex items-center gap-2">
                   <Zap className="text-amber-500" size={20} />
-                  <span>{lang === 'ar' ? 'مؤشر سرعة استهلاك وتآكل الهوامش (Float Erosion Velocity Index)' : 'Float Erosion Velocity & Near-Critical Path Index'}</span>
+                  <span>{lang === 'ar' ? 'تآكل الهوامش والأنشطة شبه الحرجة (Float Erosion)' : 'Float Erosion & Near-Critical Index'}</span>
                   <span className="px-2 py-0.5 rounded text-[10px] font-black bg-rose-100 text-rose-800 border border-rose-200">
                     SCL Delay Defense Rule
                   </span>
                 </h3>
                 <p className="text-xs text-slate-500 mt-1">
                   {lang === 'ar'
-                    ? 'رصد معدل تآكل الهامش الكلي أسبوعياً (ΔTF/Week) وكشف الأنشطة شبه الحرجة (Near-Critical: 0 < TF ≤ 10 أيام) قبل تحولها لمسار حرج يعطل المشروع.'
-                    : 'Track float burn rate per week and proactively isolate near-critical activities (0 < TF <= 10 days) before critical slippage occurs.'}
+                    ? 'التآكل محسوب من الفرق بين التحديث الحالي والسابق (TF السابق − TF الحالي)، وشبه الحرج هو 0 < TF ≤ 5 أيام.'
+                    : 'Erosion is measured previous-vs-current TF; near-critical is 0 < TF ≤ 5 days.'}
                 </p>
               </div>
             </div>
 
-            {/* Metrics Breakdown */}
+            {/* Metrics Breakdown (computed from the control report) */}
             <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
               <div className="p-3 bg-rose-50/80 rounded-xl border border-rose-200">
-                <span className="text-[11px] text-rose-900 font-bold block mb-0.5">أنشطة حرجة تماماً (TF = 0)</span>
+                <span className="text-[11px] text-rose-900 font-bold block mb-0.5">{lang === 'ar' ? 'أنشطة حرجة (TF = 0)' : 'Critical (TF = 0)'}</span>
                 <div className="text-xl font-black text-rose-900 font-mono">
-                  {activities.filter((a) => a.is_critical || (a.total_float !== undefined && a.total_float <= 0)).length} أنشطة
+                  {control?.project.criticalCount ?? 0} {lang === 'ar' ? 'أنشطة' : ''}
                 </div>
-                <span className="text-[10px] text-rose-700">تحدد تاريخ نهاية المشروع المباشر</span>
+                <span className="text-[10px] text-rose-700">{lang === 'ar' ? 'تحدد تاريخ نهاية المشروع المباشر' : 'Drive the project finish'}</span>
               </div>
 
               <div className="p-3 bg-amber-50/80 rounded-xl border border-amber-200">
-                <span className="text-[11px] text-amber-900 font-bold block mb-0.5">أنشطة شبه حرجة (0 &lt; TF ≤ 10 أيام)</span>
+                <span className="text-[11px] text-amber-900 font-bold block mb-0.5">{lang === 'ar' ? 'أنشطة شبه حرجة (0 < TF ≤ 5)' : 'Near-critical (0 < TF ≤ 5)'}</span>
                 <div className="text-xl font-black text-amber-900 font-mono">
-                  {activities.filter((a) => (a.total_float || 0) > 0 && (a.total_float || 0) <= 10).length} أنشطة
+                  {control?.project.nearCriticalCount ?? 0} {lang === 'ar' ? 'أنشطة' : ''}
                 </div>
-                <span className="text-[10px] text-amber-800">معرضة للتحول لمسار حرج فور حدوث أي بطء</span>
+                <span className="text-[10px] text-amber-800">{lang === 'ar' ? 'معرضة للتحول لمسار حرج' : 'May join the critical path'}</span>
               </div>
 
               <div className="p-3 bg-blue-50/80 rounded-xl border border-blue-200">
-                <span className="text-[11px] text-blue-900 font-bold block mb-0.5">أعلى سرعة تآكل للهامش</span>
+                <span className="text-[11px] text-blue-900 font-bold block mb-0.5">{lang === 'ar' ? 'أعلى تآكل مسجل' : 'Top measured erosion'}</span>
                 <div className="text-xl font-black text-blue-900 font-mono">
-                  3.5 يوم / أسبوع
+                  {topErosion ? `-${topErosion.erosion} d (${topErosion.code})` : 'N/A'}
                 </div>
-                <span className="text-[10px] text-blue-700">في أعمال دكت التكييف وشبكات الحريق</span>
+                <span className="text-[10px] text-blue-700">
+                  {control?.migration.hasPrevious
+                    ? (lang === 'ar' ? `منذ التحديث السابق (${previousSnapshot?.data_date})` : `Since previous update (${previousSnapshot?.data_date})`)
+                    : (lang === 'ar' ? 'لا يوجد تحديث سابق للمقارنة' : 'No previous update to compare')}
+                </span>
               </div>
 
               <div className="p-3 bg-emerald-50/80 rounded-xl border border-emerald-200">
-                <span className="text-[11px] text-emerald-900 font-bold block mb-0.5">أنشطة ذات أمان كافٍ (TF &gt; 10 أيام)</span>
+                <span className="text-[11px] text-emerald-900 font-bold block mb-0.5">{lang === 'ar' ? 'أنشطة ذات أمان كافٍ (TF > 5)' : 'Safe buffer (TF > 5)'}</span>
                 <div className="text-xl font-black text-emerald-900 font-mono">
-                  {activities.filter((a) => (a.total_float || 0) > 10).length} أنشطة
+                  {(control?.statused || []).filter((x) => !x.completed && x.totalFloat > 5).length} {lang === 'ar' ? 'أنشطة' : ''}
                 </div>
-                <span className="text-[10px] text-emerald-700">هوامش كافية لامتصاص التذبذبات الموقعية</span>
+                <span className="text-[10px] text-emerald-700">{lang === 'ar' ? 'هوامش كافية لامتصاص التذبذبات' : 'Enough buffer for volatility'}</span>
               </div>
             </div>
 
@@ -1275,67 +1342,273 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
               <table className="w-full text-xs">
                 <thead className="bg-slate-50 text-slate-700 font-bold border-b">
                   <tr>
-                    <th className="p-3 text-right">كود النشاط</th>
-                    <th className="p-3 text-right">اسم النشاط</th>
-                    <th className="p-3 text-center">الهامش الكلي الحالي (TF)</th>
-                    <th className="p-3 text-center">سرعة التآكل (ΔTF/Week)</th>
-                    <th className="p-3 text-center">تصنيف الحساسية والخطورة</th>
-                    <th className="p-3 text-right">الإجراء الوقائي المقترح</th>
+                    <th className="p-3 text-right">{lang === 'ar' ? 'كود النشاط' : 'Code'}</th>
+                    <th className="p-3 text-right">{lang === 'ar' ? 'اسم النشاط' : 'Activity'}</th>
+                    <th className="p-3 text-center">{lang === 'ar' ? 'الهامش الحالي (TF)' : 'Current TF'}</th>
+                    <th className="p-3 text-center">{lang === 'ar' ? 'هامش التحديث السابق' : 'Previous TF'}</th>
+                    <th className="p-3 text-center">{lang === 'ar' ? 'التآكل المقاس (ΔTF)' : 'Measured erosion'}</th>
+                    <th className="p-3 text-center">{lang === 'ar' ? 'أيام حتى الحرج' : 'Days to critical'}</th>
+                    <th className="p-3 text-center">{lang === 'ar' ? 'تصنيف الحساسية' : 'Sensitivity'}</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
                   {activities.map((act) => {
-                    const tf = Number(act.total_float || 0);
-                    let erosionRate = tf === 0 ? 0 : tf <= 5 ? 3.5 : tf <= 10 ? 1.8 : 0.4;
-                    let sensitivityBadge = (
+                    const st = stById.get(act.id);
+                    const tf = st ? st.totalFloat : Number(act.total_float || 0);
+                    const crit = st ? st.critical : !!act.is_critical;
+                    const er = erosionById.get(act.id);
+                    const nc = ncById.get(act.id);
+                    const badge = crit || tf <= 0 ? (
+                      <span className="px-2 py-0.5 rounded-full text-[10px] font-black bg-rose-100 text-rose-800 border border-rose-300">
+                        🚨 {lang === 'ar' ? 'مسار حرج نشط' : 'Critical'}
+                      </span>
+                    ) : tf <= 5 ? (
+                      <span className="px-2 py-0.5 rounded-full text-[10px] font-black bg-amber-100 text-amber-800 border border-amber-200">
+                        ⚡ {lang === 'ar' ? 'شبه حرج' : 'Near-critical'}
+                      </span>
+                    ) : (
                       <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800">
-                        مستقر وآمن (Safe Buffer)
+                        {lang === 'ar' ? 'آمن' : 'Safe'}
                       </span>
                     );
-                    let recommendation = 'متابعة وتحديث نسب الإنجاز الدورية كالمعتاد.';
-
-                    if (act.is_critical || tf <= 0) {
-                      sensitivityBadge = (
-                        <span className="px-2 py-0.5 rounded-full text-[10px] font-black bg-rose-100 text-rose-800 border border-rose-300 animate-pulse">
-                          🚨 مسار حرج نشط (Critical)
-                        </span>
-                      );
-                      recommendation = 'تطبيق تعجيل فوري (Crashing) وحماية الموارد المخصصة للنشاط.';
-                    } else if (tf <= 5) {
-                      sensitivityBadge = (
-                        <span className="px-2 py-0.5 rounded-full text-[10px] font-black bg-rose-50 text-rose-700 border border-rose-200">
-                          ⚠️ فائق الحساسية (High Sensitivity)
-                        </span>
-                      );
-                      recommendation = 'تجهيز فرق إضافية ومراجعة جاهزية التوريدات لتجنب تحوله لحرج.';
-                    } else if (tf <= 10) {
-                      sensitivityBadge = (
-                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-800 border border-amber-200">
-                          ⚡ شبه حرج (Near-Critical)
-                        </span>
-                      );
-                      recommendation = 'مراقبة أسبوعية لمعدل التآكل لمنع استهلاك ما تبقى من الهامش.';
-                    }
-
                     return (
                       <tr key={act.id} className="hover:bg-slate-50">
                         <td className="p-3 font-mono font-bold text-slate-900">{act.code}</td>
                         <td className="p-3 text-slate-800 font-semibold">{act.name}</td>
                         <td className="p-3 text-center font-mono font-bold">
-                          <span className={tf <= 0 ? 'text-rose-600 font-black' : tf <= 10 ? 'text-amber-700 font-black' : 'text-slate-700'}>
-                            {tf} يوم
+                          <span className={tf <= 0 ? 'text-rose-600 font-black' : tf <= 5 ? 'text-amber-700 font-black' : 'text-slate-700'}>
+                            {tf} {lang === 'ar' ? 'يوم' : 'd'}
                           </span>
                         </td>
+                        <td className="p-3 text-center font-mono text-slate-600">{er ? er.prevTf : 'N/A'}</td>
                         <td className="p-3 text-center font-mono font-bold text-slate-700">
-                          {erosionRate > 0 ? `-${erosionRate} d/wk` : '0 d/wk'}
+                          {er ? (er.erosion > 0 ? `-${er.erosion}` : er.erosion < 0 ? `+${-er.erosion}` : '0') : 'N/A'}
                         </td>
-                        <td className="p-3 text-center">{sensitivityBadge}</td>
-                        <td className="p-3 text-slate-600 font-medium">{recommendation}</td>
+                        <td className="p-3 text-center font-mono text-slate-700">
+                          {nc ? (nc.daysUntilCritical !== null ? `~${nc.daysUntilCritical}` : '—') : 'N/A'}
+                        </td>
+                        <td className="p-3 text-center">{badge}</td>
                       </tr>
                     );
                   })}
                 </tbody>
               </table>
+            </div>
+            {!control?.migration.hasPrevious && (
+              <p className="text-[11px] text-slate-400">{lang === 'ar' ? 'لا يوجد تحديث سابق محفوظ — أعمدة التآكل N/A حتى حفظ أول لقطة.' : 'No saved previous update — erosion columns read N/A until the first snapshot is saved.'}</p>
+            )}
+          </div>
+        </div>
+      )}
+      {/* Update Control Tab — F5: variances, migration, milestones, accuracy, actions, confidence. */}
+      {scheduleTab === 'control' && control && (
+        <div className="space-y-4">
+          <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-sm space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-4 border-b pb-3">
+              <div>
+                <h3 className="text-base font-black text-slate-900 flex items-center gap-2">
+                  <ShieldAlert className="text-slate-700" size={20} />
+                  <span>{lang === 'ar' ? 'التحكم بتحديث الجدول (Update Control)' : 'Schedule Update Control'}</span>
+                  <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-900 border border-amber-200">
+                    Data Date {control.dataDate}
+                  </span>
+                </h3>
+                <p className="text-xs text-slate-500 mt-1">
+                  {lang === 'ar'
+                    ? 'كل الأرقام محسوبة من الـ CPM المعتمد عند تاريخ التحديث — لا تواريخ مستقبلية كحقائق، ولا قيم مخترعة.'
+                    : 'Every number derives from the canonical statused CPM — no future-dated actuals, no invented values.'}
+                </p>
+              </div>
+              <button
+                onClick={() => void handleSaveControlSnapshot()}
+                disabled={savingSnapshot}
+                className="flex items-center gap-1.5 bg-slate-900 hover:bg-slate-800 text-amber-400 px-4 py-2 rounded-xl text-xs font-bold transition-all disabled:opacity-50 cursor-pointer shadow-sm"
+              >
+                <Save size={13} />
+                {savingSnapshot
+                  ? (lang === 'ar' ? 'جاري الحفظ...' : 'Saving...')
+                  : (lang === 'ar' ? 'حفظ لقطة التحديث' : 'Save update snapshot')}
+              </button>
+            </div>
+
+            {/* KPI strip */}
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+              <div className="p-3 bg-slate-50 rounded-xl border border-slate-200">
+                <span className="text-[11px] text-slate-500 font-bold block">{lang === 'ar' ? 'النهاية المتوقعة' : 'Forecast finish'}</span>
+                <div className="text-sm font-black text-slate-900 font-mono">{control.project.forecastFinish || 'N/A'}</div>
+              </div>
+              <div className="p-3 bg-slate-50 rounded-xl border border-slate-200">
+                <span className="text-[11px] text-slate-500 font-bold block">{lang === 'ar' ? 'التأخير الكلي (يوم)' : 'Total delay (d)'}</span>
+                <div className={`text-sm font-black font-mono ${(control.project.totalDelayWd || 0) > 0 ? 'text-rose-700' : 'text-emerald-700'}`}>
+                  {control.project.totalDelayWd !== null ? (control.project.totalDelayWd > 0 ? `+${control.project.totalDelayWd}` : control.project.totalDelayWd) : 'N/A'}
+                </div>
+              </div>
+              <div className="p-3 bg-slate-50 rounded-xl border border-slate-200">
+                <span className="text-[11px] text-slate-500 font-bold block">{lang === 'ar' ? 'التأخير عن التحديث السابق' : 'Delay vs previous'}</span>
+                <div className="text-sm font-black text-slate-900 font-mono">
+                  {control.project.delayVsPreviousWd !== null ? (control.project.delayVsPreviousWd > 0 ? `+${control.project.delayVsPreviousWd}` : control.project.delayVsPreviousWd) : 'N/A'}
+                </div>
+              </div>
+              <div className="p-3 bg-slate-50 rounded-xl border border-slate-200">
+                <span className="text-[11px] text-slate-500 font-bold block">{lang === 'ar' ? 'حرجة / شبه حرجة' : 'Critical / near'}</span>
+                <div className="text-sm font-black text-slate-900 font-mono">{control.project.criticalCount} / {control.project.nearCriticalCount}</div>
+              </div>
+              <div className="p-3 bg-slate-50 rounded-xl border border-slate-200">
+                <span className="text-[11px] text-slate-500 font-bold block">{lang === 'ar' ? 'أخطاء سلامة البيانات' : 'Integrity errors'}</span>
+                <div className={`text-sm font-black font-mono ${control.integrity.some((f) => f.severity === 'error') ? 'text-rose-700' : 'text-emerald-700'}`}>
+                  {control.integrity.filter((f) => f.severity === 'error').length}
+                </div>
+              </div>
+              <div className="p-3 bg-slate-50 rounded-xl border border-slate-200">
+                <span className="text-[11px] text-slate-500 font-bold block">{lang === 'ar' ? 'التقدم (مرجح بالمدد)' : 'Progress (dur-wtd)'}</span>
+                <div className="text-sm font-black text-slate-900 font-mono">{control.project.progressPct !== null ? `${control.project.progressPct}%` : 'N/A'}</div>
+              </div>
+            </div>
+
+            {/* Integrity findings */}
+            <div>
+              <h4 className="text-xs font-black text-slate-800 mb-2">{lang === 'ar' ? 'سلامة بيانات التقدم' : 'Progress integrity'}</h4>
+              {control.integrity.length === 0 ? (
+                <p className="text-xs text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-xl p-3">{lang === 'ar' ? 'لا توجد ملاحظات — البيانات متوافقة مع تاريخ التحديث.' : 'Clean — all progress is consistent with the Data Date.'}</p>
+              ) : (
+                <div className="overflow-x-auto border border-slate-200 rounded-xl max-h-56 overflow-y-auto">
+                  <table className="w-full text-xs">
+                    <thead className="bg-slate-50 text-slate-700 font-bold border-b sticky top-0">
+                      <tr>
+                        <th className="p-2 text-center">{lang === 'ar' ? 'الخطورة' : 'Severity'}</th>
+                        <th className="p-2 text-right">{lang === 'ar' ? 'النشاط' : 'Activity'}</th>
+                        <th className="p-2 text-right">{lang === 'ar' ? 'الملاحظة' : 'Finding'}</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {control.integrity.slice(0, 30).map((f, i) => (
+                        <tr key={i} className="hover:bg-slate-50">
+                          <td className="p-2 text-center">
+                            <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${f.severity === 'error' ? 'bg-rose-100 text-rose-800' : f.severity === 'warning' ? 'bg-amber-100 text-amber-800' : 'bg-blue-100 text-blue-800'}`}>
+                              {f.severity}
+                            </span>
+                          </td>
+                          <td className="p-2 font-mono font-bold text-slate-900">{f.activityCode || '—'} <span className="text-slate-400 font-normal">{f.code}</span></td>
+                          <td className="p-2 text-slate-600">{f.message}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {control.integrity.length > 30 && (
+                    <p className="text-[11px] text-slate-400 p-2">+{control.integrity.length - 30} {lang === 'ar' ? 'ملاحظات أخرى' : 'more findings'}</p>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Migration + accuracy */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+              <div className="p-3 bg-slate-50 rounded-xl border border-slate-200 text-xs">
+                <h4 className="font-black text-slate-800 mb-1.5">{lang === 'ar' ? 'هجرة المسار الحرج' : 'Critical-path migration'}</h4>
+                {!control.migration.hasPrevious ? (
+                  <p className="text-slate-400">N/A — {lang === 'ar' ? 'لا يوجد تحديث سابق' : 'no previous update'}</p>
+                ) : (
+                  <ul className="space-y-1 text-slate-600">
+                    <li><span className="font-bold text-slate-800">{lang === 'ar' ? 'دخلت الحرج:' : 'Entered:'}</span> <span className="font-mono">{control.migration.enteredCritical.join(', ') || '—'}</span></li>
+                    <li><span className="font-bold text-slate-800">{lang === 'ar' ? 'غادرت الحرج:' : 'Left:'}</span> <span className="font-mono">{control.migration.leftCritical.join(', ') || '—'}</span></li>
+                    <li><span className="font-bold text-slate-800">{lang === 'ar' ? 'علاقات حاكمة جديدة:' : 'New driving links:'}</span> <span className="font-mono">{control.migration.newDrivingLinkIds.length}</span></li>
+                  </ul>
+                )}
+              </div>
+              <div className="p-3 bg-slate-50 rounded-xl border border-slate-200 text-xs">
+                <h4 className="font-black text-slate-800 mb-1.5">{lang === 'ar' ? 'دقة التوقعات السابقة' : 'Forecast accuracy'}</h4>
+                {!control.accuracy.hasPrevious ? (
+                  <p className="text-slate-400">N/A — {lang === 'ar' ? 'لا يوجد تحديث سابق' : 'no previous update'}</p>
+                ) : (
+                  <ul className="space-y-1 text-slate-600">
+                    <li><span className="font-bold text-slate-800">{lang === 'ar' ? 'انحراف النهاية:' : 'Finish drift:'}</span> <span className="font-mono">{control.accuracy.driftWd !== null ? `${control.accuracy.driftWd > 0 ? '+' : ''}${control.accuracy.driftWd}d` : 'N/A'}</span></li>
+                    <li><span className="font-bold text-slate-800">{lang === 'ar' ? 'أُنجز منذ التحديث السابق:' : 'Completed since:'}</span> <span className="font-mono">{control.accuracy.completedSince} ({lang === 'ar' ? 'مطابق' : 'match'} {control.accuracy.matched} / {lang === 'ar' ? 'متأخر' : 'late'} {control.accuracy.lateVsForecast} / {lang === 'ar' ? 'مبكر' : 'early'} {control.accuracy.earlyVsForecast})</span></li>
+                    <li><span className="font-bold text-slate-800">{lang === 'ar' ? 'التحيز:' : 'Bias:'}</span> <span className="font-mono">{control.accuracy.bias}{control.accuracy.meanAbsErrWd !== null ? ` (MAE ${control.accuracy.meanAbsErrWd}d)` : ''}</span></li>
+                  </ul>
+                )}
+              </div>
+            </div>
+
+            {/* Milestones */}
+            <div>
+              <h4 className="text-xs font-black text-slate-800 mb-2">{lang === 'ar' ? 'ضبط المعالم (Milestones)' : 'Milestone control'}</h4>
+              {control.milestones.length === 0 ? (
+                <p className="text-xs text-slate-400">N/A — {lang === 'ar' ? 'لا معالم معرفة' : 'no milestones defined'}</p>
+              ) : (
+                <div className="overflow-x-auto border border-slate-200 rounded-xl">
+                  <table className="w-full text-xs">
+                    <thead className="bg-slate-50 text-slate-700 font-bold border-b">
+                      <tr>
+                        <th className="p-2 text-right">{lang === 'ar' ? 'المعلم' : 'Milestone'}</th>
+                        <th className="p-2 text-center">{lang === 'ar' ? 'تاريخ الأساس' : 'Baseline'}</th>
+                        <th className="p-2 text-center">{lang === 'ar' ? 'المتوقع / الفعلي' : 'Forecast / actual'}</th>
+                        <th className="p-2 text-center">{lang === 'ar' ? 'الانحراف (يوم)' : 'Variance (d)'}</th>
+                        <th className="p-2 text-center">{lang === 'ar' ? 'الحالة' : 'State'}</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {control.milestones.map((m) => (
+                        <tr key={m.id} className="hover:bg-slate-50">
+                          <td className="p-2"><span className="font-mono font-bold text-slate-900">{m.code}</span> <span className="text-slate-600">{m.name}</span></td>
+                          <td className="p-2 text-center font-mono text-slate-600">{m.baselineDate || 'N/A'}</td>
+                          <td className="p-2 text-center font-mono text-slate-600">{m.forecastDate || 'N/A'}</td>
+                          <td className="p-2 text-center font-mono font-bold">{m.varianceWd !== null ? (m.varianceWd > 0 ? `+${m.varianceWd}` : m.varianceWd) : 'N/A'}</td>
+                          <td className="p-2 text-center">
+                            <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${m.state === 'achieved' ? 'bg-emerald-100 text-emerald-800' : m.state === 'on_track' ? 'bg-blue-100 text-blue-800' : m.state === 'at_risk' ? 'bg-amber-100 text-amber-800' : m.state === 'slipped' ? 'bg-rose-100 text-rose-800' : 'bg-slate-100 text-slate-500'}`}>
+                              {m.state}
+                            </span>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+
+            {/* Top actions */}
+            <div>
+              <h4 className="text-xs font-black text-slate-800 mb-2">{lang === 'ar' ? 'أهم ٥ إجراءات قرار' : 'Top-5 decision actions'}</h4>
+              {control.actions.length === 0 ? (
+                <p className="text-xs text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-xl p-3">{lang === 'ar' ? 'لا إجراءات مطلوبة — التحديث نظيف.' : 'No actions required — clean update.'}</p>
+              ) : (
+                <ol className="space-y-2">
+                  {control.actions.map((a) => (
+                    <li key={a.rank} className="p-3 bg-slate-50 rounded-xl border border-slate-200 text-xs">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="w-5 h-5 rounded-full bg-slate-900 text-amber-400 text-[10px] font-black flex items-center justify-center">{a.rank}</span>
+                        <span className="font-black text-slate-900">{a.issue}</span>
+                        <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${a.confidence === 'High' ? 'bg-emerald-100 text-emerald-800' : a.confidence === 'Medium' ? 'bg-amber-100 text-amber-800' : 'bg-rose-100 text-rose-800'}`}>
+                          {a.confidence}
+                        </span>
+                      </div>
+                      <p className="text-slate-600 mt-1"><span className="font-bold">{lang === 'ar' ? 'الدليل:' : 'Evidence:'}</span> {a.evidence.join(' · ')}</p>
+                      <p className="text-slate-600"><span className="font-bold">{lang === 'ar' ? 'الأثر:' : 'Impact:'}</span> {a.impact}</p>
+                      <p className="text-slate-800"><span className="font-bold">{lang === 'ar' ? 'الإجراء:' : 'Action:'}</span> {a.action}</p>
+                    </li>
+                  ))}
+                </ol>
+              )}
+            </div>
+
+            {/* Confidence */}
+            <div>
+              <h4 className="text-xs font-black text-slate-800 mb-2">{lang === 'ar' ? 'الثقة بكل مؤشر' : 'Confidence per KPI'}</h4>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2">
+                {(Object.entries(control.confidence) as Array<[string, { level: string; sources: string[]; notes: string[] }]>).map(([kpi, c]) => (
+                  <div key={kpi} className="p-2.5 bg-slate-50 rounded-xl border border-slate-200 text-xs">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-bold text-slate-700">{kpi}</span>
+                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${c.level === 'High' ? 'bg-emerald-100 text-emerald-800' : c.level === 'Medium' ? 'bg-amber-100 text-amber-800' : 'bg-rose-100 text-rose-800'}`}>
+                        {c.level}
+                      </span>
+                    </div>
+                    <ul className="text-[11px] text-slate-500 mt-1 space-y-0.5">
+                      {c.notes.map((n, i) => (<li key={i}>• {n}</li>))}
+                    </ul>
+                  </div>
+                ))}
+              </div>
             </div>
           </div>
         </div>
