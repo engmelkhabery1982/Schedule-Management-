@@ -77,7 +77,7 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
   const [boqOverrides, setBoqOverrides] = useState<BoqPlanOverrides>(EMPTY_BOQ_OVERRIDES);
   const [boqTab, setBoqTab] = useState<'class' | 'wbs' | 'acts' | 'logic' | 'cost' | 'valid'>('class');
   const [newLink, setNewLink] = useState({ from: '', to: '', type: 'FS', lag: 0 });
-  const [boqDone, setBoqDone] = useState<{ persist: BoqPersistPlan; canApprove: boolean } | null>(null);
+  const [boqDone, setBoqDone] = useState<{ persist: BoqPersistPlan; canApprove: boolean; criticalCount: number } | null>(null);
   const [doneSource, setDoneSource] = useState<'xer' | 'boq' | null>(null);
   const [boqBaseline, setBoqBaseline] = useState<{ ok: boolean; version: number | null; error: string | null } | null>(null);
 
@@ -254,7 +254,7 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
     try {
       const boqRows = parsedRows.map((row, i) => ({
         rowKey: `boq-${String(i + 1).padStart(4, '0')}`,
-        item_code: row.code,
+        code: row.code,
         description: row.description,
         unit: row.unit,
         quantity: row.quantity,
@@ -287,7 +287,7 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
           : '';
         throw new Error(`${result.error || 'فشل الحفظ'}${cleanupNote}`);
       }
-      setBoqDone({ persist, canApprove: persist.canApproveBaseline });
+      setBoqDone({ persist, canApprove: persist.canApproveBaseline, criticalCount: plan.findings.filter((f) => f.severity === 'critical').length });
       setDoneSource('boq');
       setStep('done');
     } catch (err: unknown) {
@@ -306,8 +306,6 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
         const r = a as Record<string, unknown>;
         return {
           activity_id: String(r.id),
-          code: String(r.code),
-          name: String(r.name),
           planned_start: typeof r.early_start === 'string' ? r.early_start : null,
           planned_finish: typeof r.early_finish === 'string' ? r.early_finish : null,
           duration_days: Number(r.duration_days) || 0,
@@ -321,7 +319,7 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
         costByAct.set(String(r.activity_id), Number(r.planned_cost) || 0);
       }
       for (const a of acts) a.planned_cost = costByAct.get(a.activity_id) || 0;
-      const res = await approveBoqBaseline(supabase, boqDone.persist.projectId, acts, 1, 'Initial Baseline');
+      const res = await approveBoqBaseline(supabase, boqDone.persist.projectId, acts, { canApproveBaseline: boqDone.canApprove, criticalCount: boqDone.criticalCount }, 1, 'Initial Baseline');
       if (!res.ok) {
         setBoqBaseline({ ok: false, version: null, error: res.error });
         return;

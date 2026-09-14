@@ -76,8 +76,6 @@ function uuid(): string {
 
 export interface BoqProjectInput {
   name: string;
-  name_ar?: string;
-  code?: string;
   client?: string;
   location?: string;
   contract_value?: number;
@@ -92,7 +90,7 @@ export interface BoqProjectInput {
 export function buildBoqPersistPlan(
   plan: BoqPlan,
   project: BoqProjectInput,
-  boqRows: Array<{ rowKey: string; item_code: string; description: string; unit: string; quantity: number; unit_price: number; total_price: number }>
+  boqRows: Array<{ rowKey: string; code: string; description: string; unit: string; quantity: number; unit_price: number; total_price: number }>
 ): BoqPersistPlan {
   const projectId = uuid();
   const activityIdByStable: Record<string, string> = {};
@@ -108,7 +106,7 @@ export function buildBoqPersistPlan(
   const boqItems = boqRows.map((b) => ({
     id: boqIdByRowKey[b.rowKey],
     project_id: projectId,
-    item_code: b.item_code,
+    code: b.code,
     description: b.description,
     unit: b.unit,
     quantity: b.quantity,
@@ -152,7 +150,7 @@ export function buildBoqPersistPlan(
     project_id: projectId,
     predecessor_id: activityIdByStable[l.fromActivityId],
     successor_id: activityIdByStable[l.toActivityId],
-    relationship_type: l.type,
+    link_type: l.type,
     lag_days: l.lagDays,
   }));
 
@@ -173,7 +171,6 @@ export function buildBoqPersistPlan(
   const resources = plan.resources.map((r) => ({
     id: resourceIdByStable[r.stableId],
     project_id: projectId,
-    code: r.code,
     name: r.name,
     type: r.type,
     unit: r.unit,
@@ -205,9 +202,10 @@ export function buildBoqPersistPlan(
     project: {
       id: projectId,
       name: project.name,
-      name_ar: project.name_ar || null,
-      code: project.code || null,
+      client: project.client || null,
       location: project.location || null,
+      contract_value: project.contract_value ?? null,
+      description: project.description || null,
       start_date: project.start_date,
       end_date: project.end_date,
       status: project.status || "planning",
@@ -305,13 +303,31 @@ export async function persistBoqPersistPlan(
   };
 }
 
+export interface BoqBaselineEligibility {
+  canApproveBaseline: boolean;
+  criticalCount: number;
+}
+
 export async function approveBoqBaseline(
   client: BoqDbClient,
   projectId: string,
-  activities: Array<{ activity_id: string; code: string; name: string; planned_start: string | null; planned_finish: string | null; duration_days: number; planned_cost: number }>,
+  activities: Array<{ activity_id: string; planned_start: string | null; planned_finish: string | null; duration_days: number; planned_cost: number }>,
+  eligibility: BoqBaselineEligibility,
   version = 1,
   name = "Initial Baseline"
 ): Promise<BoqBaselineResult> {
+  // F2.1 defense in depth: the service refuses on its own authority, before any
+  // INSERT, so no caller (present UI or future) can baseline an invalid plan.
+  if (!eligibility || eligibility.canApproveBaseline !== true) {
+    const criticals = eligibility && typeof eligibility.criticalCount === "number" ? eligibility.criticalCount : "unknown";
+    return {
+      ok: false,
+      error: `Baseline approval refused: plan is not eligible (critical failures: ${criticals}). Resolve critical validation findings first.`,
+      baselineId: null,
+      version: null,
+      activityCount: 0,
+    };
+  }
   try {
     const header = {
       id: uuid(), project_id: projectId, version, name,
@@ -320,7 +336,13 @@ export async function approveBoqBaseline(
     const { error: hErr } = await client.from("project_baselines").insert(header);
     if (hErr) throw new Error(`project_baselines: ${hErr.message}`);
     const rows = activities.map((a) => ({
-      id: uuid(), baseline_id: header.id, project_id: projectId, ...a,
+      id: uuid(),
+      baseline_id: header.id,
+      activity_id: a.activity_id,
+      early_start: a.planned_start,
+      early_finish: a.planned_finish,
+      duration_days: a.duration_days,
+      planned_cost: a.planned_cost,
     }));
     if (rows.length > 0) {
       const { error: rErr } = await client.from("baseline_activities").insert(rows);
