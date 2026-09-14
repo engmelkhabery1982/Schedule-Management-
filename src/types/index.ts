@@ -154,6 +154,17 @@ export interface ActivityLink {
   link_type: 'FS' | 'SS' | 'FF' | 'SF' | string;
   lag_days: number;
   /**
+   * F1.1: exact signed XER lag hours (TASKPRED.lag_hr_cnt). Null for legacy/manual
+   * links. Display + export round trip; the CPM engine consumes `lag_days_exact`.
+   */
+  lag_hours?: number | null;
+  /**
+   * F1.1: exact fractional working-day lag (lag_hr_cnt / predecessor-calendar hpd at
+   * import, unrounded). CPM execution input with per-type floor/ceil placement. Null
+   * keeps the exact legacy `lag_days` path.
+   */
+  lag_days_exact?: number | null;
+  /**
    * Optional audit timestamp.
    * Compatibility field: the auto-fix routines in `src/lib/scheduleQualityEngine.ts` stamp
    * newly created links with `created_at`, while the `activity_links` table in
@@ -197,6 +208,8 @@ export interface ActivityResource {
 }
 
 /** P6 working calendar imported from XER (reference data; CPM runs on project calendar_type). */
+export type P6CalendarPattern = 'parsed' | 'no_data' | 'unparseable' | 'exceptions_unsupported';
+
 export interface P6Calendar {
   id: string;
   project_id: string;
@@ -210,6 +223,11 @@ export interface P6Calendar {
   base_p6_clndr_id: string | null;
   workweek_json: Record<string, unknown> | null;
   exceptions_json: string[] | null;
+  /**
+   * F1.1: clndr_data parse outcome. Null on pre-F1.1 rows (the resolver derives it from
+   * the stored JSON: workweek present -> 'parsed', else 'no_data').
+   */
+  pattern_status: P6CalendarPattern | null;
   created_at: string;
 }
 

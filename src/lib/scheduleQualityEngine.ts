@@ -805,9 +805,15 @@ export async function autoFixDcmaIssues(
         await supabase.from('activity_links').update({
           lag_days: 0,
           link_type: 'FS',
+          // F1.1: the fix redefines the relationship as FS+0, so hour-precision
+          // provenance of the old lag must not survive to override it at CPM time.
+          lag_hours: null,
+          lag_days_exact: null,
         }).eq('id', link.id);
         link.lag_days = 0;
         link.link_type = 'FS';
+        link.lag_hours = null;
+        link.lag_days_exact = null;
         fixedCount++;
       }
     }
@@ -820,9 +826,15 @@ export async function autoFixDcmaIssues(
         await supabase.from('activity_links').update({
           link_type: 'FS',
           lag_days: 0,
+          // F1.1: same coherence as the lag fix above — stale hour precision must not
+          // override the rewritten FS+0 relationship.
+          lag_hours: null,
+          lag_days_exact: null,
         }).eq('id', link.id);
         link.link_type = 'FS';
         link.lag_days = 0;
+        link.lag_hours = null;
+        link.lag_days_exact = null;
         fixedCount++;
       }
     }

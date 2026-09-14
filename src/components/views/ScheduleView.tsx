@@ -10,12 +10,13 @@ import type {
   Resource,
   ActivityResource,
   CalendarType,
+  P6Calendar,
   ActivityType,
   ActivityConstraintType,
   PercentCompleteType,
 } from '@/types';
 import { calculateCpm, type LinkDrivingResult } from '@/lib/cpmEngine';
-import { addWorkingDays, subtractWorkingDays, getCalendar, countWorkingDays } from '@/lib/calendarEngine';
+import { addWorkingDays, subtractWorkingDays, getCalendar, countWorkingDays, resolveActivityExecutionCalendar } from '@/lib/calendarEngine';
 import { DEFAULT_DATA_DATE } from '@/lib/projectControlsConstants';
 import {
   Zap,
@@ -90,6 +91,8 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
   const [wbsNodes, setWbsNodes] = useState<WbsNode[]>([]);
   const [baselineActivities, setBaselineActivities] = useState<BaselineActivity[]>([]);
   const [links, setLinks] = useState<ActivityLink[]>([]);
+  // F1.1: P6 calendars for per-activity CPM execution + diagnostics (empty = legacy path).
+  const [calendars, setCalendars] = useState<P6Calendar[]>([]);
   const [linkDrivingMap, setLinkDrivingMap] = useState<Map<string, boolean>>(new Map());
   const [resources, setResources] = useState<Resource[]>([]);
   const [assignments, setAssignments] = useState<ActivityResource[]>([]);
@@ -201,16 +204,18 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
   async function loadData() {
     if (!project) return;
     setLoading(true);
-    const [actRes, wbsRes, baselineRes, linkRes, resourceRes, assignmentRes] = await Promise.all([
+    const [actRes, wbsRes, baselineRes, linkRes, resourceRes, assignmentRes, calRes] = await Promise.all([
       supabase.from('activities').select('*, wbs_node:wbs_nodes(*)').eq('project_id', project.id).order('sort_order', { ascending: true }),
       supabase.from('wbs_nodes').select('*').eq('project_id', project.id).order('sort_order', { ascending: true }),
       supabase.from('baseline_activities').select('*'),
       supabase.from('activity_links').select('*').eq('project_id', project.id),
       supabase.from('resources').select('*').eq('project_id', project.id).order('name'),
       supabase.from('activity_resources').select('*, resource:resources(*)').eq('project_id', project.id),
+      supabase.from('calendars').select('*').eq('project_id', project.id),
     ]);
     const acts = (actRes.data || []) as Activity[];
     const linksData = (linkRes.data || []) as ActivityLink[];
+    const calendarsData = (calRes.data || []) as P6Calendar[];
 
     // Calculate CPM & driving links
     const cpm = calculateCpm(acts, linksData, {
@@ -218,6 +223,7 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
       dataDate: project.data_date || DEFAULT_DATA_DATE,
       statusLogic: project.status_logic || 'retained_logic',
       calculateDrag: true,
+      calendars: calendarsData,
     });
 
     const drivingMap = new Map<string, boolean>();
@@ -232,6 +238,7 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
     setLinks(linksData);
     setResources((resourceRes.data || []) as Resource[]);
     setAssignments((assignmentRes.data || []) as ActivityResource[]);
+    setCalendars(calendarsData);
     setLoading(false);
   }
 
@@ -249,6 +256,7 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
       dataDate: dDate,
       statusLogic: sLogic,
       calculateDrag: true,
+      calendars,
     });
 
     if (calculation.cycle) {
@@ -331,6 +339,11 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
   };
 
   // Filtered Activities
+  // F1.1: P6 calendar lookup for the calendar diagnostics column below. Resolution runs
+  // through the same calendarEngine helper the CPM engine uses, so the badge always
+  // describes the calendar that actually scheduled the activity.
+  const calendarsById = useMemo(() => new Map(calendars.map((c) => [c.id, c])), [calendars]);
+
   const filteredActivities = useMemo(() => {
     return activities.filter((a) => {
       if (filterCriticalOnly && !a.is_critical) return false;
@@ -2010,7 +2023,25 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
 
                         {visibleColumns.calendar_type && (
                           <td className="p-3 font-mono text-[10px] text-slate-600">
-                            {act.calendar_type || selectedCalendar}
+                            {(() => {
+                              if (!act.calendar_id || calendarsById.size === 0) return act.calendar_type || selectedCalendar;
+                              const resolved = resolveActivityExecutionCalendar(act, calendarsById, getCalendar(selectedCalendar), []);
+                              if (resolved.source === 'activity_calendar' || resolved.source === 'activity_calendar_partial') {
+                                return (
+                                  <span title={resolved.source === 'activity_calendar_partial'
+                                    ? (lang === 'ar' ? 'تقويم P6 (نمط العمل فقط — الاستثناءات غير مدعومة)' : 'P6 calendar (pattern only — exceptions unsupported)')
+                                    : (lang === 'ar' ? 'تقويم P6 مستورد' : 'Imported P6 calendar')}>
+                                    {resolved.calendarName}
+                                    {resolved.source === 'activity_calendar_partial' && <span className="text-amber-600 font-bold"> ⚠</span>}
+                                  </span>
+                                );
+                              }
+                              return (
+                                <span title={lang === 'ar' ? 'التقويم المسند غير صالح — تم استخدام تقويم المشروع' : 'Assigned calendar unusable — project calendar fallback used'}>
+                                  {selectedCalendar} <span className="text-amber-600 font-bold">(fallback)</span>
+                                </span>
+                              );
+                            })()}
                           </td>
                         )}
 
@@ -2188,7 +2219,15 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
                         <td className="p-2.5 font-bold">{activities.find((a) => a.id === link.predecessor_id)?.code || '-'}</td>
                         <td className="p-2.5 font-mono font-bold text-amber-700">{link.link_type}</td>
                         <td className="p-2.5 font-bold">{activities.find((a) => a.id === link.successor_id)?.code || '-'}</td>
-                        <td className="p-2.5 font-mono">{link.lag_days} {lang === 'ar' ? 'يوم' : 'd'}</td>
+                        <td className="p-2.5 font-mono">
+                          {link.lag_hours !== null && link.lag_hours !== undefined ? (
+                            <span title={`${lang === 'ar' ? 'الأصل من الملف' : 'Original from file'}: ${link.lag_hours}h (≈${Number(link.lag_days_exact ?? link.lag_days).toFixed(2)}d)`}>
+                              {link.lag_hours}h
+                            </span>
+                          ) : (
+                            <>{link.lag_days} {lang === 'ar' ? 'يوم' : 'd'}</>
+                          )}
+                        </td>
                         <td className="p-2.5 text-center">
                           {isDriving ? (
                             <span className="px-2 py-0.5 rounded-full text-[10px] font-black bg-blue-100 text-blue-800 border border-blue-200">

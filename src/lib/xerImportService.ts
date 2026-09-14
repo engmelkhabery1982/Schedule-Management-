@@ -183,6 +183,8 @@ export function buildXerImportPlan(parsed: ParsedXerResult, opts: XerImportOptio
         ? { day_hours: dayHours, working_days: c.workingDaysPerWeek, day_index_base: 'P6 DaysOfWeek 1..7 (Sunday-first convention)' }
         : null,
       exceptions_json: c.exceptions,
+      // F1.1: parse outcome drives CPM fallback (full / pattern-only / project fallback).
+      pattern_status: c.patternStatus,
     } satisfies Record<string, unknown>;
   });
   const calsUnsupported = parsed.calendars.filter((c) => c.patternStatus === 'unparseable' || c.patternStatus === 'exceptions_unsupported').length;
@@ -290,6 +292,7 @@ export function buildXerImportPlan(parsed: ParsedXerResult, opts: XerImportOptio
 
   // Links ---------------------------------------------------------------------
   const linkRows: Record<string, unknown>[] = [];
+  const hourLagNotes: string[] = [];
   for (const l of parsed.links) {
     const predId = actIdByXer.get(l.predXerId);
     const succId = actIdByXer.get(l.succXerId);
@@ -312,7 +315,14 @@ export function buildXerImportPlan(parsed: ParsedXerResult, opts: XerImportOptio
       successor_id: succId,
       link_type: l.linkType,
       lag_days: l.lagDays,
+      // F1.1: original hours (display/export) + exact fractional days (CPM execution).
+      lag_hours: l.lagHours,
+      lag_days_exact: l.lagDaysExact,
     });
+    // F1.1: collect sub-day lags for the reconciliation note (original value/unit).
+    if (l.lagRounded && l.lagHours !== null && Number.isFinite(Number(l.lagDaysExact))) {
+      hourLagNotes.push(`${label} ${l.linkType || '?'} ${l.lagHours}h (≈${Number(l.lagDaysExact).toFixed(2)}d, predecessor basis)`);
+    }
   }
 
   // Assignments ----------------------------------------------------------------
@@ -459,12 +469,22 @@ export function buildXerImportPlan(parsed: ParsedXerResult, opts: XerImportOptio
   const actualsPreserved = parsed.activities.filter((a) => a.actualStart || a.actualFinish).length;
   const constraintsImported = parsed.activities.filter((a) => a.constraintType).length;
   const constraintsSource = parsed.activities.filter((a) => a.constraintRaw).length;
+  // F1.1 execution-semantics notes: sub-day lag provenance + calendar fallback surface.
+  const relationshipNotes = hourLagNotes.length > 0
+    ? [`${hourLagNotes.length} link(s) carry sub-day lag — exact hours preserved for CPM (e.g. ${hourLagNotes.slice(0, 2).join('; ')}${hourLagNotes.length > 2 ? '…' : ''})`]
+    : [];
+  const fallbackCals = parsed.calendars.filter((c) => !c.workweek).length;
+  const partialCals = parsed.calendars.filter((c) => c.patternStatus === 'exceptions_unsupported').length;
+  const calendarNotes = [
+    ...(fallbackCals > 0 ? [`${fallbackCals} calendar(s) carry no usable work pattern — project-calendar fallback at execution`] : []),
+    ...(partialCals > 0 ? [`${partialCals} calendar(s) execute work-pattern-only — exceptions unsupported, dates may differ from P6`] : []),
+  ];
   const sections: ReconSection[] = [
     section('Project', 1, 1, 0, 0, skippedProjectsNote()),
     section('WBS', parsed.wbs.length, wbsRows.length, countDrops('wbs'), 0),
     section('Activities', parsed.activities.length, activityRows.length, countDrops('activity'), 0),
-    section('Relationships', parsed.links.length, linkRows.length, parsed.links.length - linkRows.length, 0),
-    section('Calendars', parsed.calendars.length, calendarRows.length, 0, calsUnsupported),
+    section('Relationships', parsed.links.length, linkRows.length, parsed.links.length - linkRows.length, 0, relationshipNotes),
+    section('Calendars', parsed.calendars.length, calendarRows.length, 0, calsUnsupported, calendarNotes),
     section('Resources', parsed.resources.length, resourceRows.length, 0, 0,
       skippedResources.length > 0 ? [`${skippedResources.length} resource(s) not assigned in this project — skipped`] : []),
     section('Assignments', parsed.assignments.length, assignmentRows.length, parsed.assignments.length - assignmentRows.length, 0,

@@ -319,6 +319,8 @@ export interface XerLinkSource {
   linkTypeRaw: string | null;
   lagDays: number;
   lagHours: number | null;
+  /** F1.1: unrounded lag_hr_cnt / predecessor hpd — the exact CPM execution input. */
+  lagDaysExact: number | null;
   lagBasis: string;
   lagRounded: boolean;
   crossProject: boolean;
@@ -853,6 +855,7 @@ export function parseXerContent(xerText: string): ParsedXerResult {
       linkTypeRaw: (row['pred_type'] || '').trim() || null,
       lagDays: lag.days ?? 0,
       lagHours: lagH,
+      lagDaysExact: lagH / hpd,
       lagBasis: `lag_hr_cnt=${lagH}h / predecessor ${basis}${lag.rounded ? ' (rounded)' : ''}`,
       lagRounded: lag.rounded,
       crossProject,

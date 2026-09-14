@@ -72,7 +72,8 @@ export function generateXer(data: XerExportData): string {
     const predId = taskIdMap[link.predecessor_id] || 1;
     const succId = taskIdMap[link.successor_id] || 1;
     const predType = link.link_type === 'FS' ? 'FS' : link.link_type === 'SS' ? 'SS' : link.link_type === 'FF' ? 'FF' : 'SF';
-    const lagHours = link.lag_days * 8;
+    // F1.1: lossless round trip — the original filed hours win; legacy rows keep days*8.
+    const lagHours = link.lag_hours ?? link.lag_days * 8;
     lines.push(`${linkIdCounter}\t1\t${predId}\t${succId}\t${predType}\t${lagHours}`);
     linkIdCounter++;
   }

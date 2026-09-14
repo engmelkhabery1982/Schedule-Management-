@@ -1,4 +1,4 @@
-import type { Activity, ActivityLink, CalendarType, ProjectCalendar, ActivityConstraintType } from '@/types';
+import type { Activity, ActivityLink, CalendarType, P6Calendar, ProjectCalendar, ActivityConstraintType } from '@/types';
 import {
   getCalendar,
   isWorkingDay,
@@ -9,6 +9,10 @@ import {
   countWorkingDays,
   calculateLinkDate,
   offsetWorkingDays,
+  effectiveLinkLagDays,
+  forwardLagShift,
+  backwardLagShift,
+  resolveActivityExecutionCalendar,
 } from './calendarEngine';
 
 export interface CpmOptions {
@@ -17,6 +21,13 @@ export interface CpmOptions {
   dataDate?: string | null;
   statusLogic?: 'retained_logic' | 'progress_override';
   calculateDrag?: boolean;
+  /**
+   * F1.1: project P6 calendars (the `calendars` table rows). An activity whose
+   * `calendar_id` matches a usable row is scheduled on that P6 work pattern; anything
+   * else keeps the exact legacy path (activity `calendar_type`, else project default).
+   * Omit (or pass []) and the calculation is byte-identical to pre-F1.1.
+   */
+  calendars?: P6Calendar[];
 }
 
 export interface CpmResult {
@@ -143,8 +154,14 @@ export function calculateCpm(
     successors.set(link.predecessor_id, [...(successors.get(link.predecessor_id) || []), link]);
   });
 
-  // Helper to get calendar for specific activity
+  // F1.1: resolve each activity onto its P6 calendar when one is assigned and usable;
+  // the resolver's legacy branch reproduces the historical logic verbatim, so projects
+  // without calendar assignments (or callers that pass no calendars) are unaffected.
+  const p6ById = new Map((options.calendars || []).map((c) => [c.id, c]));
   const getActivityCalendar = (act: Activity): ProjectCalendar => {
+    if (p6ById.size > 0 && act.calendar_id) {
+      return resolveActivityExecutionCalendar(act, p6ById, defaultCalendar, customHolidays).calendar;
+    }
     if (act.calendar_type) {
       return getCalendar(act.calendar_type, customHolidays);
     }
@@ -192,6 +209,16 @@ export function calculateCpm(
     const isStarted = Boolean(activity.actual_start) || activity.percent_complete > 0;
     const isMilestone = activity.is_milestone || activity.activity_type === 'start_milestone' || activity.activity_type === 'finish_milestone';
 
+    // F1.1: when this successor itself runs on a P6 calendar, relationship results are
+    // placed onto it (lag still shifts on the predecessor basis inside calculateLinkDate).
+    let succPlaceCal: ProjectCalendar | null = null;
+    if (p6ById.size > 0 && activity.calendar_id) {
+      const resolved = resolveActivityExecutionCalendar(activity, p6ById, defaultCalendar, customHolidays);
+      if (resolved.source === 'activity_calendar' || resolved.source === 'activity_calendar_partial') {
+        succPlaceCal = resolved.calendar;
+      }
+    }
+
     let totalDuration = isMilestone ? 0 : Math.max(1, Number(activity.duration_days || 1));
     let remainingDuration = totalDuration;
 
@@ -237,8 +264,9 @@ export function calculateCpm(
             predDates.finish,
             remainingDuration,
             linkType,
-            link.lag_days || 0,
+            effectiveLinkLagDays(link),
             predCal,
+            succPlaceCal,
           );
 
           // Check for out of sequence execution (successor started before predecessor completed)
@@ -365,7 +393,7 @@ export function calculateCpm(
         if (succDates && succAct) {
           const succCal = getActivityCalendar(succAct);
           const linkType = (link.link_type as 'FS' | 'SS' | 'FF' | 'SF') || 'FS';
-          const lag = link.lag_days || 0;
+          const lag = effectiveLinkLagDays(link);
 
           // Backward pass: the exact inverse of the forward relationship rules.
           //
@@ -391,9 +419,13 @@ export function calculateCpm(
           // matching the forward pass where a one-day lead starts the successor exactly on the
           // predecessor finish. Leads of any other size keep their sign, so the negative-lag
           // behaviour established for FS and SF is preserved.
+          //
+          // F1.1: `lag` may be fractional (hour-derived). backwardLagShift negates the rounded
+          // forward shift instead of rounding the negation, keeping the backward pass the
+          // exact inverse at any precision; whole-day lags reduce to the rule above.
           const constrainedBySuccFinish = linkType === 'FF' || linkType === 'SF';
           const predecessorEventIsStart = linkType === 'SS' || linkType === 'SF';
-          const backwardOffset = linkType === 'FS' ? -lag - 1 : -lag;
+          const backwardOffset = backwardLagShift(lag, linkType);
 
           const predecessorAnchor = offsetWorkingDays(
             constrainedBySuccFinish ? succDates.finish : succDates.start,
@@ -461,8 +493,11 @@ export function calculateCpm(
         const succAct = byId.get(link.successor_id);
         if (succEarly && succAct) {
           const succCal = getActivityCalendar(succAct);
-          const lag = link.lag_days || 0;
           const linkType = (link.link_type as 'FS' | 'SS' | 'FF' | 'SF') || 'FS';
+          // F1.1: free float consumes the same rounded forward shift the forward pass
+          // placed, so a driving fractional link still reports zero free float. Whole-day
+          // lags reduce to the historical `- lag` verbatim.
+          const lag = forwardLagShift(effectiveLinkLagDays(link), linkType);
 
           // Free float per relationship type (GAP-013): the working-day slack between the
           // predecessor event that drives the link and the successor event that link constrains,
