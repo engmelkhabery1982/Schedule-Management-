@@ -1,5 +1,6 @@
 import type { Activity, BaselineActivity, CostTransaction, ProgressUpdate } from '@/types';
 import type { GeneratedAlert } from '@/lib/alertEngine';
+import { governedDefaultToday } from '@/lib/projectControlsConstants';
 
 export interface PerformanceTrend {
   direction: 'improving' | 'stable' | 'deteriorating';
@@ -47,7 +48,9 @@ export function calculatePerformanceTrend(
 export function calculateBaselineVariances(
   activities: Activity[],
   baselineActivities: BaselineActivity[],
-  today = new Date(),
+  // F9 (acceptance A): the implicit "today" is the governed Data Date default, never the machine
+  // clock — baseline variance is control math and must be reproducible from project data alone.
+  today = governedDefaultToday(),
 ): BaselineVariance[] {
   const baselineByActivity = new Map(baselineActivities.map((item) => [item.activity_id, item]));
   return activities.map((activity) => {

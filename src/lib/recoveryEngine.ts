@@ -1,5 +1,6 @@
 import type { Activity, BaselineActivity } from '@/types';
 import type { ComprehensiveProjectEvm } from '@/lib/planningEngine';
+import { governedDefaultToday } from '@/lib/projectControlsConstants';
 
 export interface RecoveryAnalysis {
   requiredSpi: number;
@@ -19,7 +20,9 @@ export function calculateRecoveryPlan(
   activities: Activity[],
   baselines: BaselineActivity[],
   evm: ComprehensiveProjectEvm,
-  today = new Date(),
+  // F9 (acceptance A): governed Data Date default instead of the machine clock — recovery targets
+  // are control math and must be reproducible from project data alone.
+  today = governedDefaultToday(),
 ): RecoveryAnalysis {
   const baselineByActivity = new Map(baselines.map((baseline) => [baseline.activity_id, baseline]));
   const openActivities = activities.filter((activity) => activity.percent_complete < 100);

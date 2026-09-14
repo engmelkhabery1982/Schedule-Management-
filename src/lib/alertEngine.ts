@@ -1,5 +1,6 @@
 import type { Activity } from '@/types';
 import type { ComprehensiveProjectEvm } from '@/lib/planningEngine';
+import { governedDefaultToday } from '@/lib/projectControlsConstants';
 
 export interface GeneratedAlert {
   fingerprint: string;
@@ -13,7 +14,9 @@ export interface GeneratedAlert {
 export function generateScheduleAlerts(
   activities: Activity[],
   evm: ComprehensiveProjectEvm,
-  today = new Date(),
+  // F9 (acceptance A): governed Data Date default instead of the machine clock — alerts are
+  // control output and must be reproducible from project data alone.
+  today = governedDefaultToday(),
 ): GeneratedAlert[] {
   const alerts: GeneratedAlert[] = [];
   if (evm.spi < 0.9) {

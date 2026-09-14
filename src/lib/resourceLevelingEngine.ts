@@ -7,6 +7,7 @@ import type {
   ResourceSummaryItem,
 } from '@/types';
 import { getCalendar, addWorkingDays, countWorkingDays, isWorkingDay } from './calendarEngine';
+import { DEFAULT_DATA_DATE } from './projectControlsConstants';
 
 export interface LevelingResult {
   leveledActivities: { activityId: string; earlyStart: string; earlyFinish: string; shiftDays: number }[];
@@ -38,7 +39,9 @@ export function generateResourceHistogram(
   });
 
   if (minDate > maxDate) {
-    minDate = new Date().toISOString().split('T')[0];
+    // F9 (acceptance A): dateless activities anchor the leveling window to the governed Data Date,
+    // never to the machine clock, so leveling output stays reproducible from project data alone.
+    minDate = DEFAULT_DATA_DATE;
     maxDate = addWorkingDays(minDate, 30, calendar);
   }
 

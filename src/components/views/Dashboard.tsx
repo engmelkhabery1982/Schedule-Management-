@@ -186,6 +186,23 @@ export default function Dashboard({ project, onNavigate }: DashboardProps) {
         supabase.from('cost_control_snapshots').select('*').eq('project_id', project.id).order('data_date', { ascending: false }).limit(10),
       ]);
 
+      // F9 (item 5): supabase-js resolves failed reads with `{ error }` instead of throwing. A failed
+      // read must never render as an "empty" dashboard (which reads as "no data"), so the first
+      // failed table aborts the load and surfaces a meaningful, table-named error.
+      const failedRead = ([
+        ['activities', actRes], ['risks', riskRes], ['issues', issueRes], ['budget_lines', budgetRes],
+        ['progress_updates', progRes], ['cost_transactions', costRes], ['baseline_activities', baselineRes],
+        ['project_alerts', alertsRes], ['activity_links', linksRes], ['activity_resources', assignmentsRes],
+        ['resources', resourcesRes], ['boq_items', boqRes], ['schedule_update_snapshots', snapRes],
+        ['wbs_nodes', cwbsRes], ['activity_boq_allocations', calRes], ['cost_control_snapshots', csnapRes],
+      ] as [string, { error?: { message?: string } | null }][]).find(([, res]) => Boolean(res?.error));
+      if (failedRead) {
+        const reason = failedRead[1].error?.message || (lang === 'ar' ? 'خطأ غير معروف' : 'unknown database error');
+        throw new Error(lang === 'ar'
+          ? `تعذر تحميل بيانات لوحة التحكم من جدول [${failedRead[0]}]: ${reason}`
+          : `Failed to load dashboard data from [${failedRead[0]}]: ${reason}`);
+      }
+
       const activityData = (actRes.data || []) as Activity[];
       const budgetData = (budgetRes.data || []) as BudgetLine[];
       const baselineData = (baselineRes.data || []) as BaselineActivity[];
@@ -208,7 +225,10 @@ export default function Dashboard({ project, onNavigate }: DashboardProps) {
       setCostSnapshots((((csnapRes as { data?: unknown }).data || []) as CostControlSnapshot[]));
       setAlerts((alertsRes.data || []) as ProjectAlert[]);
     } catch (err: any) {
+      // F9 (item 5): the failure is surfaced in the UI (banner below the header), not only logged —
+      // a silent catch would render a healthy-looking but empty dashboard.
       console.error('Error loading dashboard:', err);
+      setError(err?.message || (lang === 'ar' ? 'تعذر تحميل بيانات لوحة التحكم.' : 'Failed to load dashboard data.'));
     } finally {
       setLoading(false);
     }
@@ -357,7 +377,12 @@ ${noticeForm.contractorName}`;
     );
   }, [startDate, endDate, plannedBudget, actualCost, overallProgress, evm.spi, evm.cpi, criticalActivities, nearCriticalActivities, governedDataDate, risks]);
 
-  const baselineVariances = useMemo(() => calculateBaselineVariances(activities, baselineActivities), [activities, baselineActivities]);
+  // F9 (acceptance A): baseline variance is evaluated at the governed Data Date, never at the
+  // machine clock — this count feeds behindBaselineCount and the control-health score.
+  const baselineVariances = useMemo(
+    () => calculateBaselineVariances(activities, baselineActivities, new Date(`${governedDataDate}T00:00:00Z`)),
+    [activities, baselineActivities, governedDataDate],
+  );
   const behindBaselineCount = baselineVariances.filter((item) => item.status === 'behind').length;
   const resourceConflictCount = alerts.filter((alert) => alert.alert_type === 'resource').length;
   const controlHealth = useMemo(() => calculateControlHealth(evm, alerts, behindBaselineCount, resourceConflictCount), [evm, alerts, behindBaselineCount, resourceConflictCount]);
@@ -584,6 +609,16 @@ ${noticeForm.contractorName}`;
 
   return (
     <div className="space-y-6">
+      {/* F9 (item 5): a failed data load is announced — never rendered as a silent empty dashboard. */}
+      {error && (
+        <div className="flex items-start gap-3 bg-rose-50 border border-rose-300 text-rose-800 rounded-xl p-4 text-sm">
+          <AlertTriangle size={18} className="mt-0.5 shrink-0 text-rose-600" />
+          <div>
+            <p className="font-bold">{lang === 'ar' ? 'تعذر تحميل بعض بيانات لوحة التحكم' : 'Dashboard data failed to load'}</p>
+            <p className="mt-0.5 break-words">{error}</p>
+          </div>
+        </div>
+      )}
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 bg-white p-5 rounded-xl border border-slate-200 shadow-sm">
         <div>

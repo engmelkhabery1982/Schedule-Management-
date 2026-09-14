@@ -18,6 +18,7 @@ import { WORK_TYPE_BINDING, type BoqWorkType } from '@/lib/boqClassifier';
 import { parseXerContent, type ParsedXerResult } from '@/lib/xerImporter';
 import { buildXerImportPlan, persistXerImportPlan, type ReconReport, type XerImportPlan } from '@/lib/xerImportService';
 import type { CalendarType, ParsedBoqRow, Project } from '@/types';
+import { DEFAULT_DATA_DATE } from '@/lib/projectControlsConstants';
 import {
   Upload,
   FileSpreadsheet,
@@ -66,7 +67,9 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
     client: '',
     location: '',
     contract_value: '',
-    start_date: new Date().toISOString().split('T')[0],
+    // F9 (acceptance A): default to the governed Data Date constant — a machine-clock default could
+    // silently start a project after the governed control date. The field stays user-editable.
+    start_date: DEFAULT_DATA_DATE,
     description: '',
   });
   const [boqFile, setBoqFile] = useState<File | null>(null);

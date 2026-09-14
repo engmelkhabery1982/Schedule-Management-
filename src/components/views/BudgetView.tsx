@@ -292,7 +292,13 @@ export default function BudgetView({ project }: BudgetViewProps) {
       approver: (transaction?.approval_level || 0) === 0 ? 'project_control' : 'finance_manager',
       decision: 'approve',
     });
-    if (!error) await loadData();
+    // F9 (items 5 & 11): a failed approval RPC must be announced — silently doing nothing left the
+    // user believing the transaction was approved (it feeds the approved-only AC filter).
+    if (error) {
+      setNotice(`تعذر اعتماد المعاملة: ${error.message}`);
+      return;
+    }
+    await loadData();
   }
 
   async function rejectTransaction(id: string) {
@@ -302,7 +308,12 @@ export default function BudgetView({ project }: BudgetViewProps) {
       decision: 'reject',
       review_notes: 'مرفوض للمراجعة والتصحيح',
     });
-    if (!error) await loadData();
+    // F9 (item 5): same gating for rejection.
+    if (error) {
+      setNotice(`تعذر رفض المعاملة: ${error.message}`);
+      return;
+    }
+    await loadData();
   }
 
   async function saveActual(id: string) {
@@ -317,7 +328,12 @@ export default function BudgetView({ project }: BudgetViewProps) {
       actual_cost: editActual,
       remaining_cost: remaining,
     }).eq('id', id);
-    if (error) return;
+    // F9 (item 5): announce the failure — the previous silent `return` left the editor open with no
+    // explanation, indistinguishable from a stuck UI.
+    if (error) {
+      setNotice(`تعذر حفظ التكلفة الفعلية: ${error.message}`);
+      return;
+    }
     setEditingId(null);
     await loadData();
   }

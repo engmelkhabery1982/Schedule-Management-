@@ -14,6 +14,7 @@ import {
   backwardLagShift,
   resolveActivityExecutionCalendar,
 } from './calendarEngine';
+import { DEFAULT_DATA_DATE } from './projectControlsConstants';
 
 export interface CpmOptions {
   calendarType?: CalendarType;
@@ -182,12 +183,14 @@ export function calculateCpm(
 
   activities.forEach((activity) => topological(activity.id));
 
-  // Determine Project Start Date & Data Date
+  // Determine Project Start Date & Data Date.
+  // F9 (acceptance A): when no activity carries a date the anchor is the governed DEFAULT_DATA_DATE,
+  // never the machine clock — CPM output must depend only on project data, not on when it runs.
   const baseProjectStart = activities.reduce((earliest, act) => {
     const s = act.actual_start || act.early_start;
     if (!s) return earliest;
     return !earliest || s < earliest ? s : earliest;
-  }, new Date().toISOString().split('T')[0]);
+  }, DEFAULT_DATA_DATE);
 
   const defaultStart = getNextWorkingDay(baseProjectStart, defaultCalendar);
   const dataDate = options.dataDate

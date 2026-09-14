@@ -22,3 +22,15 @@
  * may be dated after the data date.
  */
 export const DEFAULT_DATA_DATE = '2026-09-13';
+
+/**
+ * Governed "today" for control math (F9 hardening, acceptance A).
+ *
+ * Any engine that needs a `today: Date` fallback must anchor it to the governed Data Date, never
+ * to the machine clock: control results must be reproducible from project data alone, so the same
+ * dataset always yields the same numbers regardless of when (or on which machine) it is opened.
+ * Parsed as UTC midnight so the date survives timezone conversion intact.
+ */
+export function governedDefaultToday(): Date {
+  return new Date(`${DEFAULT_DATA_DATE}T00:00:00Z`);
+}

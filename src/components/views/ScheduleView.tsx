@@ -1,5 +1,6 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { supabase } from '@/lib/supabase';
+import { assertDbWriteOk } from '@/lib/supabaseErrors';
 import { getLanguage, translations, type Language } from '@/lib/i18n';
 import type {
   Project,
@@ -333,27 +334,47 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
     });
     setLinkDrivingMap(drivingMap);
 
+    // F9 (item 5): each CPM result write is gated. A failure means the persisted schedule no
+    // longer matches the canonical calculation, so it is reported and `false` is returned — the
+    // caller must not announce a successful recalculation over a stale database.
+    let persistFailure: string | null = null;
     for (const result of calculation.results) {
-      await supabase.from('activities').update({
-        early_start: result.earlyStart,
-        early_finish: result.earlyFinish,
-        late_start: result.lateStart,
-        late_finish: result.lateFinish,
-        total_float: result.totalFloat,
-        free_float: result.freeFloat,
-        is_critical: result.isCritical,
-        activity_drag: result.activityDrag,
-      }).eq('id', result.activityId);
+      try {
+        assertDbWriteOk(await supabase.from('activities').update({
+          early_start: result.earlyStart,
+          early_finish: result.earlyFinish,
+          late_start: result.lateStart,
+          late_finish: result.lateFinish,
+          total_float: result.totalFloat,
+          free_float: result.freeFloat,
+          is_critical: result.isCritical,
+          activity_drag: result.activityDrag,
+        }).eq('id', result.activityId), 'حفظ نتائج CPM على النشاط');
+      } catch (err: unknown) {
+        persistFailure = (err as Error)?.message || 'خطأ غير معروف';
+        break;
+      }
     }
 
     setIsRecalculating(false);
+    if (persistFailure) {
+      setMessage(`تعذر حفظ نتائج حساب CPM في قاعدة البيانات: ${persistFailure}`);
+      return false;
+    }
     return true;
   }
 
   const handleCalendarChange = async (cal: CalendarType) => {
     setSelectedCalendar(cal);
     if (project) {
-      await supabase.from('projects').update({ calendar_type: cal }).eq('id', project.id);
+      // F9 (item 5): gate the write — on failure the calendar reverts and nothing is recalculated.
+      try {
+        assertDbWriteOk(await supabase.from('projects').update({ calendar_type: cal }).eq('id', project.id), 'حفظ تقويم المشروع');
+      } catch (err: unknown) {
+        if (project.calendar_type) setSelectedCalendar(project.calendar_type);
+        setMessage(`تعذر تطبيق التقويم: ${(err as Error)?.message || 'خطأ غير معروف'}`);
+        return;
+      }
       await recalculatePersistedSchedule(activities, links, cal, currentDataDate, statusLogic);
       await loadData();
       setMessage(`تم تطبيق تقويم المشروع (${cal === '6_days' ? '6 أيام - الجمعة عطلة' : cal === '5_days' ? '5 أيام - الجمعة والسبت عطلة' : '7 أيام عمل مستمر'}) وإعادة حساب تواريخ CPM.`);
@@ -363,7 +384,15 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
   const handleDataDateChange = async (newDate: string) => {
     setCurrentDataDate(newDate);
     if (project) {
-      await supabase.from('projects').update({ data_date: newDate }).eq('id', project.id);
+      // F9 (item 5, control-critical): the Data Date write is gated BEFORE the change event — a
+      // failed write must never leave the app running on a Data Date the database does not hold.
+      try {
+        assertDbWriteOk(await supabase.from('projects').update({ data_date: newDate }).eq('id', project.id), 'حفظ تاريخ المتابعة (Data Date)');
+      } catch (err: unknown) {
+        if (project.data_date) setCurrentDataDate(project.data_date);
+        setMessage(`تعذر تحديث تاريخ المتابعة: ${(err as Error)?.message || 'خطأ غير معروف'}`);
+        return;
+      }
       window.dispatchEvent(new CustomEvent('project-data-date-changed', {
         detail: { projectId: project.id, dataDate: newDate }
       }));
@@ -376,7 +405,14 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
   const handleStatusLogicChange = async (logic: 'retained_logic' | 'progress_override') => {
     setStatusLogic(logic);
     if (project) {
-      await supabase.from('projects').update({ status_logic: logic }).eq('id', project.id);
+      // F9 (item 5): gate the write — on failure the logic setting reverts and nothing is recalculated.
+      try {
+        assertDbWriteOk(await supabase.from('projects').update({ status_logic: logic }).eq('id', project.id), 'حفظ خيار حساب التقدم');
+      } catch (err: unknown) {
+        if (project.status_logic) setStatusLogic(project.status_logic as 'retained_logic' | 'progress_override');
+        setMessage(`تعذر اعتماد خيار الحساب: ${(err as Error)?.message || 'خطأ غير معروف'}`);
+        return;
+      }
       await recalculatePersistedSchedule(activities, links, selectedCalendar, currentDataDate, logic);
       await loadData();
       setMessage(`تم اعتماد خيار الحساب: ${logic === 'retained_logic' ? 'المنطق المتبقي (Retained Logic)' : 'تجاوز التقدم (Progress Override)'}`);
@@ -771,10 +807,21 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
           ? newStart
           : addWorkingDays(newStart, act.duration_days, calendar);
 
-        await supabase.from('activities').update({
-          early_start: newStart,
-          early_finish: newFinish,
-        }).eq('id', act.id);
+        // F9 (item 5): a failed drag write is reported and the drag is discarded — the grid is
+        // reloaded so the bar snaps back to what the database actually holds.
+        try {
+          assertDbWriteOk(await supabase.from('activities').update({
+            early_start: newStart,
+            early_finish: newFinish,
+          }).eq('id', act.id), `نقل النشاط [${act.code}]`);
+        } catch (err: unknown) {
+          setMessage(`تعذر نقل النشاط [${act.code}]: ${(err as Error)?.message || 'خطأ غير معروف'}`);
+          setDraggedActivityId(null);
+          setDragAction(null);
+          setCurrentDragOffsetDays(0);
+          await loadData();
+          return;
+        }
 
         const changed = activities.map((a) => a.id === act.id ? { ...a, early_start: newStart, early_finish: newFinish } : a);
         await recalculatePersistedSchedule(changed, links);
@@ -782,12 +829,23 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
         await loadData();
       } else if (dragAction === 'resize') {
         const newDuration = Math.max(1, (act.duration_days || 1) + currentDragOffsetDays);
-        const newFinish = addWorkingDays(act.early_start || '2026-09-15', newDuration, calendar);
+        // F9 (acceptance A/B): the former hardcoded '2026-09-15' literal invented a start date for
+        // a dateless activity; the governed Data Date is the only sanctioned fallback anchor.
+        const newFinish = addWorkingDays(act.early_start || currentDataDate, newDuration, calendar);
 
-        await supabase.from('activities').update({
-          duration_days: newDuration,
-          early_finish: newFinish,
-        }).eq('id', act.id);
+        try {
+          assertDbWriteOk(await supabase.from('activities').update({
+            duration_days: newDuration,
+            early_finish: newFinish,
+          }).eq('id', act.id), `تعديل مدة النشاط [${act.code}]`);
+        } catch (err: unknown) {
+          setMessage(`تعذر تعديل مدة النشاط [${act.code}]: ${(err as Error)?.message || 'خطأ غير معروف'}`);
+          setDraggedActivityId(null);
+          setDragAction(null);
+          setCurrentDragOffsetDays(0);
+          await loadData();
+          return;
+        }
 
         const changed = activities.map((a) => a.id === act.id ? { ...a, duration_days: newDuration, early_finish: newFinish } : a);
         await recalculatePersistedSchedule(changed, links);

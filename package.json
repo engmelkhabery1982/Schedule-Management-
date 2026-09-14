@@ -8,7 +8,9 @@
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit -p tsconfig.app.json"
+    "typecheck": "tsc --noEmit -p tsconfig.app.json",
+    "validate:controls": "esbuild scripts/validate-controls.ts --bundle --platform=node --format=esm --alias:@=./src --outfile=node_modules/.cache/validate-controls.mjs --log-level=error && node node_modules/.cache/validate-controls.mjs",
+    "perf:controls": "esbuild scripts/perf-controls.ts --bundle --platform=node --format=esm --alias:@=./src --outfile=node_modules/.cache/perf-controls.mjs --log-level=error && node node_modules/.cache/perf-controls.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.57.4",

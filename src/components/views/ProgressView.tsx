@@ -1,5 +1,6 @@
 import { useState, useEffect, useMemo } from 'react';
 import { supabase } from '@/lib/supabase';
+import { assertDbWriteOk } from '@/lib/supabaseErrors';
 import type {
   Project,
   Activity,
@@ -252,7 +253,9 @@ export default function ProgressView({ project }: ProgressViewProps) {
     activity_id: '',
     boq_item_id: '',
     request_number: 'WIR-CIV-006',
-    inspection_date: new Date().toISOString().split('T')[0],
+    // F9 (acceptance A): the inspection date defaults to the governed Data Date, never to the
+    // machine clock — a machine "today" after the Data Date would contradict the submission gate.
+    inspection_date: resolveDataDate(project),
     quantity: 0,
     parent_reference: '',
     notes: '',
@@ -276,6 +279,11 @@ export default function ProgressView({ project }: ProgressViewProps) {
   useEffect(() => {
     setCutoffDate(governedDataDate);
     setRevisionNameOverride(null);
+  }, [governedDataDate]);
+  // F9 (acceptance A): re-anchor the inspection form's date when the project's governed Data Date
+  // changes (project switch or monthly cut-off), so the default can never sit after the Data Date.
+  useEffect(() => {
+    setInspectionForm((prev) => ({ ...prev, inspection_date: governedDataDate }));
   }, [governedDataDate]);
   const [outOfSequenceMode, setOutOfSequenceMode] = useState<'retained_logic' | 'progress_override'>('retained_logic');
   const [wizardStep, setWizardStep] = useState<1 | 2 | 3>(1);
@@ -675,8 +683,9 @@ export default function ProgressView({ project }: ProgressViewProps) {
     const retention = isSubExecuted ? terms.retentionAmount : 0;
 
     try {
-      // 1. Log the daily update record
-      await supabase.from('progress_updates').insert({
+      // 1. Log the daily update record — F9 (item 5): a failed insert throws with a named context
+      // and stops the save; it must never fall through to a success message.
+      assertDbWriteOk(await supabase.from('progress_updates').insert({
         project_id: project.id,
         activity_id: act.id,
         update_date: entryDate,
@@ -699,16 +708,16 @@ export default function ProgressView({ project }: ProgressViewProps) {
         client_earned_value: clientEarnedVal,
         profit_margin_sar: profitMargin,
         retention_deducted: retention,
-      });
+      }), 'تعذر حفظ سجل الإنجاز اليومي');
 
       // 2. Update the activity record with cumulative progress
-      await supabase.from('activities').update({
+      assertDbWriteOk(await supabase.from('activities').update({
         actual_quantity: newCumulativeQty,
         percent_complete: newPercent,
         remaining_duration_days: remainingDuration,
         actual_start: actualStart,
         actual_finish: actualFinish,
-      }).eq('id', act.id);
+      }).eq('id', act.id), 'تعذر تحديث النشاط بالمنجز التراكمي');
 
       const execLabel = isSubExecuted
         ? `بواسطة مقاول الباطن (${subName || 'غير محدد'}) | تكلفة الباطن: ${money(subCost)} | إيراد المالك: ${clientEarnedVal.toLocaleString()} ر.س | الربح: ${money(profitMargin)} | ${retentionLabel(terms.retentionPercent)}: ${money(retention)}`
@@ -742,6 +751,9 @@ export default function ProgressView({ project }: ProgressViewProps) {
     setSaving(true);
     try {
       let savedCount = 0;
+      // F9 (item 5): per-entry failures are collected and reported honestly (partial save is shown
+      // as partial), instead of the old behaviour where every write error was invisible.
+      const failedEntries: string[] = [];
       let totalEarnedToday = 0;
       let totalSubCostToday = 0;
       // Entries whose package has no contractual rate: reported, never priced by estimate (GAP-020).
@@ -784,8 +796,10 @@ export default function ProgressView({ project }: ProgressViewProps) {
           : `إدخال يومي ${entryDate}: +${qty} ${act.unit || 'وحدة'} (تنفيذ ذاتي)`;
         const note = dailyNotes[actId] || defaultNote;
 
-        // Insert log
-        await supabase.from('progress_updates').insert({
+        // Insert log — F9 (item 5): each activity's save is gated; a failure is collected per
+        // entry (with the activity code) instead of silently faking the whole batch as saved.
+        try {
+        assertDbWriteOk(await supabase.from('progress_updates').insert({
           project_id: project.id,
           activity_id: act.id,
           update_date: entryDate,
@@ -804,29 +818,42 @@ export default function ProgressView({ project }: ProgressViewProps) {
           client_earned_value: clientEarnedToday,
           profit_margin_sar: profitMargin,
           retention_deducted: retention,
-        });
+        }), `تعذر حفظ يومية النشاط [${act.code}]`);
 
         // Update activity
-        await supabase.from('activities').update({
+        assertDbWriteOk(await supabase.from('activities').update({
           actual_quantity: newCumulativeQty,
           percent_complete: newPercent,
           remaining_duration_days: remainingDuration,
           actual_start: actualStart,
           actual_finish: actualFinish,
-        }).eq('id', act.id);
+        }).eq('id', act.id), `تعذر تحديث النشاط [${act.code}]`);
 
         savedCount++;
+        } catch (entryErr: unknown) {
+          failedEntries.push(`[${act.code}] ${(entryErr as Error)?.message || 'خطأ غير معروف'}`);
+        }
       }
 
-      setMessage(
-        `تم اعتماد اليومية لـ (${savedCount}) أنشطة | إيراد المالك المكتسب: ${totalEarnedToday.toLocaleString()} ر.س | تكلفة مقاولي الباطن: ${totalSubCostToday.toLocaleString()} ر.س | صافي الهامش: +${(totalEarnedToday - totalSubCostToday).toLocaleString()} ر.س${
-          unpricedSubEntries > 0
-            ? ` | تنبيه: ${unpricedSubEntries} إدخال باطن بدون سعر تعاقدي (N/A) ولم تُحتسب تكلفته`
-            : ''
-        }`
-      );
-      setDailyInputs({});
-      setDailyNotes({});
+      if (failedEntries.length === 0) {
+        setMessage(
+          `تم اعتماد اليومية لـ (${savedCount}) أنشطة | إيراد المالك المكتسب: ${totalEarnedToday.toLocaleString()} ر.س | تكلفة مقاولي الباطن: ${totalSubCostToday.toLocaleString()} ر.س | صافي الهامش: +${(totalEarnedToday - totalSubCostToday).toLocaleString()} ر.س${
+            unpricedSubEntries > 0
+              ? ` | تنبيه: ${unpricedSubEntries} إدخال باطن بدون سعر تعاقدي (N/A) ولم تُحتسب تكلفته`
+              : ''
+          }`
+        );
+        setDailyInputs({});
+        setDailyNotes({});
+      } else {
+        setMessage(
+          `فشل حفظ اليومية لـ ${failedEntries.length} نشاط: ${failedEntries.join(' | ')}${
+            savedCount > 0
+              ? ` — تم حفظ (${savedCount}) أنشطة بنجاح وأُعيد تحميل البيانات؛ راجع الكميات قبل إعادة الحفظ لتفادي الاحتساب المزدوج.`
+              : '.'
+          }`
+        );
+      }
       await loadData();
     } catch (err: any) {
       setMessage(`خطأ أثناء حفظ اليومية: ${err?.message || 'خطأ غير معروف'}`);
@@ -892,7 +919,8 @@ export default function ProgressView({ project }: ProgressViewProps) {
       activity_id: '',
       boq_item_id: '',
       request_number: `WIR-CIV-00${inspections.length + 2}`,
-      inspection_date: new Date().toISOString().split('T')[0],
+      // F9 (acceptance A): re-default to the governed Data Date, not the machine clock.
+      inspection_date: governedDataDate,
       quantity: 0,
       parent_reference: '',
       notes: '',
@@ -920,11 +948,17 @@ export default function ProgressView({ project }: ProgressViewProps) {
     }
 
     if (status === 'rejected') {
-      await supabase.from('inspection_requests').update({
-        status: 'rejected',
-        approved_by: 'Resident Engineer / الاستشاري المشرف',
-        rejected_reason: 'عدم مطابقة مناسيب أو تقارير فحص الجودة الموقعية.',
-      }).eq('id', id);
+      // F9 (item 5): gate the rejection write — a failed update must not be announced as rejected.
+      try {
+        assertDbWriteOk(await supabase.from('inspection_requests').update({
+          status: 'rejected',
+          approved_by: 'Resident Engineer / الاستشاري المشرف',
+          rejected_reason: 'عدم مطابقة مناسيب أو تقارير فحص الجودة الموقعية.',
+        }).eq('id', id), `تعذر رفض طلب الفحص [${req.request_number}]`);
+      } catch (err: unknown) {
+        setMessage(`تعذر رفض طلب الفحص [${req.request_number}]: ${(err as Error)?.message || 'خطأ غير معروف'}`);
+        return;
+      }
       setMessage(`تم رفض طلب الفحص [${req.request_number}] وإخطار المقاول بالملاحظات.`);
       await loadData();
       return;
@@ -969,25 +1003,28 @@ export default function ProgressView({ project }: ProgressViewProps) {
     const subName = isSub ? req.subcontractor_name || terms.subPkgName : null;
 
     try {
-      // 1. Update inspection request record
-      await supabase.from('inspection_requests').update({
+      // 1. Update inspection request record — F9 (item 5): each propagation step is gated; the
+      // first failed write throws with its step name and the chain stops before any success text.
+      // (The steps stay sequential rather than transactional — a DB transaction redesign would
+      // expand scope; the failure is now surfaced instead of silent, which is the F9 requirement.)
+      assertDbWriteOk(await supabase.from('inspection_requests').update({
         status: 'approved',
         approved_quantity: qty,
         approved_at: new Date().toISOString(),
         approved_by: 'Resident Engineer / المهندس الاستشاري المشرف',
-      }).eq('id', id);
+      }).eq('id', id), `تعذر تحديث طلب الفحص [${req.request_number}] إلى معتمد`);
 
       // 2. Update activity in CPM schedule
-      await supabase.from('activities').update({
+      assertDbWriteOk(await supabase.from('activities').update({
         actual_quantity: newCumulativeQty,
         percent_complete: newPercent,
         remaining_duration_days: remainingDuration,
         actual_start: act.actual_start || req.inspection_date,
         actual_finish: newPercent >= 100 ? req.inspection_date : null,
-      }).eq('id', act.id);
+      }).eq('id', act.id), `تعذر تحديث النشاط [${act.code}] بالمنجز المعتمد`);
 
       // 3. Log progress update record
-      await supabase.from('progress_updates').insert({
+      assertDbWriteOk(await supabase.from('progress_updates').insert({
         project_id: project.id,
         activity_id: act.id,
         update_date: req.inspection_date,
@@ -1008,7 +1045,7 @@ export default function ProgressView({ project }: ProgressViewProps) {
         client_earned_value: clientEarnedVal,
         profit_margin_sar: profitMargin,
         retention_deducted: retention,
-      });
+      }), `تعذر تسجيل منجز طلب الفحص [${req.request_number}]`);
 
       // 4. If Subcontractor: Update subcontract package executedQuantity & log cost transaction
       if (isSub) {
@@ -1043,7 +1080,7 @@ export default function ProgressView({ project }: ProgressViewProps) {
         // Insert formal cost transaction — only when the amount is contractual. An unpriced package
         // produces no cost entry rather than a zero or estimated one (GAP-020).
         if (subCost !== null) {
-          await supabase.from('cost_transactions').insert({
+          assertDbWriteOk(await supabase.from('cost_transactions').insert({
             project_id: project.id,
             activity_id: act.id,
             boq_item_id: req.boq_item_id || null,
@@ -1057,7 +1094,7 @@ export default function ProgressView({ project }: ProgressViewProps) {
             approved_at: new Date().toISOString(),
             invoice_number: `IPC-${req.request_number}`,
             vendor: subName || undefined,
-          });
+          }), `تعذر ترحيل استحقاق مقاول الباطن [${req.request_number}]`);
         }
       }
 
@@ -1079,10 +1116,12 @@ export default function ProgressView({ project }: ProgressViewProps) {
     if (!project) return;
     setCutoffProcessing(true);
     try {
-      await supabase.from('projects').update({
+      // F9 (item 5): the Data Date write is gated — if it fails, the cut-off event is NOT dispatched
+      // and no revision is recorded, so the app can never proceed on a Data Date the DB never got.
+      assertDbWriteOk(await supabase.from('projects').update({
         data_date: cutoffDate,
         status_logic: outOfSequenceMode,
-      }).eq('id', project.id);
+      }).eq('id', project.id), 'تعذر حفظ تاريخ المتابعة الجديد في قاعدة البيانات');
 
       window.dispatchEvent(new CustomEvent('project-data-date-changed', {
         detail: { projectId: project.id, dataDate: cutoffDate }
