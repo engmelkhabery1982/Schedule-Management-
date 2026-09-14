@@ -742,6 +742,8 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
                             <th className="text-right p-2">الثقة</th>
                             <th className="text-right p-2">الموقع</th>
                             <th className="text-right p-2">تأكيد</th>
+                            <th className="text-right p-2">ترتيب</th>
+                            <th className="text-right p-2">توزيع الكمية</th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-100">
@@ -810,6 +812,40 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
                                   ) : (
                                     <span className="text-slate-300">—</span>
                                   )}
+                                </td>
+                                <td className="p-2">
+                                  <input
+                                    type="number"
+                                    placeholder="—"
+                                    value={boqOverrides.sequence[c.rowKey] ?? ''}
+                                    onChange={(e) =>
+                                      setBoqOverrides((o) => {
+                                        const seq = { ...o.sequence };
+                                        if (e.target.value === '') delete seq[c.rowKey];
+                                        else seq[c.rowKey] = Number(e.target.value);
+                                        return { ...o, sequence: seq };
+                                      })
+                                    }
+                                    className="px-2 py-1 border border-slate-300 rounded text-xs w-14"
+                                    title="ترتيب الجبهة في تسلسل الأطقم"
+                                  />
+                                </td>
+                                <td className="p-2">
+                                  <input
+                                    type="text"
+                                    placeholder="Zone A=3000; Zone B=2000"
+                                    value={boqOverrides.distribution[c.rowKey] ?? ''}
+                                    onChange={(e) =>
+                                      setBoqOverrides((o) => {
+                                        const dist = { ...o.distribution };
+                                        if (e.target.value.trim() === '') delete dist[c.rowKey];
+                                        else dist[c.rowKey] = e.target.value;
+                                        return { ...o, distribution: dist };
+                                      })
+                                    }
+                                    className="px-2 py-1 border border-slate-300 rounded text-xs w-40"
+                                    title="توزيع الكمية بين الجبهات: التسمية=الكمية مفصولة بفاصلة منقوطة"
+                                  />
                                 </td>
                               </tr>
                             );
@@ -968,6 +1004,7 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
                               <th className="text-right p-2">النوع</th>
                               <th className="text-right p-2">اللاحق</th>
                               <th className="text-right p-2">Lag</th>
+                              <th className="text-right p-2">الكود</th>
                               <th className="text-right p-2">القاعدة</th>
                               <th className="text-right p-2"></th>
                             </tr>
@@ -982,6 +1019,7 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
                                   <td className="p-2 font-mono font-bold text-blue-700">{l.type}</td>
                                   <td className="p-2 text-slate-700">{to?.code} {to?.name}</td>
                                   <td className="p-2 font-mono">{l.lagDays}</td>
+                                  <td className="p-2 font-mono text-[10px] text-indigo-700">{l.ruleCode}</td>
                                   <td className="p-2 text-[10px] text-slate-400 max-w-52 truncate">{l.rule}</td>
                                   <td className="p-2">
                                     <button

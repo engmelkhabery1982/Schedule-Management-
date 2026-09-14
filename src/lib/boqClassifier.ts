@@ -44,7 +44,7 @@ export interface BoqLocationHint {
   /** Human label, e.g. "Zone A". */
   label: string;
   /** Which locator produced the hint (for the review UI). */
-  kind: "zone" | "floor" | "building" | "chainage" | "sector" | "segment" | "street" | "structure" | "manhole";
+  kind: "zone" | "floor" | "building" | "chainage" | "sector" | "section" | "segment" | "street" | "structure" | "manhole";
 }
 
 export interface BoqClassification {
@@ -128,6 +128,7 @@ const LOCATORS: Locator[] = [
   { kind: "chainage", re: /ch\.?\s*(\d+\s*\+\s*\d+)/i, label: (m) => `Ch ${m[1].replace(/\s+/g, "")}`, key: (m) => `chainage:${m[1].replace(/\s+/g, "")}` },
   { kind: "sector", re: /sector\s*(\d+)/i, label: (m) => `Sector ${m[1]}`, key: (m) => `sector:${m[1]}` },
   { kind: "sector", re: /قطاع\s*([a-z0-9\u0600-\u06FF]+)/i, label: (m) => `Sector ${m[1]}`, key: (m) => `sector:${m[1]}` },
+  { kind: "section", re: /section\s*([a-z0-9]+)/i, label: (m) => `Section ${m[1].toUpperCase()}`, key: (m) => `section:${m[1].toLowerCase()}` },
   { kind: "segment", re: /segment\s*([a-z0-9]+)/i, label: (m) => `Segment ${m[1].toUpperCase()}`, key: (m) => `segment:${m[1].toLowerCase()}` },
   { kind: "street", re: /street\s+(.+?)(?:\s{2,}|$)/i, label: (m) => `St ${m[1].trim()}`, key: (m) => `street:${m[1].trim().toLowerCase()}` },
   { kind: "street", re: /شارع\s*([a-z0-9\u0600-\u06FF ]+)/i, label: (m) => `St ${m[1].trim()}`, key: (m) => `street:${m[1].trim()}` },
@@ -142,6 +143,30 @@ const STRUCTURE_HINTS: Array<{ key: string; label: string; tokens: string[] }> =
   { key: "structure:mosque", label: "Mosque", tokens: ["mosque", "مسجد"] },
   { key: "structure:gate", label: "Gate house", tokens: ["gate house", "gatehouse", "غرفه حارس", "بوابه"] },
 ];
+
+/**
+ * F3: every location hint beyond the first one (multi-location rows keep the first
+ * hint; the rest are disclosed so the user can distribute quantity explicitly).
+ */
+export function extraLocationHints(description: string, section: string): string[] {
+  const hay = `${description} ${section}`;
+  const keys: string[] = [];
+  for (const loc of LOCATORS) {
+    const re = new RegExp(loc.re.source, loc.re.flags.includes("g") ? loc.re.flags : loc.re.flags + "g");
+    let m: RegExpMatchArray | null;
+    while ((m = re.exec(hay)) !== null) {
+      keys.push(loc.key(m));
+      if (m[0].length === 0) break;
+    }
+  }
+  const n = normalizeText(hay);
+  for (const st of STRUCTURE_HINTS) {
+    if (has(n, ...st.tokens)) keys.push(st.key);
+  }
+  const seen = new Set<string>();
+  const uniq = keys.filter((k) => !seen.has(k) && (seen.add(k), true));
+  return uniq.slice(1);
+}
 
 export function extractLocationHint(description: string, section: string): BoqLocationHint | null {
   const hay = `${description} ${section}`;

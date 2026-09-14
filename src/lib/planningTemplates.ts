@@ -64,6 +64,8 @@ export interface TemplateLink {
   /** Documented lag in working days (0 unless stated). */
   lagDays: number;
   rule: string;
+  /** F3: stable rule code carried onto every generated link (logic provenance). */
+  code: string;
 }
 
 export interface PlanningTemplate {
@@ -76,6 +78,8 @@ export interface PlanningTemplate {
   links: TemplateLink[];
   /** Human logic narrative shown in the review UI. */
   logicNotes: string;
+  /** F3: provenance of the template production rates (assumption library, not history). */
+  rateProvenance: { sourceLabel: string; applicability: string; confidence: string };
 }
 
 // -------------------------------------------------------------------------------------
@@ -89,6 +93,11 @@ export const PLANNING_TEMPLATES: Record<PlanningTemplateKey, PlanningTemplate> =
     defaultPackage: "substructure",
     order: 10,
     logicNotes: "Excavation -> blinding -> waterproofing (when specified) -> rebar+formwork in PARALLEL (SS) -> concrete (FS after both) -> curing.",
+    rateProvenance: {
+      sourceLabel: "F3 planning-rate library v1 (assumption — not a historical record)",
+      applicability: "Footing/raft production steps; assumes open-cut excavation and ready-mix supply",
+      confidence: "planning-assumption",
+    },
     steps: [
       { key: "E", name: "Foundation excavation", kind: "mapped", costWeight: 0.12, unit: "m3", dailyOutput: 400, defaultDays: null, defaultCrews: 1, crew: [
         { code: "eq-excavator", name: "Excavator", type: "equipment", unit: "day", count: 1 },
@@ -116,16 +125,16 @@ export const PLANNING_TEMPLATES: Record<PlanningTemplateKey, PlanningTemplate> =
       ]},
     ],
     links: [
-      { from: "E", to: "B", type: "FS", lagDays: 0, rule: "Blinding follows completed excavation." },
-      { from: "B", to: "W", type: "FS", lagDays: 0, rule: "Waterproofing on cured blinding (skipped with step W when not specified)." },
-      { from: "B", to: "R", type: "FS", lagDays: 0, rule: "Rebar starts on prepared base (via W when waterproofing exists)." },
-      { from: "W", to: "R", type: "FS", lagDays: 0, rule: "Rebar after waterproofing protection." },
-      { from: "B", to: "F", type: "SS", lagDays: 0, rule: "Formwork starts with rebar preparation (parallel trades)." },
-      { from: "W", to: "F", type: "SS", lagDays: 0, rule: "Formwork with waterproofed base ready (parallel)." },
-      { from: "R", to: "F", type: "SS", lagDays: 0, rule: "Rebar and formwork proceed in parallel." },
-      { from: "R", to: "C", type: "FS", lagDays: 0, rule: "Concrete only after rebar complete." },
-      { from: "F", to: "C", type: "FS", lagDays: 0, rule: "Concrete only after formwork complete (closed forms)." },
-      { from: "C", to: "U", type: "FS", lagDays: 0, rule: "Curing follows pour." },
+      { from: "E", to: "B", type: "FS", lagDays: 0, code: "SUBSTRUCTURE_FLOW_EXCV_TO_BLIND", rule: "Blinding follows completed excavation." },
+      { from: "B", to: "W", type: "FS", lagDays: 0, code: "SUBSTRUCTURE_FLOW_BLIND_TO_WATERPROOF", rule: "Waterproofing on cured blinding (skipped with step W when not specified)." },
+      { from: "B", to: "R", type: "FS", lagDays: 0, code: "SUBSTRUCTURE_FLOW_BLIND_TO_REBAR", rule: "Rebar starts on prepared base (via W when waterproofing exists)." },
+      { from: "W", to: "R", type: "FS", lagDays: 0, code: "SUBSTRUCTURE_FLOW_WATERPROOF_TO_REBAR", rule: "Rebar after waterproofing protection." },
+      { from: "B", to: "F", type: "SS", lagDays: 0, code: "SUBSTRUCTURE_FLOW_BLIND_WITH_FORM", rule: "Formwork starts with rebar preparation (parallel trades)." },
+      { from: "W", to: "F", type: "SS", lagDays: 0, code: "SUBSTRUCTURE_FLOW_WATERPROOF_WITH_FORM", rule: "Formwork with waterproofed base ready (parallel)." },
+      { from: "R", to: "F", type: "SS", lagDays: 0, code: "SUBSTRUCTURE_FLOW_REBAR_WITH_FORM", rule: "Rebar and formwork proceed in parallel." },
+      { from: "R", to: "C", type: "FS", lagDays: 0, code: "SUBSTRUCTURE_FLOW_REBAR_TO_CONC", rule: "Concrete only after rebar complete." },
+      { from: "F", to: "C", type: "FS", lagDays: 0, code: "SUBSTRUCTURE_FLOW_FORM_TO_CONC", rule: "Concrete only after formwork complete (closed forms)." },
+      { from: "C", to: "U", type: "FS", lagDays: 0, code: "SUBSTRUCTURE_FLOW_CONC_TO_CURE", rule: "Curing follows pour." },
     ],
   },
 
@@ -135,6 +144,11 @@ export const PLANNING_TEMPLATES: Record<PlanningTemplateKey, PlanningTemplate> =
     defaultPackage: "superstructure",
     order: 20,
     logicNotes: "Rebar and formwork in PARALLEL (SS) -> concrete FS after both -> curing.",
+    rateProvenance: {
+      sourceLabel: "F3 planning-rate library v1 (assumption — not a historical record)",
+      applicability: "Column/wall production steps; assumes conventional formwork and pumped concrete",
+      confidence: "planning-assumption",
+    },
     steps: [
       { key: "R", name: "Column/wall rebar", kind: "mapped", costWeight: 0.34, unit: "ton", dailyOutput: 1.0, defaultDays: null, defaultCrews: 1, crew: [
         { code: "crew-steelfixer", name: "Steel fixer crew", type: "labor", unit: "day", count: 6 },
@@ -151,10 +165,10 @@ export const PLANNING_TEMPLATES: Record<PlanningTemplateKey, PlanningTemplate> =
       ]},
     ],
     links: [
-      { from: "R", to: "F", type: "SS", lagDays: 0, rule: "Rebar and formwork proceed in parallel." },
-      { from: "R", to: "C", type: "FS", lagDays: 0, rule: "Concrete only after rebar complete." },
-      { from: "F", to: "C", type: "FS", lagDays: 0, rule: "Concrete only after formwork complete." },
-      { from: "C", to: "U", type: "FS", lagDays: 0, rule: "Curing follows pour." },
+      { from: "R", to: "F", type: "SS", lagDays: 0, code: "VERTICAL_FLOW_REBAR_WITH_FORM", rule: "Rebar and formwork proceed in parallel." },
+      { from: "R", to: "C", type: "FS", lagDays: 0, code: "VERTICAL_FLOW_REBAR_TO_CONC", rule: "Concrete only after rebar complete." },
+      { from: "F", to: "C", type: "FS", lagDays: 0, code: "VERTICAL_FLOW_FORM_TO_CONC", rule: "Concrete only after formwork complete." },
+      { from: "C", to: "U", type: "FS", lagDays: 0, code: "VERTICAL_FLOW_CONC_TO_CURE", rule: "Curing follows pour." },
     ],
   },
 
@@ -164,6 +178,11 @@ export const PLANNING_TEMPLATES: Record<PlanningTemplateKey, PlanningTemplate> =
     defaultPackage: "superstructure",
     order: 30,
     logicNotes: "Formwork soffits first (FS) -> rebar on formed soffits -> concrete FS after both -> curing.",
+    rateProvenance: {
+      sourceLabel: "F3 planning-rate library v1 (assumption — not a historical record)",
+      applicability: "Slab/beam production steps; assumes soffit formwork and pumped concrete",
+      confidence: "planning-assumption",
+    },
     steps: [
       { key: "F", name: "Slab/beam formwork", kind: "mapped", costWeight: 0.30, unit: "m2", dailyOutput: 45, defaultDays: null, defaultCrews: 1, crew: [
         { code: "crew-carpenter", name: "Carpenter crew", type: "labor", unit: "day", count: 8 },
@@ -180,10 +199,10 @@ export const PLANNING_TEMPLATES: Record<PlanningTemplateKey, PlanningTemplate> =
       ]},
     ],
     links: [
-      { from: "F", to: "R", type: "FS", lagDays: 0, rule: "Rebar follows formed soffits." },
-      { from: "R", to: "C", type: "FS", lagDays: 0, rule: "Concrete only after rebar complete." },
-      { from: "F", to: "C", type: "FS", lagDays: 0, rule: "Concrete only after formwork complete." },
-      { from: "C", to: "U", type: "FS", lagDays: 0, rule: "Curing follows pour." },
+      { from: "F", to: "R", type: "FS", lagDays: 0, code: "HORIZONTAL_FLOW_FORM_TO_REBAR", rule: "Rebar follows formed soffits." },
+      { from: "R", to: "C", type: "FS", lagDays: 0, code: "HORIZONTAL_FLOW_REBAR_TO_CONC", rule: "Concrete only after rebar complete." },
+      { from: "F", to: "C", type: "FS", lagDays: 0, code: "HORIZONTAL_FLOW_FORM_TO_CONC", rule: "Concrete only after formwork complete." },
+      { from: "C", to: "U", type: "FS", lagDays: 0, code: "HORIZONTAL_FLOW_CONC_TO_CURE", rule: "Curing follows pour." },
     ],
   },
   MASONRY_V1: {
@@ -192,6 +211,11 @@ export const PLANNING_TEMPLATES: Record<PlanningTemplateKey, PlanningTemplate> =
     defaultPackage: "architectural",
     order: 40,
     logicNotes: "Single production step (blockwork). No invented sub-steps.",
+    rateProvenance: {
+      sourceLabel: "F3 planning-rate library v1 (assumption — not a historical record)",
+      applicability: "Blockwork production; assumes 200mm units and ground-level handling",
+      confidence: "planning-assumption",
+    },
     steps: [
       { key: "K", name: "Blockwork", kind: "mapped", costWeight: 1.0, unit: "m2", dailyOutput: 25, defaultDays: null, defaultCrews: 1, crew: [
         { code: "crew-mason", name: "Mason crew", type: "labor", unit: "day", count: 6 },
@@ -206,6 +230,11 @@ export const PLANNING_TEMPLATES: Record<PlanningTemplateKey, PlanningTemplate> =
     defaultPackage: "mass_grading",
     order: 50,
     logicNotes: "Survey -> clearing (when specified) -> excavation -> haul (SS with excavation) -> fill -> compaction -> final grade.",
+    rateProvenance: {
+      sourceLabel: "F3 planning-rate library v1 (assumption — not a historical record)",
+      applicability: "Bulk earthworks; assumes dozer/excavator spreads on accessible ground",
+      confidence: "planning-assumption",
+    },
     steps: [
       { key: "S", name: "Setting out / survey", kind: "intrinsic", costWeight: 0.03, unit: null, dailyOutput: null, defaultDays: 3, defaultCrews: 1, crew: [
         { code: "crew-surveyor", name: "Survey crew", type: "labor", unit: "day", count: 3 },
@@ -235,13 +264,13 @@ export const PLANNING_TEMPLATES: Record<PlanningTemplateKey, PlanningTemplate> =
       ]},
     ],
     links: [
-      { from: "S", to: "L", type: "FS", lagDays: 0, rule: "Clearing after setting out." },
-      { from: "S", to: "E", type: "FS", lagDays: 0, rule: "Excavation after setting out (via clearing when specified)." },
-      { from: "L", to: "E", type: "FS", lagDays: 0, rule: "Excavation on cleared ground." },
-      { from: "E", to: "H", type: "SS", lagDays: 0, rule: "Hauling proceeds with excavation." },
-      { from: "E", to: "P", type: "FS", lagDays: 0, rule: "Fill after cut complete in the front." },
-      { from: "P", to: "O", type: "FS", lagDays: 0, rule: "Compaction after fill placement." },
-      { from: "O", to: "G", type: "FS", lagDays: 0, rule: "Final grade on compacted surface." },
+      { from: "S", to: "L", type: "FS", lagDays: 0, code: "GRADING_FLOW_SURVEY_TO_CLEAR", rule: "Clearing after setting out." },
+      { from: "S", to: "E", type: "FS", lagDays: 0, code: "GRADING_FLOW_SURVEY_TO_EXCV", rule: "Excavation after setting out (via clearing when specified)." },
+      { from: "L", to: "E", type: "FS", lagDays: 0, code: "GRADING_FLOW_CLEAR_TO_EXCV", rule: "Excavation on cleared ground." },
+      { from: "E", to: "H", type: "SS", lagDays: 0, code: "GRADING_FLOW_EXCV_WITH_HAUL", rule: "Hauling proceeds with excavation." },
+      { from: "E", to: "P", type: "FS", lagDays: 0, code: "GRADING_FLOW_EXCV_TO_FILL", rule: "Fill after cut complete in the front." },
+      { from: "P", to: "O", type: "FS", lagDays: 0, code: "GRADING_FLOW_FILL_TO_COMPACT", rule: "Compaction after fill placement." },
+      { from: "O", to: "G", type: "FS", lagDays: 0, code: "GRADING_FLOW_COMPACT_TO_GRADE", rule: "Final grade on compacted surface." },
     ],
   },
   PIPE_NETWORK_V1: {
@@ -250,6 +279,11 @@ export const PLANNING_TEMPLATES: Record<PlanningTemplateKey, PlanningTemplate> =
     defaultPackage: "network_general",
     order: 60,
     logicNotes: "Survey -> trench excavation -> bedding -> installation -> jointing (SS) -> testing -> backfill -> reinstatement.",
+    rateProvenance: {
+      sourceLabel: "F3 planning-rate library v1 (assumption — not a historical record)",
+      applicability: "Trench pipe networks; assumes open-cut trench in normal soil",
+      confidence: "planning-assumption",
+    },
     steps: [
       { key: "S", name: "Setting out / survey", kind: "intrinsic", costWeight: 0.02, unit: null, dailyOutput: null, defaultDays: 2, defaultCrews: 1, crew: [
         { code: "crew-surveyor", name: "Survey crew", type: "labor", unit: "day", count: 3 },
@@ -280,14 +314,14 @@ export const PLANNING_TEMPLATES: Record<PlanningTemplateKey, PlanningTemplate> =
       ]},
     ],
     links: [
-      { from: "S", to: "E", type: "FS", lagDays: 0, rule: "Trenching after setting out." },
-      { from: "E", to: "D", type: "FS", lagDays: 0, rule: "Bedding on excavated trench." },
-      { from: "D", to: "I", type: "FS", lagDays: 0, rule: "Pipes on prepared bedding." },
-      { from: "I", to: "J", type: "SS", lagDays: 0, rule: "Jointing proceeds with laying." },
-      { from: "I", to: "T", type: "FS", lagDays: 0, rule: "Testing after installation complete." },
-      { from: "J", to: "T", type: "FS", lagDays: 0, rule: "Testing after jointing complete." },
-      { from: "T", to: "B", type: "FS", lagDays: 0, rule: "Backfill only after passed test." },
-      { from: "B", to: "N", type: "FS", lagDays: 0, rule: "Reinstatement on backfilled trench." },
+      { from: "S", to: "E", type: "FS", lagDays: 0, code: "PIPE_FLOW_SURVEY_TO_EXCV", rule: "Trenching after setting out." },
+      { from: "E", to: "D", type: "FS", lagDays: 0, code: "PIPE_FLOW_EXCV_TO_BEDDING", rule: "Bedding on excavated trench." },
+      { from: "D", to: "I", type: "FS", lagDays: 0, code: "PIPE_FLOW_BEDDING_TO_PIPE", rule: "Pipes on prepared bedding." },
+      { from: "I", to: "J", type: "SS", lagDays: 0, code: "PIPE_FLOW_PIPE_WITH_JOINT", rule: "Jointing proceeds with laying." },
+      { from: "I", to: "T", type: "FS", lagDays: 0, code: "PIPE_FLOW_PIPE_TO_TEST", rule: "Testing after installation complete." },
+      { from: "J", to: "T", type: "FS", lagDays: 0, code: "PIPE_FLOW_JOINT_TO_TEST", rule: "Testing after jointing complete." },
+      { from: "T", to: "B", type: "FS", lagDays: 0, code: "PIPE_FLOW_TEST_TO_BACKFILL", rule: "Backfill only after passed test." },
+      { from: "B", to: "N", type: "FS", lagDays: 0, code: "PIPE_FLOW_BACKFILL_TO_REINSTATE", rule: "Reinstatement on backfilled trench." },
     ],
   },
   ROAD_PAVEMENT_V1: {
@@ -296,6 +330,11 @@ export const PLANNING_TEMPLATES: Record<PlanningTemplateKey, PlanningTemplate> =
     defaultPackage: "pavement",
     order: 70,
     logicNotes: "Subgrade -> subbase -> base -> prime -> binder -> wearing (strict layer sequence).",
+    rateProvenance: {
+      sourceLabel: "F3 planning-rate library v1 (assumption — not a historical record)",
+      applicability: "Pavement layers; assumes a mechanical paving spread",
+      confidence: "planning-assumption",
+    },
     steps: [
       { key: "G", name: "Subgrade preparation", kind: "mapped", costWeight: 0.10, unit: "m2", dailyOutput: 2500, defaultDays: null, defaultCrews: 1, crew: [
         { code: "eq-grader", name: "Grader", type: "equipment", unit: "day", count: 1 },
@@ -324,12 +363,12 @@ export const PLANNING_TEMPLATES: Record<PlanningTemplateKey, PlanningTemplate> =
       ]},
     ],
     links: [
-      { from: "G", to: "S", type: "FS", lagDays: 0, rule: "Subbase on prepared subgrade." },
-      { from: "S", to: "B", type: "FS", lagDays: 0, rule: "Base on subbase." },
-      { from: "B", to: "P", type: "FS", lagDays: 0, rule: "Prime on finished base." },
-      { from: "B", to: "N", type: "FS", lagDays: 0, rule: "Binder on primed base (direct when prime not specified)." },
-      { from: "P", to: "N", type: "FS", lagDays: 0, rule: "Binder after prime coat." },
-      { from: "N", to: "W", type: "FS", lagDays: 0, rule: "Wearing on binder course." },
+      { from: "G", to: "S", type: "FS", lagDays: 0, code: "ROAD_FLOW_SUBGRADE_TO_SUBBASE", rule: "Subbase on prepared subgrade." },
+      { from: "S", to: "B", type: "FS", lagDays: 0, code: "ROAD_FLOW_SUBBASE_TO_BASE", rule: "Base on subbase." },
+      { from: "B", to: "P", type: "FS", lagDays: 0, code: "ROAD_FLOW_BASE_TO_PRIME", rule: "Prime on finished base." },
+      { from: "B", to: "N", type: "FS", lagDays: 0, code: "ROAD_FLOW_BASE_TO_BINDER", rule: "Binder on primed base (direct when prime not specified)." },
+      { from: "P", to: "N", type: "FS", lagDays: 0, code: "ROAD_FLOW_PRIME_TO_BINDER", rule: "Binder after prime coat." },
+      { from: "N", to: "W", type: "FS", lagDays: 0, code: "ROAD_FLOW_BINDER_TO_WEARING", rule: "Wearing on binder course." },
     ],
   },
 
@@ -339,6 +378,11 @@ export const PLANNING_TEMPLATES: Record<PlanningTemplateKey, PlanningTemplate> =
     defaultPackage: "kerbs",
     order: 80,
     logicNotes: "Single production step. Sequenced from the pavement base (FS) and finished with the wearing course (FF).",
+    rateProvenance: {
+      sourceLabel: "F3 planning-rate library v1 (assumption — not a historical record)",
+      applicability: "Kerb laying; assumes precast units on a prepared bed",
+      confidence: "planning-assumption",
+    },
     steps: [
       { key: "K", name: "Kerb laying", kind: "mapped", costWeight: 1.0, unit: "m", dailyOutput: 100, defaultDays: null, defaultCrews: 1, crew: [
         { code: "crew-kerb", name: "Kerb laying crew", type: "labor", unit: "day", count: 5 },

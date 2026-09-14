@@ -16,6 +16,7 @@ import { calculateCpm } from "./cpmEngine";
 import {
   WORK_TYPE_BINDING,
   classifyBoqRow,
+  extraLocationHints,
   type BoqClassification,
   type BoqFamily,
   type BoqWorkType,
@@ -57,6 +58,10 @@ export interface BoqPlanOverrides {
   wbs: Record<string, string>;
   removeLinks: string[];
   addLinks: BoqUserLink[];
+  /** F3: per-BOQ-row front sequence number (orders crew-flow lanes; lower first). */
+  sequence: Record<string, number>;
+  /** F3: per-BOQ-row quantity distribution "Label=qty; Label=qty" across fronts. */
+  distribution: Record<string, string>;
 }
 
 export const EMPTY_BOQ_OVERRIDES: BoqPlanOverrides = {
@@ -70,6 +75,8 @@ export const EMPTY_BOQ_OVERRIDES: BoqPlanOverrides = {
   wbs: {},
   removeLinks: [],
   addLinks: [],
+  sequence: {},
+  distribution: {},
 };
 
 // -------------------------------------------------------------------------------------
@@ -123,6 +130,8 @@ export interface PlannedLink {
   lagDays: number;
   rule: string;
   origin: "template" | "sequence" | "crewflow" | "milestone" | "user";
+  /** F3: stable rule code (e.g. PIPE_FLOW_EXCV_TO_BEDDING, CREW_CONTINUITY_EXCV). */
+  ruleCode: string;
 }
 
 export interface PlannedBudgetLine {
@@ -165,6 +174,15 @@ export interface PlanFinding {
   refStableId: string | null;
 }
 
+export interface MaterialBalanceEntry {
+  frontId: string;
+  label: string;
+  cutQty: number;
+  fillQty: number;
+  unbalancedQty: number;
+  haulStatus: "hauled-per-boq" | "export-undefined" | "import-undefined" | "balanced";
+}
+
 export interface BoqPlanRecon {
   boqTotal: number;
   allocatedTotal: number;
@@ -183,6 +201,8 @@ export interface BoqPlanRecon {
   projectStart: string | null;
   projectFinish: string | null;
   spanDays: number;
+  /** F3: cut/fill balance per mass-grading front (empty when no grading fronts). */
+  materialBalance: MaterialBalanceEntry[];
 }
 
 export interface BoqPlan {
@@ -277,7 +297,13 @@ function splitExact(total: number, weights: number[]): number[] {
 // Internal: fronts (many BOQ rows -> one front -> N template activities)
 // -------------------------------------------------------------------------------------
 
-interface FrontRow { index: number; classification: BoqClassification; }
+interface FrontRow {
+  index: number;
+  classification: BoqClassification;
+  /** F3 distribution piece: quantity in the ROW's unit + cost share. Undefined = whole row. */
+  pieceQty?: number;
+  pieceCost?: number;
+}
 
 interface Front {
   id: string;
@@ -287,13 +313,52 @@ interface Front {
   locationKey: string | null;
   locationLabel: string | null;
   rows: FrontRow[];
+  /** F3: min member sequence override (null = unordered, sorts by location key). */
+  orderSeq: number | null;
 }
+
+// F3: semantic step names for CREW_CONTINUITY rule codes.
+const STEP_SEMANTIC: Record<string, Record<string, string>> = {
+  RC_SUBSTRUCTURE_V1: { E: "EXCV", B: "BLIND", W: "WATERPROOF", R: "REBAR", F: "FORM", C: "CONC", U: "CURE" },
+  RC_VERTICAL_V1: { R: "REBAR", F: "FORM", C: "CONC", U: "CURE" },
+  RC_HORIZONTAL_V1: { F: "FORM", R: "REBAR", C: "CONC", U: "CURE" },
+  MASONRY_V1: { K: "BLOCKWORK" },
+  MASS_GRADING_V1: { S: "SURVEY", L: "CLEAR", E: "EXCV", H: "HAUL", P: "FILL", O: "COMPACT", G: "GRADE" },
+  PIPE_NETWORK_V1: { S: "SURVEY", E: "EXCV", D: "BEDDING", I: "PIPE", J: "JOINT", T: "TEST", B: "BACKFILL", N: "REINSTATE" },
+  ROAD_PAVEMENT_V1: { G: "SUBGRADE", S: "SUBBASE", B: "BASE", P: "PRIME", N: "BINDER", W: "WEAR" },
+  ROAD_KERB_V1: { K: "KERB" },
+};
+
+export interface DistributionPiece { locationKey: string; locationLabel: string; qty: number; }
+
+/**
+ * F3: parse a user quantity distribution ("Zone A=3000; Zone B=2000").
+ * Deterministic; invalid text or non-positive quantities are reported, never guessed.
+ */
+export function parseDistribution(raw: string): { pieces: DistributionPiece[]; error: string | null } {
+  const pieces: DistributionPiece[] = [];
+  for (const part of raw.split(";")) {
+    const t = part.trim();
+    if (!t) continue;
+    const eq = t.indexOf("=");
+    if (eq <= 0) return { pieces: [], error: `unparseable entry "${t}" (want Label=qty)` };
+    const label = t.slice(0, eq).trim();
+    const qty = Number(t.slice(eq + 1).trim());
+    if (!label) return { pieces: [], error: `empty label in "${t}"` };
+    if (!Number.isFinite(qty) || qty < 0) return { pieces: [], error: `invalid quantity in "${t}"` };
+    pieces.push({ locationKey: `user:${slug(label)}`, locationLabel: label, qty });
+  }
+  if (pieces.length === 0) return { pieces: [], error: "empty distribution" };
+  return { pieces, error: null };
+}
+
+export interface DistributionFlag { rowKey: string; kind: "mismatch" | "unparseable"; message: string; }
 
 function buildFronts(
   rows: ParsedBoqRow[],
   classifications: BoqClassification[],
   overrides: BoqPlanOverrides
-): { fronts: Front[]; usable: BoqClassification[]; review: BoqClassification[] } {
+): { fronts: Front[]; usable: BoqClassification[]; review: BoqClassification[]; distFlags: DistributionFlag[] } {
   const usable: BoqClassification[] = [];
   const review: BoqClassification[] = [];
   for (const c of classifications) {
@@ -304,14 +369,11 @@ function buildFronts(
     if (overrides.excludedFamilies.includes(fam) || fam === "unassigned") { review.push(c); continue; }
     usable.push(c);
   }
+  const distFlags: DistributionFlag[] = [];
   const groups = new Map<string, Front>();
-  usable.forEach((c) => {
+  const place = (c: BoqClassification, index: number, locationKey: string | null, locationLabel: string | null, pieceQty?: number, pieceCost?: number) => {
     const wt = overrides.workType[c.rowKey] || c.workType;
     const binding = WORK_TYPE_BINDING[wt as Exclude<BoqWorkType, "review_required">];
-    const index = Number(c.rowKey.slice(4)) - 1;
-    const locOverride = overrides.location[c.rowKey];
-    const locationKey = locOverride ? `user:${slug(locOverride)}` : (c.locationHint ? c.locationHint.key : null);
-    const locationLabel = locOverride || (c.locationHint ? c.locationHint.label : null);
     const key = `${c.family}|${c.packageKey}|${binding.template}|${locationKey || "main"}`;
     let front = groups.get(key);
     if (!front) {
@@ -319,11 +381,44 @@ function buildFronts(
         id: `front-${slug(c.family)}-${slug(c.packageKey)}-${slug(binding.template)}-${slug(locationKey || "main")}`,
         family: c.family, packageKey: c.packageKey,
         templateKey: binding.template as PlanningTemplateKey,
-        locationKey, locationLabel, rows: [],
+        locationKey, locationLabel, rows: [], orderSeq: null,
       };
       groups.set(key, front);
     }
-    front.rows.push({ index, classification: c });
+    front.rows.push({ index, classification: c, pieceQty, pieceCost });
+    const seq = overrides.sequence[c.rowKey];
+    if (typeof seq === "number" && Number.isFinite(seq)) {
+      front.orderSeq = front.orderSeq === null ? seq : Math.min(front.orderSeq, seq);
+    }
+  };
+  usable.forEach((c) => {
+    const index = Number(c.rowKey.slice(4)) - 1;
+    const row = rows[index];
+    const locOverride = overrides.location[c.rowKey];
+    const baseKey = locOverride ? `user:${slug(locOverride)}` : (c.locationHint ? c.locationHint.key : null);
+    const baseLabel = locOverride || (c.locationHint ? c.locationHint.label : null);
+    const rawDist = (overrides.distribution[c.rowKey] || "").trim();
+    if (!rawDist) {
+      place(c, index, baseKey, baseLabel);
+      return;
+    }
+    // F3: user-declared split across fronts (cost follows quantity pro-rata, exact cents).
+    // Anything invalid keeps the item unsplit — never an arbitrary equal split.
+    const parsed = parseDistribution(rawDist);
+    if (parsed.error) {
+      distFlags.push({ rowKey: c.rowKey, kind: "unparseable", message: `distribution ignored: ${parsed.error}` });
+      place(c, index, baseKey, baseLabel);
+      return;
+    }
+    const sum = parsed.pieces.reduce((a, p) => a + p.qty, 0);
+    const tol = Math.max(0.01, Math.abs(row.quantity) * 1e-6);
+    if (Math.abs(sum - row.quantity) > tol) {
+      distFlags.push({ rowKey: c.rowKey, kind: "mismatch", message: `distribution sums to ${sum} but row quantity is ${row.quantity} — kept unsplit` });
+      place(c, index, baseKey, baseLabel);
+      return;
+    }
+    const costs = splitExact(row.total_price, parsed.pieces.map((p) => p.qty));
+    parsed.pieces.forEach((p, i) => place(c, index, p.locationKey, p.locationLabel, p.qty, costs[i]));
   });
   const fronts = [...groups.values()].sort((a, b) =>
     FAMILY_ORDER.indexOf(a.family) - FAMILY_ORDER.indexOf(b.family)
@@ -332,10 +427,9 @@ function buildFronts(
     || (a.locationKey || "").localeCompare(b.locationKey || "")
   );
   for (const f of fronts) f.rows.sort((x, y) => x.index - y.index);
-  return { fronts, usable, review };
+  return { fronts, usable, review, distFlags };
 }
 
-// -------------------------------------------------------------------------------------
 // WBS: L1 project root / L2 package / L3 location (only from source) / L4 front
 // -------------------------------------------------------------------------------------
 
@@ -405,7 +499,7 @@ function buildWbs(projectName: string, fronts: Front[]): PlannedWbs[] {
 
 interface StepWork {
   stepKey: string;
-  rows: Array<{ index: number; classification: BoqClassification; row: ParsedBoqRow }>;
+  rows: Array<{ index: number; classification: BoqClassification; row: ParsedBoqRow; pieceQtyConverted: number | null; pieceCost: number | null }>;
   qty: number;
   unit: string | null;
 }
@@ -421,12 +515,17 @@ function collectStepWork(front: Front, rows: ParsedBoqRow[], overrides: BoqPlanO
     const binding = WORK_TYPE_BINDING[wt as Exclude<BoqWorkType, "review_required">];
     if (!binding) continue;
     const row = rows[fr.index];
+    const factor = row.quantity !== 0 ? fr.classification.quantityConverted / row.quantity : 0;
+    const pieceQtyConverted = fr.pieceQty !== undefined ? fr.pieceQty * factor : null;
+    const pieceCost = fr.pieceCost !== undefined ? fr.pieceCost : null;
     for (const sk of binding.steps) {
       const w = work.get(sk);
       if (!w) continue;
-      w.rows.push({ index: fr.index, classification: fr.classification, row });
+      w.rows.push({ index: fr.index, classification: fr.classification, row, pieceQtyConverted, pieceCost });
       const step = template.steps.find((s) => s.key === sk)!;
-      if (step.unit && fr.classification.unit === step.unit) w.qty += fr.classification.quantityConverted;
+      if (step.unit && fr.classification.unit === step.unit) {
+        w.qty += pieceQtyConverted !== null ? pieceQtyConverted : fr.classification.quantityConverted;
+      }
     }
   }
   return work;
@@ -445,12 +544,13 @@ function computeStepDuration(
   if (userDays && userDays > 0) {
     return { days: Math.round(userDays), basis: "user", note: `User-set ${Math.round(userDays)}d`, crews };
   }
-  const rate = (overrides.rate[activityId] && overrides.rate[activityId] > 0)
-    ? overrides.rate[activityId] : dailyOutput;
+  const userRate = overrides.rate[activityId] && overrides.rate[activityId] > 0 ? overrides.rate[activityId] : null;
+  const rate = userRate !== null ? userRate : dailyOutput;
   if (rate && rate > 0 && w.qty > 0 && w.unit) {
     const days = Math.max(1, Math.ceil(w.qty / (rate * crews)));
     const q = w.qty.toLocaleString("en-US", { maximumFractionDigits: 2 });
-    return { days, basis: "library_rate", note: `${q} ${w.unit} @ ${rate}/d x ${crews} crew(s)`, crews };
+    const prov = userRate !== null ? "(user project-specific rate)" : "; Library planning rate \u2014 review recommended";
+    return { days, basis: "library_rate", note: `${q} ${w.unit} @ ${rate}/d x ${crews} crew(s) ${prov}`, crews };
   }
   if (defaultDays && defaultDays > 0) {
     return { days: defaultDays, basis: "template_default", note: `Template default ${defaultDays}d (no BOQ quantity)`, crews };
@@ -479,15 +579,18 @@ function computeFrontCosts(
     const row = rows[fr.index];
     const targets = binding.steps.filter((sk) => costs.has(sk));
     if (targets.length === 0) continue;
+    const fund = fr.pieceCost !== undefined ? fr.pieceCost : row.total_price;
+    const factor = row.quantity !== 0 ? fr.classification.quantityConverted / row.quantity : 0;
+    const pieceQ = fr.pieceQty !== undefined ? fr.pieceQty * factor : fr.classification.quantityConverted;
     if (targets.length === 1) {
       const c = costs.get(targets[0])!;
-      c.cost += row.total_price;
+      c.cost += fund;
       const step = template.steps.find((s) => s.key === targets[0])!;
-      const qtyShare = step.unit && fr.classification.unit === step.unit ? fr.classification.quantityConverted : null;
-      c.allocs.push({ rowKey: fr.classification.rowKey, index: fr.index, cost: row.total_price, qtyShare, basis: "single_step_full" });
+      const qtyShare = step.unit && fr.classification.unit === step.unit ? pieceQ : null;
+      c.allocs.push({ rowKey: fr.classification.rowKey, index: fr.index, cost: fund, qtyShare, basis: "single_step_full" });
     } else {
       const weights = targets.map((sk) => template.steps.find((s) => s.key === sk)!.costWeight);
-      const parts = splitExact(row.total_price, weights);
+      const parts = splitExact(fund, weights);
       targets.forEach((sk, i) => {
         const c = costs.get(sk)!;
         c.cost += parts[i];
@@ -598,18 +701,18 @@ function buildLogic(fronts: Front[], sets: BuiltSets, overrides: BoqPlanOverride
   const actSet = new Set(sets.activities.map((a) => a.stableId));
   const exists = (id: string) => actSet.has(id);
   let n = 0;
-  const add = (from: string, to: string, type: TemplateLinkType, lagDays: number, rule: string, origin: PlannedLink["origin"]) => {
+  const add = (from: string, to: string, type: TemplateLinkType, lagDays: number, rule: string, origin: PlannedLink["origin"], ruleCode: string) => {
     if (!exists(from) || !exists(to) || from === to) return;
     if (links.some((l) => l.fromActivityId === from && l.toActivityId === to && l.type === type)) return;
     n++;
-    links.push({ stableId: `lnk-${String(n).padStart(4, "0")}`, fromActivityId: from, toActivityId: to, type, lagDays, rule, origin });
+    links.push({ stableId: `lnk-${String(n).padStart(4, "0")}`, fromActivityId: from, toActivityId: to, type, lagDays, rule, origin, ruleCode });
   };
 
   // 1. Template edges (endpoints missing when a conditional step had no BOQ item).
   for (const front of fronts) {
     const template = PLANNING_TEMPLATES[front.templateKey];
     for (const e of template.links) {
-      add(actId(front, e.from), actId(front, e.to), e.type, e.lagDays, `${template.key}: ${e.rule}`, "template");
+      add(actId(front, e.from), actId(front, e.to), e.type, e.lagDays, `${template.key}: ${e.rule}`, "template", e.code);
     }
   }
 
@@ -641,7 +744,7 @@ function buildLogic(fronts: Front[], sets: BuiltSets, overrides: BoqPlanOverride
         const match = rule.perLocation ? prev.find((pf) => (pf.locationKey || "main") === (nf.locationKey || "main")) : undefined;
         const pf = match || prev[prev.length - 1];
         const from = lastOf(pf); const to = firstOf(nf);
-        if (from && to) add(from, to, "FS", 0, `Sequence: ${pf.packageKey} -> ${nf.packageKey}${match ? " (same location)" : " (package fan)"}`, "sequence");
+        if (from && to) add(from, to, "FS", 0, `Sequence: ${pf.packageKey} -> ${nf.packageKey}${match ? " (same location)" : " (package fan)"}`, "sequence", match ? "ZONE_PROGRESSION" : "PACKAGE_PROGRESSION");
       }
     }
   }
@@ -651,7 +754,7 @@ function buildLogic(fronts: Front[], sets: BuiltSets, overrides: BoqPlanOverride
     .sort((a, b) => PLANNING_TEMPLATES[a.templateKey].order - PLANNING_TEMPLATES[b.templateKey].order);
   for (let i = 0; i + 1 < bridgeFronts.length; i++) {
     const from = lastOf(bridgeFronts[i]); const to = firstOf(bridgeFronts[i + 1]);
-    if (from && to) add(from, to, "FS", 0, "Sequence: bridge RC template order", "sequence");
+    if (from && to) add(from, to, "FS", 0, "Sequence: bridge RC template order", "sequence", "BRIDGE_TEMPLATE_ORDER");
   }
 
   // 2c. Kerb interleave: FS from pavement base, FF to wearing (same location preferred).
@@ -663,16 +766,52 @@ function buildLogic(fronts: Front[], sets: BuiltSets, overrides: BoqPlanOverride
     const kAct = actId(kf, "K");
     const baseActs = sets.activities.filter((a) => a.frontId === pf.id && a.stepKey === "B");
     const wearActs = sets.activities.filter((a) => a.frontId === pf.id && a.stepKey === "W");
-    if (baseActs[0]) add(baseActs[0].stableId, kAct, "FS", 0, "Kerb starts after pavement base (same front chain)", "sequence");
-    if (wearActs[0]) add(kAct, wearActs[0].stableId, "FF", 0, "Kerbs finish with the wearing course", "sequence");
+    if (baseActs[0]) add(baseActs[0].stableId, kAct, "FS", 0, "Kerb starts after pavement base (same front chain)", "sequence", "KERB_FROM_BASE");
+    if (wearActs[0]) add(kAct, wearActs[0].stableId, "FF", 0, "Kerbs finish with the wearing course", "sequence", "KERB_FINISH_WITH_WEARING");
     else if (baseActs[0]) {
       const last = lastOf(pf);
-      if (last && last !== baseActs[0].stableId) add(kAct, last, "FF", 0, "Kerbs finish with pavement completion", "sequence");
+      if (last && last !== baseActs[0].stableId) add(kAct, last, "FF", 0, "Kerbs finish with pavement completion", "sequence", "KERB_FINISH_WITH_PAVEMENT");
     }
   }
 
-  // 3. Crew flow: same (family, package, template, step) across locations chains FS
-  // when every instantiation runs a single crew.
+  // 2d. F3 floor/zone progression inside superstructure: vertical(N) -> slab(N) ->
+  // vertical(N+1). Same-location V->H first, then consecutive locations chain H->V.
+  const superFronts = fronts.filter((f) => f.family === "building" && f.packageKey === "superstructure");
+  const superByLoc = new Map<string, Front[]>();
+  for (const f of superFronts) {
+    const k = f.locationKey || "main";
+    if (!superByLoc.has(k)) superByLoc.set(k, []);
+    superByLoc.get(k)!.push(f);
+  }
+  const locOrder = (f: Front): [number, string] => [f.orderSeq === null ? 1 : 0, f.locationKey || "main"];
+  const locs = [...superByLoc.keys()].sort((a, b) => {
+    const fa = superByLoc.get(a)![0]; const fb = superByLoc.get(b)![0];
+    const oa = locOrder(fa); const ob = locOrder(fb);
+    const sa = fa.orderSeq === null ? Number.MAX_SAFE_INTEGER : fa.orderSeq;
+    const sb = fb.orderSeq === null ? Number.MAX_SAFE_INTEGER : fb.orderSeq;
+    return oa[0] - ob[0] || sa - sb || oa[1].localeCompare(ob[1]);
+  });
+  for (const loc of locs) {
+    const members = superByLoc.get(loc)!;
+    const vert = members.find((f) => f.templateKey === "RC_VERTICAL_V1");
+    const horz = members.find((f) => f.templateKey === "RC_HORIZONTAL_V1");
+    if (vert && horz) {
+      const from = lastOf(vert); const to = firstOf(horz);
+      if (from && to) add(from, to, "FS", 0, `Structural: columns/walls complete before slab (${loc})`, "sequence", "FLOOR_VERTICAL_TO_SLAB");
+    }
+  }
+  for (let i = 0; i + 1 < locs.length; i++) {
+    const horzPrev = superByLoc.get(locs[i])!.find((f) => f.templateKey === "RC_HORIZONTAL_V1");
+    const vertNext = superByLoc.get(locs[i + 1])!.find((f) => f.templateKey === "RC_VERTICAL_V1");
+    if (horzPrev && vertNext) {
+      const from = lastOf(horzPrev); const to = firstOf(vertNext);
+      if (from && to) add(from, to, "FS", 0, `Structural: slab ${locs[i]} complete before vertical ${locs[i + 1]}`, "sequence", "SLAB_TO_NEXT_VERTICAL");
+    }
+  }
+
+  // 3. F3 crew continuity: the same crew cannot work two fronts at once. With k crews
+  // the ordered fronts split into k contiguous lanes; chaining happens within a lane
+  // only, so crew count changes the network itself (k=1 reproduces the F2 chain).
   const stepGroups = new Map<string, PlannedActivity[]>();
   for (const a of sets.activities) {
     if (a.isMilestone || !a.frontId || !a.stepKey) continue;
@@ -683,15 +822,25 @@ function buildLogic(fronts: Front[], sets: BuiltSets, overrides: BoqPlanOverride
   }
   for (const [, group] of stepGroups) {
     if (group.length < 2) continue;
-    if (!group.every((a) => a.crewCount === 1)) continue;
     const ordered = [...group].sort((a, b) => {
       const fa = fronts.find((x) => x.id === a.frontId)!;
       const fb = fronts.find((x) => x.id === b.frontId)!;
-      return (fa.locationKey || "").localeCompare(fb.locationKey || "");
+      const sa = fa.orderSeq === null ? Number.MAX_SAFE_INTEGER : fa.orderSeq;
+      const sb = fb.orderSeq === null ? Number.MAX_SAFE_INTEGER : fb.orderSeq;
+      return sa - sb || (fa.locationKey || "").localeCompare(fb.locationKey || "");
     });
-    for (let i = 0; i + 1 < ordered.length; i++) {
-      add(ordered[i].stableId, ordered[i + 1].stableId, "FS", 0,
-        `Crew flow: single crew moves ${ordered[i].stepKey} across locations`, "crewflow");
+    const k = Math.max(1, Math.min(...ordered.map((a) => a.crewCount)));
+    if (k >= ordered.length) continue;
+    const laneSize = Math.ceil(ordered.length / k);
+    const f0 = fronts.find((x) => x.id === ordered[0].frontId)!;
+    const sem = (STEP_SEMANTIC[f0.templateKey] || {})[ordered[0].stepKey || ""] || ordered[0].stepKey || "?";
+    const crewName = PLANNING_TEMPLATES[f0.templateKey].steps.find((st) => st.key === ordered[0].stepKey)?.crew[0]?.name || "crew";
+    for (let lane = 0; lane < k; lane++) {
+      const members = ordered.slice(lane * laneSize, (lane + 1) * laneSize);
+      for (let i = 0; i + 1 < members.length; i++) {
+        add(members[i].stableId, members[i + 1].stableId, "FS", 0,
+          `Crew continuity (${crewName}): lane ${lane + 1}/${k} across ${ordered.length} fronts with ${k} crew(s)`, "crewflow", `CREW_CONTINUITY_${sem}`);
+      }
     }
   }
   // 4. Milestones: START/FINISH fan + package completion + testing-complete.
@@ -736,15 +885,15 @@ function buildLogic(fronts: Front[], sets: BuiltSets, overrides: BoqPlanOverride
     pkgMsByPkg.set(pkgKey, pkgMs);
     const hasSucc = new Set(links.map((l) => l.fromActivityId));
     for (const m of members) {
-      if (!hasSucc.has(m.stableId)) add(m.stableId, pkgMs, "FS", 0, "Package completion fan-in", "milestone");
+      if (!hasSucc.has(m.stableId)) add(m.stableId, pkgMs, "FS", 0, "Package completion fan-in", "milestone", "MILESTONE_PACKAGE_FANIN");
     }
     const tests = members.filter((m) => m.stepKey === "T");
     if (tests.length > 0) {
       const tMs = addMs(`ms-test-${slug(fam)}-${slug(pkg)}`, `${label} testing complete`, "testing", wbsId);
-      for (const t of tests) add(t.stableId, tMs, "FS", 0, "Testing completion fan-in", "milestone");
-      add(tMs, pkgMs, "FS", 0, "Testing gates package completion", "milestone");
+      for (const t of tests) add(t.stableId, tMs, "FS", 0, "Testing completion fan-in", "milestone", "MILESTONE_TEST_FANIN");
+      add(tMs, pkgMs, "FS", 0, "Testing gates package completion", "milestone", "MILESTONE_TEST_GATE");
     }
-    add(pkgMs, finishMs, "FS", 0, "Package completion to project finish", "milestone");
+    add(pkgMs, finishMs, "FS", 0, "Package completion to project finish", "milestone", "MILESTONE_TO_FINISH");
   }
 
   // START fan-out / FINISH fan-in AFTER all other logic (no unintended open ends).
@@ -753,8 +902,8 @@ function buildLogic(fronts: Front[], sets: BuiltSets, overrides: BoqPlanOverride
   for (const a of [...sets.activities].sort((x, y) => x.sortOrder - y.sortOrder)) {
     if (a.stableId === startMs || a.stableId === finishMs) continue;
     if (a.isMilestone) continue;
-    if (!hasPred.has(a.stableId)) add(startMs, a.stableId, "FS", 0, "Project start fan-out", "milestone");
-    if (!hasSucc.has(a.stableId)) add(a.stableId, finishMs, "FS", 0, "Project finish fan-in", "milestone");
+    if (!hasPred.has(a.stableId)) add(startMs, a.stableId, "FS", 0, "Project start fan-out", "milestone", "MILESTONE_START_FANOUT");
+    if (!hasSucc.has(a.stableId)) add(a.stableId, finishMs, "FS", 0, "Project finish fan-in", "milestone", "MILESTONE_FINISH_FANIN");
   }
 
   // 5. User link edits: removals first, then additions.
@@ -767,7 +916,7 @@ function buildLogic(fronts: Front[], sets: BuiltSets, overrides: BoqPlanOverride
     links.push({
       stableId: `user-link-${i}`, fromActivityId: u.fromActivityId, toActivityId: u.toActivityId,
       type: u.type, lagDays: Math.max(0, Math.round(u.lagDays || 0)),
-      rule: "User-added logic", origin: "user",
+      rule: "User-added logic", origin: "user", ruleCode: "USER_LOGIC",
     });
   });
   return links;
@@ -875,11 +1024,94 @@ function runCpm(
 // except an empty or cyclic plan which cannot be scheduled at all)
 // -------------------------------------------------------------------------------------
 
+// -------------------------------------------------------------------------------------
+// F3: cut/fill balance per mass-grading front. Cut and fill are independent BOQ
+// quantities — never assumed equal; a haul balance is never invented.
+// -------------------------------------------------------------------------------------
+
+function buildMaterialBalance(fronts: Front[], rows: ParsedBoqRow[], overrides: BoqPlanOverrides): MaterialBalanceEntry[] {
+  const out: MaterialBalanceEntry[] = [];
+  for (const front of fronts) {
+    if (front.templateKey !== "MASS_GRADING_V1") continue;
+    const work = collectStepWork(front, rows, overrides);
+    const cutQty = Math.round((work.get("E")?.qty || 0) * 1000) / 1000;
+    const fillQty = Math.round((work.get("P")?.qty || 0) * 1000) / 1000;
+    const unbalancedQty = Math.round((cutQty - fillQty) * 1000) / 1000;
+    const haulRows = work.get("H")?.rows.length || 0;
+    const haulStatus = haulRows > 0 ? "hauled-per-boq"
+      : unbalancedQty > 0.001 ? "export-undefined"
+      : unbalancedQty < -0.001 ? "import-undefined" : "balanced";
+    out.push({
+      frontId: front.id,
+      label: front.locationLabel || "package level",
+      cutQty, fillQty, unbalancedQty,
+      haulStatus: haulStatus as MaterialBalanceEntry["haulStatus"],
+    });
+  }
+  return out.sort((a, b) => a.frontId.localeCompare(b.frontId));
+}
+
+// F3: lightweight resource-feasibility sweep (validation only — no leveling engine).
+function checkResourceFeasibility(sets: BuiltSets): PlanFinding[] {
+  const F: PlanFinding[] = [];
+  const resByStable = new Map(sets.resources.map((r) => [r.stableId, r]));
+  const actsByRes = new Map<string, PlannedActivity[]>();
+  for (const asn of sets.assignments) {
+    const a = sets.activities.find((x) => x.stableId === asn.activityStableId);
+    if (!a || a.isMilestone || !a.earlyStart || !a.earlyFinish) continue;
+    if (!actsByRes.has(asn.resourceStableId)) actsByRes.set(asn.resourceStableId, []);
+    actsByRes.get(asn.resourceStableId)!.push(a);
+  }
+  for (const [resStable, acts] of actsByRes) {
+    const uniq = [...new Map(acts.map((a) => [a.stableId, a])).values()]
+      .sort((x, y) => (x.earlyStart || "").localeCompare(y.earlyStart || ""));
+    const capacity = Math.max(1, Math.min(...uniq.map((a) => a.crewCount)));
+    let worst = 1;
+    let worstDay = "";
+    for (const a of uniq) {
+      const day = a.earlyStart || "";
+      const concurrent = uniq.filter((b) => (b.earlyStart || "") <= day && day <= (b.earlyFinish || "")).length;
+      if (concurrent > worst) { worst = concurrent; worstDay = day; }
+    }
+    if (worst > capacity) {
+      const code = resByStable.get(resStable)?.code || resStable;
+      F.push({ severity: "warning", code: "resource_overallocation",
+        message: `Crew ${code}: ${worst} overlapping activities on ${worstDay} exceed ${capacity} crew(s) — add crews or resequence`, refStableId: null });
+    }
+  }
+  return F;
+}
+
+// F3: reachability over the non-milestone subgraph (milestone fan excluded).
+function coreReachability(sets: BuiltSets, links: PlannedLink[]): Map<string, Set<string>> {
+  const core = new Set(sets.activities.filter((a) => !a.isMilestone).map((a) => a.stableId));
+  const succ = new Map<string, string[]>();
+  for (const l of links) {
+    if (!core.has(l.fromActivityId) || !core.has(l.toActivityId)) continue;
+    if (!succ.has(l.fromActivityId)) succ.set(l.fromActivityId, []);
+    succ.get(l.fromActivityId)!.push(l.toActivityId);
+  }
+  const reach = new Map<string, Set<string>>();
+  for (const id of core) {
+    const seen = new Set<string>();
+    const stack = [...(succ.get(id) || [])];
+    while (stack.length > 0) {
+      const nx = stack.pop()!;
+      if (seen.has(nx)) continue;
+      seen.add(nx);
+      stack.push(...(succ.get(nx) || []));
+    }
+    reach.set(id, seen);
+  }
+  return reach;
+}
+
 function validatePlan(
   rows: ParsedBoqRow[], classifications: BoqClassification[],
   fronts: Front[], sets: BuiltSets, links: PlannedLink[],
   usable: BoqClassification[], review: BoqClassification[],
-  cpm: CpmAttachment, overrides: BoqPlanOverrides
+  cpm: CpmAttachment, overrides: BoqPlanOverrides,
+  distFlags: DistributionFlag[], materialBalance: MaterialBalanceEntry[]
 ): PlanFinding[] {
   const F: PlanFinding[] = [];
   const crit = (code: string, message: string, ref: string | null = null) => F.push({ severity: "critical", code, message, refStableId: ref });
@@ -948,6 +1180,69 @@ function validatePlan(
     if (!hasSucc.has(a.stableId)) warn("open_finish", `${a.code} ${a.name}: no successor`, a.stableId);
   }
 
+  // F3: distribution flags (mismatch blocks approval — the split did not apply).
+  for (const d of distFlags) {
+    if (d.kind === "mismatch") crit("distribution_mismatch", `BOQ ${d.rowKey}: ${d.message}`, d.rowKey);
+    else warn("distribution_unparseable", `BOQ ${d.rowKey}: ${d.message}`, d.rowKey);
+  }
+
+  // F3: multi-location rows keep their first hint; the rest need explicit distribution.
+  for (const c of usable) {
+    const idx = Number(c.rowKey.slice(4)) - 1;
+    const extra = extraLocationHints(rows[idx]?.description || "", rows[idx]?.section || "");
+    if (extra.length > 0) {
+      info("multi_location_row", `BOQ ${c.rowKey}: additional location hints ignored (${extra.join(", ")}) — distribute quantity explicitly to use them`, c.rowKey);
+    }
+  }
+
+  // F3: material balance exposure (cut/fill independent; haul never invented).
+  for (const mb of materialBalance) {
+    info("material_balance", `Grading ${mb.label}: cut ${mb.cutQty} m3, fill ${mb.fillQty} m3, unbalanced ${mb.unbalancedQty} m3 (${mb.haulStatus})`, null);
+    if (mb.haulStatus === "export-undefined" || mb.haulStatus === "import-undefined") {
+      warn("haul_balance_review", `Grading ${mb.label}: ${Math.abs(mb.unbalancedQty).toLocaleString()} m3 ${mb.haulStatus === "export-undefined" ? "surplus with no export/destination in source" : "shortfall with no import/borrow in source"} — Review Required`, null);
+    }
+  }
+
+  // F3: resource feasibility (lightweight — no leveling engine).
+  for (const a of sets.activities) {
+    if (a.isMilestone || a.durationBasis !== "library_rate") continue;
+    if (!sets.assignments.some((x) => x.activityStableId === a.stableId)) {
+      crit("missing_crew", `${a.code} ${a.name}: production-based activity has no crew assignment`, a.stableId);
+    }
+  }
+  for (const [actId, rate] of Object.entries(overrides.rate)) {
+    if (!(rate > 0)) warn("impossible_rate", `Activity ${actId}: user rate ${rate} is not positive — library rate used instead`, actId);
+  }
+  F.push(...checkResourceFeasibility(sets));
+
+  // F3: crew count allows parallelism but the network serialized the fronts anyway.
+  {
+    const reach = coreReachability(sets, links);
+    const laneGroups = new Map<string, PlannedActivity[]>();
+    for (const a of sets.activities) {
+      if (a.isMilestone || !a.frontId || !a.stepKey) continue;
+      const f = fronts.find((x) => x.id === a.frontId)!;
+      const k = `${f.family}|${f.packageKey}|${f.templateKey}|${a.stepKey}`;
+      if (!laneGroups.has(k)) laneGroups.set(k, []);
+      laneGroups.get(k)!.push(a);
+    }
+    for (const [, group] of laneGroups) {
+      if (group.length < 2) continue;
+      const k = Math.max(1, Math.min(...group.map((a) => a.crewCount)));
+      if (k < 2) continue;
+      let serialized = true;
+      for (let i = 0; i < group.length && serialized; i++) {
+        for (let j = 0; j < group.length && serialized; j++) {
+          if (i === j) continue;
+          const ri = reach.get(group[i].stableId)!;
+          const rj = reach.get(group[j].stableId)!;
+          if (!ri.has(group[j].stableId) && !rj.has(group[i].stableId)) serialized = false;
+        }
+      }
+      if (serialized) warn("crew_parallelism_unused", `Step ${group[0].stepKey}: ${k} crews available but all ${group.length} fronts serialized — verify logic`, null);
+    }
+  }
+
   const sysGroups = new Map<string, Set<string>>();
   for (const f of fronts) {
     const k = `${f.family}|${f.templateKey}|${f.locationKey || "main"}`;
@@ -1012,7 +1307,8 @@ function validatePlan(
 
 function buildRecon(
   rows: ParsedBoqRow[], sets: BuiltSets, links: PlannedLink[], wbs: PlannedWbs[],
-  usable: BoqClassification[], review: BoqClassification[], cpm: CpmAttachment
+  usable: BoqClassification[], review: BoqClassification[], cpm: CpmAttachment,
+  materialBalance: MaterialBalanceEntry[]
 ): BoqPlanRecon {
   const boqTotal = rows.reduce((a, r) => a + (Number.isFinite(r.total_price) ? r.total_price : 0), 0);
   const allocatedTotal = sets.allocations.reduce((a, x) => a + x.costShare, 0);
@@ -1040,6 +1336,7 @@ function buildRecon(
     projectStart: cpm.projectStart,
     projectFinish: cpm.projectFinish,
     spanDays,
+    materialBalance,
   };
 }
 
@@ -1049,7 +1346,7 @@ export function generateBoqPlan(
   overrides: BoqPlanOverrides = EMPTY_BOQ_OVERRIDES
 ): BoqPlan {
   const classifications = rows.map((row, i) => classifyBoqRow(row, `boq-${String(i + 1).padStart(4, "0")}`));
-  const { fronts, usable, review } = buildFronts(rows, classifications, overrides);
+  const { fronts, usable, review, distFlags } = buildFronts(rows, classifications, overrides);
   const wbs = buildWbs(profile.projectName, fronts);
   const sets = buildActivities(fronts, rows, wbs, overrides);
   const links = buildLogic(fronts, sets, overrides);
@@ -1061,8 +1358,9 @@ export function generateBoqPlan(
   const cpm = sets.activities.length > 0
     ? runCpm(sets, links, profile)
     : { projectStart: null, projectFinish: null, cycle: null, failed: null };
-  const findings = validatePlan(rows, classifications, fronts, sets, links, usable, review, cpm, overrides);
-  const recon = buildRecon(rows, sets, links, wbs, usable, review, cpm);
+  const materialBalance = buildMaterialBalance(fronts, rows, overrides);
+  const findings = validatePlan(rows, classifications, fronts, sets, links, usable, review, cpm, overrides, distFlags, materialBalance);
+  const recon = buildRecon(rows, sets, links, wbs, usable, review, cpm, materialBalance);
 
   const hasCycle = cpm.cycle !== null;
   const isEmpty = sets.activities.filter((a) => !a.isMilestone).length === 0;
@@ -1085,5 +1383,6 @@ export function emptyBoqOverrides(): BoqPlanOverrides {
   return {
     workType: {}, confirmed: {}, excludedFamilies: [], location: {},
     duration: {}, rate: {}, crews: {}, wbs: {}, removeLinks: [], addLinks: [],
+    sequence: {}, distribution: {},
   };
 }
