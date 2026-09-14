@@ -40,10 +40,14 @@ import { analyzeIntegratedDecisions, gateConfidence } from '@/lib/integratedDeci
 import { analyzeForecastTrust } from '@/lib/forecastTrustEngine';
 import { reconcileFinishForecasts, calculateCpmDeterministicEarlyFinish } from '@/lib/forecastReconciliation';
 import { calculateControlHealth } from '@/lib/controlHealthEngine';
+import {
+  simulateComplexProjectScenario, resolveScenarioScheduleBasis, runPrecisionWatchdogAudit,
+  STANDARD_COMPLEX_SCENARIOS,
+} from '@/lib/complexScenarioSimulator';
 import type {
   Activity, ActivityBoqAllocation, ActivityLink, ActivityResource, BaselineActivity, BoqItem,
-  CostControlSnapshot, CostTransaction, ParsedBoqRow, ProgressUpdate, Resource,
-  ScheduleUpdateSnapshot, WbsNode,
+  ComplexScenarioResult, CostControlSnapshot, CostTransaction, ParsedBoqRow, Project,
+  ProgressUpdate, Resource, ScheduleUpdateSnapshot, WbsNode,
 } from '@/types';
 
 // ---------------------------------------------------------------------------
@@ -373,6 +377,41 @@ console.log('--- S1 CPM core');
   eq('S1 workingDayDelta Aug27→Sep3 = 6', workingDayDelta('2026-08-27', '2026-09-03', getCalendar('6_days')), 6);
   eq('S1 workingDayDelta Fri→Sat = 0 (non-working from)', workingDayDelta('2026-09-04', '2026-09-05', getCalendar('6_days')), 0);
   eq('S1 workingDayDelta symmetric negatives', workingDayDelta('2026-09-10', '2026-08-27', getCalendar('6_days')), -12);
+
+  // F9.1 project-start anchor: the Data Date the engine derives must be the earliest date the
+  // PROJECT DATA actually carries (actual_start || early_start), NOT a reduce seeded with the
+  // governed constant. DEFAULT_DATA_DATE is used only when no activity carries any usable date,
+  // and an explicit options.dataDate stays authoritative.
+  {
+    // A — every activity date is AFTER DEFAULT_DATA_DATE, no explicit dataDate supplied.
+    const lateActs = [
+      act({ id: 'AN1', code: 'AN1', duration_days: 5, early_start: '2027-01-03' }), // Sunday, working in 6_days
+      act({ id: 'AN2', code: 'AN2', duration_days: 5, early_start: '2027-03-01' }),
+    ];
+    const lateCalc = calculateCpm(lateActs, [link('LAN', 'AN1', 'AN2')], { calendarType: '6_days' });
+    eq('S1 anchor A: all-later-dated project anchors to its own earliest date', lateCalc.dataDate, '2027-01-03');
+    ok('S1 anchor A: NOT pulled back to the governed DEFAULT_DATA_DATE', lateCalc.dataDate > DEFAULT_DATA_DATE);
+    // actual_start alone must also feed the anchor.
+    const withActual = calculateCpm([act({ id: 'AN3', code: 'AN3', duration_days: 5, actual_start: '2027-01-03' })], [], { calendarType: '6_days' });
+    eq('S1 anchor A: actual_start alone feeds the derived anchor', withActual.dataDate, '2027-01-03');
+
+    // B — every activity date is BEFORE DEFAULT_DATA_DATE.
+    const earlyActs = [
+      act({ id: 'AN4', code: 'AN4', duration_days: 5, early_start: '2026-03-02' }), // Monday
+      act({ id: 'AN5', code: 'AN5', duration_days: 5, early_start: '2026-05-04' }), // Monday
+    ];
+    const earlyCalc = calculateCpm(earlyActs, [link('LAN2', 'AN4', 'AN5')], { calendarType: '6_days' });
+    eq('S1 anchor B: all-earlier-dated project anchors to its own earliest date', earlyCalc.dataDate, '2026-03-02');
+
+    // C — completely dateless project falls back to exactly the governed constant.
+    const dateless = [act({ id: 'AN6', code: 'AN6', duration_days: 5 }), act({ id: 'AN7', code: 'AN7', duration_days: 5 })];
+    const datelessCalc = calculateCpm(dateless, [link('LAN3', 'AN6', 'AN7')], { calendarType: '6_days' });
+    eq('S1 anchor C: fully dateless project falls back to governed DEFAULT_DATA_DATE', datelessCalc.dataDate, DEFAULT_DATA_DATE);
+
+    // D — explicit options.dataDate overrides the derived project anchor.
+    const overrideCalc = calculateCpm(lateActs, [link('LAN4', 'AN1', 'AN2')], { calendarType: '6_days', dataDate: '2026-08-27' }); // Thursday
+    eq('S1 anchor D: explicit options.dataDate overrides the derived anchor', overrideCalc.dataDate, '2026-08-27');
+  }
 }
 
 // ===========================================================================
@@ -852,6 +891,107 @@ console.log('--- S13 determinism (acceptance J)');
   const sparseA = JSON.stringify(runPipeline(SPARSE));
   const sparseB = JSON.stringify(runPipeline(SPARSE));
   eq('S13 sparse determinism', sparseB, sparseA);
+}
+
+// ===========================================================================
+console.log('--- S14 complex-scenario schedule basis (F9.1 anti-fabrication)');
+// ===========================================================================
+{
+  // A fully-formed Project literal (no cast): supplies every field the Project type requires so the
+  // simulator's basis resolution and cost outcome read real values, not fabricated defaults.
+  const mkProject = (o: Partial<Project> = {}): Project => ({
+    id: 'p1', name: 'Scenario Test Project', client: null, location: null, contract_value: 1000000,
+    currency: 'SAR', start_date: null, end_date: null, data_date: DD, duration_days: null,
+    status: 'active', description: null, calendar_type: '6_days', created_at: '2026-01-01T00:00:00Z',
+    ...o,
+  });
+  const scenario = STANDARD_COMPLEX_SCENARIOS[1]; // supply-chain shock: non-zero delay + VO days
+  const seedOpts = { seed: 42, iterations: 100, risks: [] };
+
+  // --- resolveScenarioScheduleBasis: source precedence ----------------------
+  const bProj = resolveScenarioScheduleBasis(mkProject({ start_date: '2026-07-01', end_date: '2027-01-01', duration_days: 200 }), [], []);
+  ok('S14 basis: project start + declared duration',
+    bProj.available && bProj.startSource === 'project' && bProj.durationSource === 'project_duration_days'
+    && bProj.startDate === '2026-07-01' && bProj.baseDurationDays === 200);
+
+  const bAct = resolveScenarioScheduleBasis(mkProject({ duration_days: 100 }), [act({ id: 'BA', code: 'BA', early_start: '2026-07-01', duration_days: 5 })], []);
+  ok('S14 basis: start falls back to the earliest real activity date',
+    bAct.available && bAct.startSource === 'earliest_activity' && bAct.startDate === '2026-07-01' && bAct.durationSource === 'project_duration_days');
+
+  const bSpan = resolveScenarioScheduleBasis(mkProject({ start_date: '2026-07-01', end_date: '2026-09-01' }), [], []);
+  ok('S14 basis: duration falls back to the project working-day date span',
+    bSpan.available && bSpan.durationSource === 'project_date_span' && (bSpan.baseDurationDays ?? 0) > 0);
+
+  const bNet = resolveScenarioScheduleBasis(
+    mkProject({ start_date: '2026-07-01' }),
+    [act({ id: 'BN1', code: 'BN1', duration_days: 10 }), act({ id: 'BN2', code: 'BN2', duration_days: 5 })],
+    [link('BLN', 'BN1', 'BN2')],
+  );
+  ok('S14 basis: duration falls back to the deterministic CPM network',
+    bNet.available && bNet.durationSource === 'cpm_network' && (bNet.baseDurationDays ?? 0) > 0);
+
+  const bNone = resolveScenarioScheduleBasis(mkProject(), [], []);
+  ok('S14 basis: no real data ⇒ unavailable with a bilingual reason',
+    !bNone.available && bNone.startDate === null && bNone.baseDurationDays === null
+    && bNone.reasonAr !== null && bNone.reasonEn !== null);
+
+  // --- fabrication guard: a dateless project with an empty network ----------
+  const emptyProject = mkProject(); // no start/end/duration; the old code invented 195d / 2026-09-15 / 2027-04-30
+  const naRes = simulateComplexProjectScenario(emptyProject, [], [], [], scenario, null, seedOpts);
+  eq('S14 dateless: scheduleBasisAvailable is false', naRes.scheduleBasisAvailable, false);
+  ok('S14 dateless: bilingual basis reason present', naRes.scheduleBasisReasonAr !== null && naRes.scheduleBasisReasonEn !== null);
+  // The former bug fabricated a schedule window — prove every one of those outputs is now N/A.
+  eq('S14 dateless: finishDate N/A (was 2027-04-30)', naRes.finishDate, null);
+  eq('S14 dateless: totalDurationDays N/A (was max(90,195+variance))', naRes.totalDurationDays, null);
+  ok('S14 dateless: NOT the old fabricated 195-day window', naRes.totalDurationDays !== Math.max(90, 195 + naRes.varianceDays));
+  ok('S14 dateless: finishDate is not the fabricated 2027-04-30', naRes.finishDate !== '2027-04-30');
+  eq('S14 dateless: criticalPathLength N/A', naRes.criticalPathLength, null);
+  eq('S14 dateless: p80FinishDate N/A', naRes.p80FinishDate, null);
+  // Duration-dependent financials are N/A too — no cost figure built on an invented duration.
+  eq('S14 dateless: simulatedCostOutcomeSar N/A', naRes.simulatedCostOutcomeSar, null);
+  eq('S14 dateless: eacOptimistic N/A', naRes.eacOptimistic, null);
+  eq('S14 dateless: eacRealistic N/A', naRes.eacRealistic, null);
+  eq('S14 dateless: eacPessimistic N/A', naRes.eacPessimistic, null);
+  eq('S14 dateless: eacBottomUp N/A', naRes.eacBottomUp, null);
+  eq('S14 dateless: spi N/A', naRes.spi, null);
+  eq('S14 dateless: cpi N/A', naRes.cpi, null);
+  eq('S14 dateless: peakCashDeficitSar N/A', naRes.peakCashDeficitSar, null);
+  eq('S14 dateless: p80CostSar N/A', naRes.p80CostSar, null);
+  eq('S14 dateless: costVarianceSar N/A', naRes.costVarianceSar, null);
+  eq('S14 dateless: costVariancePercent N/A', naRes.costVariancePercent, null);
+  ok('S14 dateless: every EAC model reports index_not_measured',
+    naRes.eacModelStatuses.optimistic === 'index_not_measured' && naRes.eacModelStatuses.realistic === 'index_not_measured'
+    && naRes.eacModelStatuses.pessimistic === 'index_not_measured' && naRes.eacModelStatuses.bottomUp === 'index_not_measured');
+  eq('S14 dateless: probabilistic envelope invalid', naRes.probabilisticEnvelope.valid, false);
+  eq('S14 dateless: envelope ran zero iterations', naRes.probabilisticEnvelope.iterations, 0);
+  ok('S14 dateless: varianceDays still modelled (parameter-only signal)', Number.isFinite(naRes.varianceDays));
+  ok('S14 dateless: feasibilityScore still computed', Number.isFinite(naRes.feasibilityScore));
+  noNonFinite('S14 dateless result carries no NaN/Infinity', naRes);
+
+  // The watchdog must report N/A for an unavailable scenario — never divide by a null.
+  const naWatch = runPrecisionWatchdogAudit(emptyProject, [], [], [naRes]);
+  noNonFinite('S14 watchdog over the unavailable scenario', naWatch);
+  ok('S14 watchdog emits a per-scenario N/A EVM metric',
+    naWatch.some((m) => m.id === `WATCH-EVM-${naRes.scenarioId}` && m.precisionStatus === 'acceptable' && m.deviation === 0));
+
+  // --- available path: a real schedule basis yields finite, non-null outputs -
+  const fullProject = mkProject({ start_date: '2026-07-01', duration_days: 200, contract_value: 5000000 });
+  const okRes = simulateComplexProjectScenario(fullProject, FULL.activities, FULL.links, [], scenario, null, seedOpts);
+  eq('S14 available: scheduleBasisAvailable is true', okRes.scheduleBasisAvailable, true);
+  ok('S14 available: finishDate resolved', okRes.finishDate !== null);
+  ok('S14 available: totalDurationDays resolved and positive', okRes.totalDurationDays !== null && okRes.totalDurationDays > 0);
+  noNonFinite('S14 available result carries no NaN/Infinity', okRes);
+
+  // Determinism: the same seed produces byte-identical scenario figures (acceptance J, per-scenario).
+  const okRes2 = simulateComplexProjectScenario(fullProject, FULL.activities, FULL.links, [], scenario, null, seedOpts);
+  const keyFigures = (r: ComplexScenarioResult) => JSON.stringify({
+    finishDate: r.finishDate, totalDurationDays: r.totalDurationDays, criticalPathLength: r.criticalPathLength,
+    simulatedCostOutcomeSar: r.simulatedCostOutcomeSar, eacRealistic: r.eacRealistic, spi: r.spi, cpi: r.cpi,
+    peakCashDeficitSar: r.peakCashDeficitSar, p80FinishDate: r.p80FinishDate, p80CostSar: r.p80CostSar,
+    env: [r.probabilisticEnvelope.p50DurationDays, r.probabilisticEnvelope.p80DurationDays,
+      r.probabilisticEnvelope.p90DurationDays, r.probabilisticEnvelope.p80CostSar],
+  });
+  eq('S14 determinism: identical seed ⇒ identical scenario figures', keyFigures(okRes2), keyFigures(okRes));
 }
 
 // ---------------------------------------------------------------------------

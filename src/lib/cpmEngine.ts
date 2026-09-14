@@ -184,13 +184,16 @@ export function calculateCpm(
   activities.forEach((activity) => topological(activity.id));
 
   // Determine Project Start Date & Data Date.
-  // F9 (acceptance A): when no activity carries a date the anchor is the governed DEFAULT_DATA_DATE,
-  // never the machine clock — CPM output must depend only on project data, not on when it runs.
-  const baseProjectStart = activities.reduce((earliest, act) => {
+  // F9.1: the anchor is the earliest date the PROJECT DATA actually carries. The governed
+  // DEFAULT_DATA_DATE is used ONLY when no activity carries any usable date at all — seeding the
+  // reduce with the constant (F9) wrongly pulled an all-later-dated project back to that anchor.
+  // An explicit `options.dataDate` remains authoritative (unchanged below).
+  const earliestActivityDate = activities.reduce((earliest: string | null, act) => {
     const s = act.actual_start || act.early_start;
     if (!s) return earliest;
-    return !earliest || s < earliest ? s : earliest;
-  }, DEFAULT_DATA_DATE);
+    return earliest === null || s < earliest ? s : earliest;
+  }, null);
+  const baseProjectStart = earliestActivityDate ?? DEFAULT_DATA_DATE;
 
   const defaultStart = getNextWorkingDay(baseProjectStart, defaultCalendar);
   const dataDate = options.dataDate

@@ -951,10 +951,12 @@ export interface ComplexScenarioResult {
   scenarioNameAr: string;
   scenarioNameEn: string;
   category: string;
-  finishDate: string;
+  /** Null when the schedule basis is unavailable (F9.1) — never a fabricated finish date. */
+  finishDate: string | null;
   varianceDays: number;
-  totalDurationDays: number;
-  criticalPathLength: number;
+  /** Null when the schedule basis is unavailable (F9.1) — never a fabricated duration. */
+  totalDurationDays: number | null;
+  criticalPathLength: number | null;
   /** Scenario BAC = canonical BAC + the scenario's variation-order value. */
   bac: number;
   /** Canonical BAC at the Data Date (SSOT) — never a `contract_value || 1000000` fallback. */
@@ -968,13 +970,15 @@ export interface ComplexScenarioResult {
   /** Measured canonical indices the scenario deltas are applied to. */
   baselineCpi: number;
   baselineSpi: number;
-  /** The simulation's own cost outcome (formerly reported as `eacBottomUp`). */
-  simulatedCostOutcomeSar: number;
-  /** Deterministic multi-EAC family — identical to BudgetView for identical inputs (GAP-047). */
-  eacOptimistic: number;
-  eacRealistic: number;
-  eacPessimistic: number;
-  eacBottomUp: number;
+  /** The simulation's own cost outcome (formerly reported as `eacBottomUp`). Null when it would
+   * have to be derived from an unavailable schedule basis (F9.1). */
+  simulatedCostOutcomeSar: number | null;
+  /** Deterministic multi-EAC family — identical to BudgetView for identical inputs (GAP-047).
+   * Null when the scenario indices are unavailable because the schedule basis is (F9.1). */
+  eacOptimistic: number | null;
+  eacRealistic: number | null;
+  eacPessimistic: number | null;
+  eacBottomUp: number | null;
   /** Per-model validity, so a consumer renders "—" instead of a placeholder number. */
   eacModelStatuses: {
     optimistic: ForecastModelStatus;
@@ -982,21 +986,22 @@ export interface ComplexScenarioResult {
     pessimistic: ForecastModelStatus;
     bottomUp: ForecastModelStatus;
   };
-  costVarianceSar: number;
-  costVariancePercent: number;
-  /** Scenario-adjusted indices = canonical index x the simulated delta factor (1.0 when neutral). */
-  spi: number;
-  cpi: number;
-  peakCashDeficitSar: number;
+  costVarianceSar: number | null;
+  costVariancePercent: number | null;
+  /** Scenario-adjusted indices = canonical index x the simulated delta factor (1.0 when neutral).
+   * Null when the schedule basis is unavailable (F9.1) — the factors need a real duration. */
+  spi: number | null;
+  cpi: number | null;
+  peakCashDeficitSar: number | null;
   /**
    * P80 finish date read from the SIMULATED duration distribution (GAP-029) -- never the former
    * `deterministic duration x 1.08`. When no valid simulation exists it falls back to the
    * deterministic scenario finish date and `probabilisticEnvelope.valid` is false, so a consumer can
    * always tell a sampled percentile from a deterministic outcome.
    */
-  p80FinishDate: string;
+  p80FinishDate: string | null;
   /** P80 cost read from the simulated cost distribution -- never `deterministic cost x 1.06`. */
-  p80CostSar: number;
+  p80CostSar: number | null;
   /** The sampled envelope behind the two P80 fields, separated from the deterministic deltas. */
   probabilisticEnvelope: ScenarioProbabilisticEnvelope;
   feasibilityScore: number; // 0-100
@@ -1004,6 +1009,15 @@ export interface ComplexScenarioResult {
   riskRating: 'low' | 'medium' | 'high' | 'critical';
   mitigationStrategyAr: string;
   mitigationStrategyEn: string;
+  /**
+   * F9.1: whether a real schedule basis (start + duration) was available. When false, the
+   * schedule/duration outputs are N/A and the financial outputs that depend on a fabricated
+   * duration are also N/A — nothing is invented from a hardcoded default.
+   */
+  scheduleBasisAvailable: boolean;
+  /** Bilingual reason the schedule basis was unavailable; null when it was available. */
+  scheduleBasisReasonAr: string | null;
+  scheduleBasisReasonEn: string | null;
 }
 
 export interface PrecisionWatchdogMetric {

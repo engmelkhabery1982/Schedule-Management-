@@ -11,7 +11,8 @@ import type {
   PrecisionWatchdogMetric,
   ScenarioProbabilisticEnvelope,
 } from '@/types';
-import { addWorkingDays, getCalendar } from '@/lib/calendarEngine';
+import { addWorkingDays, countWorkingDays, getCalendar } from '@/lib/calendarEngine';
+import { earliestDate, isIsoDate } from '@/lib/chronologyGuard';
 import { calculateProjectEvmAtDataDate, type TcpiStatus } from '@/lib/planningEngine';
 import { calculateMultiEacForecast } from '@/lib/budgetForecastEngine';
 import { calculateDeterministicNetworkDuration, runMonteCarloSimulation } from '@/lib/monteCarloEngine';
@@ -202,6 +203,86 @@ export interface ScenarioSimulationOptions {
 }
 
 /**
+ * F9.1: the authoritative schedule basis a scenario may simulate against — a real start date and a
+ * real base duration. Both are derived ONLY from valid project / canonical schedule data; nothing is
+ * invented. The former implementation fell back to `duration_days || 195`, `start_date ||
+ * '2026-09-15'` and `end_date || '2027-04-30'`, which fabricated a schedule window (and every
+ * duration- and cost-dependent scenario output built on it) for any project missing those fields.
+ *
+ * Resolution order:
+ *   start    = project.start_date (valid ISO)  →  earliest activity actual_start/early_start
+ *   duration = project.duration_days (>0)      →  project.start→end working-day span
+ *              →  deterministic CPM network duration over the real activity logic
+ *
+ * If either cannot be resolved from real data, `available` is false and the caller must publish N/A
+ * for the schedule outputs and for the financial outputs that depend on a fabricated duration.
+ */
+export interface ScenarioScheduleBasis {
+  available: boolean;
+  startDate: string | null;
+  baseDurationDays: number | null;
+  /** Where the resolved start came from; null when unavailable. */
+  startSource: 'project' | 'earliest_activity' | null;
+  /** Where the resolved duration came from; null when unavailable. */
+  durationSource: 'project_duration_days' | 'project_date_span' | 'cpm_network' | null;
+  reasonAr: string | null;
+  reasonEn: string | null;
+}
+
+export function resolveScenarioScheduleBasis(
+  project: Pick<Project, 'start_date' | 'end_date' | 'duration_days' | 'calendar_type'>,
+  activities: Activity[],
+  links: ActivityLink[],
+): ScenarioScheduleBasis {
+  const calendar = getCalendar(project.calendar_type || '6_days');
+
+  // --- start date: project field first, else the earliest real activity date -------------------
+  let startDate: string | null = isIsoDate(project.start_date) ? project.start_date : null;
+  let startSource: ScenarioScheduleBasis['startSource'] = startDate ? 'project' : null;
+  if (!startDate) {
+    const earliest = earliestDate(activities, (a) => a.actual_start || a.early_start);
+    if (earliest) { startDate = earliest; startSource = 'earliest_activity'; }
+  }
+
+  // --- base duration: project field, else project date span, else the CPM network ---------------
+  let baseDurationDays: number | null = null;
+  let durationSource: ScenarioScheduleBasis['durationSource'] = null;
+  const declared = Number(project.duration_days);
+  if (Number.isFinite(declared) && declared > 0) {
+    baseDurationDays = Math.round(declared);
+    durationSource = 'project_duration_days';
+  } else if (isIsoDate(project.start_date) && isIsoDate(project.end_date) && project.end_date >= project.start_date) {
+    const span = countWorkingDays(project.start_date, project.end_date, calendar);
+    if (span > 0) { baseDurationDays = span; durationSource = 'project_date_span'; }
+  }
+  if (baseDurationDays === null) {
+    const network = calculateDeterministicNetworkDuration(activities, links);
+    if (network.valid && network.durationDays > 0) {
+      baseDurationDays = network.durationDays;
+      durationSource = 'cpm_network';
+    }
+  }
+
+  const available = startDate !== null && baseDurationDays !== null;
+  if (available) {
+    return { available, startDate, baseDurationDays, startSource, durationSource, reasonAr: null, reasonEn: null };
+  }
+  const missing: string[] = [];
+  if (startDate === null) missing.push('a valid project/earliest-activity start date');
+  if (baseDurationDays === null) missing.push('a valid project duration, date span, or CPM network duration');
+  return {
+    available: false,
+    startDate,
+    baseDurationDays,
+    startSource,
+    durationSource,
+    reasonAr: `أساس الجدول غير متاح: لا توجد ${startDate === null ? 'تاريخ بدء صالح للمشروع أو لأقرب نشاط' : ''}${startDate === null && baseDurationDays === null ? ' و' : ''}${baseDurationDays === null ? 'مدة صالحة للمشروع أو لفترة تاريخيه أو لشبكة المسار الحرج' : ''}. لا يتم اختلاق مدة أو تاريخ انتهاء؛ مخرجات الجدول والمخرجات المالية المعتمدة على المدة تظهر N/A.`,
+    reasonEn: `Schedule basis unavailable: missing ${missing.join(' and ')}. No duration or finish date is fabricated; schedule outputs and the financial outputs that depend on a duration are reported as N/A.`,
+  };
+}
+
+
+/**
  * Execute Deep Simulation of a specific project under complex scenario parameters.
  *
  * The result is deliberately split in two:
@@ -239,12 +320,17 @@ export function simulateComplexProjectScenario(
           tcpiStatus: evm.tcpiStatus,
         };
       })();
-  const baseDurationDays = Number(project.duration_days || 195);
-  const startDate = project.start_date || '2026-09-15';
-  const baseFinishDate = project.end_date || '2027-04-30';
+  // F9.1: the schedule basis comes ONLY from valid project/canonical data. The former
+  // `|| 195` / `|| '2026-09-15'` / `|| '2027-04-30'` fallbacks fabricated a schedule window and
+  // every duration/cost output built on it. When the basis is missing, those outputs become N/A.
+  const basis = resolveScenarioScheduleBasis(project, activities, links);
+  const baseDurationDays = basis.baseDurationDays; // number | null
+  const startDate = basis.startDate; // string | null
 
   // 1. Calculate duration and critical path shifts
   // Adjusted duration = (Base Duration + Critical Delay Days + VO Days) / (Productivity * Subcontractor Factor)
+  // The scenario deltas below are parameter-only and always computable; the ABSOLUTE duration and
+  // finish date need a real base and are N/A without one.
   const effectiveProductivity = Math.max(0.4, p.productivityFactor * (0.7 + 0.3 * p.subcontractorCapacityFactor));
   const rawAddedDays = Math.round(p.criticalDelayDays + p.variationOrderDays);
   
@@ -252,8 +338,12 @@ export function simulateComplexProjectScenario(
   const crashingCompressionDays = p.crashingOvertimeFactor > 1.0 ? Math.round((p.crashingOvertimeFactor - 1.0) * 45) : 0;
   
   const netDurationVarianceDays = Math.round((rawAddedDays / effectiveProductivity) - crashingCompressionDays);
-  const totalSimulatedDurationDays = Math.max(90, baseDurationDays + netDurationVarianceDays);
-  const simulatedFinishDate = addWorkingDays(startDate, totalSimulatedDurationDays, calendar);
+  const totalSimulatedDurationDays =
+    baseDurationDays !== null ? Math.max(90, baseDurationDays + netDurationVarianceDays) : null;
+  const simulatedFinishDate =
+    startDate !== null && totalSimulatedDurationDays !== null
+      ? addWorkingDays(startDate, totalSimulatedDurationDays, calendar)
+      : null;
 
   // 2. Financial simulation: the scenario's budget change, its cost outcome, and the deterministic
   //    multi-EAC family from the SHARED engine (GAP-009 / GAP-047).
@@ -267,49 +357,70 @@ export function simulateComplexProjectScenario(
   const baseSubcontractorCost = shareOf(SCENARIO_COST_NATURE_SPLIT_BASIS_POINTS.subcontractors);
   const baseOverheadCost = shareOf(SCENARIO_COST_NATURE_SPLIT_BASIS_POINTS.overheads);
 
-  // Apply inflation, escalation and crashing premiums
+  // Apply inflation, escalation and crashing premiums. The overhead prolongation factor and the
+  // summed outcome both need a real duration ratio; without a schedule basis the cost outcome — and
+  // everything derived from it — is N/A rather than built on a fabricated duration.
   const simMaterialCost = baseMaterialCost * (1 + p.materialInflationPercent / 100);
   const simLaborCost = baseLaborCost * (1 + p.laborRateEscalationPercent / 100) * Math.max(1.0, 1.0 + (p.crashingOvertimeFactor - 1.0) * 0.6);
   const simEquipmentCost = baseEquipmentCost * (1 + (p.materialInflationPercent * 0.3) / 100);
   const simSubcontractorCost = baseSubcontractorCost * (1 + (p.laborRateEscalationPercent * 0.5) / 100);
-  const simOverheadCost = baseOverheadCost * (baseDurationDays > 0 ? totalSimulatedDurationDays / baseDurationDays : 1);
+  const durationProlongationFactor =
+    baseDurationDays !== null && totalSimulatedDurationDays !== null && baseDurationDays > 0
+      ? totalSimulatedDurationDays / baseDurationDays
+      : null;
+  const simOverheadCost = durationProlongationFactor !== null ? baseOverheadCost * durationProlongationFactor : null;
 
-  /** The simulation's own cost outcome. It is a scenario result, not an actual cost and not an EAC. */
-  const simulatedCostOutcomeSar = Math.round(simMaterialCost + simLaborCost + simEquipmentCost + simSubcontractorCost + simOverheadCost);
-  const costVarianceSar = simulatedCostOutcomeSar - newBac;
-  const costVariancePercent = newBac > 0 ? Number(((costVarianceSar / newBac) * 100).toFixed(2)) : 0;
+  /** The simulation's own cost outcome. It is a scenario result, not an actual cost and not an EAC.
+   * Null when it would depend on a fabricated duration (no schedule basis). */
+  const simulatedCostOutcomeSar = simOverheadCost !== null
+    ? Math.round(simMaterialCost + simLaborCost + simEquipmentCost + simSubcontractorCost + simOverheadCost)
+    : null;
+  const costVarianceSar = simulatedCostOutcomeSar !== null ? simulatedCostOutcomeSar - newBac : null;
+  const costVariancePercent =
+    costVarianceSar !== null && newBac > 0 ? Number(((costVarianceSar / newBac) * 100).toFixed(2)) : null;
 
   // Scenario performance indices are the MEASURED canonical indices scaled by the simulated delta
   // factors. A neutral scenario (no delay, no inflation, no VO) leaves both factors at exactly 1,
   // so the baseline scenario reproduces the canonical indices — and therefore BudgetView's numbers.
+  // Both factors need a real duration/cost basis; without one the scaled indices are N/A.
   const scheduleOutcomeFactor =
-    totalSimulatedDurationDays > 0 ? Number((baseDurationDays / totalSimulatedDurationDays).toFixed(6)) : 1;
+    baseDurationDays !== null && totalSimulatedDurationDays !== null && totalSimulatedDurationDays > 0
+      ? Number((baseDurationDays / totalSimulatedDurationDays).toFixed(6))
+      : null;
   const costOutcomeFactor =
-    simulatedCostOutcomeSar > 0 && newBac > 0 ? Number((newBac / simulatedCostOutcomeSar).toFixed(6)) : 1;
-  const spi = Number((Number(baseline.spi || 0) * scheduleOutcomeFactor).toFixed(3));
-  const cpi = Number((Number(baseline.cpi || 0) * costOutcomeFactor).toFixed(3));
+    simulatedCostOutcomeSar !== null && simulatedCostOutcomeSar > 0 && newBac > 0
+      ? Number((newBac / simulatedCostOutcomeSar).toFixed(6))
+      : null;
+  const spi = scheduleOutcomeFactor !== null ? Number((Number(baseline.spi || 0) * scheduleOutcomeFactor).toFixed(3)) : null;
+  const cpi = costOutcomeFactor !== null ? Number((Number(baseline.cpi || 0) * costOutcomeFactor).toFixed(3)) : null;
 
   // Multi-EAC Models — one shared implementation. Measured EV and AC are facts at the Data Date:
-  // nothing here fabricates a "35% spent so far" position to feed them.
-  const forecast = calculateMultiEacForecast({
-    bac: newBac,
-    ev: Number(baseline.ev || 0),
-    ac: Number(baseline.ac || 0),
-    cpi,
-    spi,
-    tcpi: Number(baseline.tcpi || 0),
-    tcpiStatus: baseline.tcpiStatus,
-  });
-  const eacOptimistic = forecast.optimistic.eac;
-  const eacRealistic = forecast.realistic.eac;
-  const eacPessimistic = forecast.pessimistic.eac;
-  const eacBottomUp = forecast.bottomUp.eac;
+  // nothing here fabricates a "35% spent so far" position to feed them. Without scenario indices
+  // (no schedule basis) the EAC family is N/A rather than computed from a fabricated duration.
+  const forecast = spi !== null && cpi !== null
+    ? calculateMultiEacForecast({
+        bac: newBac,
+        ev: Number(baseline.ev || 0),
+        ac: Number(baseline.ac || 0),
+        cpi,
+        spi,
+        tcpi: Number(baseline.tcpi || 0),
+        tcpiStatus: baseline.tcpiStatus,
+      })
+    : null;
+  const eacOptimistic = forecast ? forecast.optimistic.eac : null;
+  const eacRealistic = forecast ? forecast.realistic.eac : null;
+  const eacPessimistic = forecast ? forecast.pessimistic.eac : null;
+  const eacBottomUp = forecast ? forecast.bottomUp.eac : null;
 
   // 3. Peak Cash Deficit Calculation (Working capital strain)
-  // Monthly billing delays + material cost surges
-  const monthlyBurnRate = simulatedCostOutcomeSar / (totalSimulatedDurationDays / 30);
+  // Monthly billing delays + material cost surges. The burn rate spreads the cost outcome over the
+  // simulated duration, so it is N/A when either is unavailable.
   const cashInflowLagMonths = p.cashInflowDelayDays / 30;
-  const peakCashDeficitSar = Math.round(monthlyBurnRate * (1.5 + cashInflowLagMonths) + (p.materialInflationPercent > 10 ? 250000 : 80000));
+  const peakCashDeficitSar =
+    simulatedCostOutcomeSar !== null && totalSimulatedDurationDays !== null && totalSimulatedDurationDays > 0
+      ? Math.round((simulatedCostOutcomeSar / (totalSimulatedDurationDays / 30)) * (1.5 + cashInflowLagMonths) + (p.materialInflationPercent > 10 ? 250000 : 80000))
+      : null;
 
   // 4. Probabilistic percentile envelope (GAP-029) -- sampled, never a static multiplier.
   //
@@ -329,9 +440,14 @@ export function simulateComplexProjectScenario(
   //    If the network cannot be simulated (a logic cycle, no activities), no percentile is published:
   //    the envelope is marked unavailable and the deterministic scenario values are shown as such.
   const deterministicNetwork = calculateDeterministicNetworkDuration(activities, links);
+  // F9.1: the Monte Carlo envelope can only be scaled/anchored when a real schedule basis exists.
+  // Without one, no percentile is published — the envelope is marked unavailable with the reason,
+  // and no duration is fabricated to force a run.
+  const canSimulate =
+    basis.available && totalSimulatedDurationDays !== null && simulatedCostOutcomeSar !== null && startDate !== null;
   const durationScaleFactor =
-    deterministicNetwork.valid && deterministicNetwork.durationDays > 0
-      ? totalSimulatedDurationDays / deterministicNetwork.durationDays
+    canSimulate && deterministicNetwork.valid && deterministicNetwork.durationDays > 0
+      ? (totalSimulatedDurationDays as number) / deterministicNetwork.durationDays
       : 1;
   const scenarioActivities: Activity[] = activities.map((act) =>
     act.is_milestone
@@ -344,87 +460,103 @@ export function simulateComplexProjectScenario(
   const envelopeRisks = options?.risks || [];
   const openRiskCount = envelopeRisks.filter((r) => r.status === 'open').length;
   const envelopeIterations = Math.max(1, Math.round(options?.iterations ?? 500));
-  const simulation = runMonteCarloSimulation(
-    scenarioActivities,
-    links,
-    envelopeRisks,
-    simulatedCostOutcomeSar,
-    envelopeIterations,
-    project.calendar_type || '6_days',
-    { seed: options?.seed ?? null, dataDate: project.data_date || null },
-  );
+  const simulation = canSimulate
+    ? runMonteCarloSimulation(
+        scenarioActivities,
+        links,
+        envelopeRisks,
+        simulatedCostOutcomeSar as number,
+        envelopeIterations,
+        project.calendar_type || '6_days',
+        { seed: options?.seed ?? null, dataDate: project.data_date || null },
+      )
+    : null;
+  const simValid = simulation?.valid ?? false;
+  const simCostAvailable = simulation?.costAvailable ?? false;
 
-  const envelopeCaveatAr = simulation.valid
-    ? openRiskCount === 0
-      ? 'لا توجد مخاطر مفتوحة ممررة للمحاكاة: تشتت المدد يأتي من الحد المتفائل (0.85×) وحده، لذا قد يقل P80 عن مدة السيناريو الحتمية.'
-      : `تم استخراج النسب من توزيع المحاكاة الفعلية (${simulation.validIterations} دورة) مع ${openRiskCount} خطراً مفتوحاً.`
-    : 'تعذّر تشغيل المحاكاة الاحتمالية؛ القيم المعروضة هي ناتج السيناريو الحتمي وليست نسباً احتمالية.';
+  const basisCaveatAr = basis.available ? null : basis.reasonAr;
+  const basisCaveatEn = basis.available ? null : basis.reasonEn;
+  const envelopeCaveatAr = !canSimulate
+    ? (basisCaveatAr || 'تعذّر تشغيل المحاكاة الاحتمالية؛ القيم المعروضة هي ناتج السيناريو الحتمي وليست نسباً احتمالية.')
+    : simValid
+      ? openRiskCount === 0
+        ? 'لا توجد مخاطر مفتوحة ممررة للمحاكاة: تشتت المدد يأتي من الحد المتفائل (0.85×) وحده، لذا قد يقل P80 عن مدة السيناريو الحتمية.'
+        : `تم استخراج النسب من توزيع المحاكاة الفعلية (${simulation?.validIterations ?? 0} دورة) مع ${openRiskCount} خطراً مفتوحاً.`
+      : 'تعذّر تشغيل المحاكاة الاحتمالية؛ القيم المعروضة هي ناتج السيناريو الحتمي وليست نسباً احتمالية.';
   // When the schedule simulates but no cost basis exists, the published cost stays the
   // deterministic scenario outcome and the caveat says so -- the duration percentiles are unaffected.
   const costCaveatAr =
     'لا يوجد أساس تكلفة للسيناريو — التكلفة المعروضة هي الناتج الحتمي وليست نسبة احتمالية.';
   const costCaveatEn =
     'The scenario has no cost basis — the cost shown is the deterministic outcome, not a percentile.';
-  const envelopeCaveatEn = simulation.valid
-    ? openRiskCount === 0
-      ? 'No open risks were supplied to the simulation: duration dispersion comes from the optimistic bound (0.85x) alone, so P80 can sit below the deterministic scenario duration.'
-      : `Percentiles sampled from the actual simulation distribution (${simulation.validIterations} iterations) with ${openRiskCount} open risk(s).`
-    : 'The probabilistic simulation could not run; the figures shown are the deterministic scenario outcome, not percentiles.';
+  const envelopeCaveatEn = !canSimulate
+    ? (basisCaveatEn || 'The probabilistic simulation could not run; the figures shown are the deterministic scenario outcome, not percentiles.')
+    : simValid
+      ? openRiskCount === 0
+        ? 'No open risks were supplied to the simulation: duration dispersion comes from the optimistic bound (0.85x) alone, so P80 can sit below the deterministic scenario duration.'
+        : `Percentiles sampled from the actual simulation distribution (${simulation?.validIterations ?? 0} iterations) with ${openRiskCount} open risk(s).`
+      : 'The probabilistic simulation could not run; the figures shown are the deterministic scenario outcome, not percentiles.';
 
   const probabilisticEnvelope: ScenarioProbabilisticEnvelope = {
-    valid: simulation.valid,
-    source: simulation.valid ? 'monte_carlo' : 'unavailable',
-    iterations: simulation.validIterations,
-    p50DurationDays: simulation.valid ? simulation.p50Days : null,
-    p80DurationDays: simulation.valid ? simulation.p80Days : null,
-    p90DurationDays: simulation.valid ? simulation.p90Days : null,
-    p50CostSar: simulation.valid && simulation.costAvailable ? simulation.p50Cost : null,
-    p80CostSar: simulation.valid && simulation.costAvailable ? simulation.p80Cost : null,
-    p90CostSar: simulation.valid && simulation.costAvailable ? simulation.p90Cost : null,
-    p50FinishDate: simulation.valid ? addWorkingDays(startDate, simulation.p50Days, calendar) : null,
-    p90FinishDate: simulation.valid ? addWorkingDays(startDate, simulation.p90Days, calendar) : null,
-    minDurationDays: simulation.valid ? simulation.minDurationDays : null,
-    maxDurationDays: simulation.valid ? simulation.maxDurationDays : null,
-    minCostSar: simulation.valid && simulation.costAvailable ? simulation.minCost : null,
-    maxCostSar: simulation.valid && simulation.costAvailable ? simulation.maxCost : null,
+    valid: simValid,
+    source: simValid ? 'monte_carlo' : 'unavailable',
+    iterations: simulation?.validIterations ?? 0,
+    p50DurationDays: simValid ? (simulation?.p50Days ?? null) : null,
+    p80DurationDays: simValid ? (simulation?.p80Days ?? null) : null,
+    p90DurationDays: simValid ? (simulation?.p90Days ?? null) : null,
+    p50CostSar: simValid && simCostAvailable ? (simulation?.p50Cost ?? null) : null,
+    p80CostSar: simValid && simCostAvailable ? (simulation?.p80Cost ?? null) : null,
+    p90CostSar: simValid && simCostAvailable ? (simulation?.p90Cost ?? null) : null,
+    p50FinishDate: simValid && startDate !== null ? addWorkingDays(startDate, simulation?.p50Days ?? 0, calendar) : null,
+    p90FinishDate: simValid && startDate !== null ? addWorkingDays(startDate, simulation?.p90Days ?? 0, calendar) : null,
+    minDurationDays: simValid ? (simulation?.minDurationDays ?? null) : null,
+    maxDurationDays: simValid ? (simulation?.maxDurationDays ?? null) : null,
+    minCostSar: simValid && simCostAvailable ? (simulation?.minCost ?? null) : null,
+    maxCostSar: simValid && simCostAvailable ? (simulation?.maxCost ?? null) : null,
     deterministicNetworkDurationDays: deterministicNetwork.durationDays,
     durationScaleFactor: Number(durationScaleFactor.toFixed(6)),
     openRiskCount,
-    costAvailable: simulation.costAvailable,
-    seed: simulation.seed,
-    noteAr:
-      simulation.valid && simulation.costAvailable
+    costAvailable: simCostAvailable,
+    seed: simulation?.seed ?? options?.seed ?? null,
+    noteAr: !canSimulate
+      ? envelopeCaveatAr
+      : simValid && simCostAvailable
         ? envelopeCaveatAr
-        : simulation.valid
+        : simValid
           ? `${envelopeCaveatAr} ${costCaveatAr}`
-          : `${envelopeCaveatAr} ${simulation.validation.messageAr || ''}`.trim(),
-    noteEn:
-      simulation.valid && simulation.costAvailable
+          : `${envelopeCaveatAr} ${simulation?.validation.messageAr || ''}`.trim(),
+    noteEn: !canSimulate
+      ? envelopeCaveatEn
+      : simValid && simCostAvailable
         ? envelopeCaveatEn
-        : simulation.valid
+        : simValid
           ? `${envelopeCaveatEn} ${costCaveatEn}`
-          : `${envelopeCaveatEn} ${simulation.validation.messageEn || ''}`.trim(),
+          : `${envelopeCaveatEn} ${simulation?.validation.messageEn || ''}`.trim(),
   };
 
   // The published P80 pair: sampled when the envelope is valid, otherwise the deterministic outcome
   // with `probabilisticEnvelope.valid === false` telling the consumer which one it is looking at.
   // Cost additionally falls back to the deterministic outcome when the run had no cost basis
   // (`costAvailable === false` + the envelope caveat say so); durations are unaffected.
-  const p80DurationDays = simulation.valid ? simulation.p80Days : totalSimulatedDurationDays;
-  const p80FinishDate = addWorkingDays(startDate, p80DurationDays, calendar);
+  const p80DurationDays = simValid ? (simulation?.p80Days ?? null) : totalSimulatedDurationDays;
+  const p80FinishDate =
+    startDate !== null && p80DurationDays !== null ? addWorkingDays(startDate, p80DurationDays, calendar) : null;
   const p80CostSar =
-    simulation.valid && simulation.costAvailable ? simulation.p80Cost : simulatedCostOutcomeSar;
+    simValid && simCostAvailable ? (simulation?.p80Cost ?? null) : simulatedCostOutcomeSar;
 
-  // 5. Feasibility Score & Risk Classification
+  // 5. Feasibility Score & Risk Classification. The duration signal is parameter-only and always
+  // available; the cost signal is applied only when a real cost outcome exists (F9.1: no fabricated
+  // duration ⇒ no fabricated cost variance feeding the rating).
   let feasibilityScore = 100;
   if (netDurationVarianceDays > 0) feasibilityScore -= Math.min(40, netDurationVarianceDays * 0.7);
-  if (costVariancePercent > 0) feasibilityScore -= Math.min(40, costVariancePercent * 1.2);
+  if (costVariancePercent !== null && costVariancePercent > 0) feasibilityScore -= Math.min(40, costVariancePercent * 1.2);
   if (p.cashInflowDelayDays > 30) feasibilityScore -= 15;
   feasibilityScore = Math.max(10, Math.min(100, Math.round(feasibilityScore)));
 
   let riskRating: 'low' | 'medium' | 'high' | 'critical' = 'low';
-  if (feasibilityScore < 45 || netDurationVarianceDays > 40 || costVariancePercent > 20) riskRating = 'critical';
-  else if (feasibilityScore < 65 || netDurationVarianceDays > 20 || costVariancePercent > 10) riskRating = 'high';
+  const costPct = costVariancePercent; // number | null
+  if (feasibilityScore < 45 || netDurationVarianceDays > 40 || (costPct !== null && costPct > 20)) riskRating = 'critical';
+  else if (feasibilityScore < 65 || netDurationVarianceDays > 20 || (costPct !== null && costPct > 10)) riskRating = 'high';
   else if (feasibilityScore < 85 || netDurationVarianceDays > 5) riskRating = 'medium';
 
   // 6. FIDIC Claim Clause Mapping & Mitigation
@@ -490,12 +622,20 @@ export function simulateComplexProjectScenario(
     eacRealistic,
     eacPessimistic,
     eacBottomUp,
-    eacModelStatuses: {
-      optimistic: forecast.optimistic.status,
-      realistic: forecast.realistic.status,
-      pessimistic: forecast.pessimistic.status,
-      bottomUp: forecast.bottomUp.status,
-    },
+    eacModelStatuses: forecast
+      ? {
+          optimistic: forecast.optimistic.status,
+          realistic: forecast.realistic.status,
+          pessimistic: forecast.pessimistic.status,
+          bottomUp: forecast.bottomUp.status,
+        }
+      : {
+          // No scenario indices (no schedule basis) ⇒ every EAC model is not computable (F9.1).
+          optimistic: 'index_not_measured',
+          realistic: 'index_not_measured',
+          pessimistic: 'index_not_measured',
+          bottomUp: 'index_not_measured',
+        },
     costVarianceSar,
     costVariancePercent,
     spi,
@@ -509,6 +649,9 @@ export function simulateComplexProjectScenario(
     riskRating,
     mitigationStrategyAr,
     mitigationStrategyEn,
+    scheduleBasisAvailable: basis.available,
+    scheduleBasisReasonAr: basis.reasonAr,
+    scheduleBasisReasonEn: basis.reasonEn,
   };
 }
 
@@ -548,6 +691,24 @@ export function runPrecisionWatchdogAudit(
 
   // 2. EVM Conservation Law — the deviation is measured, not asserted.
   results.forEach((res) => {
+    // F9.1: a scenario with no schedule basis publishes N/A indices/EAC/cost — there is nothing to
+    // reconcile, so the audit reports N/A instead of dividing by a null or fabricating a deviation.
+    if (res.cpi === null || res.spi === null || res.eacRealistic === null || res.simulatedCostOutcomeSar === null) {
+      metrics.push({
+        id: `WATCH-EVM-${res.scenarioId}`,
+        category: 'evm_conservation',
+        labelAr: `الدقة الرياضية لـ EVM: ${res.scenarioNameAr.slice(0, 30)}...`,
+        labelEn: `EVM Precision: ${res.scenarioNameEn.slice(0, 30)}...`,
+        formula: 'EAC(realistic) = BAC / CPI  |  BAC(scenario) = BAC(canonical) + VO',
+        calculatedValue: 'N/A — أساس الجدول غير متاح (لا مدة/تاريخ محاكى)',
+        expectedValue: 'N/A — no scenario schedule basis, so no EAC to reconcile',
+        deviation: 0,
+        precisionStatus: 'acceptable',
+        notesAr: res.scheduleBasisReasonAr || 'لا توجد مخرجات EVM لأن أساس الجدول غير متاح؛ لا تُختلق قيم.',
+        notesEn: res.scheduleBasisReasonEn || 'No EVM outputs because the schedule basis is unavailable; nothing is fabricated.',
+      });
+      return;
+    }
     // The shared realistic model is `CPI > 0 ? round(BAC / CPI) : BAC`; recompute it from the
     // published scenario figures and report the true difference instead of a hardcoded 0.
     const expectedRealisticEac = res.cpi > 0 ? Math.round(res.bac / res.cpi) : res.bac;

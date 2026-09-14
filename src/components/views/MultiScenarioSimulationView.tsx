@@ -163,12 +163,18 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
   }, [activeProject, activities, budgetLines, boqItems, costTransactions, progressUpdates]);
 
   /** A model whose denominator is not measurable is rendered as N/A, never as its placeholder. */
-  const renderEac = (value: number, status: ForecastModelStatus) =>
-    status === 'valid' || status === 'valid_estimated_etc'
+  const renderEac = (value: number | null, status: ForecastModelStatus) =>
+    value !== null && (status === 'valid' || status === 'valid_estimated_etc')
       ? `${value.toLocaleString()} ${isRtl ? 'ر.س' : 'SAR'}`
       : isRtl
         ? 'غير قابل للحساب (N/A)'
         : 'Not computable (N/A)';
+
+  const NA = isRtl ? 'غير متاح (N/A)' : 'N/A';
+  /** A scenario figure that is null because the schedule basis was unavailable renders as N/A. */
+  const num = (v: number | null, suffix = '') => (v === null ? NA : `${v.toLocaleString()}${suffix}`);
+  const idx = (v: number | null) => (v === null ? NA : v.toFixed(2));
+  const dateOr = (v: string | null) => v ?? NA;
 
   // Compute Standard Scenarios Results
   const scenarioResults: ComplexScenarioResult[] = useMemo(() => {
@@ -213,6 +219,17 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
     if (selectedScenarioId === 'SCN-CUSTOM-USER') return customScenarioResult;
     return scenarioResults.find((s) => s.scenarioId === selectedScenarioId) || scenarioResults[1];
   }, [selectedScenarioId, scenarioResults, customScenarioResult]);
+
+  // F9.1: whether any scenario could not resolve a real schedule basis (start + duration). When so,
+  // the affected schedule/duration/cost outputs are N/A and the UI says why — nothing is fabricated.
+  const scheduleBasisMissing = scenarioResults.some((s) => !s.scheduleBasisAvailable)
+    || (customScenarioResult ? !customScenarioResult.scheduleBasisAvailable : false);
+  const basisReasonKey = isRtl ? 'scheduleBasisReasonAr' : 'scheduleBasisReasonEn';
+  const scheduleBasisReason =
+    scenarioResults.find((s) => !s.scheduleBasisAvailable)?.[basisReasonKey]
+    || (customScenarioResult && !customScenarioResult.scheduleBasisAvailable
+      ? customScenarioResult[basisReasonKey]
+      : null);
 
   if (loading || !activeProject) {
     return (
@@ -440,6 +457,20 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
               </span>
             </div>
 
+            {/* F9.1: when no real schedule basis exists, say so plainly — the schedule/duration and
+                duration-dependent cost figures below are N/A, never fabricated from a default. */}
+            {scheduleBasisMissing && (
+              <div className="flex items-start gap-2.5 bg-amber-50 border border-amber-300 text-amber-900 rounded-xl p-3.5 text-xs mb-3">
+                <AlertTriangle size={16} className="mt-0.5 shrink-0 text-amber-600" />
+                <div>
+                  <p className="font-bold">
+                    {isRtl ? 'أساس الجدول غير كافٍ — مخرجات المدة/التاريخ N/A' : 'Insufficient schedule basis — duration/date outputs are N/A'}
+                  </p>
+                  <p className="mt-0.5 break-words">{scheduleBasisReason}</p>
+                </div>
+              </div>
+            )}
+
             <div className="overflow-x-auto">
               <table className="w-full text-right text-xs">
                 <thead>
@@ -488,7 +519,7 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
                         </td>
 
                         <td className="p-3 text-center font-mono font-bold text-slate-900 text-[11px]">
-                          {s.finishDate}
+                          {dateOr(s.finishDate)}
                         </td>
 
                         <td className="p-3 text-center font-mono text-[11px]">
@@ -514,20 +545,24 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
                         </td>
 
                         <td className="p-3 text-center font-mono text-[11px]">
-                          <span
-                            className={`font-bold ${
-                              s.costVarianceSar > 0 ? 'text-rose-600' : s.costVarianceSar < 0 ? 'text-emerald-600' : 'text-slate-600'
-                            }`}
-                          >
-                            {s.costVarianceSar > 0 ? `+${s.costVarianceSar.toLocaleString()}` : s.costVarianceSar.toLocaleString()} ر.س
-                            <span className="text-[10px] block text-slate-400">({s.costVariancePercent > 0 ? `+${s.costVariancePercent}%` : `${s.costVariancePercent}%`})</span>
-                          </span>
+                          {s.costVarianceSar === null || s.costVariancePercent === null ? (
+                            <span className="font-bold text-slate-400">{NA}</span>
+                          ) : (
+                            <span
+                              className={`font-bold ${
+                                s.costVarianceSar > 0 ? 'text-rose-600' : s.costVarianceSar < 0 ? 'text-emerald-600' : 'text-slate-600'
+                              }`}
+                            >
+                              {s.costVarianceSar > 0 ? `+${s.costVarianceSar.toLocaleString()}` : s.costVarianceSar.toLocaleString()} ر.س
+                              <span className="text-[10px] block text-slate-400">({s.costVariancePercent > 0 ? `+${s.costVariancePercent}%` : `${s.costVariancePercent}%`})</span>
+                            </span>
+                          )}
                         </td>
 
                         <td className="p-3 text-center font-mono font-bold text-[11px]">
-                          <span className={s.spi < 1 ? 'text-rose-600' : 'text-emerald-600'}>{s.spi.toFixed(2)}</span>
+                          <span className={s.spi !== null && s.spi < 1 ? 'text-rose-600' : 'text-emerald-600'}>{idx(s.spi)}</span>
                           <span className="text-slate-400 mx-1">/</span>
-                          <span className={s.cpi < 1 ? 'text-amber-600' : 'text-emerald-600'}>{s.cpi.toFixed(2)}</span>
+                          <span className={s.cpi !== null && s.cpi < 1 ? 'text-amber-600' : 'text-emerald-600'}>{idx(s.cpi)}</span>
                           {/* Scenario-adjusted indices: the measured canonical pair with the simulated delta applied. */}
                           <span className="text-[9px] block text-slate-400 font-sans">
                             {isRtl
@@ -537,12 +572,12 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
                         </td>
 
                         <td className="p-3 text-center font-mono font-bold text-rose-700 text-[11px]">
-                          -{s.peakCashDeficitSar.toLocaleString()} ر.س
+                          {s.peakCashDeficitSar === null ? NA : `-${s.peakCashDeficitSar.toLocaleString()} ر.س`}
                         </td>
 
                         <td className="p-3 text-center font-mono text-[10px] text-slate-600">
-                          <div>{s.p80FinishDate}</div>
-                          <div className="text-slate-400">{s.p80CostSar.toLocaleString()} ر.س</div>
+                          <div>{dateOr(s.p80FinishDate)}</div>
+                          <div className="text-slate-400">{num(s.p80CostSar, ' ر.س')}</div>
                           {/* GAP-029: the sampled envelope is labelled as sampled; a deterministic fallback says so. */}
                           {s.probabilisticEnvelope.valid ? (
                             <div className="text-[9px] text-slate-400 font-sans mt-0.5" title={s.probabilisticEnvelope.noteEn || undefined}>
@@ -618,8 +653,8 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
                   </div>
                   <p className="text-[9px] text-slate-500 font-sans pt-1 border-t border-slate-700">
                     {isRtl
-                      ? `EV/AC مقاسان حتى تاريخ البيانات: ${selectedScenarioDetail.canonicalEvSar.toLocaleString()} / ${selectedScenarioDetail.canonicalAcSar.toLocaleString()} ر.س · التكلفة المحاكاة: ${selectedScenarioDetail.simulatedCostOutcomeSar.toLocaleString()} ر.س`
-                      : `Measured EV/AC at the Data Date: ${selectedScenarioDetail.canonicalEvSar.toLocaleString()} / ${selectedScenarioDetail.canonicalAcSar.toLocaleString()} SAR · simulated cost outcome: ${selectedScenarioDetail.simulatedCostOutcomeSar.toLocaleString()} SAR`}
+                      ? `EV/AC مقاسان حتى تاريخ البيانات: ${selectedScenarioDetail.canonicalEvSar.toLocaleString()} / ${selectedScenarioDetail.canonicalAcSar.toLocaleString()} ر.س · التكلفة المحاكاة: ${selectedScenarioDetail.simulatedCostOutcomeSar === null ? NA : selectedScenarioDetail.simulatedCostOutcomeSar.toLocaleString()} ر.س`
+                      : `Measured EV/AC at the Data Date: ${selectedScenarioDetail.canonicalEvSar.toLocaleString()} / ${selectedScenarioDetail.canonicalAcSar.toLocaleString()} SAR · simulated cost outcome: ${selectedScenarioDetail.simulatedCostOutcomeSar === null ? NA : selectedScenarioDetail.simulatedCostOutcomeSar.toLocaleString()} SAR`}
                   </p>
                 </div>
 
@@ -627,9 +662,13 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
                 <div className="bg-slate-800/80 p-3.5 rounded-xl border border-slate-700 space-y-1.5">
                   <p className="text-[10px] text-blue-400 font-bold uppercase">{isRtl ? 'المسار الحرج والهوامش' : 'Critical Path & Drag'}</p>
                   <p className="text-slate-300 text-[11px]">
-                    {isRtl
-                      ? `المدة الكلية المحاكاة ${selectedScenarioDetail.totalDurationDays} يوماً مع تحول أنشطة الخرسانة والمشتريات لمسار حرج صفرى.`
-                      : `Simulated duration is ${selectedScenarioDetail.totalDurationDays} days with concrete and long-lead items dominating critical path.`}
+                    {selectedScenarioDetail.totalDurationDays === null
+                      ? (isRtl
+                          ? 'المدة الكلية غير متاحة — لا يوجد أساس جدول صالح للمشروع (لا تُختلق مدة).'
+                          : 'Total duration unavailable — no valid project schedule basis (no duration is fabricated).')
+                      : (isRtl
+                          ? `المدة الكلية المحاكاة ${selectedScenarioDetail.totalDurationDays} يوماً مع تحول أنشطة الخرسانة والمشتريات لمسار حرج صفرى.`
+                          : `Simulated duration is ${selectedScenarioDetail.totalDurationDays} days with concrete and long-lead items dominating critical path.`)}
                   </p>
                   <p className="text-amber-300 font-bold text-[11px] font-mono">
                     {isRtl ? `درجة الجدوى: ${selectedScenarioDetail.feasibilityScore}/100` : `Feasibility: ${selectedScenarioDetail.feasibilityScore}/100`}
@@ -863,7 +902,7 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 text-center">
                   <div className="bg-slate-800/80 p-3 rounded-xl border border-slate-700">
                     <p className="text-[10px] text-slate-400 uppercase font-bold">{isRtl ? 'التاريخ النهائي المتوقع' : 'Finish Date'}</p>
-                    <p className="text-base font-black text-white font-mono mt-1">{customScenarioResult.finishDate}</p>
+                    <p className="text-base font-black text-white font-mono mt-1">{dateOr(customScenarioResult.finishDate)}</p>
                     <span className="text-[10px] text-rose-400 font-mono">
                       {customScenarioResult.varianceDays > 0 ? `+${customScenarioResult.varianceDays} يوم` : `${customScenarioResult.varianceDays} يوم`}
                     </span>
@@ -875,20 +914,24 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
                       {renderEac(customScenarioResult.eacBottomUp, customScenarioResult.eacModelStatuses.bottomUp)}
                     </p>
                     <span className="text-[10px] text-amber-300 font-mono">
-                      {customScenarioResult.costVarianceSar > 0 ? `+${customScenarioResult.costVarianceSar.toLocaleString()}` : customScenarioResult.costVarianceSar.toLocaleString()} ر.س
+                      {customScenarioResult.costVarianceSar === null
+                        ? NA
+                        : `${customScenarioResult.costVarianceSar > 0 ? '+' : ''}${customScenarioResult.costVarianceSar.toLocaleString()} ر.س`}
                     </span>
                     {/* The simulation's own cost outcome is reported next to the forecast, never as it. */}
                     <span className="text-[9px] block text-slate-500 font-sans">
-                      {isRtl
-                        ? `نتيجة المحاكاة: ${customScenarioResult.simulatedCostOutcomeSar.toLocaleString()} ر.س`
-                        : `simulated outcome: ${customScenarioResult.simulatedCostOutcomeSar.toLocaleString()} SAR`}
+                      {customScenarioResult.simulatedCostOutcomeSar === null
+                        ? (isRtl ? 'نتيجة المحاكاة: غير متاحة (لا أساس مدة)' : 'simulated outcome: N/A (no duration basis)')
+                        : (isRtl
+                            ? `نتيجة المحاكاة: ${customScenarioResult.simulatedCostOutcomeSar.toLocaleString()} ر.س`
+                            : `simulated outcome: ${customScenarioResult.simulatedCostOutcomeSar.toLocaleString()} SAR`)}
                     </span>
                   </div>
 
                   <div className="bg-slate-800/80 p-3 rounded-xl border border-slate-700">
                     <p className="text-[10px] text-slate-400 uppercase font-bold">{isRtl ? 'مؤشرات الكفاءة (SPI / CPI)' : 'SPI / CPI'}</p>
                     <p className="text-base font-black text-white font-mono mt-1">
-                      {customScenarioResult.spi.toFixed(2)} / {customScenarioResult.cpi.toFixed(2)}
+                      {idx(customScenarioResult.spi)} / {idx(customScenarioResult.cpi)}
                     </p>
                     <span className="text-[10px] text-slate-400 font-mono">
                       EAC Realistic: {renderEac(customScenarioResult.eacRealistic, customScenarioResult.eacModelStatuses.realistic)}
@@ -902,7 +945,7 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
 
                   <div className="bg-slate-800/80 p-3 rounded-xl border border-slate-700">
                     <p className="text-[10px] text-slate-400 uppercase font-bold">{isRtl ? 'عجز السيولة الأقصى' : 'Peak Cash Squeeze'}</p>
-                    <p className="text-base font-black text-rose-400 font-mono mt-1">-{customScenarioResult.peakCashDeficitSar.toLocaleString()} ر.س</p>
+                    <p className="text-base font-black text-rose-400 font-mono mt-1">{customScenarioResult.peakCashDeficitSar === null ? NA : `-${customScenarioResult.peakCashDeficitSar.toLocaleString()} ر.س`}</p>
                     <span className="text-[10px] text-slate-400 font-mono">Working Capital Gap</span>
                   </div>
                 </div>
