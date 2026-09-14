@@ -51,6 +51,96 @@ interface DataGovernanceViewProps {
   project: Project | null;
 }
 
+/**
+ * Everything rendered on this screen is bound to the `GovernanceAuditResult` produced by
+ * `dataGovernanceEngine`. The helpers below only *format* engine output: they never supply a
+ * fallback figure, so a value the audit could not derive is displayed as `N/A` rather than as a
+ * reassuring zero or a demo constant. (Final UI Governance Binding Fix.)
+ */
+const NA = 'N/A';
+
+/** Money as returned by the engine; `N/A` when the engine reported the value as unavailable. */
+function fmtMoney(value: number | null | undefined, rtl: boolean): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return NA;
+  const text = Math.round(value).toLocaleString();
+  return rtl ? `${text} ر.س` : `${text} SAR`;
+}
+
+/** Ratio as returned by the engine (already null when it was not a measured value). */
+function fmtIndex(value: number | null | undefined, digits = 3): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return NA;
+  return value.toFixed(digits);
+}
+
+/** Progress percentage as returned by the engine (already rounded to 1 decimal there). */
+function fmtPercent(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return NA;
+  return `${value}%`;
+}
+
+type CheckStatus = GovernanceCheckItem['status'];
+
+/**
+ * Status → label + palette. Class strings are literal module-scope constants so the Tailwind JIT
+ * scanner can see every one of them.
+ */
+const STATUS_TONE: Record<CheckStatus, { chip: string; text: string; dot: string; ar: string; en: string }> = {
+  passed: { chip: 'bg-emerald-100 text-emerald-800', text: 'text-emerald-700', dot: 'bg-emerald-500', ar: 'مطابق', en: 'Matched' },
+  repaired: { chip: 'bg-blue-100 text-blue-800', text: 'text-blue-700', dot: 'bg-blue-500', ar: 'تم إصلاحه', en: 'Repaired' },
+  warning: { chip: 'bg-amber-100 text-amber-800', text: 'text-amber-700', dot: 'bg-amber-500', ar: 'تحذير', en: 'Warning' },
+  violation: { chip: 'bg-red-100 text-red-800', text: 'text-red-700', dot: 'bg-red-500', ar: 'مخالفة', en: 'Violation' },
+};
+
+/** Tone used when there is no check result to read a verdict from — it never claims a pass. */
+const NEUTRAL_TONE = {
+  chip: 'bg-slate-100 text-slate-600',
+  text: 'text-slate-600',
+  dot: 'bg-slate-400',
+  bar: 'bg-slate-300',
+  ar: NA,
+  en: NA,
+};
+
+/** Palette for a percentage that is itself the verdict (pillar / network scores). */
+function scoreTone(score: number | null | undefined): { chip: string; text: string; bar: string } {
+  if (score === null || score === undefined || !Number.isFinite(score)) {
+    return { chip: 'bg-slate-100 text-slate-600', text: 'text-slate-500', bar: 'bg-slate-300' };
+  }
+  if (score >= 95) return { chip: 'bg-emerald-50 text-emerald-700', text: 'text-emerald-700', bar: 'bg-emerald-500' };
+  if (score >= 70) return { chip: 'bg-amber-50 text-amber-700', text: 'text-amber-700', bar: 'bg-amber-500' };
+  return { chip: 'bg-red-50 text-red-700', text: 'text-red-700', bar: 'bg-red-500' };
+}
+
+/** Worst status among a set of checks — the only verdict a summary card may show. */
+function worstStatus(items: (GovernanceCheckItem | null | undefined)[]): CheckStatus {
+  const list = items.filter(Boolean) as GovernanceCheckItem[];
+  if (list.length === 0) return 'warning';
+  if (list.some((c) => c.status === 'violation')) return 'violation';
+  if (list.some((c) => c.status === 'warning')) return 'warning';
+  return 'passed';
+}
+
+/** Bilingual labels for the canonical EVM engine's source metadata (`evmParity.bacSource/acSource`). */
+const BAC_SOURCE_LABEL: Record<string, { ar: string; en: string }> = {
+  contract_value: { ar: 'القيمة التعاقدية', en: 'contract value' },
+  budget_lines: { ar: 'خطوط ميزانية CBS', en: 'CBS budget lines' },
+  boq_items: { ar: 'جدول الكميات (BOQ)', en: 'BOQ items' },
+  caller_supplied: { ar: 'قيمة مُدخلة من المستدعي', en: 'caller-supplied scalar' },
+  unavailable: { ar: 'غير متاح — لا مصدر معتمد', en: 'unavailable — no authoritative source' },
+};
+const AC_SOURCE_LABEL: Record<string, { ar: string; en: string }> = {
+  approved_cost_transactions: { ar: 'معاملات التكلفة المعتمدة', en: 'approved cost transactions' },
+  budget_line_actuals: { ar: 'التكاليف الفعلية المسجلة في خطوط الميزانية', en: 'stored budget-line actuals' },
+  caller_supplied: { ar: 'قيمة مُدخلة من المستدعي', en: 'caller-supplied scalar' },
+  unavailable: { ar: 'غير متاح — لا دليل تكلفة فعلية', en: 'unavailable — no actual-cost evidence' },
+};
+function sourceLabel(map: Record<string, { ar: string; en: string }>, key: string | undefined, rtl: boolean): string {
+  if (!key) return NA;
+  const found = map[key];
+  if (!found) return String(key);
+  return rtl ? found.ar : found.en;
+}
+
 export default function DataGovernanceView({ project }: DataGovernanceViewProps) {
   const [lang, setLang] = useState<Language>(getLanguage());
   const [loading, setLoading] = useState(true);
@@ -188,6 +278,229 @@ export default function DataGovernanceView({ project }: DataGovernanceViewProps)
     });
   }, [auditResult, selectedPillar, searchQuery]);
 
+  // ---------------------------------------------------------------------------
+  // Values rendered by the cards/tabs below. Each one is read from the audit
+  // result; anything the audit does not provide stays `null` and renders as N/A.
+  // ---------------------------------------------------------------------------
+  const ssot = auditResult?.financialSsot ?? null;
+  const evm = auditResult?.evmParity ?? null;
+  const findCheck = (id: string): GovernanceCheckItem | null =>
+    auditResult?.checks.find((c) => c.id === id) ?? null;
+  const netChecks = (auditResult?.checks ?? []).filter((c) => c.pillar === 'network_cpm');
+  const networkPillar = auditResult?.pillars.find((p) => p.id === 'network_cpm') ?? null;
+  const net01 = findCheck('GOV-NET-01');
+  const net03 = findCheck('GOV-NET-03');
+  const relCheck = findCheck('GOV-REL-01');
+  const evmCheck = findCheck('GOV-EVM-01');
+  const fid02Check = findCheck('GOV-FID-02');
+
+  // GOV-REL-01 reports "<n> سجلات غير مرتبطة". The count is read from the engine's own text; when
+  // it cannot be parsed the card shows N/A instead of defaulting to a reassuring zero.
+  const orphanCount: number | null = (() => {
+    if (!relCheck) return null;
+    const match = /(\d+)/.exec(String(relCheck.actualValue));
+    return match ? Number(match[1]) : null;
+  })();
+
+  const contractValueAvailable = !!ssot && ssot.contractValue > 0;
+  const ssotStatus: CheckStatus = !ssot
+    ? 'warning'
+    : contractValueAvailable
+      ? (ssot.isPerfectMatch ? 'passed' : 'warning')
+      : 'warning';
+  const ssotTone = ssot ? STATUS_TONE[ssotStatus] : NEUTRAL_TONE;
+  const cpmStatus = worstStatus(netChecks);
+  const cpmTone = STATUS_TONE[cpmStatus];
+  const relTone = relCheck ? STATUS_TONE[relCheck.status] : NEUTRAL_TONE;
+
+  // Certificate verdict: violations dominate warnings dominate a clean run. It is derived from the
+  // audit's own tallies, never asserted unconditionally.
+  const violationCount = auditResult?.violationCount ?? 0;
+  const warningCount = auditResult?.warningCount ?? 0;
+  const certificateVerdict: 'clean' | 'warnings' | 'violations' =
+    violationCount > 0 ? 'violations' : warningCount > 0 ? 'warnings' : 'clean';
+  const nonPassingChecks = (auditResult?.checks ?? []).filter(
+    (c) => c.status === 'warning' || c.status === 'violation',
+  );
+  const nonPassingCodes = nonPassingChecks.map((c) => c.code);
+  const nonPassingList =
+    nonPassingCodes.length <= 6
+      ? nonPassingCodes.join('، ')
+      : `${nonPassingCodes.slice(0, 6).join('، ')} … (+${nonPassingCodes.length - 6})`;
+
+  // SSOT reconciliation rows. Only references the audit result actually carries are given an amount:
+  // `financialSsot.baselineCost` is a copy of the BOQ total inside the engine (not an independent
+  // baseline cost load) and no S-Curve target is provided at all, so those two rows render N/A
+  // instead of repeating the contract value and implying a five-way parity that was never measured.
+  type SsotRow = {
+    key: string;
+    labelAr: string;
+    labelEn: string;
+    sourceAr: string;
+    sourceEn: string;
+    amount: number | null;
+    isReference?: boolean;
+  };
+  const ssotRows: SsotRow[] = [
+    {
+      key: 'contract',
+      labelAr: 'القيمة التعاقدية الرسمية (Master Contract Value)',
+      labelEn: 'Official Contract Value',
+      sourceAr: 'عقد المقاولة الرئيسي المعتمد',
+      sourceEn: 'Approved main contract',
+      amount: contractValueAvailable && ssot ? ssot.contractValue : null,
+      isReference: true,
+    },
+    {
+      key: 'boq',
+      labelAr: 'إجمالي جدول الكميات التعاقدي (BOQ Aggregate Total)',
+      labelEn: 'Master BOQ Aggregate Total',
+      sourceAr: boqItems.length > 0 ? `مجموع ${boqItems.length} بند كميات مسجل` : 'لا توجد بنود كميات مسجلة للمشروع',
+      sourceEn: boqItems.length > 0 ? `Sum of ${boqItems.length} recorded BOQ items` : 'No BOQ items recorded for this project',
+      amount: boqItems.length > 0 && ssot ? ssot.boqTotal : null,
+    },
+    {
+      key: 'budget',
+      labelAr: 'الميزانية التقديرية المعتمدة (Approved Budget BAC)',
+      labelEn: 'Approved Budget (BAC)',
+      sourceAr: budgetLines.length > 0 ? `مجموع ${budgetLines.length} خط ميزانية CBS` : 'لا توجد خطوط ميزانية مسجلة للمشروع',
+      sourceEn: budgetLines.length > 0 ? `Sum of ${budgetLines.length} CBS budget lines` : 'No budget lines recorded for this project',
+      amount: budgetLines.length > 0 && ssot ? ssot.budgetBac : null,
+    },
+    {
+      key: 'baseline',
+      labelAr: 'أحمال خط الأساس المحملة بالموارد (Schedule Cost Load)',
+      labelEn: 'Baseline Cost-Loaded Schedule',
+      sourceAr: 'غير متوفر — لا تقدم نتيجة التدقيق قيمة مستقلة موثوقة',
+      sourceEn: 'Not available — the audit result carries no independent authoritative value',
+      amount: null,
+    },
+    {
+      key: 'scurve',
+      labelAr: 'نقطة النهاية لمنحنى S-Curve (Target EVM BAC)',
+      labelEn: 'EVM Cumulative Target BAC',
+      sourceAr: 'غير متوفر — لا تقدم نتيجة التدقيق هدفاً معتمداً لمنحنى S',
+      sourceEn: 'Not available — the audit result carries no authoritative S-Curve target',
+      amount: null,
+    },
+  ];
+  const ssotAvailableCount = ssotRows.filter((r) => r.amount !== null).length;
+  const referenceAmount = ssotRows[0].amount;
+
+  // EVM tab: metric cards. Values are the engine's own (`evmParity`); the badge for each card is the
+  // status of the corresponding governance check (GOV-EVM-01) — never a literal "Pass".
+  const evmBannerTone = evmCheck ? STATUS_TONE[evmCheck.status] : NEUTRAL_TONE;
+  const evmCards: { key: string; title: string; formula: string; value: string; available: boolean; note?: string }[] = [
+    {
+      key: 'bac',
+      title: 'BAC — Budget at Completion',
+      formula: isRtl ? 'BAC: القيمة التعاقدية ← ميزانية CBS ← BOQ' : 'BAC: contract value ← CBS budget ← BOQ',
+      value: fmtMoney(evm?.bac ?? null, isRtl),
+      available: (evm?.bac ?? null) !== null,
+      note: isRtl ? `المصدر: ${sourceLabel(BAC_SOURCE_LABEL, evm?.bacSource, isRtl)}` : `source: ${sourceLabel(BAC_SOURCE_LABEL, evm?.bacSource, isRtl)}`,
+    },
+    {
+      key: 'pv',
+      title: 'Planned Value (PV)',
+      formula: isRtl ? 'PV: القيمة المخططة المُرحّلة على تواريخ CPM حتى تاريخ البيانات' : 'PV: planned value time-phased on CPM dates up to the data date',
+      value: fmtMoney(evm?.pv ?? null, isRtl),
+      available: (evm?.pv ?? null) !== null,
+    },
+    {
+      key: 'ev',
+      title: 'Earned Value (EV)',
+      formula: isRtl ? 'EV: من سجلات التقدم المعتمدة ونسب الإنجاز المسجلة' : 'EV: from approved progress records and recorded percent complete',
+      value: fmtMoney(evm?.ev ?? null, isRtl),
+      available: (evm?.ev ?? null) !== null,
+    },
+    {
+      key: 'ac',
+      title: 'Actual Cost (AC)',
+      formula: isRtl ? 'AC: معاملات التكلفة المعتمدة ← التكاليف الفعلية المسجلة' : 'AC: approved cost transactions ← stored budget actuals',
+      value: fmtMoney(evm?.ac ?? null, isRtl),
+      available: (evm?.ac ?? null) !== null,
+      note: isRtl ? `المصدر: ${sourceLabel(AC_SOURCE_LABEL, evm?.acSource, isRtl)}` : `source: ${sourceLabel(AC_SOURCE_LABEL, evm?.acSource, isRtl)}`,
+    },
+    { key: 'sv', title: 'Schedule Variance (SV)', formula: 'SV = EV − PV', value: fmtMoney(evm?.sv ?? null, isRtl), available: (evm?.sv ?? null) !== null },
+    { key: 'cv', title: 'Cost Variance (CV)', formula: 'CV = EV − AC', value: fmtMoney(evm?.cv ?? null, isRtl), available: (evm?.cv ?? null) !== null },
+    { key: 'spi', title: 'Schedule Performance Index (SPI)', formula: 'SPI = EV / PV', value: fmtIndex(evm?.spi), available: (evm?.spi ?? null) !== null },
+    { key: 'cpi', title: 'Cost Performance Index (CPI)', formula: 'CPI = EV / AC', value: fmtIndex(evm?.cpi), available: (evm?.cpi ?? null) !== null },
+    { key: 'eac', title: 'Estimate at Completion (EAC)', formula: 'EAC = BAC / CPI', value: fmtMoney(evm?.eac ?? null, isRtl), available: (evm?.eac ?? null) !== null },
+    { key: 'vac', title: 'Variance at Completion (VAC)', formula: 'VAC = BAC − EAC', value: fmtMoney(evm?.vac ?? null, isRtl), available: (evm?.vac ?? null) !== null },
+    { key: 'tcpi', title: 'To-Complete Performance Index (TCPI)', formula: 'TCPI = (BAC − EV) / (BAC − AC)', value: fmtIndex(evm?.tcpi), available: (evm?.tcpi ?? null) !== null },
+    {
+      key: 'earned',
+      title: isRtl ? 'نسبة الإنجاز المكتسبة' : 'Earned Progress',
+      formula: 'earned% = EV / BAC × 100',
+      value: fmtPercent(evm?.earnedProgressPercent ?? null),
+      available: (evm?.earnedProgressPercent ?? null) !== null,
+    },
+    {
+      key: 'planned',
+      title: isRtl ? 'نسبة الإنجاز المخططة' : 'Planned Progress',
+      formula: 'planned% = PV / BAC × 100',
+      value: fmtPercent(evm?.plannedProgressPercent ?? null),
+      available: (evm?.plannedProgressPercent ?? null) !== null,
+    },
+    {
+      key: 'datadate',
+      title: isRtl ? 'تاريخ البيانات المعتمد' : 'Governed Data Date',
+      formula: isRtl ? 'تاريخ القطع الذي حُسبت عنده كل القيم أعلاه' : 'The cutoff every value above was computed at',
+      value: evm?.dataDate ?? NA,
+      available: !!evm?.dataDate,
+    },
+  ];
+
+  // Certificate: badge and wording follow the audit's own tallies, so a run with warnings or
+  // violations can never render as an unconditional approval.
+  const certBadge = !auditResult
+    ? { label: NA, className: 'bg-slate-100 text-slate-600 border-slate-300' }
+    : certificateVerdict === 'violations'
+      ? {
+          label: isRtl
+            ? `مخالفات مفتوحة (${violationCount}) — درجة ${auditResult.ratingGrade}`
+            : `OPEN VIOLATIONS (${violationCount}) — GRADE ${auditResult.ratingGrade}`,
+          className: 'bg-red-100 text-red-800 border-red-300',
+        }
+      : certificateVerdict === 'warnings'
+        ? {
+            label: isRtl
+              ? `اكتمل الفحص مع تحذيرات (${warningCount}) — درجة ${auditResult.ratingGrade}`
+              : `AUDIT COMPLETED WITH WARNINGS (${warningCount}) — GRADE ${auditResult.ratingGrade}`,
+            className: 'bg-amber-100 text-amber-800 border-amber-300',
+          }
+        : {
+            label: `VERIFIED GRADE ${auditResult.ratingGrade}`,
+            className: 'bg-emerald-100 text-emerald-800 border-emerald-300',
+          };
+
+  const projectName = project?.name ?? '';
+  const certStatement = !auditResult
+    ? NA
+    : certificateVerdict === 'violations'
+      ? isRtl
+        ? `لا تُصدر هذه الشهادة إقراراً بالامتثال الكامل. خضعت بيانات المشروع "${projectName}" للفحص الآلي عبر ${auditResult.totalChecks} ضابطاً، ونتج عنه ${violationCount} مخالفة مفتوحة و${warningCount} تحذيراً، بدرجة ${auditResult.overallScore}% (${auditResult.ratingGrade}). البنود غير المطابقة: ${nonPassingList}. تجب معالجة المخالفات وإعادة الفحص قبل إصدار أي إقرار امتثال.`
+        : `This certificate does NOT constitute a full-compliance attestation. Data for project "${projectName}" was audited across ${auditResult.totalChecks} controls, producing ${violationCount} open violations and ${warningCount} warnings, at ${auditResult.overallScore}% (${auditResult.ratingGrade}). Non-conforming controls: ${nonPassingList}. The violations must be resolved and the audit re-run before any compliance attestation is issued.`
+      : certificateVerdict === 'warnings'
+        ? isRtl
+          ? `اكتمل الفحص الآلي لبيانات المشروع "${projectName}" مع تحذيرات: ${auditResult.totalChecks} ضابطاً، ${auditResult.passedCount} مطابق، ${warningCount} تحذير، دون مخالفات، بدرجة ${auditResult.overallScore}% (${auditResult.ratingGrade}). البنود الناقصة الأدلة أو غير القابلة للقياس: ${nonPassingList}. لا يُعلَن الامتثال الكامل قبل استيفائها.`
+          : `The automated audit of data for project "${projectName}" completed WITH WARNINGS: ${auditResult.totalChecks} controls, ${auditResult.passedCount} passed, ${warningCount} warnings and no violations, at ${auditResult.overallScore}% (${auditResult.ratingGrade}). Controls lacking evidence or not measurable: ${nonPassingList}. Full compliance is not declared until they are closed.`
+        : isRtl
+          ? `تشهد هذه الشهادة بأن بيانات المشروع "${projectName}" اجتازت الفحص الآلي عبر ${auditResult.totalChecks} ضابطاً دون مخالفات ودون تحذير، بدرجة ${auditResult.overallScore}% (${auditResult.ratingGrade})، وفق الأدلة المسجلة في هذه الجولة.`
+          : `This certifies that data for project "${projectName}" passed the automated audit across ${auditResult.totalChecks} controls with no violations and no warnings, scoring ${auditResult.overallScore}% (${auditResult.ratingGrade}), on the evidence recorded in this run.`;
+
+  const fid02Note =
+    fid02Check && fid02Check.status !== 'passed'
+      ? isRtl
+        ? ' ضابط المطابقة الثلاثية (أمر الشراء ↔ استلام المواد GRN ↔ فاتورة المورد) غير قابل للتحقق حالياً لأن النظام لا يحتوي سجلات أوامر شراء أو استلام مواد أو فواتير موردين، ولذلك هو مُعلَن N/A ضمن التحذيرات.'
+        : ' The 3-way match control (PO ↔ GRN ↔ vendor invoice) cannot currently be verified because the system holds no purchase-order, goods-receipt or vendor-invoice records; it is therefore reported as N/A among the warnings.'
+      : '';
+  const certScopeStatement = !auditResult
+    ? NA
+    : isRtl
+      ? `نطاق الإقرار: ${auditResult.passedCount} ضابطاً مطابقاً من أصل ${auditResult.totalChecks}، ${warningCount} تحذيراً، ${violationCount} مخالفة. لا يتضمن هذا الإقرار أي ضابط لم يُقيَّم فعلياً.${fid02Note}`
+      : `Attestation scope: ${auditResult.passedCount} of ${auditResult.totalChecks} controls passed, ${warningCount} warnings, ${violationCount} violations. Nothing is attested here that was not actually evaluated.${fid02Note}`;
+
   if (loading || !auditResult) {
     return (
       <div className="flex flex-col items-center justify-center min-h-[400px] gap-4">
@@ -311,18 +624,33 @@ export default function DataGovernanceView({ project }: DataGovernanceViewProps)
           </div>
           <div className="flex items-baseline gap-2 mb-1">
             <span className="text-2xl font-black text-slate-900">
-              {auditResult.financialSsot.contractValue.toLocaleString()}
+              {contractValueAvailable && ssot ? ssot.contractValue.toLocaleString() : NA}
             </span>
-            <span className="text-xs font-bold text-slate-500">ر.س</span>
+            {contractValueAvailable && (
+              <span className="text-xs font-bold text-slate-500">{isRtl ? 'ر.س' : 'SAR'}</span>
+            )}
           </div>
           <div className="flex items-center gap-1.5 mt-2">
-            <span className="inline-block w-2 h-2 rounded-full bg-emerald-500" />
-            <span className="text-[11px] font-bold text-emerald-700">
-              {isRtl ? 'مطابقة تامة 100% (العقد = الكميات = الميزانية)' : '100% Reconciled (Contract = BOQ = BAC)'}
+            <span className={`inline-block w-2 h-2 rounded-full ${ssotTone.dot}`} />
+            <span className={`text-[11px] font-bold ${ssotTone.text}`}>
+              {!ssot
+                ? NA
+                : !contractValueAvailable
+                  ? (isRtl ? 'لا توجد قيمة تعاقدية مسجلة — المطابقة غير قابلة للتقييم' : 'No contract value recorded — parity cannot be assessed')
+                  : ssot.isPerfectMatch
+                    ? (isRtl ? 'مطابق: العقد = الكميات = الميزانية' : 'Reconciled: Contract = BOQ = BAC')
+                    : (isRtl ? 'غير مطابق — يوجد فرق مالي غير مسوّى' : 'Not reconciled — unresolved financial variance')}
             </span>
           </div>
           <p className="text-[11px] text-slate-500 mt-1">
-            {isRtl ? 'حجم التعارض: 0.00 ر.س' : 'Variance: 0.00 SAR'}
+            {!ssot
+              ? NA
+              : isRtl
+                ? `أكبر فرق مسجَّل: ${fmtMoney(ssot.maxVarianceSar, isRtl)}`
+                : `Max recorded variance: ${fmtMoney(ssot.maxVarianceSar, isRtl)}`}
+          </p>
+          <p className="text-[10px] text-slate-400 mt-1 font-mono">
+            {isRtl ? 'الكميات (BOQ)' : 'BOQ'} {fmtMoney(ssot?.boqTotal, isRtl)} • {isRtl ? 'الميزانية (BAC)' : 'BAC'} {fmtMoney(ssot?.budgetBac, isRtl)}
           </p>
         </div>
 
@@ -337,16 +665,25 @@ export default function DataGovernanceView({ project }: DataGovernanceViewProps)
             </div>
           </div>
           <div className="flex items-baseline gap-2 mb-1">
-            <span className="text-3xl font-black text-slate-900">100%</span>
-            <span className="text-xs font-bold text-blue-600 bg-blue-50 px-2 py-0.5 rounded">
-              DCMA 14/14
+            <span className={`text-3xl font-black ${networkPillar ? scoreTone(networkPillar.score).text : 'text-slate-400'}`}>
+              {networkPillar ? `${networkPillar.score}%` : NA}
+            </span>
+            <span className={`text-xs font-bold px-2 py-0.5 rounded ${cpmTone.chip}`}>
+              {networkPillar
+                ? `${networkPillar.passed}/${networkPillar.total} ${isRtl ? 'فحوص الشبكة' : 'network checks'}`
+                : NA}
             </span>
           </div>
           <p className="text-[11px] text-slate-600 mt-2 font-medium">
-            {isRtl ? '0 نهايات مفتوحة • 0 علاقات سالبة • 0 تعارض هوامش' : '0 open ends • 0 negative lags • 0 float loops'}
+            {isRtl ? 'النهايات المفتوحة والليد السالب: ' : 'Open ends & negative leads: '}
+            {net01 ? String(net01.actualValue) : NA}
           </p>
           <div className="text-[10px] text-slate-400 mt-1">
-            {isRtl ? 'متصل من أمر المباشرة حتى التسليم' : 'Unbroken chain from NTP to Handover'}
+            {isRtl ? 'استمرارية المسار الحرج (DCMA-11): ' : 'Critical path continuity (DCMA-11): '}
+            {net03 ? String(net03.actualValue).slice(0, 110) : NA}
+          </div>
+          <div className={`text-[10px] font-bold mt-1.5 ${cpmTone.text}`}>
+            {isRtl ? `حالة ركيزة الشبكة: ${cpmTone.ar}` : `Network pillar status: ${cpmTone.en}`}
           </div>
         </div>
 
@@ -361,16 +698,23 @@ export default function DataGovernanceView({ project }: DataGovernanceViewProps)
             </div>
           </div>
           <div className="flex items-baseline gap-2 mb-1">
-            <span className="text-3xl font-black text-purple-700">0</span>
-            <span className="text-xs font-bold text-purple-800 bg-purple-100 px-2 py-0.5 rounded">
+            <span className={`text-3xl font-black ${relTone.text}`}>
+              {orphanCount === null ? NA : orphanCount}
+            </span>
+            <span className={`text-xs font-bold px-2 py-0.5 rounded ${relTone.chip}`}>
               {isRtl ? 'سجلات معزولة' : 'Orphan Records'}
             </span>
           </div>
           <p className="text-[11px] text-slate-600 mt-2 font-medium">
-            {isRtl ? '100% من الأنشطة والموارد والمعاملات مرتبطة' : '100% of activities, resources & txns linked'}
+            {relCheck ? String(relCheck.actualValue) : NA}
           </p>
-          <div className="text-[10px] text-slate-400 mt-1">
-            {isRtl ? 'تكامل 12 جدول وقاعدة بيانات' : 'Cross-checked across 12 data tables'}
+          <div className="text-[10px] text-slate-400 mt-1 line-clamp-2">
+            {relCheck ? (isRtl ? relCheck.descriptionAr : relCheck.descriptionEn) : NA}
+          </div>
+          <div className={`text-[10px] font-bold mt-1.5 ${relTone.text}`}>
+            {relCheck
+              ? (isRtl ? `GOV-REL-01: ${relTone.ar}` : `GOV-REL-01: ${relTone.en}`)
+              : NA}
           </div>
         </div>
       </div>
@@ -452,13 +796,13 @@ export default function DataGovernanceView({ project }: DataGovernanceViewProps)
                     <span className="text-xs font-bold text-slate-800">
                       {isRtl ? pillar.nameAr : pillar.nameEn}
                     </span>
-                    <span className="text-xs font-black text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded">
+                    <span className={`text-xs font-black px-2 py-0.5 rounded ${scoreTone(pillar.score).chip}`}>
                       {pillar.score}%
                     </span>
                   </div>
                   <div className="w-full bg-slate-200 rounded-full h-1.5 overflow-hidden">
                     <div
-                      className="bg-emerald-500 h-1.5 rounded-full"
+                      className={`h-1.5 rounded-full ${scoreTone(pillar.score).bar}`}
                       style={{ width: `${pillar.score}%` }}
                     />
                   </div>
@@ -563,7 +907,7 @@ export default function DataGovernanceView({ project }: DataGovernanceViewProps)
                             {item.actualValue}
                           </td>
                           <td className="p-3 text-center font-mono font-bold text-[11px]">
-                            <span className="text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded">
+                            <span className={`px-2 py-0.5 rounded ${STATUS_TONE[item.status].chip}`}>
                               {item.variance}
                             </span>
                           </td>
@@ -593,8 +937,8 @@ export default function DataGovernanceView({ project }: DataGovernanceViewProps)
                                   </p>
                                   <p className="text-slate-600 leading-relaxed text-[11px]">
                                     {isRtl
-                                      ? 'يتم تطبيق محرك التحقق الآلي في الزمن الحقيقي عند كل تعديل بالجدول الزمني أو اعتماد مستخلص أو تسجيل قيد مالي.'
-                                      : 'Real-time automated integrity engine validates each CPM change, IPC certification, or GL journal.'}
+                                      ? 'يُقيَّم هذا الضابط عند تشغيل فحص الحوكمة على بيانات المشروع المحمّلة حالياً، وتُعرض قيمه المستهدفة والفعلية كما أعادها المحرك دون تعديل.'
+                                      : 'This control is evaluated when the governance audit runs over the currently loaded project data; its expected and actual values are shown exactly as the engine returned them.'}
                                   </p>
                                   {item.fixActionNameAr && (
                                     <button
@@ -620,7 +964,7 @@ export default function DataGovernanceView({ project }: DataGovernanceViewProps)
         </div>
       )}
 
-      {/* TAB 2: SSOT Financial Triangulation */}
+      {/* TAB 2: SSOT Financial Triangulation — every figure bound to auditResult.financialSsot */}
       {activeTab === 'ssot' && (
         <div className="space-y-6">
           <div className="bg-white p-6 rounded-2xl border border-slate-200/80 shadow-xs">
@@ -631,15 +975,33 @@ export default function DataGovernanceView({ project }: DataGovernanceViewProps)
                 </h3>
                 <p className="text-xs text-slate-500 mt-1">
                   {isRtl
-                    ? 'مطابقة تامة بين القيمة التعاقدية، وجدول الكميات (BOQ)، وخط الميزانية المعتمد (BAC)، وأحمال خط الأساس، ومنحنى EVM.'
-                    : 'Exact cross-triangulation between Contract Price, BOQ Items, Approved BAC, Resource Baseline, and EVM S-Curve.'}
+                    ? 'مقابلة القيمة التعاقدية مع إجمالي جدول الكميات (BOQ) وخطوط الميزانية المعتمدة (BAC) بالأرقام التي أعادها محرك الحوكمة كما هي. المرجعيات التي لا تملك قيمة موثوقة تظهر N/A.'
+                    : 'Contract value against the BOQ total and the approved budget lines (BAC), using exactly the figures the governance engine returned. References without an authoritative value are shown as N/A.'}
                 </p>
               </div>
 
-              <div className="flex items-center gap-2 bg-emerald-50 border border-emerald-200 px-3.5 py-1.5 rounded-xl">
-                <CheckCircle2 size={16} className="text-emerald-600" />
-                <span className="text-xs font-black text-emerald-800">
-                  {isRtl ? 'تطابق تام (0.00 ر.س فارق)' : 'Zero Variance (100% Parity)'}
+              <div
+                className={`flex items-center gap-2 px-3.5 py-1.5 rounded-xl border ${
+                  ssotStatus === 'passed' ? 'bg-emerald-50 border-emerald-200' : 'bg-amber-50 border-amber-200'
+                }`}
+              >
+                {ssotStatus === 'passed' ? (
+                  <CheckCircle2 size={16} className="text-emerald-600" />
+                ) : (
+                  <AlertTriangle size={16} className="text-amber-600" />
+                )}
+                <span className={`text-xs font-black ${ssotStatus === 'passed' ? 'text-emerald-800' : 'text-amber-800'}`}>
+                  {!ssot
+                    ? NA
+                    : !contractValueAvailable
+                      ? (isRtl ? 'لا توجد قيمة تعاقدية — المطابقة غير قابلة للتقييم' : 'No contract value — parity cannot be assessed')
+                      : ssot.isPerfectMatch
+                        ? (isRtl
+                            ? `مطابق ضمن حد المحرك (< 1 ر.س) — أكبر فرق ${fmtMoney(ssot.maxVarianceSar, isRtl)}`
+                            : `Matched within the engine tolerance (< 1 SAR) — max variance ${fmtMoney(ssot.maxVarianceSar, isRtl)}`)
+                        : (isRtl
+                            ? `فرق مالي غير مسوّى: ${fmtMoney(ssot.maxVarianceSar, isRtl)}`
+                            : `Unresolved financial variance: ${fmtMoney(ssot.maxVarianceSar, isRtl)}`)}
                 </span>
               </div>
             </div>
@@ -658,88 +1020,72 @@ export default function DataGovernanceView({ project }: DataGovernanceViewProps)
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 font-medium">
-                  <tr>
-                    <td className="p-3.5 font-bold text-slate-900">
-                      1. {isRtl ? 'القيمة التعاقدية الرسمية (Master Contract Value)' : 'Official Contract Value'}
-                    </td>
-                    <td className="p-3 text-slate-600">عقد المقاولة الرئيسي المعتمد</td>
-                    <td className="p-3 text-center font-mono font-bold text-slate-900">2,345,150.00</td>
-                    <td className="p-3 text-center font-mono font-bold text-emerald-700">100.00%</td>
-                    <td className="p-3 text-center font-mono text-emerald-700">0.00 ر.س</td>
-                    <td className="p-3 text-center">
-                      <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800">
-                        معتمد (Baseline)
-                      </span>
-                    </td>
-                  </tr>
-
-                  <tr>
-                    <td className="p-3.5 font-bold text-slate-900">
-                      2. {isRtl ? 'إجمالي جدول الكميات التعاقدي (BOQ Aggregate Total)' : 'Master BOQ Aggregate Total'}
-                    </td>
-                    <td className="p-3 text-slate-600">مجموع 12 بند كميات معتمد</td>
-                    <td className="p-3 text-center font-mono font-bold text-slate-900">2,345,150.00</td>
-                    <td className="p-3 text-center font-mono font-bold text-emerald-700">100.00%</td>
-                    <td className="p-3 text-center font-mono text-emerald-700">0.00 ر.س</td>
-                    <td className="p-3 text-center">
-                      <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800">
-                        مطابق 100%
-                      </span>
-                    </td>
-                  </tr>
-
-                  <tr>
-                    <td className="p-3.5 font-bold text-slate-900">
-                      3. {isRtl ? 'الميزانية التقديرية المعتمدة (Approved Budget BAC)' : 'Approved Budget (BAC)'}
-                    </td>
-                    <td className="p-3 text-slate-600">هيكل مراكز التكلفة الخمسة (CBS)</td>
-                    <td className="p-3 text-center font-mono font-bold text-slate-900">2,345,150.00</td>
-                    <td className="p-3 text-center font-mono font-bold text-emerald-700">100.00%</td>
-                    <td className="p-3 text-center font-mono text-emerald-700">0.00 ر.س</td>
-                    <td className="p-3 text-center">
-                      <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800">
-                        مطابق 100%
-                      </span>
-                    </td>
-                  </tr>
-
-                  <tr>
-                    <td className="p-3.5 font-bold text-slate-900">
-                      4. {isRtl ? 'أحمال خط الأساس المحملة بالموارد (Schedule Cost Load)' : 'Baseline Cost-Loaded Schedule'}
-                    </td>
-                    <td className="p-3 text-slate-600">مجموع قيم أنشطة CPM</td>
-                    <td className="p-3 text-center font-mono font-bold text-slate-900">2,345,150.00</td>
-                    <td className="p-3 text-center font-mono font-bold text-emerald-700">100.00%</td>
-                    <td className="p-3 text-center font-mono text-emerald-700">0.00 ر.س</td>
-                    <td className="p-3 text-center">
-                      <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800">
-                        مطابق 100%
-                      </span>
-                    </td>
-                  </tr>
-
-                  <tr>
-                    <td className="p-3.5 font-bold text-slate-900">
-                      5. {isRtl ? 'نقطة النهاية لمنحنى S-Curve (Target EVM BAC)' : 'EVM Cumulative Target BAC'}
-                    </td>
-                    <td className="p-3 text-slate-600">منحنى القيمة المكتسبة التراكمي</td>
-                    <td className="p-3 text-center font-mono font-bold text-slate-900">2,345,150.00</td>
-                    <td className="p-3 text-center font-mono font-bold text-emerald-700">100.00%</td>
-                    <td className="p-3 text-center font-mono text-emerald-700">0.00 ر.س</td>
-                    <td className="p-3 text-center">
-                      <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800">
-                        مطابق 100%
-                      </span>
-                    </td>
-                  </tr>
+                  {ssotRows.map((row, idx) => {
+                    const hasAmount = row.amount !== null;
+                    const comparable = hasAmount && !row.isReference && referenceAmount !== null && referenceAmount > 0;
+                    const variance = comparable ? (row.amount as number) - (referenceAmount as number) : null;
+                    const matched = variance !== null && Math.abs(variance) < 1;
+                    const rowTone = !hasAmount
+                      ? NEUTRAL_TONE
+                      : row.isReference || matched
+                        ? STATUS_TONE.passed
+                        : STATUS_TONE.warning;
+                    return (
+                      <tr key={row.key}>
+                        <td className="p-3.5 font-bold text-slate-900">
+                          {idx + 1}. {isRtl ? row.labelAr : row.labelEn}
+                        </td>
+                        <td className="p-3 text-slate-600">{isRtl ? row.sourceAr : row.sourceEn}</td>
+                        <td className="p-3 text-center font-mono font-bold text-slate-900">
+                          {hasAmount
+                            ? (row.amount as number).toLocaleString(undefined, {
+                                minimumFractionDigits: 2,
+                                maximumFractionDigits: 2,
+                              })
+                            : NA}
+                        </td>
+                        <td className={`p-3 text-center font-mono font-bold ${rowTone.text}`}>
+                          {row.isReference
+                            ? (isRtl ? 'المرجع' : 'Reference')
+                            : comparable
+                              ? `${(((row.amount as number) / (referenceAmount as number)) * 100).toFixed(2)}%`
+                              : NA}
+                        </td>
+                        <td className={`p-3 text-center font-mono ${rowTone.text}`}>
+                          {variance === null
+                            ? row.isReference
+                              ? '—'
+                              : NA
+                            : `${variance > 0 ? '+' : variance < 0 ? '−' : ''}${Math.abs(Math.round(variance)).toLocaleString()} ر.س`}
+                        </td>
+                        <td className="p-3 text-center">
+                          <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-bold ${rowTone.chip}`}>
+                            {!hasAmount
+                              ? (isRtl ? 'غير متاح' : 'Not available')
+                              : row.isReference
+                                ? (isRtl ? 'مرجع المطابقة' : 'Parity reference')
+                                : matched
+                                  ? (isRtl ? 'مطابق' : 'Matched')
+                                  : (isRtl ? 'فرق غير مسوّى' : 'Unresolved variance')}
+                          </span>
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
+
+            <p className="text-[11px] text-slate-500 mt-4 leading-relaxed">
+              {isRtl
+                ? `المرجعيات المتاحة للمطابقة: ${ssotAvailableCount} من ${ssotRows.length}. لا تُعلَن مطابقة خماسية لأن نتيجة التدقيق الحالية لا توفر قيمة مستقلة لأحمال خط الأساس ولا هدفاً معتمداً لمنحنى S (financialSsot.baselineCost نسخة من إجمالي BOQ داخل المحرك)، لذلك يظهر هذان الصفّان N/A بدل نسخ القيمة التعاقدية.`
+                : `References available for parity: ${ssotAvailableCount} of ${ssotRows.length}. No five-way parity is claimed: the current audit result provides no independent value for the baseline cost load and no authoritative S-Curve target (financialSsot.baselineCost is a copy of the BOQ total inside the engine), so those two rows show N/A instead of repeating the contract value.`}
+            </p>
           </div>
         </div>
       )}
 
-      {/* TAB 3: EVM Mathematical Verifier */}
+      {/* TAB 3: EVM Mathematical Verifier — bound to auditResult.evmParity only */}
       {activeTab === 'evm_math' && (
         <div className="space-y-6">
           <div className="bg-white p-6 rounded-2xl border border-slate-200/80 shadow-xs">
@@ -748,100 +1094,78 @@ export default function DataGovernanceView({ project }: DataGovernanceViewProps)
             </h3>
             <p className="text-xs text-slate-500 mb-6">
               {isRtl
-                ? 'فحص حسابي فوري لقوانين EVM القياسية للتأكد من انعدام الانحراف التراكمي (Rounding Drift) والدقة حتى الهللة الأخيرة.'
-                : 'Real-time mathematical audit enforcing standard PMI EVM equations with zero decimal drift.'}
+                ? 'كل قيمة أدناه منسوخة كما هي من محرك EVM القانوني عند تاريخ البيانات المعتمد، ودور هذه الشاشة هو التنسيق فقط. أي مدخل لا يستطيع المحرك اشتقاقه يظهر N/A — لا يُستبدل بصفر ولا بأي رقم بديل، والصفر الظاهر هو صفر مقاس فعلاً.'
+                : 'Every value below is copied verbatim from the canonical EVM engine at the governed data date; this screen only formats it. Any input the engine cannot derive is shown as N/A — never substituted with zero or another figure, and a displayed zero is a measured zero.'}
             </p>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-              {/* Formula 1: PV */}
-              <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-bold text-slate-500">Planned Value (PV)</span>
-                  <span className="text-[10px] font-mono font-bold bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded">
-                    Pass
-                  </span>
-                </div>
-                <p className="text-xs font-mono font-bold text-slate-800">PV = BAC × Planned%</p>
-                <p className="text-xs text-slate-600 font-mono">
-                  2,345,150 × 40.0% = <strong className="text-slate-950 font-bold">938,060.00 ر.س</strong>
-                </p>
+            {/* Verdict banner — the status is the governance check's own, not a literal badge */}
+            <div className={`p-4 rounded-xl border border-slate-200 mb-5 ${evmBannerTone.chip}`}>
+              <div className="flex flex-col md:flex-row md:items-center justify-between gap-2">
+                <span className="text-xs font-black">
+                  {evmCheck
+                    ? isRtl
+                      ? `حالة الضابط GOV-EVM-01: ${evmBannerTone.ar}`
+                      : `GOV-EVM-01 status: ${evmBannerTone.en}`
+                    : NA}
+                </span>
+                <span className="text-[11px] font-mono font-bold">
+                  {isRtl ? 'تاريخ البيانات: ' : 'Data date: '}
+                  {evm?.dataDate ?? NA}
+                  {' • '}
+                  {evm?.isRigorous
+                    ? isRtl
+                      ? 'كل المؤشرات مقاسة من مدخلات حقيقية'
+                      : 'all indices measured from real inputs'
+                    : isRtl
+                      ? 'بعض المدخلات غير متاحة — قيمها N/A'
+                      : 'some inputs unavailable — shown as N/A'}
+                </span>
               </div>
-
-              {/* Formula 2: EV */}
-              <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-bold text-slate-500">Earned Value (EV)</span>
-                  <span className="text-[10px] font-mono font-bold bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded">
-                    Pass
-                  </span>
-                </div>
-                <p className="text-xs font-mono font-bold text-slate-800">EV = BAC × Actual%</p>
-                <p className="text-xs text-slate-600 font-mono">
-                  2,345,150 × 40.5% = <strong className="text-slate-950 font-bold">949,785.75 ر.س</strong>
-                </p>
-              </div>
-
-              {/* Formula 3: SV */}
-              <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-bold text-slate-500">Schedule Variance (SV)</span>
-                  <span className="text-[10px] font-mono font-bold bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded">
-                    Pass
-                  </span>
-                </div>
-                <p className="text-xs font-mono font-bold text-slate-800">SV = EV - PV</p>
-                <p className="text-xs text-slate-600 font-mono">
-                  949,785.75 - 938,060 = <strong className="text-emerald-700 font-bold">+11,725.75 ر.س</strong>
-                </p>
-              </div>
-
-              {/* Formula 4: SPI */}
-              <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-bold text-slate-500">Schedule Index (SPI)</span>
-                  <span className="text-[10px] font-mono font-bold bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded">
-                    Pass
-                  </span>
-                </div>
-                <p className="text-xs font-mono font-bold text-slate-800">SPI = EV / PV</p>
-                <p className="text-xs text-slate-600 font-mono">
-                  949,785.75 / 938,060 = <strong className="text-emerald-700 font-bold">1.012 (Ahead)</strong>
-                </p>
-              </div>
-
-              {/* Formula 5: CPI */}
-              <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-bold text-slate-500">Cost Index (CPI)</span>
-                  <span className="text-[10px] font-mono font-bold bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded">
-                    Pass
-                  </span>
-                </div>
-                <p className="text-xs font-mono font-bold text-slate-800">CPI = EV / AC</p>
-                <p className="text-xs text-slate-600 font-mono">
-                  949,785.75 / 709,500 = <strong className="text-emerald-700 font-bold">1.338 (Under Budget)</strong>
-                </p>
-              </div>
-
-              {/* Formula 6: EAC */}
-              <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-bold text-slate-500">Estimate at Completion (EAC)</span>
-                  <span className="text-[10px] font-mono font-bold bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded">
-                    Pass
-                  </span>
-                </div>
-                <p className="text-xs font-mono font-bold text-slate-800">EAC = BAC / CPI</p>
-                <p className="text-xs text-slate-600 font-mono">
-                  2,345,150 / 1.338 = <strong className="text-emerald-700 font-bold">1,752,727.95 ر.س</strong>
-                </p>
-              </div>
+              <p className="text-[11px] mt-2 leading-relaxed font-mono">
+                {evmCheck ? String(evmCheck.actualValue) : NA}
+              </p>
+              <p className="text-[10px] mt-1.5 opacity-80 font-mono">
+                {isRtl ? 'مصدر BAC: ' : 'BAC source: '}
+                {sourceLabel(BAC_SOURCE_LABEL, evm?.bacSource, isRtl)}
+                {' • '}
+                {isRtl ? 'مصدر AC: ' : 'AC source: '}
+                {sourceLabel(AC_SOURCE_LABEL, evm?.acSource, isRtl)}
+              </p>
             </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+              {evmCards.map((card) => {
+                const tone = card.available && evmCheck ? STATUS_TONE[evmCheck.status] : NEUTRAL_TONE;
+                return (
+                  <div key={card.key} className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs font-bold text-slate-500">{card.title}</span>
+                      <span className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded ${tone.chip}`}>
+                        {card.available && evmCheck ? (isRtl ? tone.ar : tone.en) : NA}
+                      </span>
+                    </div>
+                    <p className="text-xs font-mono font-bold text-slate-800">{card.formula}</p>
+                    <p className="text-xs text-slate-600 font-mono">
+                      <strong className="text-slate-950 font-bold">{card.value}</strong>
+                    </p>
+                    {card.note && <p className="text-[10px] text-slate-500 font-mono">{card.note}</p>}
+                  </div>
+                );
+              })}
+            </div>
+
+            <p className="text-[11px] text-slate-500 mt-5 leading-relaxed">
+              {evmCheck
+                ? isRtl
+                  ? `الأثر المتوقع: ${evmCheck.impactAr}`
+                  : `Expected impact: ${evmCheck.impactEn}`
+                : NA}
+            </p>
           </div>
         </div>
       )}
 
-      {/* TAB 4: Governance Certificate */}
+      {/* TAB 4: Governance Certificate — verdict derived from the audit's own tallies */}
       {activeTab === 'certificate' && (
         <div className="bg-white p-8 rounded-2xl border border-slate-300 shadow-md max-w-4xl mx-auto print:p-0 print:border-none print:shadow-none">
           <div className="flex justify-between items-start border-b-2 border-slate-900 pb-6 mb-6">
@@ -860,51 +1184,73 @@ export default function DataGovernanceView({ project }: DataGovernanceViewProps)
             </div>
 
             <div className="text-left">
-              <span className="inline-block px-3 py-1 rounded-full text-xs font-mono font-black bg-emerald-100 text-emerald-800 border border-emerald-300">
-                VERIFIED GRADE {auditResult.ratingGrade}
+              <span
+                className={`inline-block px-3 py-1 rounded-full text-xs font-mono font-black border ${certBadge.className}`}
+              >
+                {certBadge.label}
               </span>
               <p className="text-[10px] text-slate-400 mt-1 font-mono">
                 Audit Date: {new Date(auditResult.auditTimestamp).toLocaleDateString()}
+              </p>
+              <p className="text-[10px] text-slate-500 mt-0.5 font-mono">
+                {isRtl ? 'النتيجة' : 'Score'}: {auditResult.overallScore}% • Grade {auditResult.ratingGrade} •{' '}
+                {isRtl ? 'تحذيرات' : 'warnings'} {warningCount} / {isRtl ? 'مخالفات' : 'violations'} {violationCount}
               </p>
             </div>
           </div>
 
           <div className="space-y-4 text-xs text-slate-700 leading-relaxed mb-6">
-            <p>
-              {isRtl
-                ? `يشهد نظام الرقابة والتحكم بالمشاريع بأن بيانات المشروع: "${project?.name}" قد خضعت للفحص والتدقيق الآلي الشامل لجميع الجداول والروابط والعمليات الحسابية والمالية، وتم التحقق من مطابقتها التامة للمعايير الهندسية والتعاقدية.`
-                : `This is to certify that project data for "${project?.name}" has been audited across all relational databases, CPM schedule logic, financial General Ledger, and FIDIC controls.`}
-            </p>
+            <p>{certStatement}</p>
 
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 my-4 p-4 bg-slate-50 rounded-xl border border-slate-200 text-center">
               <div>
-                <p className="text-[10px] text-slate-400 uppercase font-bold">{isRtl ? 'القيمة المعتمدة' : 'Contract BAC'}</p>
-                <p className="text-sm font-black text-slate-900 font-mono mt-0.5">2,345,150 ر.س</p>
+                <p className="text-[10px] text-slate-400 uppercase font-bold">
+                  {isRtl ? 'القيمة التعاقدية' : 'Contract Value'}
+                </p>
+                <p className="text-sm font-black text-slate-900 font-mono mt-0.5">
+                  {contractValueAvailable && ssot ? `${ssot.contractValue.toLocaleString()} ر.س` : NA}
+                </p>
               </div>
               <div>
-                <p className="text-[10px] text-slate-400 uppercase font-bold">{isRtl ? 'درجة الجودة' : 'Quality Score'}</p>
-                <p className="text-sm font-black text-emerald-600 font-mono mt-0.5">{auditResult.overallScore}%</p>
+                <p className="text-[10px] text-slate-400 uppercase font-bold">
+                  {isRtl ? 'درجة الجودة' : 'Quality Score'}
+                </p>
+                <p className={`text-sm font-black font-mono mt-0.5 ${scoreTone(auditResult.overallScore).text}`}>
+                  {auditResult.overallScore}% ({auditResult.ratingGrade})
+                </p>
               </div>
               <div>
-                <p className="text-[10px] text-slate-400 uppercase font-bold">{isRtl ? 'مطابقة DCMA' : 'DCMA Score'}</p>
-                <p className="text-sm font-black text-blue-600 font-mono mt-0.5">14 / 14 Pass</p>
+                <p className="text-[10px] text-slate-400 uppercase font-bold">
+                  {isRtl ? 'ركيزة شبكة CPM' : 'CPM Network Pillar'}
+                </p>
+                <p
+                  className={`text-sm font-black font-mono mt-0.5 ${
+                    networkPillar ? scoreTone(networkPillar.score).text : 'text-slate-400'
+                  }`}
+                >
+                  {networkPillar ? `${networkPillar.score}% (${networkPillar.passed}/${networkPillar.total})` : NA}
+                </p>
               </div>
               <div>
-                <p className="text-[10px] text-slate-400 uppercase font-bold">{isRtl ? 'السجلات المعزولة' : 'Orphan FK'}</p>
-                <p className="text-sm font-black text-purple-600 font-mono mt-0.5">0 (Clean)</p>
+                <p className="text-[10px] text-slate-400 uppercase font-bold">
+                  {isRtl ? 'السجلات المعزولة' : 'Orphan FK'}
+                </p>
+                <p className={`text-sm font-black font-mono mt-0.5 ${relTone.text}`}>
+                  {orphanCount === null ? NA : `${orphanCount} (${isRtl ? relTone.ar : relTone.en})`}
+                </p>
               </div>
             </div>
 
-            <p className="text-slate-500 text-[11px]">
-              {isRtl
-                ? 'تم فحص ومطابقة 100% من علاقات الأنشطة (Predecessors/Successors)، وسجلات المستخلصات، والمطابقة الثلاثية لأوامر الشراء وفواتير الموردين ومقاولي الباطن.'
-                : '100% of schedule logic links, progress logs, 3-way matching purchase orders, and subcontractor certificates have been reconciled with zero discrepancies.'}
+            <p className="text-slate-600 text-[11px] leading-relaxed">
+              {isRtl ? auditResult.summaryAr : auditResult.summaryEn}
             </p>
+
+            <p className="text-slate-500 text-[11px] leading-relaxed">{certScopeStatement}</p>
           </div>
 
           <div className="pt-6 border-t border-slate-200 flex flex-col sm:flex-row justify-between items-center gap-4 text-[11px] text-slate-500">
             <div className="flex items-center gap-2">
-              <ShieldCheck size={16} className="text-emerald-600" />
+              <ShieldCheck size={16} className={certificateVerdict === 'clean' ? 'text-emerald-600' : 'text-amber-600'} />
               <span>{isRtl ? 'نظام الحوكمة الرقمي المعتمد' : 'Automated Enterprise Governance Engine'}</span>
             </div>
             <button
@@ -917,6 +1263,7 @@ export default function DataGovernanceView({ project }: DataGovernanceViewProps)
           </div>
         </div>
       )}
+
     </div>
   );
 }
