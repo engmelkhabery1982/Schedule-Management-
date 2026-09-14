@@ -1,10 +1,23 @@
 import { useState, useRef, useMemo } from 'react';
 import { supabase } from '@/lib/supabase';
 import { parseBoqFile, categorizeBoqItem } from '@/lib/boqParser';
-import { generateSchedule } from '@/lib/scheduleGenerator';
+import {
+  EMPTY_BOQ_OVERRIDES,
+  FAMILY_LABELS,
+  generateBoqPlan,
+  type BoqPlan,
+  type BoqPlanOverrides,
+} from '@/lib/boqPlanningEngine';
+import {
+  approveBoqBaseline,
+  buildBoqPersistPlan,
+  persistBoqPersistPlan,
+  type BoqPersistPlan,
+} from '@/lib/boqPlanService';
+import { WORK_TYPE_BINDING, type BoqWorkType } from '@/lib/boqClassifier';
 import { parseXerContent, type ParsedXerResult } from '@/lib/xerImporter';
 import { buildXerImportPlan, persistXerImportPlan, type ReconReport, type XerImportPlan } from '@/lib/xerImportService';
-import type { ParsedBoqRow, Project } from '@/types';
+import type { CalendarType, ParsedBoqRow, Project } from '@/types';
 import {
   Upload,
   FileSpreadsheet,
@@ -15,6 +28,9 @@ import {
   Layers,
   Database,
   ArrowRight,
+  Plus,
+  Trash2,
+  ShieldCheck,
 } from 'lucide-react';
 
 interface ImportViewProps {
@@ -22,6 +38,23 @@ interface ImportViewProps {
 }
 
 type ImportSource = 'boq' | 'xer';
+
+// F2: Arabic labels for the planning work-type select (engine keys stay English).
+const WORK_TYPE_AR: Record<BoqWorkType, string> = {
+  sub_excv: 'حفر أساسات', sub_blind: 'خرسانة نظافة', sub_waterproof: 'عزل أساسات',
+  sub_rebar: 'حديد قواعد', sub_form: 'نجارة قواعد', sub_conc: 'خرسانة قواعد', sub_composite: 'قواعد كاملة (مركب)',
+  vert_rebar: 'حديد أعمدة/حوائط', vert_form: 'نجارة أعمدة/حوائط', vert_conc: 'خرسانة أعمدة/حوائط', vert_composite: 'أعمدة كاملة (مركب)',
+  horz_form: 'نجارة أسقف/كمرات', horz_rebar: 'حديد أسقف/كمرات', horz_conc: 'خرسانة أسقف/كمرات', horz_composite: 'سقف كامل (مركب)',
+  masonry: 'مباني بلوك',
+  grade_survey: 'مساحة تسوية', grade_clear: 'تنظيف موقع', grade_excv: 'حفر كميات', grade_haul: 'نقل ناتج',
+  grade_fill: 'ردم هندسي', grade_compact: 'دمك', grade_final: 'تشطيب تسوية',
+  pipe_survey: 'مساحة شبكات', pipe_excv: 'حفر خنادق', pipe_bedding: 'فرشة', pipe_install: 'تركيب مواسير',
+  pipe_joint: 'وصلات/محابس', pipe_test: 'اختبار ضغط', pipe_backfill: 'ردم خنادق', pipe_reinstate: 'إعادة رصف',
+  road_subgrade: 'تربة تأسيس', road_subbase: 'أساس مساعد', road_base: 'أساس', road_prime: 'رش تشريبي',
+  road_binder: 'أسفلت رابط', road_wearing: 'أسفلت سطحي', road_asphalt_composite: 'أسفلت (مركب)',
+  kerb: 'بردورات',
+  review_required: 'مراجعة مطلوبة',
+};
 
 export default function ImportView({ onProjectCreated }: ImportViewProps) {
   const [importSource, setImportSource] = useState<ImportSource>('boq');
@@ -38,6 +71,15 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
   });
   const [boqFile, setBoqFile] = useState<File | null>(null);
   const [parsedRows, setParsedRows] = useState<ParsedBoqRow[]>([]);
+
+  // F2: BOQ planning wizard state (preview -> review -> confirm -> persist; no auto-baseline)
+  const [boqCalendar, setBoqCalendar] = useState<CalendarType>('6_days');
+  const [boqOverrides, setBoqOverrides] = useState<BoqPlanOverrides>(EMPTY_BOQ_OVERRIDES);
+  const [boqTab, setBoqTab] = useState<'class' | 'wbs' | 'acts' | 'logic' | 'cost' | 'valid'>('class');
+  const [newLink, setNewLink] = useState({ from: '', to: '', type: 'FS', lag: 0 });
+  const [boqDone, setBoqDone] = useState<{ persist: BoqPersistPlan; canApprove: boolean } | null>(null);
+  const [doneSource, setDoneSource] = useState<'xer' | 'boq' | null>(null);
+  const [boqBaseline, setBoqBaseline] = useState<{ ok: boolean; version: number | null; error: string | null } | null>(null);
 
   // XER state
   const [xerFile, setXerFile] = useState<File | null>(null);
@@ -75,6 +117,21 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [parsedXer, projectInfo.name, projectInfo.client, projectInfo.location, projectInfo.contract_value, projectInfo.description, projectInfo.start_date, xerDataDate, xerCurrency, xerBaselineOptIn]);
+  const boqPlanPreview: { plan: BoqPlan } | { planError: string } | null = useMemo(() => {
+    if (parsedRows.length === 0) return null;
+    try {
+      return {
+        plan: generateBoqPlan(
+          parsedRows,
+          { projectName: projectInfo.name, startDate: projectInfo.start_date, calendarType: boqCalendar },
+          boqOverrides,
+        ),
+      };
+    } catch (err) {
+      return { planError: (err as Error).message || 'تعذر بناء الخطة' };
+    }
+  }, [parsedRows, projectInfo.name, projectInfo.start_date, boqCalendar, boqOverrides]);
+
   const fileInputRef = useRef<HTMLInputElement>(null);
   const xerFileInputRef = useRef<HTMLInputElement>(null);
 
@@ -94,6 +151,11 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
         if (!row.category) row.category = categorizeBoqItem(row.description);
       }
       setParsedRows(rows);
+      setBoqOverrides(EMPTY_BOQ_OVERRIDES);
+      setBoqTab('class');
+      setBoqDone(null);
+      setBoqBaseline(null);
+      setDoneSource(null);
       setParseProgress(`تم تحليل ${rows.length} بند بنجاح`);
     } catch {
       setError('حدث خطأ أثناء قراءة الملف. تأكد من صيغة الملف (Excel أو CSV)');
@@ -172,166 +234,101 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
     setStep('done');
   }
 
-  async function handleImportBoq() {
+  // F2: confirm the reviewed plan -> persist as Draft (status 'planning', NO baseline).
+  async function handleConfirmBoqPlan() {
     if (!projectInfo.name || !projectInfo.start_date) {
       setError('الرجاء إدخال اسم المشروع وتاريخ البداية');
       return;
     }
-    if (parsedRows.length === 0) {
-      setError('الرجاء استيراد ملف المقايسة أولاً');
+    if (!boqPlanPreview || !('plan' in boqPlanPreview)) {
+      setError('لا توجد خطة صالحة للاعتماد — راجع بنود المقايسة أولاً');
       return;
     }
-
+    const plan = boqPlanPreview.plan;
+    if (!plan.canSave) {
+      setError(plan.saveBlockReason || 'تعذر حفظ الخطة');
+      return;
+    }
     setStep('analyzing');
     setError('');
-
     try {
-      // 1. Create project
-      const totalValue = parsedRows.reduce((sum, r) => sum + r.total_price, 0);
-      const { data: projectData, error: projectErr } = await supabase
-        .from('projects')
-        .insert({
-          name: projectInfo.name,
-          client: projectInfo.client || null,
-          location: projectInfo.location || null,
-          contract_value: parseFloat(projectInfo.contract_value) || totalValue,
-          currency: 'SAR',
-          start_date: projectInfo.start_date,
-          status: 'active',
-          description: projectInfo.description || null,
-        })
-        .select()
-        .single();
-
-      if (projectErr || !projectData) throw new Error('فشل إنشاء المشروع');
-      const project = projectData as Project;
-
-      // 2. Insert BOQ items
-      setParseProgress('جاري حفظ بنود المقايسة...');
-      const boqInserts = parsedRows.map((row, i) => ({
-        project_id: project.id,
-        code: row.code,
+      const boqRows = parsedRows.map((row, i) => ({
+        rowKey: `boq-${String(i + 1).padStart(4, '0')}`,
+        item_code: row.code,
         description: row.description,
         unit: row.unit,
         quantity: row.quantity,
         unit_price: row.unit_price,
         total_price: row.total_price,
-        category: row.category,
-        section: row.section,
-        sort_order: i,
       }));
-      const { error: boqErr } = await supabase.from('boq_items').insert(boqInserts);
-      if (boqErr) throw new Error('فشل حفظ بنود المقايسة');
-
-      // 3. Generate schedule
-      setParseProgress('جاري إنشاء WBS والجدول الزمني عبر محرك التخطيط...');
-      const schedule = generateSchedule(parsedRows, projectInfo.start_date, [], project.calendar_type);
-
-      // 4. Insert WBS nodes
-      const wbsInserts = schedule.wbsNodes.map((w) => ({
-        project_id: project.id,
-        parent_id: null,
-        code: w.code,
-        name: w.name,
-        level: w.level,
-        sort_order: w.sort_order,
-      }));
-      const { data: wbsData, error: wbsErr } = await supabase.from('wbs_nodes').insert(wbsInserts).select();
-      if (wbsErr) throw new Error('فشل إنشاء WBS');
-
-      const wbsCodeToId: Record<string, string> = {};
-      for (const w of wbsData || []) {
-        wbsCodeToId[w.code] = w.id;
-      }
-
-      // 5. Insert activities
-      setParseProgress('جاري إنشاء الأنشطة وشبكة CPM...');
-      const actInserts = schedule.activities.map((a) => ({
-        project_id: project.id,
-        wbs_node_id: a.wbs_node_code ? wbsCodeToId[a.wbs_node_code] || null : null,
-        code: a.code,
-        name: a.name,
-        early_start: a.early_start,
-        early_finish: a.early_finish,
-        late_start: a.late_start,
-        late_finish: a.late_finish,
-        duration_days: a.duration_days,
-        planned_quantity: a.planned_quantity,
-        actual_quantity: 0,
-        unit: a.unit,
-        percent_complete: 0,
-        is_critical: a.is_critical,
-        is_milestone: a.is_milestone,
-        total_float: 0,
-        free_float: 0,
-        actual_start: null,
-        actual_finish: null,
-        sort_order: a.sort_order,
-      }));
-      const { data: actData, error: actErr } = await supabase.from('activities').insert(actInserts).select();
-      if (actErr) throw new Error('فشل إنشاء الأنشطة');
-
-      const actCodeToId: Record<string, string> = {};
-      for (const a of actData || []) {
-        actCodeToId[a.code] = a.id;
-      }
-
-      // 6. Create Baseline
-      const { data: baselineData } = await supabase
-        .from('project_baselines')
-        .insert({
-          project_id: project.id,
-          version: 1,
-          name: 'Initial Baseline',
-          status: 'approved',
-          approved_at: new Date().toISOString(),
-          is_active: true,
-        })
-        .select()
-        .single();
-
-      if (baselineData) {
-        const baselineActivities = (schedule.activities || [])
-          .map((activity) => ({
-            baseline_id: baselineData.id,
-            activity_id: actCodeToId[activity.code],
-            early_start: activity.early_start,
-            early_finish: activity.early_finish,
-            duration_days: activity.duration_days,
-            planned_cost: schedule.budgetLines.find((line) => line.description === activity.name)?.planned_cost || 0,
-          }))
-          .filter((activity) => Boolean(activity.activity_id));
-        await supabase.from('baseline_activities').insert(baselineActivities);
-      }
-
-      // 7. Insert links
-      const linkInserts = schedule.links.map((l) => ({
-        project_id: project.id,
-        predecessor_id: actCodeToId[l.predecessor_code],
-        successor_id: actCodeToId[l.successor_code],
-        link_type: l.link_type,
-        lag_days: l.lag_days,
-      }));
-      await supabase.from('activity_links').insert(linkInserts);
-
-      // 8. Update project dates
-      const lastActivity = schedule.activities[schedule.activities.length - 1];
-      const totalDays = Math.round(
-        (new Date(lastActivity.early_finish).getTime() - new Date(projectInfo.start_date).getTime()) / (1000 * 60 * 60 * 24),
+      const persist = buildBoqPersistPlan(
+        plan,
+        {
+          name: projectInfo.name,
+          client: projectInfo.client || undefined,
+          location: projectInfo.location || undefined,
+          contract_value: parseFloat(projectInfo.contract_value) || plan.recon.boqTotal,
+          description: projectInfo.description || undefined,
+          start_date: projectInfo.start_date,
+          end_date: plan.recon.projectFinish || projectInfo.start_date,
+          status: 'planning',
+          currency: 'SAR',
+          calendar_type: boqCalendar,
+        },
+        boqRows,
       );
-      await supabase.from('projects').update({
-        end_date: lastActivity.early_finish,
-        duration_days: totalDays,
-        status: 'active',
-      }).eq('id', project.id);
-
+      setParseProgress('جاري حفظ المشروع والخطة المعتمدة...');
+      const result = await persistBoqPersistPlan(supabase, persist, (stepName, done, total) => {
+        setParseProgress(`جاري حفظ ${stepName}... (${done}/${total})`);
+      });
+      if (!result.ok) {
+        const cleanupNote = result.cleanedUp.length > 0
+          ? ` تم التراجع عن: ${result.cleanedUp.join('، ')} — لا يوجد مشروع نصف محفوظ.`
+          : '';
+        throw new Error(`${result.error || 'فشل الحفظ'}${cleanupNote}`);
+      }
+      setBoqDone({ persist, canApprove: persist.canApproveBaseline });
+      setDoneSource('boq');
       setStep('done');
-      setTimeout(() => {
-        onProjectCreated(project);
-      }, 1000);
-    } catch (err: any) {
-      setError(err.message || 'حدث خطأ أثناء استيراد المقايسة');
+    } catch (err: unknown) {
+      setError((err as Error).message || 'حدث خطأ أثناء حفظ الخطة');
       setStep('info');
+    }
+  }
+
+  // F2: explicit baseline approval only — refused while critical findings exist.
+  async function handleApproveBoqBaseline() {
+    if (!boqDone) return;
+    setError('');
+    try {
+      setParseProgress('جاري اعتماد خط الأساس...');
+      const acts = boqDone.persist.activities.map((a) => {
+        const r = a as Record<string, unknown>;
+        return {
+          activity_id: String(r.id),
+          code: String(r.code),
+          name: String(r.name),
+          planned_start: typeof r.early_start === 'string' ? r.early_start : null,
+          planned_finish: typeof r.early_finish === 'string' ? r.early_finish : null,
+          duration_days: Number(r.duration_days) || 0,
+          planned_cost: 0,
+        };
+      });
+      // Planned cost per activity comes from the persisted budget lines in the plan.
+      const costByAct = new Map<string, number>();
+      for (const b of boqDone.persist.budgetLines) {
+        const r = b as Record<string, unknown>;
+        costByAct.set(String(r.activity_id), Number(r.planned_cost) || 0);
+      }
+      for (const a of acts) a.planned_cost = costByAct.get(a.activity_id) || 0;
+      const res = await approveBoqBaseline(supabase, boqDone.persist.projectId, acts, 1, 'Initial Baseline');
+      if (!res.ok) {
+        setBoqBaseline({ ok: false, version: null, error: res.error });
+        return;
+      }
+      setBoqBaseline({ ok: true, version: res.version, error: null });
+    } catch (err: unknown) {
+      setBoqBaseline({ ok: false, version: null, error: (err as Error).message });
     }
   }
 
@@ -342,6 +339,76 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
           <Loader size={48} className="text-amber-500 animate-spin mx-auto mb-4" />
           <h3 className="text-lg font-semibold text-slate-800 mb-2">جاري المعالجة وبناء شبكة المشروع</h3>
           <p className="text-sm text-slate-500">{parseProgress}</p>
+        </div>
+      </div>
+    );
+  }
+
+  // F2: BOQ done branch (Draft project, explicit baseline approval only). The XER done
+  // branch below is untouched.
+  if (step === 'done' && doneSource === 'boq' && boqDone) {
+    const r = boqDone.persist.planRecon;
+    return (
+      <div className="flex items-start justify-center min-h-[50vh] py-8">
+        <div className="w-full max-w-3xl text-center p-8 bg-white rounded-2xl shadow-sm border border-slate-200">
+          <div className="w-20 h-20 rounded-full flex items-center justify-center mx-auto mb-4 bg-emerald-100">
+            <CheckCircle size={40} className="text-emerald-600" />
+          </div>
+          <h3 className="text-xl font-bold text-slate-800 mb-2">تم إنشاء المشروع كمسودة تخطيط</h3>
+          <p className="text-sm text-slate-500 mb-4">الحالة: planning (مسودة) — لم يُنشأ أي خط أساس تلقائياً.</p>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs mb-4">
+            <div className="bg-slate-50 p-3 rounded-lg border border-slate-200">
+              <span className="text-slate-500 block">بنود موزعة</span>
+              <span className="font-bold text-emerald-700 text-sm">{r.usableItemCount}</span>
+            </div>
+            <div className="bg-slate-50 p-3 rounded-lg border border-slate-200">
+              <span className="text-slate-500 block">بنود مراجعة</span>
+              <span className="font-bold text-amber-700 text-sm">{r.reviewItemCount}</span>
+            </div>
+            <div className="bg-slate-50 p-3 rounded-lg border border-slate-200">
+              <span className="text-slate-500 block">أنشطة / علاقات</span>
+              <span className="font-bold text-slate-800 text-sm">{r.activityCount} / {r.linkCount}</span>
+            </div>
+            <div className="bg-slate-50 p-3 rounded-lg border border-slate-200">
+              <span className="text-slate-500 block">الموزع / غير الموزع</span>
+              <span className="font-bold text-emerald-700 text-sm">{r.allocatedTotal.toLocaleString()}</span>
+              <span className="font-bold text-red-600 text-sm"> / {r.unallocatedTotal.toLocaleString()}</span>
+            </div>
+          </div>
+          {boqBaseline && (
+            <div className={`text-sm font-semibold mb-4 p-3 rounded-lg ${boqBaseline.ok ? 'bg-emerald-50 text-emerald-700' : 'bg-red-50 text-red-700'}`}>
+              {boqBaseline.ok ? `تم اعتماد خط الأساس v${boqBaseline.version}` : `تعذر الاعتماد: ${boqBaseline.error}`}
+            </div>
+          )}
+          {error && (
+            <div className="flex items-center gap-2 p-3 mb-4 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
+              <AlertCircle size={18} />
+              <span>{error}</span>
+            </div>
+          )}
+          <div className="flex flex-wrap justify-center gap-3">
+            {!boqBaseline?.ok && (
+              <button
+                onClick={handleApproveBoqBaseline}
+                disabled={!boqDone.canApprove}
+                title={boqDone.canApprove ? 'اعتماد خط الأساس v1' : 'توجد ملاحظات حرجة تمنع الاعتماد — راجع تبويب التحقق'}
+                className="inline-flex items-center gap-2 bg-amber-500 text-slate-900 px-6 py-3 rounded-lg font-semibold hover:bg-amber-600 transition-colors disabled:opacity-50"
+              >
+                <ShieldCheck size={18} />
+                اعتماد خط الأساس
+              </button>
+            )}
+            <button
+              onClick={() => {
+                const pr = boqDone.persist.project as unknown as Record<string, unknown>;
+                onProjectCreated({ id: boqDone.persist.projectId, created_at: new Date().toISOString(), duration_days: null, ...pr } as unknown as Project);
+              }}
+              className="inline-flex items-center gap-2 bg-blue-600 text-white px-6 py-3 rounded-lg font-semibold hover:bg-blue-700 transition-colors"
+            >
+              الانتقال إلى المشروع
+              <ArrowRight size={18} className="rotate-180" />
+            </button>
+          </div>
         </div>
       </div>
     );
@@ -562,52 +629,549 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
           </div>
 
           {parsedRows.length > 0 && (
-            <div className="mt-4">
-              <div className="flex items-center justify-between mb-3">
-                <p className="text-sm font-medium text-slate-700">معاينة بنود المقايسة ({parsedRows.length} بند)</p>
-                <p className="text-sm font-bold text-emerald-700">
-                  الإجمالي: {parsedRows.reduce((s, r) => s + r.total_price, 0).toLocaleString()} ريال
-                </p>
+            <div className="mt-4 space-y-4">
+              {/* F2: calendar + detected families */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+                <div>
+                  <label className="block font-medium text-slate-600 mb-1">تقويم الخطة (أيام العمل)</label>
+                  <select
+                    value={boqCalendar}
+                    onChange={(e) => setBoqCalendar(e.target.value as CalendarType)}
+                    className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-emerald-500 outline-none"
+                  >
+                    <option value="6_days">6 أيام (الافتراضي)</option>
+                    <option value="5_days">5 أيام</option>
+                    <option value="7_days">7 أيام</option>
+                  </select>
+                </div>
+                <div>
+                  <span className="block font-medium text-slate-600 mb-1">العائلات المكتشفة (اضغط للاستبعاد/الإرجاع)</span>
+                  <div className="flex flex-wrap gap-2">
+                    {boqPlanPreview && 'plan' in boqPlanPreview &&
+                      Array.from(new Set(boqPlanPreview.plan.classifications.map((c) => c.family))).map((fam) => {
+                        const excluded = boqOverrides.excludedFamilies.includes(fam);
+                        const count = boqPlanPreview.plan.classifications.filter((c) => c.family === fam).length;
+                        return (
+                          <button
+                            key={fam}
+                            onClick={() =>
+                              setBoqOverrides((o) => ({
+                                ...o,
+                                excludedFamilies: excluded
+                                  ? o.excludedFamilies.filter((f) => f !== fam)
+                                  : [...o.excludedFamilies, fam],
+                              }))
+                            }
+                            className={`px-3 py-1.5 rounded-full border text-xs font-semibold ${
+                              excluded
+                                ? 'bg-slate-100 text-slate-400 border-slate-200 line-through'
+                                : 'bg-emerald-50 text-emerald-800 border-emerald-300'
+                            }`}
+                          >
+                            {FAMILY_LABELS[fam]?.ar || fam} ({count})
+                          </button>
+                        );
+                      })}
+                  </div>
+                </div>
               </div>
-              <div className="overflow-x-auto border border-slate-200 rounded-lg max-h-60">
-                <table className="w-full text-xs">
-                  <thead className="bg-slate-50 text-slate-600 sticky top-0">
-                    <tr>
-                      <th className="text-right p-2">الكود</th>
-                      <th className="text-right p-2">الوصف</th>
-                      <th className="text-right p-2">القسم</th>
-                      <th className="text-right p-2">الكمية</th>
-                      <th className="text-right p-2">السعر</th>
-                      <th className="text-right p-2">الإجمالي</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100">
-                    {parsedRows.slice(0, 10).map((r, i) => (
-                      <tr key={i} className="hover:bg-slate-50">
-                        <td className="p-2 font-mono text-slate-500">{r.code}</td>
-                        <td className="p-2 text-slate-700 max-w-xs truncate">{r.description}</td>
-                        <td className="p-2 text-slate-500">{r.category}</td>
-                        <td className="p-2 font-medium">{r.quantity.toLocaleString()}</td>
-                        <td className="p-2">{r.unit_price.toLocaleString()}</td>
-                        <td className="p-2 font-bold text-slate-800">{r.total_price.toLocaleString()}</td>
-                      </tr>
+
+              {boqPlanPreview && 'planError' in boqPlanPreview && (
+                <div className="flex items-center gap-2 p-4 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
+                  <AlertCircle size={20} />
+                  <span>{boqPlanPreview.planError}</span>
+                </div>
+              )}
+
+              {boqPlanPreview && 'plan' in boqPlanPreview && (
+                <>
+                  {/* Recon strip */}
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+                    <div className="bg-slate-50 p-3 rounded-lg border border-slate-200">
+                      <span className="text-slate-500 block">إجمالي المقايسة</span>
+                      <span className="font-bold text-slate-800 text-sm">{boqPlanPreview.plan.recon.boqTotal.toLocaleString()}</span>
+                    </div>
+                    <div className="bg-slate-50 p-3 rounded-lg border border-slate-200">
+                      <span className="text-slate-500 block">الموزع / غير الموزع</span>
+                      <span className="font-bold text-emerald-700 text-sm">{boqPlanPreview.plan.recon.allocatedTotal.toLocaleString()}</span>
+                      <span className={`font-bold text-sm ${boqPlanPreview.plan.recon.unallocatedTotal > 0 ? 'text-red-600' : 'text-slate-400'}`}>
+                        {' / '}{boqPlanPreview.plan.recon.unallocatedTotal.toLocaleString()}
+                      </span>
+                    </div>
+                    <div className="bg-slate-50 p-3 rounded-lg border border-slate-200">
+                      <span className="text-slate-500 block">أنشطة / علاقات / حرجة</span>
+                      <span className="font-bold text-slate-800 text-sm">
+                        {boqPlanPreview.plan.recon.activityCount} / {boqPlanPreview.plan.recon.linkCount} / {boqPlanPreview.plan.recon.criticalCount}
+                      </span>
+                    </div>
+                    <div className="bg-slate-50 p-3 rounded-lg border border-slate-200">
+                      <span className="text-slate-500 block">نهاية الخطة (CPM)</span>
+                      <span className="font-bold text-blue-700 text-sm font-mono">{boqPlanPreview.plan.recon.projectFinish || '—'}</span>
+                    </div>
+                  </div>
+
+                  {/* Tabs */}
+                  <div className="flex flex-wrap gap-1 rounded-xl bg-slate-200/80 p-1">
+                    {([
+                      ['class', 'التصنيف'],
+                      ['wbs', 'WBS'],
+                      ['acts', 'الأنشطة'],
+                      ['logic', 'العلاقات'],
+                      ['cost', 'التكلفة'],
+                      ['valid', 'التحقق'],
+                    ] as const).map(([key, label]) => (
+                      <button
+                        key={key}
+                        onClick={() => setBoqTab(key)}
+                        className={`flex-1 min-w-20 px-2 py-2 rounded-lg text-xs font-semibold transition-all ${
+                          boqTab === key ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'
+                        }`}
+                      >
+                        {label}
+                      </button>
                     ))}
-                  </tbody>
-                </table>
-              </div>
+                  </div>
+
+                  {/* Classification tab */}
+                  {boqTab === 'class' && (
+                    <div className="overflow-x-auto border border-slate-200 rounded-lg max-h-96">
+                      <table className="w-full text-xs">
+                        <thead className="bg-slate-50 text-slate-600 sticky top-0">
+                          <tr>
+                            <th className="text-right p-2">الكود</th>
+                            <th className="text-right p-2">الوصف</th>
+                            <th className="text-right p-2">نوع العمل</th>
+                            <th className="text-right p-2">الثقة</th>
+                            <th className="text-right p-2">الموقع</th>
+                            <th className="text-right p-2">تأكيد</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100">
+                          {boqPlanPreview.plan.classifications.map((c) => {
+                            const row = parsedRows[Number(c.rowKey.slice(4)) - 1];
+                            return (
+                              <tr key={c.rowKey} className="hover:bg-slate-50">
+                                <td className="p-2 font-mono text-slate-500">{row?.code}</td>
+                                <td className="p-2 text-slate-700 max-w-52">
+                                  <span className="block truncate">{row?.description}</span>
+                                  <span className="block text-[10px] text-slate-400">{c.reason}</span>
+                                </td>
+                                <td className="p-2">
+                                  <select
+                                    value={boqOverrides.workType[c.rowKey] || c.workType}
+                                    onChange={(e) =>
+                                      setBoqOverrides((o) => ({
+                                        ...o,
+                                        workType: { ...o.workType, [c.rowKey]: e.target.value as BoqWorkType },
+                                      }))
+                                    }
+                                    className="px-2 py-1 border border-slate-300 rounded text-xs max-w-40"
+                                  >
+                                    {[...Object.keys(WORK_TYPE_BINDING), 'review_required'].map((wt) => (
+                                      <option key={wt} value={wt}>{WORK_TYPE_AR[wt as BoqWorkType]}</option>
+                                    ))}
+                                  </select>
+                                </td>
+                                <td className="p-2">
+                                  {c.confidence === 'high' && <span className="text-emerald-700 font-bold">عالية</span>}
+                                  {c.confidence === 'medium' && <span className="text-amber-700 font-bold">متوسطة</span>}
+                                  {c.confidence === 'review' && <span className="text-red-600 font-bold">مراجعة</span>}
+                                </td>
+                                <td className="p-2">
+                                  <input
+                                    type="text"
+                                    placeholder={c.locationHint?.label || '—'}
+                                    value={boqOverrides.location[c.rowKey] ?? ''}
+                                    onChange={(e) =>
+                                      setBoqOverrides((o) => {
+                                        const loc = { ...o.location };
+                                        if (e.target.value.trim() === '') delete loc[c.rowKey];
+                                        else loc[c.rowKey] = e.target.value;
+                                        return { ...o, location: loc };
+                                      })
+                                    }
+                                    className="px-2 py-1 border border-slate-300 rounded text-xs w-24"
+                                  />
+                                </td>
+                                <td className="p-2 text-center">
+                                  {c.confidence === 'medium' ? (
+                                    <input
+                                      type="checkbox"
+                                      checked={!!boqOverrides.confirmed[c.rowKey]}
+                                      onChange={(e) =>
+                                        setBoqOverrides((o) => {
+                                          const conf = { ...o.confirmed };
+                                          if (e.target.checked) conf[c.rowKey] = true;
+                                          else delete conf[c.rowKey];
+                                          return { ...o, confirmed: conf };
+                                        })
+                                      }
+                                      className="w-4 h-4 accent-emerald-600"
+                                      title="تأكيد التصنيف"
+                                    />
+                                  ) : (
+                                    <span className="text-slate-300">—</span>
+                                  )}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+
+                  {/* WBS tab */}
+                  {boqTab === 'wbs' && (
+                    <div className="border border-slate-200 rounded-lg max-h-96 overflow-y-auto p-3 space-y-1 text-xs">
+                      {boqPlanPreview.plan.wbs.map((w) => (
+                        <div key={w.stableId} className="flex items-center gap-2" style={{ paddingRight: `${(w.level - 1) * 20}px` }}>
+                          <span className="font-mono text-slate-400">{w.code}</span>
+                          <span className={w.level <= 2 ? 'font-bold text-slate-800' : 'text-slate-700'}>{w.name}</span>
+                          {w.level === 1 && <Layers size={14} className="text-amber-500" />}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Activities tab */}
+                  {boqTab === 'acts' && (
+                    <div className="overflow-x-auto border border-slate-200 rounded-lg max-h-96">
+                      <table className="w-full text-xs">
+                        <thead className="bg-slate-50 text-slate-600 sticky top-0">
+                          <tr>
+                            <th className="text-right p-2">الكود</th>
+                            <th className="text-right p-2">النشاط</th>
+                            <th className="text-right p-2">WBS</th>
+                            <th className="text-right p-2">المدة</th>
+                            <th className="text-right p-2">المعدل/الأطقم</th>
+                            <th className="text-right p-2">التكلفة</th>
+                            <th className="text-right p-2">CPM</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100">
+                          {boqPlanPreview.plan.activities.map((a) => (
+                            <tr key={a.stableId} className={`hover:bg-slate-50 ${a.isMilestone ? 'bg-slate-50/60' : ''}`}>
+                              <td className="p-2 font-mono text-slate-500">{a.code}</td>
+                              <td className="p-2 text-slate-700 max-w-52">
+                                <span className="block truncate font-medium">{a.name}</span>
+                                <span className="block text-[10px] text-slate-400">{a.durationNote}</span>
+                              </td>
+                              <td className="p-2">
+                                {!a.isMilestone ? (
+                                  <select
+                                    value={boqOverrides.wbs[a.stableId] || a.wbsStableId}
+                                    onChange={(e) =>
+                                      setBoqOverrides((o) => ({ ...o, wbs: { ...o.wbs, [a.stableId]: e.target.value } }))
+                                    }
+                                    className="px-1 py-1 border border-slate-300 rounded text-xs max-w-28"
+                                  >
+                                    {boqPlanPreview.plan.wbs.map((w) => (
+                                      <option key={w.stableId} value={w.stableId}>{w.code} {w.name}</option>
+                                    ))}
+                                  </select>
+                                ) : (
+                                  <span className="font-mono text-slate-400">
+                                    {boqPlanPreview.plan.wbs.find((w) => w.stableId === a.wbsStableId)?.code}
+                                  </span>
+                                )}
+                              </td>
+                              <td className="p-2">
+                                {!a.isMilestone ? (
+                                  <span className="flex items-center gap-1">
+                                    <input
+                                      type="number"
+                                      min={1}
+                                      value={boqOverrides.duration[a.stableId] ?? a.durationDays}
+                                      onChange={(e) =>
+                                        setBoqOverrides((o) => ({
+                                          ...o,
+                                          duration: { ...o.duration, [a.stableId]: Math.max(1, Math.round(Number(e.target.value) || 1)) },
+                                        }))
+                                      }
+                                      className="w-14 px-1 py-1 border border-slate-300 rounded text-xs"
+                                    />
+                                    <span
+                                      className={`text-[10px] font-bold ${
+                                        a.durationBasis === 'review'
+                                          ? 'text-red-600'
+                                          : a.durationBasis === 'user'
+                                            ? 'text-blue-700'
+                                            : a.durationBasis === 'template_default'
+                      
+                                              ? 'text-amber-700'
+                                              : 'text-emerald-700'
+                                      }`}
+                                    >
+                                      {a.durationBasis === 'review' ? 'مراجعة' : a.durationBasis === 'user' ? 'يدوي' : a.durationBasis === 'template_default' ? 'افتراضي' : 'إنتاجية'}
+                                    </span>
+                                  </span>
+                                ) : (
+                                  <span className="text-slate-400">Milestone</span>
+                                )}
+                              </td>
+                              <td className="p-2">
+                                {!a.isMilestone && a.quantityUnit ? (
+                                  <span className="flex items-center gap-1">
+                                    <input
+                                      type="number"
+                                      min={0.01}
+                                      step="any"
+                                      placeholder="المعدل"
+                                      value={boqOverrides.rate[a.stableId] ?? ''}
+                                      onChange={(e) =>
+                                        setBoqOverrides((o) => {
+                                          const rate = { ...o.rate };
+                                          if (e.target.value === '') delete rate[a.stableId];
+                                          else rate[a.stableId] = Number(e.target.value);
+                                          return { ...o, rate };
+                                        })
+                                      }
+                                      className="w-16 px-1 py-1 border border-slate-300 rounded text-xs"
+                                    />
+                                    <input
+                                      type="number"
+                                      min={1}
+                                      placeholder="طقم"
+                                      value={boqOverrides.crews[a.stableId] ?? a.crewCount}
+                                      onChange={(e) =>
+                                        setBoqOverrides((o) => ({
+                                          ...o,
+                                          crews: { ...o.crews, [a.stableId]: Math.max(1, Math.round(Number(e.target.value) || 1)) },
+                                        }))
+                                      }
+                                      className="w-12 px-1 py-1 border border-slate-300 rounded text-xs"
+                                    />
+                                  </span>
+                                ) : (
+                                  <span className="text-slate-300">—</span>
+                                )}
+                              </td>
+                              <td className="p-2 font-bold text-slate-800">{a.plannedCost.toLocaleString()}</td>
+                              <td className="p-2 font-mono text-[10px] text-slate-500">
+                                {a.earlyStart?.slice(0, 10)} → {a.earlyFinish?.slice(0, 10)}
+                                {a.isCritical && !a.isMilestone && <span className="text-red-600 font-bold"> حرج</span>}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+
+                  {/* Logic tab */}
+                  {boqTab === 'logic' && (
+                    <div className="space-y-3">
+                      <div className="overflow-x-auto border border-slate-200 rounded-lg max-h-72">
+                        <table className="w-full text-xs">
+                          <thead className="bg-slate-50 text-slate-600 sticky top-0">
+                            <tr>
+                              <th className="text-right p-2">السابق</th>
+                              <th className="text-right p-2">النوع</th>
+                              <th className="text-right p-2">اللاحق</th>
+                              <th className="text-right p-2">Lag</th>
+                              <th className="text-right p-2">القاعدة</th>
+                              <th className="text-right p-2"></th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-100">
+                            {boqPlanPreview.plan.links.map((l) => {
+                              const from = boqPlanPreview.plan.activities.find((a) => a.stableId === l.fromActivityId);
+                              const to = boqPlanPreview.plan.activities.find((a) => a.stableId === l.toActivityId);
+                              return (
+                                <tr key={l.stableId} className="hover:bg-slate-50">
+                                  <td className="p-2 text-slate-700">{from?.code} {from?.name}</td>
+                                  <td className="p-2 font-mono font-bold text-blue-700">{l.type}</td>
+                                  <td className="p-2 text-slate-700">{to?.code} {to?.name}</td>
+                                  <td className="p-2 font-mono">{l.lagDays}</td>
+                                  <td className="p-2 text-[10px] text-slate-400 max-w-52 truncate">{l.rule}</td>
+                                  <td className="p-2">
+                                    <button
+                                      onClick={() => {
+                                        if (l.origin === 'user') {
+                                          const idx = Number(l.stableId.replace('user-link-', ''));
+                                          setBoqOverrides((o) => ({ ...o, addLinks: o.addLinks.filter((_, i) => i !== idx) }));
+                                        } else {
+                                          setBoqOverrides((o) => ({ ...o, removeLinks: [...o.removeLinks, l.stableId] }));
+                                        }
+                                      }}
+                                      className="text-red-500 hover:text-red-700"
+                                      title="حذف العلاقة"
+                                    >
+                                      <Trash2 size={14} />
+                                    </button>
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                      <div className="flex flex-wrap items-end gap-2 text-xs bg-slate-50 border border-slate-200 rounded-lg p-3">
+                        <div>
+                          <label className="block font-medium text-slate-600 mb-1">السابق</label>
+                          <select
+                            value={newLink.from}
+                            onChange={(e) => setNewLink({ ...newLink, from: e.target.value })}
+                            className="px-2 py-1.5 border border-slate-300 rounded text-xs max-w-44"
+                          >
+                            <option value="">—</option>
+                            {boqPlanPreview.plan.activities.map((a) => (
+                              <option key={a.stableId} value={a.stableId}>{a.code} {a.name}</option>
+                            ))}
+                          </select>
+                        </div>
+                        <div>
+                          <label className="block font-medium text-slate-600 mb-1">النوع</label>
+                          <select
+                            value={newLink.type}
+                            onChange={(e) => setNewLink({ ...newLink, type: e.target.value })}
+                            className="px-2 py-1.5 border border-slate-300 rounded text-xs"
+                          >
+                            <option value="FS">FS</option>
+                            <option value="SS">SS</option>
+                            <option value="FF">FF</option>
+                          </select>
+                        </div>
+                        <div>
+                          <label className="block font-medium text-slate-600 mb-1">اللاحق</label>
+                          <select
+                            value={newLink.to}
+                            onChange={(e) => setNewLink({ ...newLink, to: e.target.value })}
+                            className="px-2 py-1.5 border border-slate-300 rounded text-xs max-w-44"
+                          >
+                            <option value="">—</option>
+                            {boqPlanPreview.plan.activities.map((a) => (
+                              <option key={a.stableId} value={a.stableId}>{a.code} {a.name}</option>
+                            ))}
+                          </select>
+                        </div>
+                        <div>
+                          <label className="block font-medium text-slate-600 mb-1">Lag</label>
+                          <input
+                            type="number"
+                            value={newLink.lag}
+                            onChange={(e) => setNewLink({ ...newLink, lag: Number(e.target.value) || 0 })}
+                            className="w-16 px-2 py-1.5 border border-slate-300 rounded text-xs"
+                          />
+                        </div>
+                        <button
+                          onClick={() => {
+                            if (!newLink.from || !newLink.to || newLink.from === newLink.to) return;
+                            setBoqOverrides((o) => ({
+                              ...o,
+                              addLinks: [...o.addLinks, {
+                                fromActivityId: newLink.from,
+                                toActivityId: newLink.to,
+                                type: newLink.type as 'FS' | 'SS' | 'FF',
+                                lagDays: Math.max(0, Math.round(newLink.lag)),
+                              }],
+                            }));
+                            setNewLink({ from: '', to: '', type: 'FS', lag: 0 });
+                          }}
+                          disabled={!newLink.from || !newLink.to}
+                          className="flex items-center gap-1 bg-blue-600 text-white px-3 py-1.5 rounded-lg font-semibold hover:bg-blue-700 disabled:opacity-50"
+                        >
+                          <Plus size={14} />
+                          إضافة علاقة
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Cost tab */}
+                  {boqTab === 'cost' && (
+                    <div className="space-y-3">
+                      <div className="overflow-x-auto border border-slate-200 rounded-lg max-h-72">
+                        <table className="w-full text-xs">
+                          <thead className="bg-slate-50 text-slate-600 sticky top-0">
+                            <tr>
+                              <th className="text-right p-2">النشاط</th>
+                              <th className="text-right p-2">المخطط</th>
+                              <th className="text-right p-2">الملزم / الفعلي</th>
+                              <th className="text-right p-2">مصادر البنود</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-100">
+                            {boqPlanPreview.plan.budgetLines.map((b) => {
+                              const act = boqPlanPreview.plan.activities.find((a) => a.stableId === b.activityStableId);
+                              const allocs = boqPlanPreview.plan.allocations.filter((x) => x.activityStableId === b.activityStableId);
+                              return (
+                                <tr key={b.stableId} className="hover:bg-slate-50">
+                                  <td className="p-2 text-slate-700">{act?.code} {b.description}</td>
+                                  <td className="p-2 font-bold text-slate-800">{b.plannedCost.toLocaleString()}</td>
+                                  <td className="p-2 text-slate-400">0 / 0</td>
+                                  <td className="p-2 text-[10px] text-slate-500">
+                                    {allocs.length === 0 ? '—' : allocs.map((x) => {
+                                      const r = parsedRows[Number(x.rowKey.slice(4)) - 1];
+                                      return `${r?.code} (${x.costShare.toLocaleString()})`;
+                                    }).join(' + ')}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                      <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-xs space-y-1">
+                        <p className="text-slate-700">إجمالي المقايسة: <span className="font-bold">{boqPlanPreview.plan.recon.boqTotal.toLocaleString()}</span></p>
+                        <p className="text-slate-700">الموزع على الأنشطة: <span className="font-bold text-emerald-700">{boqPlanPreview.plan.recon.allocatedTotal.toLocaleString()}</span></p>
+                        <p className="text-slate-700">غير الموزع (بنود المراجعة): <span className={`font-bold ${boqPlanPreview.plan.recon.unallocatedTotal > 0 ? 'text-red-600' : 'text-slate-400'}`}>{boqPlanPreview.plan.recon.unallocatedTotal.toLocaleString()}</span></p>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Validation tab */}
+                  {boqTab === 'valid' && (
+                    <div className="space-y-2 max-h-96 overflow-y-auto">
+                      {boqPlanPreview.plan.findings.length === 0 && (
+                        <p className="text-xs text-emerald-700 font-semibold">لا توجد ملاحظات — الخطة جاهزة للاعتماد.</p>
+                      )}
+                      {(['critical', 'warning', 'info'] as const).map((sev) =>
+                        boqPlanPreview.plan.findings.filter((f) => f.severity === sev).map((f, i) => (
+                          <div
+                            key={`${sev}-${i}`}
+                            className={`text-xs p-2.5 rounded-lg border ${
+                              sev === 'critical'
+                                ? 'bg-red-50 border-red-200 text-red-800'
+                                : sev === 'warning'
+                                  ? 'bg-amber-50 border-amber-200 text-amber-800'
+                                  : 'bg-slate-50 border-slate-200 text-slate-600'
+                            }`}
+                          >
+                            <span className="font-bold font-mono">[{f.code}]</span> {f.message}
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  )}
+
+                  {/* Confirm bar */}
+                  <div className="flex flex-wrap items-center justify-between gap-3 bg-slate-50 border border-slate-200 rounded-lg p-4">
+                    <div className="text-xs space-y-1">
+                      {!boqPlanPreview.plan.canSave && (
+                        <p className="text-red-700 font-bold">تعذر الحفظ: {boqPlanPreview.plan.saveBlockReason}</p>
+                      )}
+                      {boqPlanPreview.plan.canSave && !boqPlanPreview.plan.canApproveBaseline && (
+                        <p className="text-amber-700 font-semibold">يمكن الحفظ كمسودة — الاعتماد النهائي يتطلب حل الملاحظات الحرجة.</p>
+                      )}
+                      {boqPlanPreview.plan.canApproveBaseline && (
+                        <p className="text-emerald-700 font-semibold">الخطة جاهزة: يمكن الحفظ ثم اعتماد خط الأساس.</p>
+                      )}
+                    </div>
+                    <button
+                      onClick={handleConfirmBoqPlan}
+                      disabled={!boqPlanPreview.plan.canSave || !projectInfo.name}
+                      className="flex items-center gap-2 bg-emerald-600 text-white px-6 py-3 rounded-lg font-semibold hover:bg-emerald-700 transition-colors disabled:opacity-50"
+                    >
+                      <Building2 size={20} />
+                      اعتماد الخطة وإنشاء المشروع (مسودة)
+                    </button>
+                  </div>
+                </>
+              )}
             </div>
           )}
-
-          <div className="mt-6 flex justify-end">
-            <button
-              onClick={handleImportBoq}
-              disabled={!projectInfo.name || parsedRows.length === 0}
-              className="flex items-center gap-2 bg-emerald-600 text-white px-6 py-3 rounded-lg font-semibold hover:bg-emerald-700 transition-colors disabled:opacity-50"
-            >
-              <Building2 size={20} />
-              توليد الجدول الزمني الذكي والمشروع
-            </button>
-          </div>
         </div>
       ) : (
         <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">

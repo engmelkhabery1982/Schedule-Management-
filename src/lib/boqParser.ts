@@ -42,7 +42,8 @@ export async function parseBoqFile(file: File): Promise<ParsedBoqRow[]> {
   }
 
   return rows
-    .map((row) => {
+    // F2: deterministic fallback codes (row position, not random).
+    .map((row, index) => {
       const normalized: Record<string, unknown> = {};
       for (const [k, v] of Object.entries(row)) {
         normalized[normalizeHeader(k)] = v;
@@ -58,7 +59,7 @@ export async function parseBoqFile(file: File): Promise<ParsedBoqRow[]> {
       const finalTotal = total > 0 ? total : computedTotal;
 
       return {
-        code: code || `ITEM-${Math.random().toString(36).slice(2, 7).toUpperCase()}`,
+        code: code || `ITEM-${String(index + 1).padStart(4, "0")}`,
         description,
         unit: String(normalized['unit'] || 'قطعة').trim(),
         quantity,

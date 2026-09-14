@@ -313,6 +313,23 @@ export interface BudgetLine {
   budget_basis?: string;
 }
 
+/**
+ * F2: many-to-many BOQ item <-> generated activity cost/quantity provenance.
+ * Mirrors `activity_boq_allocations`
+ * (`supabase/migrations/20260914160000_boq_planning_traceability.sql`).
+ */
+export interface ActivityBoqAllocation {
+  id: string;
+  project_id: string;
+  activity_id: string;
+  boq_item_id: string;
+  quantity_share: number | null;
+  cost_share: number;
+  allocation_basis: string;
+  is_generated: boolean;
+  created_at: string;
+}
+
 export interface ProductivityRate {
   id: string;
   category: string;
