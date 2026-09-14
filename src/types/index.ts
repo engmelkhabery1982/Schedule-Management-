@@ -334,26 +334,6 @@ export interface BaselineActivity {
 
 export type BaselineStatus = 'draft' | 'submitted' | 'approved' | 'rejected';
 
-export interface EvmMetrics {
-  bac: number;
-  pv: number;
-  ev: number;
-  ac: number;
-  sv: number;
-  cv: number;
-  spi: number;
-  cpi: number;
-  eac: number;
-  etc: number;
-  vac: number;
-  // Earned Schedule Management (ESM) metrics in time units
-  earned_schedule_months?: number;
-  actual_time_months?: number;
-  sv_t_days?: number;
-  spi_t?: number;
-  ieac_t_date?: string;
-}
-
 export interface CostTransaction {
   id: string;
   project_id: string;

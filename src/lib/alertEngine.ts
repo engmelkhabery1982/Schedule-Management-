@@ -1,4 +1,5 @@
-import type { Activity, EvmMetrics } from '@/types';
+import type { Activity } from '@/types';
+import type { ComprehensiveProjectEvm } from '@/lib/planningEngine';
 
 export interface GeneratedAlert {
   fingerprint: string;
@@ -11,7 +12,7 @@ export interface GeneratedAlert {
 
 export function generateScheduleAlerts(
   activities: Activity[],
-  evm: EvmMetrics,
+  evm: ComprehensiveProjectEvm,
   today = new Date(),
 ): GeneratedAlert[] {
   const alerts: GeneratedAlert[] = [];

@@ -105,8 +105,8 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
   }, [activities, links, baselineActivities, dcmaDataDate, project?.calendar_type, project?.status_logic]);
 
   // Compute EVM metrics using the unified engine.
-  // Typed as the canonical `ComprehensiveProjectEvm` (it always was one at runtime): the legacy
-  // `EvmMetrics` annotation hid `earnedProgressPercent`, the ratio statuses and `dataDate` from this
+  // Typed as the canonical `ComprehensiveProjectEvm` (it always was one at runtime): the former
+  // narrow annotation hid `earnedProgressPercent`, the ratio statuses and `dataDate` from this
   // report, so the progress and data-quality semantics could not be shown (GAP-039 / GAP-036).
   const evmMetrics: ComprehensiveProjectEvm = useMemo(() => {
     // Null safety (no project selected yet): return the canonical all-zero empty state instead of

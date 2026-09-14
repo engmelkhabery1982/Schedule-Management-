@@ -1,4 +1,5 @@
-import type { EvmMetrics, ProjectAlert } from '@/types';
+import type { ProjectAlert } from '@/types';
+import type { ComprehensiveProjectEvm } from '@/lib/planningEngine';
 
 export interface ControlRecommendation {
   priority: 'high' | 'medium' | 'low';
@@ -13,7 +14,7 @@ export interface ControlHealth {
 }
 
 export function calculateControlHealth(
-  evm: EvmMetrics,
+  evm: ComprehensiveProjectEvm,
   alerts: ProjectAlert[],
   behindBaselineCount: number,
   resourceConflicts: number,

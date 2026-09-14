@@ -1,4 +1,5 @@
-import type { Activity, BaselineActivity, EvmMetrics } from '@/types';
+import type { Activity, BaselineActivity } from '@/types';
+import type { ComprehensiveProjectEvm } from '@/lib/planningEngine';
 
 export interface RecoveryAnalysis {
   requiredSpi: number;
@@ -17,7 +18,7 @@ function daysUntil(date: string | null, today: Date): number {
 export function calculateRecoveryPlan(
   activities: Activity[],
   baselines: BaselineActivity[],
-  evm: EvmMetrics,
+  evm: ComprehensiveProjectEvm,
   today = new Date(),
 ): RecoveryAnalysis {
   const baselineByActivity = new Map(baselines.map((baseline) => [baseline.activity_id, baseline]));

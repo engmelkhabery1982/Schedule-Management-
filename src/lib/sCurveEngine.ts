@@ -1,5 +1,5 @@
-import type { Activity, BaselineActivity, BoqItem, CostTransaction, ProgressUpdate, EvmMetrics } from '@/types';
-import { calculateProjectEvmAtDataDate, type EvmBudgetLineInput } from '@/lib/planningEngine';
+import type { Activity, BaselineActivity, BoqItem, CostTransaction, ProgressUpdate } from '@/types';
+import { calculateProjectEvmAtDataDate, type ComprehensiveProjectEvm, type EvmBudgetLineInput } from '@/lib/planningEngine';
 import { DEFAULT_DATA_DATE } from '@/lib/projectControlsConstants';
 
 /**
@@ -99,7 +99,7 @@ export function generateSCurveData(
   baselineActivities: BaselineActivity[],
   progressUpdates: ProgressUpdate[],
   costTransactions: CostTransaction[],
-  evm: EvmMetrics & { dataDate?: string },
+  evm: ComprehensiveProjectEvm,
   projectStartDate?: string | null,
   projectEndDate?: string | null,
   customDataDate?: string | null,

@@ -1,6 +1,6 @@
-// `EvmMetrics` and `BudgetLine` are no longer imported: Wave 2 removed the two functions that
-// used them (`calculateEvmMetrics`, `calculateQuantityBasedEvm`). The canonical engine types its
-// budget input as `EvmBudgetLineInput` and returns `ComprehensiveProjectEvm`.
+// The legacy narrow metric contract is retired (Phase C): Wave 2 had already removed the two
+// functions that used it (`calculateEvmMetrics`, `calculateQuantityBasedEvm`). The canonical
+// engine types its budget input as `EvmBudgetLineInput` and returns `ComprehensiveProjectEvm`.
 import type {
   ParsedBoqRow,
   Activity,
@@ -706,20 +706,6 @@ export function calculateActivityCompletionAverage(
   return totalWeight > 0
     ? weightedValue / totalWeight / 100
     : activities.reduce((sum, activity) => sum + Number(activity.percent_complete || 0), 0) / activities.length / 100;
-}
-
-export function forecastFinishDate(
-  plannedFinish: string | null,
-  spi: number,
-  today = new Date(),
-): string | null {
-  if (!plannedFinish) return null;
-  if (spi <= 0) return null;
-  const planned = new Date(`${plannedFinish}T00:00:00Z`);
-  const remainingDays = Math.max(0, Math.ceil((planned.getTime() - today.getTime()) / (1000 * 60 * 60 * 24)));
-  const forecast = new Date(today);
-  forecast.setUTCDate(forecast.getUTCDate() + Math.ceil(remainingDays / spi));
-  return forecast.toISOString().split('T')[0];
 }
 
 export interface ForecastScenarios {

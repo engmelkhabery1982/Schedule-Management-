@@ -1,5 +1,5 @@
-import type { Activity, BoqItem, CostTransaction, EvmMetrics, ProgressUpdate, Project } from '@/types';
-import { calculateProjectEvmAtDataDate, type EvmBudgetLineInput } from '@/lib/planningEngine';
+import type { Activity, BoqItem, CostTransaction, ProgressUpdate, Project } from '@/types';
+import { calculateProjectEvmAtDataDate, type ComprehensiveProjectEvm, type EvmBudgetLineInput } from '@/lib/planningEngine';
 import { generateSCurveData, type SCurveData } from '@/lib/sCurveEngine';
 import { DEFAULT_DATA_DATE } from '@/lib/projectControlsConstants';
 
@@ -61,7 +61,7 @@ export interface EarnedScheduleSources {
   project: Project | null;
   activities: Activity[];
   /** Canonical EVM at the governed Data Date. Preferred: computed once by the caller. */
-  evm?: EvmMetrics & { dataDate?: string };
+  evm?: ComprehensiveProjectEvm;
   /** Canonical S-Curve. Preferred: the same object rendered by the S-Curve chart. */
   sCurve?: SCurveData;
   /** Source data used only when `evm` / `sCurve` are not supplied (canonical EVM, called once). */
