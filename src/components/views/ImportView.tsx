@@ -1,8 +1,9 @@
-import { useState, useRef } from 'react';
+import { useState, useRef, useMemo } from 'react';
 import { supabase } from '@/lib/supabase';
 import { parseBoqFile, categorizeBoqItem } from '@/lib/boqParser';
 import { generateSchedule } from '@/lib/scheduleGenerator';
 import { parseXerContent, type ParsedXerResult } from '@/lib/xerImporter';
+import { buildXerImportPlan, persistXerImportPlan, type ReconReport, type XerImportPlan } from '@/lib/xerImportService';
 import type { ParsedBoqRow, Project } from '@/types';
 import {
   Upload,
@@ -41,9 +42,39 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
   // XER state
   const [xerFile, setXerFile] = useState<File | null>(null);
   const [parsedXer, setParsedXer] = useState<ParsedXerResult | null>(null);
+  const [xerDataDate, setXerDataDate] = useState('');
+  const [xerCurrency, setXerCurrency] = useState('SAR');
+  const [xerBaselineOptIn, setXerBaselineOptIn] = useState(false);
+  const [finalRecon, setFinalRecon] = useState<ReconReport | null>(null);
+  const [finalPlan, setFinalPlan] = useState<XerImportPlan | null>(null);
 
   const [error, setError] = useState('');
   const [parseProgress, setParseProgress] = useState('');
+
+  function xerOptions() {
+    return {
+      projectName: projectInfo.name || parsedXer?.project?.shortName || '',
+      client: projectInfo.client || null,
+      location: projectInfo.location || null,
+      contractValue: parseFloat(projectInfo.contract_value) || null,
+      currency: xerCurrency || 'SAR',
+      startDate: parsedXer?.project?.planStart || projectInfo.start_date || null,
+      endDate: parsedXer?.project?.planEnd || null,
+      dataDate: xerDataDate || parsedXer?.project?.dataDate || null,
+      description: projectInfo.description || 'مستورد من ملف Primavera P6 (.xer)',
+      createInitialBaseline: xerBaselineOptIn,
+    };
+  }
+
+  const xerPlanPreview: { plan: XerImportPlan } | { planError: string } | null = useMemo(() => {
+    if (!parsedXer) return null;
+    try {
+      return { plan: buildXerImportPlan(parsedXer, xerOptions()) };
+    } catch (err) {
+      return { planError: (err as Error).message || 'تعذر بناء خطة الاستيراد' };
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [parsedXer, projectInfo.name, projectInfo.client, projectInfo.location, projectInfo.contract_value, projectInfo.description, projectInfo.start_date, xerDataDate, xerCurrency, xerBaselineOptIn]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const xerFileInputRef = useRef<HTMLInputElement>(null);
 
@@ -78,19 +109,24 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
       setParseProgress('جاري قراءة وتحليل ملف Primavera XER...');
       const text = await file.text();
       const result = parseXerContent(text);
-      if (result.activities.length === 0) {
-        setError('لم يتم العثور على أنشطة في ملف XER. تأكد من صلاحية الملف.');
+      if (!result.project || result.activities.length === 0) {
+        setError('لم يتم العثور على مشروع/أنشطة في ملف XER. تأكد من صلاحية الملف.');
         return;
       }
       setParsedXer(result);
-      if (result.projectName && !projectInfo.name) {
+      setFinalRecon(null);
+      setFinalPlan(null);
+      setXerBaselineOptIn(false);
+      setXerDataDate(result.project.dataDate || '');
+      setXerCurrency(result.header.currency || 'SAR');
+      if (result.project.shortName && !projectInfo.name) {
         setProjectInfo((prev) => ({
           ...prev,
-          name: result.projectName,
-          start_date: result.startDate || prev.start_date,
+          name: result.project ? result.project.shortName : prev.name,
+          start_date: result.project?.planStart || prev.start_date,
         }));
       }
-      setParseProgress(`تم استخراج ${result.activities.length} نشاط و ${result.links.length} علاقة و ${result.wbsNodes.length} مستوى WBS`);
+      setParseProgress(`تم استخراج ${result.activities.length} نشاط و ${result.links.length} علاقة و ${result.wbs.length} عقدة WBS و ${result.calendars.length} تقويم`);
     } catch {
       setError('تعذر قراءة ملف XER. تأكد من أنه ملف نصي متوافق مع Primavera P6.');
     }
@@ -101,168 +137,39 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
       setError('الرجاء اختيار ملف XER صالح أولاً');
       return;
     }
+    let plan: XerImportPlan;
+    try {
+      plan = buildXerImportPlan(parsedXer, xerOptions());
+    } catch (err) {
+      setError((err as Error).message || 'تعذر بناء خطة الاستيراد');
+      return;
+    }
 
     setStep('analyzing');
     setError('');
+    setParseProgress('جاري حفظ المشروع والجدول الزمني...');
 
+    let result: Awaited<ReturnType<typeof persistXerImportPlan>>;
     try {
-      setParseProgress('جاري إنشاء المشروع في قاعدة البيانات...');
-      const pName = projectInfo.name || parsedXer.projectName || 'مشروع Primavera المستورد';
-      const pStart = projectInfo.start_date || parsedXer.startDate || new Date().toISOString().split('T')[0];
-      const pEnd = parsedXer.endDate || pStart;
-
-      // 1. Create Project
-      const { data: projectData, error: projErr } = await supabase
-        .from('projects')
-        .insert({
-          name: pName,
-          client: projectInfo.client || null,
-          location: projectInfo.location || null,
-          contract_value: parseFloat(projectInfo.contract_value) || 0,
-          currency: 'SAR',
-          start_date: pStart,
-          end_date: pEnd,
-          status: 'active',
-          description: projectInfo.description || 'مستورد من ملف Primavera P6 (.xer)',
-        })
-        .select()
-        .single();
-
-      if (projErr || !projectData) throw new Error('فشل إنشاء المشروع');
-      const project = projectData as Project;
-
-      // 2. Insert WBS
-      setParseProgress('جاري حفظ هيكل تقسيم العمل (WBS)...');
-      const xerWbsToId: Record<string, string> = {};
-
-      for (const w of parsedXer.wbsNodes) {
-        const { data: wbsRes } = await supabase
-          .from('wbs_nodes')
-          .insert({
-            project_id: project.id,
-            code: w.code,
-            name: w.name,
-            level: w.level,
-            sort_order: 1,
-          })
-          .select()
-          .single();
-
-        if (wbsRes) {
-          xerWbsToId[w.xerId] = wbsRes.id;
-        }
-      }
-
-      // 3. Insert Resources
-      setParseProgress('جاري حفظ الموارد...');
-      const xerRsrcToId: Record<string, string> = {};
-      for (const r of parsedXer.resources) {
-        const { data: rRes } = await supabase
-          .from('resources')
-          .insert({
-            project_id: project.id,
-            name: r.name,
-            type: r.type,
-            unit: r.unit,
-            unit_rate: r.unit_rate,
-            availability: 5,
-          })
-          .select()
-          .single();
-        if (rRes) {
-          xerRsrcToId[r.xerId] = rRes.id;
-        }
-      }
-
-      // 4. Insert Activities
-      setParseProgress('جاري حفظ الأنشطة والتواريخ...');
-      const xerTaskToId: Record<string, string> = {};
-      const actInserts = parsedXer.activities.map((a, idx) => ({
-        project_id: project.id,
-        wbs_node_id: a.wbsXerId ? xerWbsToId[a.wbsXerId] || null : null,
-        code: a.code,
-        name: a.name,
-        early_start: a.early_start || pStart,
-        early_finish: a.early_finish || pStart,
-        late_start: a.late_start || a.early_start || pStart,
-        late_finish: a.late_finish || a.early_finish || pStart,
-        duration_days: a.duration_days,
-        planned_quantity: 100,
-        actual_quantity: (a.percent_complete / 100) * 100,
-        unit: 'وحدة',
-        percent_complete: a.percent_complete,
-        is_critical: a.is_critical,
-        is_milestone: a.is_milestone,
-        total_float: a.total_float || 0,
-        free_float: a.free_float || 0,
-        sort_order: idx + 1,
-      }));
-
-      const { data: actData, error: actErr } = await supabase
-        .from('activities')
-        .insert(actInserts)
-        .select();
-
-      if (actErr || !actData) throw new Error('فشل حفظ الأنشطة');
-
-      (actData as any[]).forEach((dbAct, idx) => {
-        const original = parsedXer.activities[idx];
-        if (original) {
-          xerTaskToId[original.xerId] = dbAct.id;
-        }
-      });
-
-      // 5. Insert Relationships / Links
-      setParseProgress('جاري حفظ شبكة العلاقات...');
-      const linkInserts = parsedXer.links
-        .map((l) => ({
-          project_id: project.id,
-          predecessor_id: xerTaskToId[l.predXerId],
-          successor_id: xerTaskToId[l.succXerId],
-          link_type: l.linkType,
-          lag_days: l.lagDays,
-        }))
-        .filter((l) => Boolean(l.predecessor_id && l.successor_id));
-
-      if (linkInserts.length > 0) {
-        await supabase.from('activity_links').insert(linkInserts);
-      }
-
-      // 6. Create Initial Baseline
-      setParseProgress('جاري اعتماد خط الأساس الابتدائي...');
-      const { data: baseRes } = await supabase
-        .from('project_baselines')
-        .insert({
-          project_id: project.id,
-          version: 1,
-          name: 'Primavera Import Baseline',
-          status: 'approved',
-          approved_at: new Date().toISOString(),
-          is_active: true,
-        })
-        .select()
-        .single();
-
-      if (baseRes) {
-        const baselineActivities = (actData as any[]).map((a) => ({
-          baseline_id: baseRes.id,
-          activity_id: a.id,
-          early_start: a.early_start,
-          early_finish: a.early_finish,
-          duration_days: a.duration_days,
-          planned_cost: 10000,
-        }));
-        await supabase.from('baseline_activities').insert(baselineActivities);
-      }
-
-      setStep('done');
-      setTimeout(() => {
-        onProjectCreated(project);
-      }, 1000);
-    } catch (err: any) {
-      setError(err.message || 'حدث خطأ غير متوقع أثناء استيراد ملف XER');
+      result = await persistXerImportPlan(supabase, plan);
+    } catch (err) {
+      setFinalPlan(plan);
+      setFinalRecon(plan.recon);
+      setError(`تعذر الاتصال بقاعدة البيانات: ${(err as Error).message}. لم يُحفظ أي مشروع — أعد المحاولة.`);
       setStep('info');
+      return;
     }
+    setFinalPlan(plan);
+    setFinalRecon(plan.recon);
+    if (!result.ok) {
+      const cleanupNote = result.cleanedUp
+        ? 'تم التراجع عن كل الصفوف الجزئية — لا يوجد مشروع نصف مستورد.'
+        : `تعذر التنظيف الكامل: ${(result.cleanupErrors || []).join('؛ ')}`;
+      setError(`فشل الاستيراد في خطوة (${result.failedStep}): ${result.error}. ${cleanupNote}`);
+      setStep('info');
+      return;
+    }
+    setStep('done');
   }
 
   async function handleImportBoq() {
@@ -441,14 +348,71 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
   }
 
   if (step === 'done') {
+    const loss = finalRecon?.hasLoss;
     return (
-      <div className="flex items-center justify-center min-h-[50vh]">
-        <div className="text-center max-w-md p-8 bg-white rounded-2xl shadow-sm border border-slate-200">
-          <div className="w-20 h-20 bg-emerald-100 rounded-full flex items-center justify-center mx-auto mb-4">
-            <CheckCircle size={40} className="text-emerald-600" />
+      <div className="flex items-start justify-center min-h-[50vh] py-8">
+        <div className="w-full max-w-3xl text-center p-8 bg-white rounded-2xl shadow-sm border border-slate-200">
+          <div className={`w-20 h-20 rounded-full flex items-center justify-center mx-auto mb-4 ${loss ? 'bg-amber-100' : 'bg-emerald-100'}`}>
+            <CheckCircle size={40} className={loss ? 'text-amber-600' : 'text-emerald-600'} />
           </div>
-          <h3 className="text-xl font-bold text-slate-800 mb-2">تم إنشاء المشروع بنجاح!</h3>
-          <p className="text-sm text-slate-500 mb-6">جاري التوجيه إلى لوحة التحكم والجدول الزمني...</p>
+          <h3 className="text-xl font-bold text-slate-800 mb-2">
+            {loss ? 'اكتمل الاستيراد مع ملاحظات موثقة' : 'اكتمل الاستيراد بنجاح'}
+          </h3>
+          <p className="text-sm text-slate-500 mb-4" dir="ltr">{finalRecon?.provenance.baseline}</p>
+          {finalRecon && (
+            <div className="text-right overflow-x-auto border border-slate-200 rounded-lg max-h-72 mb-4">
+              <table className="w-full text-xs">
+                <thead className="bg-slate-50 text-slate-600 sticky top-0">
+                  <tr>
+                    <th className="text-right p-2">البند</th>
+                    <th className="text-right p-2">المصدر</th>
+                    <th className="text-right p-2">المستورد</th>
+                    <th className="text-right p-2">المسقط</th>
+                    <th className="text-right p-2">غير مدعوم</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {finalRecon.sections.map((sec) => (
+                    <tr key={sec.entity} className="hover:bg-slate-50">
+                      <td className="p-2 text-slate-700 font-medium">{sec.entity}</td>
+                      <td className="p-2 font-mono">{sec.source}</td>
+                      <td className="p-2 font-mono text-emerald-700 font-bold">{sec.imported}</td>
+                      <td className={`p-2 font-mono font-bold ${sec.dropped > 0 ? 'text-red-600' : 'text-slate-400'}`}>{sec.dropped}</td>
+                      <td className={`p-2 font-mono font-bold ${sec.unsupported > 0 ? 'text-amber-600' : 'text-slate-400'}`}>{sec.unsupported}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {finalRecon && finalRecon.droppedTotal + finalRecon.unsupportedTotal > 0 && (
+            <div className="text-right max-h-56 overflow-y-auto border border-amber-200 bg-amber-50/50 rounded-lg p-3 mb-4 space-y-1">
+              {finalRecon.droppedItems.map((d, i) => (
+                <p key={`d${i}`} className="text-[11px] text-slate-700">
+                  <span className="font-bold text-red-700">مسقط [{d.entity}]</span> <span className="font-mono">{d.code}</span> — {d.reason}
+                </p>
+              ))}
+              {finalRecon.unsupportedItems.map((u, i) => (
+                <p key={`u${i}`} className="text-[11px] text-slate-700">
+                  <span className="font-bold text-amber-700">غير مدعوم [{u.entity}]</span> <span className="font-mono">{u.code}</span> — {u.reason}
+                </p>
+              ))}
+              {(finalRecon.droppedTotal > finalRecon.droppedItems.length || finalRecon.unsupportedTotal > finalRecon.unsupportedItems.length) && (
+                <p className="text-[11px] text-slate-500">+ بنود إضافية ({finalRecon.droppedTotal + finalRecon.unsupportedTotal} إجمالاً)</p>
+              )}
+            </div>
+          )}
+          <button
+            onClick={() => {
+              if (finalPlan) {
+                onProjectCreated({ id: finalPlan.projectId, created_at: new Date().toISOString(), duration_days: null, ...finalPlan.projectRow } as unknown as Project);
+              }
+            }}
+            className="inline-flex items-center gap-2 bg-blue-600 text-white px-6 py-3 rounded-lg font-semibold hover:bg-blue-700 transition-colors"
+          >
+            الانتقال إلى المشروع
+            <ArrowRight size={18} className="rotate-180" />
+          </button>
         </div>
       </div>
     );
@@ -682,7 +646,7 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
 
           {parsedXer && (
             <div className="mt-4 space-y-3">
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 text-xs">
                 <div className="bg-slate-50 p-3 rounded-lg border border-slate-200">
                   <span className="text-slate-500 block">عدد الأنشطة</span>
                   <span className="font-bold text-slate-800 text-sm">{parsedXer.activities.length}</span>
@@ -692,14 +656,132 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
                   <span className="font-bold text-blue-700 text-sm">{parsedXer.links.length}</span>
                 </div>
                 <div className="bg-slate-50 p-3 rounded-lg border border-slate-200">
-                  <span className="text-slate-500 block">مستويات WBS</span>
-                  <span className="font-bold text-emerald-700 text-sm">{parsedXer.wbsNodes.length}</span>
+                  <span className="text-slate-500 block">عقد WBS</span>
+                  <span className="font-bold text-emerald-700 text-sm">{parsedXer.wbs.length}</span>
                 </div>
                 <div className="bg-slate-50 p-3 rounded-lg border border-slate-200">
-                  <span className="text-slate-500 block">الموارد المستخرجة</span>
-                  <span className="font-bold text-amber-700 text-sm">{parsedXer.resources.length}</span>
+                  <span className="text-slate-500 block">التقويمات</span>
+                  <span className="font-bold text-indigo-700 text-sm">{parsedXer.calendars.length}</span>
+                </div>
+                <div className="bg-slate-50 p-3 rounded-lg border border-slate-200">
+                  <span className="text-slate-500 block">الموارد / التخصيصات</span>
+                  <span className="font-bold text-amber-700 text-sm">{parsedXer.resources.length} / {parsedXer.assignments.length}</span>
+                </div>
+                <div className="bg-slate-50 p-3 rounded-lg border border-slate-200">
+                  <span className="text-slate-500 block">خط الأساس</span>
+                  <span className={`font-bold text-sm ${parsedXer.baseline.status === 'available' ? 'text-emerald-700' : 'text-slate-500'}`}>
+                    {parsedXer.baseline.status === 'available' ? `P6 (${parsedXer.baseline.tasks.length})` : 'No Baseline Imported'}
+                  </span>
                 </div>
               </div>
+
+              {/* XER options: Data Date / currency provenance + explicit baseline opt-in */}
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+                <div>
+                  <label className="block font-medium text-slate-600 mb-1">Data Date {parsedXer.project?.dataDate ? '(من الملف)' : '(غير موجود في الملف)'}</label>
+                  <input
+                    type="date"
+                    value={xerDataDate}
+                    onChange={(e) => setXerDataDate(e.target.value)}
+                    className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
+                  />
+                </div>
+                <div>
+                  <label className="block font-medium text-slate-600 mb-1">العملة {parsedXer.header.currency ? `(من الملف: ${parsedXer.header.currency})` : '(الإعداد الحالي)'}</label>
+                  <input
+                    type="text"
+                    value={xerCurrency}
+                    onChange={(e) => setXerCurrency(e.target.value.toUpperCase().slice(0, 3))}
+                    className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
+                  />
+                </div>
+                <div className="flex items-end pb-1">
+                  {parsedXer.baseline.status === 'available' ? (
+                    <p className="text-emerald-700 font-semibold">سيتم استيراد P6 Baseline من الملف ({parsedXer.baseline.tasks.length} نشاط).</p>
+                  ) : (
+                    <label className="flex items-center gap-2 text-slate-700 font-medium cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={xerBaselineOptIn}
+                        onChange={(e) => setXerBaselineOptIn(e.target.checked)}
+                        className="w-4 h-4 accent-blue-600"
+                      />
+                      إنشاء خط أساس ابتدائي من الخطة المستوردة
+                    </label>
+                  )}
+                </div>
+              </div>
+
+              {/* Reconciliation report */}
+              {xerPlanPreview && 'planError' in xerPlanPreview && (
+                <div className="flex items-center gap-2 p-4 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
+                  <AlertCircle size={20} />
+                  <span>{xerPlanPreview.planError}</span>
+                </div>
+              )}
+              {xerPlanPreview && 'plan' in xerPlanPreview && (
+                <div className="space-y-3">
+                  <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-xs space-y-1">
+                    <p className="text-slate-700"><span className="text-slate-500">Data Date: </span><span className="font-mono font-bold">{xerPlanPreview.plan.recon.provenance.dataDate || '—'}</span> <span className="text-slate-400">({xerPlanPreview.plan.recon.provenance.dataDateSource})</span></p>
+                    <p className="text-slate-700"><span className="text-slate-500">العملة: </span><span className="font-mono font-bold">{xerPlanPreview.plan.recon.provenance.currency}</span> <span className="text-slate-400">({xerPlanPreview.plan.recon.provenance.currencySource})</span></p>
+                    <p className="text-slate-700"><span className="text-slate-500">منطق الحالة: </span><span className="font-mono font-bold">{xerPlanPreview.plan.recon.provenance.statusLogic}</span> <span className="text-slate-400">({xerPlanPreview.plan.recon.provenance.statusLogicSource})</span></p>
+                    <p className="text-slate-700"><span className="text-slate-500">التقويم الافتراضي: </span><span className="font-bold">{xerPlanPreview.plan.recon.provenance.defaultCalendar}</span></p>
+                  </div>
+                  {xerPlanPreview.plan.recon.hasLoss && (
+                    <div className="flex items-center gap-2 p-3 bg-amber-50 border border-amber-300 rounded-lg text-amber-800 text-xs font-semibold">
+                      <AlertCircle size={18} />
+                      <span>تنبيه: توجد بنود مسقطة/غير مدعومة موثقة أدناه — لن يتم الادعاء بنجاح كامل.</span>
+                    </div>
+                  )}
+                  <div className="overflow-x-auto border border-slate-200 rounded-lg">
+                    <table className="w-full text-xs">
+                      <thead className="bg-slate-50 text-slate-600">
+                        <tr>
+                          <th className="text-right p-2">البند</th>
+                          <th className="text-right p-2">المصدر</th>
+                          <th className="text-right p-2">المستورد</th>
+                          <th className="text-right p-2">المسقط</th>
+                          <th className="text-right p-2">غير مدعوم</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {xerPlanPreview.plan.recon.sections.map((sec) => (
+                          <tr key={sec.entity} className="hover:bg-slate-50">
+                            <td className="p-2 text-slate-700 font-medium">
+                              {sec.entity}
+                              {sec.notes.map((n, i) => (
+                                <span key={i} className="block text-[10px] font-normal text-slate-400">{n}</span>
+                              ))}
+                            </td>
+                            <td className="p-2 font-mono">{sec.source}</td>
+                            <td className="p-2 font-mono text-emerald-700 font-bold">{sec.imported}</td>
+                            <td className={`p-2 font-mono font-bold ${sec.dropped > 0 ? 'text-red-600' : 'text-slate-400'}`}>{sec.dropped}</td>
+                            <td className={`p-2 font-mono font-bold ${sec.unsupported > 0 ? 'text-amber-600' : 'text-slate-400'}`}>{sec.unsupported}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  {(xerPlanPreview.plan.recon.droppedTotal > 0 || xerPlanPreview.plan.recon.unsupportedTotal > 0) && (
+                    <div className="max-h-48 overflow-y-auto border border-slate-200 rounded-lg p-3 space-y-1 bg-white">
+                      {xerPlanPreview.plan.recon.droppedItems.map((d, i) => (
+                        <p key={`d${i}`} className="text-[11px] text-slate-700">
+                          <span className="font-bold text-red-700">مسقط [{d.entity}]</span> <span className="font-mono">{d.code}</span> — {d.reason}
+                        </p>
+                      ))}
+                      {xerPlanPreview.plan.recon.unsupportedItems.map((u, i) => (
+                        <p key={`u${i}`} className="text-[11px] text-slate-700">
+                          <span className="font-bold text-amber-700">غير مدعوم [{u.entity}]</span> <span className="font-mono">{u.code}</span> — {u.reason}
+                        </p>
+                      ))}
+                      {(xerPlanPreview.plan.recon.droppedTotal > xerPlanPreview.plan.recon.droppedItems.length ||
+                        xerPlanPreview.plan.recon.unsupportedTotal > xerPlanPreview.plan.recon.unsupportedItems.length) && (
+                        <p className="text-[11px] text-slate-500">+ بنود إضافية ({xerPlanPreview.plan.recon.droppedTotal + xerPlanPreview.plan.recon.unsupportedTotal} إجمالاً)</p>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
 
               <div className="overflow-x-auto border border-slate-200 rounded-lg max-h-60">
                 <table className="w-full text-xs">
@@ -719,11 +801,11 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
                       <tr key={i} className="hover:bg-slate-50">
                         <td className="p-2 font-mono text-slate-500">{a.code}</td>
                         <td className="p-2 text-slate-700 max-w-xs truncate">{a.name}</td>
-                        <td className="p-2">{a.early_start || '-'}</td>
-                        <td className="p-2">{a.early_finish || '-'}</td>
-                        <td className="p-2">{a.duration_days} يوم</td>
-                        <td className="p-2">{a.percent_complete}%</td>
-                        <td className="p-2">{a.is_critical ? <span className="text-red-600 font-bold">نعم</span> : 'لا'}</td>
+                        <td className="p-2">{a.earlyStart || '-'}</td>
+                        <td className="p-2">{a.earlyFinish || '-'}</td>
+                        <td className="p-2">{a.durationDays === null || a.durationDays === undefined ? '-' : `${a.durationDays} يوم`}</td>
+                        <td className="p-2">{a.percentComplete}%</td>
+                        <td className="p-2">{a.isCritical ? <span className="text-red-600 font-bold">نعم</span> : 'لا'}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -731,7 +813,6 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
               </div>
             </div>
           )}
-
           <div className="mt-6 flex justify-end">
             <button
               onClick={handleImportXer}

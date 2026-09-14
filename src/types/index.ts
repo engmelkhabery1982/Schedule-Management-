@@ -125,6 +125,8 @@ export interface Activity {
   units_percent_complete?: number;
   percent_complete_type?: PercentCompleteType;
   duration_type?: DurationType;
+  /** P6 calendar assignment (calendars.id). Null when the source carries none. */
+  calendar_id?: string | null;
   constraint_type?: ActivityConstraintType | null;
   constraint_date?: string | null;
   activity_drag?: number;
@@ -188,8 +190,27 @@ export interface ActivityResource {
   project_id: string;
   planned_quantity: number;
   actual_quantity: number;
+  /** Remaining units (P6 TASKRSRC.remain_qty). Null when the source carries none. */
+  remaining_quantity?: number | null;
   created_at: string;
   resource?: Resource;
+}
+
+/** P6 working calendar imported from XER (reference data; CPM runs on project calendar_type). */
+export interface P6Calendar {
+  id: string;
+  project_id: string;
+  /** CALENDAR.clndr_id from the file (stringified; stable within one import). */
+  p6_clndr_id: string;
+  name: string;
+  clndr_type: string | null;
+  is_default: boolean;
+  hours_per_day: number | null;
+  hours_per_week: number | null;
+  base_p6_clndr_id: string | null;
+  workweek_json: Record<string, unknown> | null;
+  exceptions_json: string[] | null;
+  created_at: string;
 }
 
 export interface ProgressUpdate {
