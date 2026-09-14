@@ -36,6 +36,9 @@ import { generateSCurveData } from '@/lib/sCurveEngine';
 import { analyzeScheduleControl } from '@/lib/scheduleControlEngine';
 import { analyzeCostControl } from '@/lib/costControlEngine';
 import { analyzeIntegratedDecisions } from '@/lib/integratedDecisionEngine';
+// F8: forecast accuracy, trends & confidence — a trust layer quoting F5/F6/F7 (no new math).
+import { analyzeForecastTrust } from '@/lib/forecastTrustEngine';
+import type { ReliabilityClass } from '@/lib/forecastTrustEngine';
 // GAP-010: the FIDIC 20.1 notice generator works on the governed Data Date, not on a literal clock.
 import { calendarDaysBetween, isAfterDataDate, isIsoDate, resolveDataDate } from '@/lib/chronologyGuard';
 import { getLanguage, translations, type Language } from '@/lib/i18n';
@@ -69,6 +72,26 @@ import {
 interface DashboardProps {
   project: Project | null;
   onNavigate: (view: ViewName) => void;
+}
+
+/** F8: shared badge palette for High/Medium/Low confidence levels. */
+function confBadgeClass(level: string): string {
+  return level === 'High' || level === 'reliable'
+    ? 'bg-emerald-100 text-emerald-800'
+    : level === 'Medium' || level === 'usable_with_caution'
+    ? 'bg-amber-100 text-amber-800'
+    : level === 'Low' || level === 'weak'
+    ? 'bg-rose-100 text-rose-800'
+    : 'bg-slate-200 text-slate-600';
+}
+
+/** F8: shared badge palette for trend directions (adverse = rose, favorable = emerald, else slate). */
+function trendBadgeClass(direction: string): string {
+  return ['slipping', 'worsening', 'eroding', 'deteriorating', 'declining'].includes(direction)
+    ? 'bg-rose-100 text-rose-700'
+    : ['recovering', 'improving'].includes(direction)
+    ? 'bg-emerald-100 text-emerald-700'
+    : 'bg-slate-100 text-slate-600';
 }
 
 export default function Dashboard({ project, onNavigate }: DashboardProps) {
@@ -421,8 +444,53 @@ ${noticeForm.contractorName}`;
       statusLogic: project.status_logic || 'retained_logic',
     });
   }, [project, control, costStrip, activities, links, baselineActivities, progressUpdates, snapshots, costSnapshots, governedDataDate]);
+  // F8: forecast trust — accuracy vs outcomes, trend quality, data-quality scores, capped confidence,
+  // stale-data and integrity findings, reliability classes, calibration and accuracy KPIs. It quotes
+  // the F5/F6/F7 reports above and never recomputes their numbers; missing evidence renders as N/A.
+  const trust = useMemo(() => {
+    if (!project || !control || !costStrip) return null;
+    return analyzeForecastTrust({
+      scheduleReport: control,
+      costReport: costStrip,
+      decisionReport: decisions,
+      activities,
+      links,
+      baselines: baselineActivities,
+      progressUpdates,
+      costTransactions,
+      boqItems,
+      allocations: costAllocations,
+      scheduleSnapshots: snapshots,
+      costSnapshots,
+      dataDate: governedDataDate,
+      calendarType: project.calendar_type || '6_days',
+    });
+  }, [project, control, costStrip, decisions, activities, links, baselineActivities, progressUpdates, costTransactions, boqItems, costAllocations, snapshots, costSnapshots, governedDataDate]);
+  const cappedActionByIssue = new Map((trust ? trust.decisionConfidence.actions : []).map((a) => [a.issueId, a]));
   const controlDelay = control ? control.project.totalDelayWd : null;
   const controlSlipped = control ? control.milestones.filter((m) => m.state === 'slipped').length : 0;
+
+  // F8: display vocabulary for directions, reliability classes and quality domains (inline, like
+  // the rest of the dashboard's bilingual labels).
+  const dirAr: Record<string, string> = {
+    slipping: 'انزلاق', recovering: 'تعافٍ', holding: 'ثبات', insufficient: 'غير كافٍ',
+    eroding: 'تآكل', improving: 'تحسّن', stable: 'مستقر', worsening: 'تدهور',
+    deteriorating: 'تدهور', declining: 'انحدار', optimistic: 'متفائل', pessimistic: 'متشائم',
+    neutral: 'محايد', mixed: 'مختلط',
+  };
+  const dirLabel = (d: string): string => (lang === 'ar' ? dirAr[d] || d : d);
+  const relAr: Record<ReliabilityClass, string> = {
+    reliable: 'موثوق', usable_with_caution: 'قابل للاستخدام بحذر', weak: 'ضعيف', not_supportable: 'غير قابل للدعم',
+  };
+  const relLabel = (c: ReliabilityClass): string => (lang === 'ar' ? relAr[c] : c);
+  const domAr: Record<string, string> = {
+    schedule: 'الجدول', progress: 'التقدم', cost: 'التكلفة', baseline: 'خط الأساس', forecast: 'التنبؤ',
+  };
+  // F8: one presentation list over integrity (already severity-sorted by the engine) + stale data.
+  const trustFindings = trust ? [
+    ...trust.integrity.map((x) => ({ severity: x.severity, code: `${x.source}/${x.code}`, message: x.message, evidence: x.evidence })),
+    ...trust.stale.map((s) => ({ severity: s.severity, code: s.code, message: s.message, evidence: s.evidence })),
+  ] : [];
 
   const kpis = [
     {
@@ -914,7 +982,11 @@ ${noticeForm.contractorName}`;
             <div>
               <h4 className="text-xs font-black text-slate-800 mb-2">{lang === 'ar' ? 'أهم القرارات' : 'Top decisions'}</h4>
               <ol className="space-y-2">
-                {decisions.actions.map((a) => (
+                {decisions.actions.map((a) => {
+                  // F8: the effective confidence is the F7 level re-capped by the integrated forecast
+                  // confidence (weakest source). F7 output itself is never modified.
+                  const cap = cappedActionByIssue.get(a.issueId);
+                  return (
                   <li key={a.issueId} className="p-3 bg-slate-50 rounded-xl border border-slate-200 text-xs">
                     <div className="flex items-center gap-2 flex-wrap">
                       <span className="w-5 h-5 rounded-full bg-slate-900 text-amber-400 text-[10px] font-black flex items-center justify-center">{a.rank}</span>
@@ -922,13 +994,27 @@ ${noticeForm.contractorName}`;
                       <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${a.confidence === 'High' ? 'bg-emerald-100 text-emerald-800' : a.confidence === 'Medium' ? 'bg-amber-100 text-amber-800' : 'bg-rose-100 text-rose-800'}`}>
                         {a.confidence}
                       </span>
+                      {cap && cap.effectiveConfidence !== cap.reportedConfidence && (
+                        <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${confBadgeClass(cap.effectiveConfidence)}`} title={cap.cappedBy}>
+                          {lang === 'ar' ? 'فعّالة' : 'effective'} {cap.effectiveConfidence}
+                        </span>
+                      )}
+                      {cap && !cap.strongRecommendationAllowed && (
+                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-slate-200 text-slate-700">
+                          {lang === 'ar' ? 'تحقيق فقط — لا توصية قوية من بيانات منخفضة الثقة' : 'investigate only — no strong recommendation on Low-confidence data'}
+                        </span>
+                      )}
                     </div>
                     <p className="text-slate-600 mt-1 font-mono text-[11px]">{a.evidence.slice(0, 4).join(' · ')}</p>
                     {a.rootCause && <p className="text-slate-600 text-[11px]"><span className="font-bold">Cause:</span> {a.rootCause.category} ({a.rootCause.confidence})</p>}
                     <p className="text-slate-800 mt-0.5"><span className="font-bold">Action:</span> {a.recommendedAction}</p>
                     <p className="text-slate-600 text-[11px]"><span className="font-bold">Benefit:</span> {a.expectedBenefit ? `−${a.expectedBenefit.daysSaved}d${a.expectedBenefit.costDelta !== null ? `, ${a.expectedBenefit.costDelta.toLocaleString()} SAR` : ''}` : a.expectedBenefitNote}</p>
+                    {cap && cap.evidenceGaps.length > 0 && (
+                      <p className="text-amber-700 text-[11px] mt-0.5"><span className="font-bold">{lang === 'ar' ? 'فجوات الأدلة' : 'Evidence gaps'}:</span> {cap.evidenceGaps.join(' · ')}</p>
+                    )}
                   </li>
-                ))}
+                  );
+                })}
               </ol>
             </div>
           )}
@@ -981,6 +1067,175 @@ ${noticeForm.contractorName}`;
               </table>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* F8: Forecast trust — accuracy, trends, data quality, capped confidence (quotes F5/F6/F7). */}
+      {trust && (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-4 space-y-4">
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <h3 className="font-semibold text-slate-800 flex items-center gap-2">
+              <ShieldCheck size={18} className="text-slate-500" />
+              {lang === 'ar' ? 'ثقة التنبؤات ودقتها وجودة البيانات' : 'Forecast Trust, Accuracy & Data Quality'}
+              <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${confBadgeClass(trust.confidence.integrated.level)}`}>
+                {trust.confidence.integrated.level}
+              </span>
+              <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${confBadgeClass(trust.reliability[2].class)}`} title={trust.reliability[2].reasons.join(' · ')}>
+                {relLabel(trust.reliability[2].class)}
+              </span>
+            </h3>
+            <span className="text-[10px] text-slate-400 font-mono" title={trust.confidence.integrated.notes.join(' · ')}>
+              {lang === 'ar' ? 'السقف من أضعف مصدر' : 'capped by weakest source'}: {trust.confidence.integrated.cappedBy}
+            </span>
+          </div>
+
+          {/* Executive trust summary */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-center">
+            <div className="p-2.5 bg-slate-50 rounded-xl border border-slate-200">
+              <span className="text-[11px] text-slate-500 font-bold block">{lang === 'ar' ? 'النهاية المتوقعة' : 'Forecast finish'}</span>
+              <span className="text-sm font-black font-mono text-slate-900">{trust.trust.forecastFinish || 'N/A'}</span>
+              <span className={`inline-block mt-1 px-2 py-0.5 rounded-full text-[10px] font-bold ${confBadgeClass(trust.trust.forecastConfidence)}`} title={trust.reliability[0].reasons.join(' · ')}>
+                {trust.trust.forecastConfidence} · {relLabel(trust.reliability[0].class)}
+              </span>
+            </div>
+            <div className="p-2.5 bg-slate-50 rounded-xl border border-slate-200">
+              <span className="text-[11px] text-slate-500 font-bold block">EAC</span>
+              <span className="text-sm font-black font-mono text-slate-900">{trust.trust.eac !== null ? trust.trust.eac.toLocaleString() : 'N/A'}</span>
+              <span className={`inline-block mt-1 px-2 py-0.5 rounded-full text-[10px] font-bold ${confBadgeClass(trust.trust.costForecastConfidence)}`} title={trust.reliability[1].reasons.join(' · ')}>
+                {trust.trust.costForecastConfidence} · {relLabel(trust.reliability[1].class)}
+              </span>
+            </div>
+            <div className="p-2.5 bg-slate-50 rounded-xl border border-slate-200">
+              <span className="text-[11px] text-slate-500 font-bold block">{lang === 'ar' ? 'جودة البيانات الإجمالية' : 'Overall data quality'}</span>
+              <span className="text-sm font-black font-mono text-slate-900">{trust.trust.overallDataQuality.score}</span>
+              <span className={`inline-block mt-1 px-2 py-0.5 rounded-full text-[10px] font-bold ${confBadgeClass(trust.trust.overallDataQuality.level)}`}>
+                {trust.trust.overallDataQuality.level}
+              </span>
+            </div>
+            <div className="p-2.5 bg-slate-50 rounded-xl border border-slate-200 text-right">
+              <span className="text-[11px] text-slate-500 font-bold block">{lang === 'ar' ? 'أعلى مخاطرة بيانات' : 'Top data risk'}</span>
+              <span className="text-[11px] font-bold text-slate-800 block">{trust.trust.topDataRisk || (lang === 'ar' ? 'لا مخاطرة مرصودة' : 'none detected')}</span>
+            </div>
+          </div>
+          <p className="text-[11px] text-slate-500 font-mono">
+            {lang === 'ar' ? 'أدق مؤشر' : 'Most reliable KPI'}: {trust.trust.mostReliableKpi ? `${trust.trust.mostReliableKpi.key} (${trust.trust.mostReliableKpi.level})` : 'N/A'}
+            {' · '}
+            {lang === 'ar' ? 'أضعف مؤشر' : 'Least reliable KPI'}: {trust.trust.leastReliableKpi ? `${trust.trust.leastReliableKpi.key} (${trust.trust.leastReliableKpi.level})` : 'N/A'}
+            {' · '}
+            {lang === 'ar' ? 'الانحياز' : 'Bias'}: <span title={trust.accuracy.bias.reason}>{dirLabel(trust.accuracy.bias.direction)}</span>
+            {' · '}
+            {lang === 'ar' ? 'المعايرة التاريخية' : 'Calibration'}: <span title={trust.calibration.overall.reason}>{trust.calibration.overall.classification ? dirLabel(trust.calibration.overall.classification) : 'N/A'}</span>
+          </p>
+
+          {/* Accuracy KPIs — each tile is N/A with its stated reason when evidence is insufficient */}
+          <div>
+            <h4 className="text-xs font-black text-slate-800 mb-2">{lang === 'ar' ? 'مؤشرات دقة التنبؤ (تُعرض فقط عند كفاية البيانات)' : 'Accuracy KPIs (published only with sufficient evidence)'}</h4>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-center">
+              {[
+                { label: lang === 'ar' ? 'متوسط خطأ تنبؤ النهاية' : 'MAE finish forecast', k: trust.accuracyKpis.maeFinishForecastWd, fmt: (v: number) => `${v} wd` },
+                { label: lang === 'ar' ? 'نسبة إصابة المعالم' : 'Milestone hit rate', k: trust.accuracyKpis.milestoneHitRatePct, fmt: (v: number) => `${v}%` },
+                { label: lang === 'ar' ? 'خطأ تنبؤ EAC' : 'EAC forecast error', k: trust.accuracyKpis.eacForecastErrorPct, fmt: (v: number) => `${v > 0 ? '+' : ''}${v}%` },
+                { label: lang === 'ar' ? 'انحراف النهاية لكل تحديث' : 'Finish drift / update', k: trust.accuracyKpis.forecastDriftPerUpdateWd, fmt: (v: number) => `${v} wd` },
+              ].map((tile) => (
+                <div key={tile.label} className="p-2 bg-slate-50 rounded-xl border border-slate-200" title={tile.k.reason}>
+                  <span className="text-[10px] text-slate-500 font-bold block">{tile.label}</span>
+                  <span className={`text-sm font-black font-mono ${tile.k.value === null ? 'text-slate-400' : 'text-slate-900'}`}>
+                    {tile.k.value !== null ? tile.fmt(tile.k.value) : 'N/A'}
+                  </span>
+                  <span className="text-[9px] text-slate-400 block font-mono">{tile.k.samples} {lang === 'ar' ? 'عينة' : 'sample(s)'}</span>
+                </div>
+              ))}
+            </div>
+            <p className="text-[11px] text-slate-500 mt-1.5 font-mono" title={[...trust.accuracy.finish.evidence, ...trust.accuracy.etc.evidence].join(' · ')}>
+              {lang === 'ar' ? 'خطأ النهاية مقابل النتيجة' : 'Finish error vs outcome'}: {trust.accuracy.finish.errorWd !== null ? `${trust.accuracy.finish.errorWd > 0 ? '+' : ''}${trust.accuracy.finish.errorWd} wd` : 'N/A'}
+              {' · '}
+              {lang === 'ar' ? 'خطأ ETC' : 'ETC error'}: {trust.accuracy.etc.error !== null ? `${trust.accuracy.etc.error > 0 ? '+' : ''}${trust.accuracy.etc.error.toLocaleString()} SAR` : 'N/A'}
+              {' · '}
+              {lang === 'ar' ? 'خطأ EAC' : 'EAC error'}: {trust.accuracy.eac.error !== null ? `${trust.accuracy.eac.error > 0 ? '+' : ''}${trust.accuracy.eac.error.toLocaleString()} SAR` : 'N/A'}
+            </p>
+          </div>
+
+          {/* Trend quality chips */}
+          <div>
+            <h4 className="text-xs font-black text-slate-800 mb-2">{lang === 'ar' ? 'جودة الاتجاهات عبر اللقطات' : 'Trend quality across snapshots'} <span className="font-normal text-slate-400">({trust.trends.evaluableCount}/{trust.trends.totalCount})</span></h4>
+            <div className="flex flex-wrap gap-2">
+              {[
+                { label: lang === 'ar' ? 'انحراف النهاية' : 'Finish', d: trust.trends.finish.direction, v: trust.trends.finish.totalDriftWd !== null ? `${trust.trends.finish.totalDriftWd > 0 ? '+' : ''}${trust.trends.finish.totalDriftWd} wd` : null, t: trust.trends.finish.reason },
+                { label: lang === 'ar' ? 'السماح العائم' : 'Float', d: trust.trends.float.direction, v: trust.trends.float.meanDeltaTfWd !== null ? `${trust.trends.float.meanDeltaTfWd > 0 ? '+' : ''}${trust.trends.float.meanDeltaTfWd} wd` : null, t: trust.trends.float.reason },
+                { label: 'CPI', d: trust.trends.cpi.direction, v: trust.trends.cpi.delta !== null ? `${trust.trends.cpi.delta > 0 ? '+' : ''}${trust.trends.cpi.delta}` : null, t: trust.trends.cpi.reason },
+                { label: 'SPI', d: trust.trends.spi.direction, v: trust.trends.spi.delta !== null ? `${trust.trends.spi.delta > 0 ? '+' : ''}${trust.trends.spi.delta}` : null, t: trust.trends.spi.reason },
+                { label: lang === 'ar' ? 'انحراف EAC' : 'EAC drift', d: trust.trends.eac.direction, v: trust.trends.eac.latestDriftFromF6 !== null ? `${trust.trends.eac.latestDriftFromF6 > 0 ? '+' : ''}${trust.trends.eac.latestDriftFromF6.toLocaleString()}` : null, t: trust.trends.eac.reason },
+                { label: 'VAC', d: trust.trends.vac.direction, v: trust.trends.vac.change !== null ? `${trust.trends.vac.change > 0 ? '+' : ''}${trust.trends.vac.change.toLocaleString()}` : null, t: trust.trends.vac.reason },
+              ].map((chip) => (
+                <span key={chip.label} className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-bold ${trendBadgeClass(chip.d)}`} title={chip.t}>
+                  {chip.label}: {dirLabel(chip.d)}{chip.v !== null ? <span className="font-mono font-normal">{chip.v}</span> : null}
+                </span>
+              ))}
+            </div>
+          </div>
+
+          {/* Data-quality scores per domain */}
+          <div>
+            <h4 className="text-xs font-black text-slate-800 mb-2">{lang === 'ar' ? 'جودة البيانات حسب المجال' : 'Data quality by domain'}</h4>
+            <div className="overflow-x-auto border border-slate-200 rounded-xl">
+              <table className="w-full text-xs">
+                <thead className="bg-slate-50 text-slate-700 font-bold border-b">
+                  <tr>
+                    <th className="p-2 text-right">{lang === 'ar' ? 'المجال' : 'Domain'}</th>
+                    <th className="p-2 text-center">{lang === 'ar' ? 'الاكتمال' : 'Complete'}</th>
+                    <th className="p-2 text-center">{lang === 'ar' ? 'الحداثة' : 'Fresh'}</th>
+                    <th className="p-2 text-center">{lang === 'ar' ? 'الاتساق' : 'Consistent'}</th>
+                    <th className="p-2 text-center">{lang === 'ar' ? 'التتبع' : 'Traceable'}</th>
+                    <th className="p-2 text-center">{lang === 'ar' ? 'الدرجة' : 'Score'}</th>
+                    <th className="p-2 text-center">{lang === 'ar' ? 'الثقة' : 'Level'}</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {trust.dataQuality.domains.map((d) => (
+                    <tr key={d.key} className="hover:bg-slate-50" title={d.notes.join(' · ')}>
+                      <td className="p-2 font-bold text-slate-900">{lang === 'ar' ? domAr[d.key] || d.key : d.key}</td>
+                      <td className="p-2 text-center font-mono text-slate-600">{d.completeness}</td>
+                      <td className="p-2 text-center font-mono text-slate-600">{d.freshness}</td>
+                      <td className="p-2 text-center font-mono text-slate-600">{d.consistency}</td>
+                      <td className="p-2 text-center font-mono text-slate-600">{d.traceability}</td>
+                      <td className="p-2 text-center font-mono font-black text-slate-900">{d.score}</td>
+                      <td className="p-2 text-center">
+                        <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${confBadgeClass(d.level)}`}>{d.level}</span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {/* Stale-data + integrity findings (evidence-based; capped list) */}
+          {trustFindings.length > 0 && (
+            <div>
+              <h4 className="text-xs font-black text-slate-800 mb-2">
+                {lang === 'ar' ? 'نتائج البيانات (تكامل وقِدم)' : 'Data findings (integrity & staleness)'}
+                <span className="font-normal text-slate-400"> ({trustFindings.length})</span>
+              </h4>
+              <ul className="space-y-1.5">
+                {trustFindings.slice(0, 6).map((x, i) => (
+                  <li key={`${x.code}-${i}`} className={`p-2.5 rounded-xl border text-xs text-slate-700 ${x.severity === 'error' ? 'bg-rose-50/70 border-rose-200' : x.severity === 'warning' ? 'bg-amber-50/60 border-amber-200' : 'bg-slate-50 border-slate-200'}`}>
+                    <span className="font-mono font-bold">{x.code}</span> — {x.message}
+                    <span className="text-slate-500 font-mono text-[11px] block">{x.evidence.slice(0, 3).join(' · ')}</span>
+                  </li>
+                ))}
+                {trustFindings.length > 6 && (
+                  <li className="text-[11px] text-slate-400 font-mono">+{trustFindings.length - 6} {lang === 'ar' ? 'نتيجة إضافية' : 'more finding(s)'}</li>
+                )}
+              </ul>
+            </div>
+          )}
+          {trust.decisionConfidence.blockedStrongCount > 0 && (
+            <p className="text-[11px] text-amber-700 font-bold">
+              {lang === 'ar'
+                ? `${trust.decisionConfidence.blockedStrongCount} من التوصيات محجوبة عن القوة: الثقة الفعّالة منخفضة — تحقيق وجمع أدلة فقط.`
+                : `${trust.decisionConfidence.blockedStrongCount} recommendation(s) blocked from strong wording: effective confidence is Low — investigate and collect evidence only.`}
+            </p>
+          )}
         </div>
       )}
 
