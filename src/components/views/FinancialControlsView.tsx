@@ -1,6 +1,13 @@
 import { useState, useMemo, useEffect } from 'react';
 import { supabase } from '@/lib/supabase';
 import { getLanguage, type Language } from '@/lib/i18n';
+// GAP-037 / GAP-010: one governed Data Date, and one rule for whether a record may count as actual.
+import {
+  calendarDaysBetween,
+  isAfterDataDate,
+  resolveDataDate,
+  sumNumeric,
+} from '@/lib/chronologyGuard';
 import type {
   Project,
   BankGuaranteeItem,
@@ -35,6 +42,50 @@ interface FinancialControlsViewProps {
   project: Project | null;
 }
 
+/**
+ * Visible DEMO / SAMPLE notice (GAP-037).
+ *
+ * None of the five domains on this screen — bank guarantees, materials on site, prolongation and
+ * liquidated damages, price escalation indices, three-way invoice matching — has a table in
+ * `supabase/migrations`, and this view issues no query at all. So each block states plainly that its
+ * rows are samples and that they feed no live project KPI, instead of letting a reader take them for
+ * contractual facts. The missing schema is reported here rather than papered over with new tables.
+ */
+function DemoSourceNotice({
+  lang,
+  dataDate,
+  domainAr,
+  domainEn,
+  detailAr,
+  detailEn,
+}: {
+  lang: Language;
+  dataDate: string;
+  domainAr: string;
+  domainEn: string;
+  detailAr?: string;
+  detailEn?: string;
+}) {
+  return (
+    <div className="p-3.5 rounded-xl border border-amber-300 bg-amber-50 flex items-start gap-2.5">
+      <ShieldAlert size={16} className="text-amber-600 flex-shrink-0 mt-0.5" />
+      <div className="text-[11px] leading-relaxed space-y-0.5">
+        <p className="font-black text-amber-900">
+          {lang === 'ar' ? `بيانات تجريبية (DEMO / SAMPLE) — ${domainAr}` : `DEMO / SAMPLE data — ${domainEn}`}
+        </p>
+        <p className="text-amber-800">
+          {lang === 'ar'
+            ? `لا يوجد جدول في قاعدة البيانات لنطاق «${domainAr}» ضمن ملفات الـ migrations الحالية، وهذه الشاشة لا تقرأ أي جدول. السجلات المعروضة عيّنة ثابتة لأغراض العرض فقط، ولا تدخل في أي مؤشر أو إجمالي مالي حي للمشروع (BAC / EV / AC، المستخلصات المعتمدة، المدفوعات، نسب الإنجاز). تاريخ خط الحالة الحاكم: ${dataDate}.`
+            : `No table exists for "${domainEn}" in the current migrations and this screen reads none. The rows shown are fixed samples for presentation only and contribute to no live project KPI or total (BAC / EV / AC, certified IPCs, payments, earned progress). Governing Data Date: ${dataDate}.`}
+        </p>
+        {(detailAr || detailEn) && (
+          <p className="text-amber-900 font-bold">{lang === 'ar' ? detailAr : detailEn}</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 type TabType = 'bank_guarantees' | 'materials_on_site' | 'prolongation_ld' | 'price_escalation' | 'three_way_matching';
 
 export default function FinancialControlsView({ project }: FinancialControlsViewProps) {
@@ -48,6 +99,11 @@ export default function FinancialControlsView({ project }: FinancialControlsView
     window.addEventListener('app-language-changed', handleLangChange);
     return () => window.removeEventListener('app-language-changed', handleLangChange);
   }, []);
+
+  // Governed Data Date of the active project (GAP-010). Every chronology test on this screen uses
+  // it: a guarantee issued later, a delivery scheduled later, an index published later or an invoice
+  // dated later is forward-looking and never an actual.
+  const dataDate = useMemo(() => resolveDataDate(project), [project]);
 
   // -------------------------------------------------------------
   // 1. Bank Guarantees & Letters of Credit State
@@ -65,7 +121,7 @@ export default function FinancialControlsView({ project }: FinancialControlsView
       currentAmountSar: 277000, // Reduced after deductions in IPCs
       reductionPercentage: 42.8,
       status: 'active',
-      daysUntilExpiry: 233,
+      daysUntilExpiry: 229, // 2026-09-13 -> 2027-04-30 at the governed Data Date (rendered value is derived)
       notes: 'يتم تخفيضه تدريجياً مع كل استقطاع دفعة مقدمة في المستخلصات الشهرية لتخفيض عمولات البنك.',
     },
     {
@@ -80,7 +136,7 @@ export default function FinancialControlsView({ project }: FinancialControlsView
       currentAmountSar: 242500,
       reductionPercentage: 0,
       status: 'active',
-      daysUntilExpiry: 294,
+      daysUntilExpiry: 290, // 2026-09-13 -> 2027-06-30 at the governed Data Date (rendered value is derived)
       notes: 'ضمان حسن التنفيذ ساري حتى الاستلام الابتدائي (Taking-Over Certificate) مع تنبيه تجديد قبل 30 يوم.',
     },
     {
@@ -95,7 +151,7 @@ export default function FinancialControlsView({ project }: FinancialControlsView
       currentAmountSar: 350000,
       reductionPercentage: 0,
       status: 'expiring_soon',
-      daysUntilExpiry: 24,
+      daysUntilExpiry: 93, // 2026-09-13 -> 2026-12-15 at the governed Data Date (rendered value is derived)
       notes: 'اعتماد مستندي غير قابل للإلغاء لاستيراد وحدات التشيلر والمضخات التخصصية.',
     },
   ]);
@@ -349,7 +405,9 @@ export default function FinancialControlsView({ project }: FinancialControlsView
       currentAmountSar: Number(newBgForm.initialAmountSar),
       reductionPercentage: 0,
       status: 'active',
-      daysUntilExpiry: 180,
+      // Derived from the governed Data Date instead of a fixed 180-day placeholder; the register
+      // renders this countdown from the same derivation, so the two can never disagree.
+      daysUntilExpiry: calendarDaysBetween(dataDate, newBgForm.expiryDate) ?? 0,
       notes: newBgForm.notes,
     };
     setGuarantees([...guarantees, newBg]);
@@ -383,6 +441,91 @@ export default function FinancialControlsView({ project }: FinancialControlsView
     setShowAddMosModal(false);
   };
 
+  // ---------------------------------------------------------------------------
+  // Chronology of every block (GAP-010): what already happened, and what is a plan
+  // ---------------------------------------------------------------------------
+
+  /** Bank guarantees: issued on or before the Data Date vs planned issuance; countdown derived. */
+  const guaranteeChronology = useMemo(() => {
+    const rows = guarantees.map((g) => {
+      const issued = !isAfterDataDate(g.issueDate, dataDate);
+      const daysUntilExpiry = calendarDaysBetween(dataDate, g.expiryDate);
+      const displayStatus: 'planned' | 'active' | 'expiring_soon' | 'expired' = !issued
+        ? 'planned'
+        : daysUntilExpiry === null
+          ? 'active'
+          : daysUntilExpiry <= 0
+            ? 'expired'
+            : daysUntilExpiry <= 30
+              ? 'expiring_soon'
+              : 'active';
+      return { ...g, issued, daysUntilExpiryLive: daysUntilExpiry, displayStatus };
+    });
+    const issuedRows = rows.filter((r) => r.issued);
+    const plannedRows = rows.filter((r) => !r.issued);
+    return {
+      rows,
+      issuedCount: issuedRows.length,
+      plannedCount: plannedRows.length,
+      issuedInitialSar: sumNumeric(issuedRows, (r) => r.initialAmountSar),
+      issuedCurrentSar: sumNumeric(issuedRows, (r) => r.currentAmountSar),
+      issuedReductionSar: sumNumeric(issuedRows, (r) => r.initialAmountSar - r.currentAmountSar),
+      plannedInitialSar: sumNumeric(plannedRows, (r) => r.initialAmountSar),
+    };
+  }, [guarantees, dataDate]);
+
+  /** Materials on site: only a delivery dated on or before the Data Date is a received actual. */
+  const mosChronology = useMemo(() => {
+    const rows = mosItems.map((m) => ({ ...m, delivered: !isAfterDataDate(m.deliveryDate, dataDate) }));
+    const delivered = rows.filter((r) => r.delivered);
+    const planned = rows.filter((r) => !r.delivered);
+    return {
+      rows,
+      deliveredCount: delivered.length,
+      plannedCount: planned.length,
+      deliveredValueSar: sumNumeric(delivered, (r) => r.totalDeliveredValueSar),
+      plannedValueSar: sumNumeric(planned, (r) => r.totalDeliveredValueSar),
+      certifiedActualSar: sumNumeric(delivered, (r) => r.certifiedAmountSar),
+      certifiedPlannedSar: sumNumeric(planned, (r) => r.certifiedAmountSar),
+      recoveredActualSar: sumNumeric(delivered, (r) => r.certifiedAmountSar - r.remainingCertifiedBalanceSar),
+    };
+  }, [mosItems, dataDate]);
+
+  /** Price escalation: an index reading dated after the Data Date is a projection, not a measurement. */
+  const escalationChronology = useMemo(() => {
+    const rows = escalationItems.map((i) => ({ ...i, measured: !isAfterDataDate(i.currentIndexDate, dataDate) }));
+    const measured = rows.filter((r) => r.measured);
+    const projected = rows.filter((r) => !r.measured);
+    return {
+      rows,
+      measuredCount: measured.length,
+      projectedCount: projected.length,
+      measuredClaimSar: sumNumeric(measured, (r) => r.escalationAdjustmentSar),
+      projectedClaimSar: sumNumeric(projected, (r) => r.escalationAdjustmentSar),
+    };
+  }, [escalationItems, dataDate]);
+
+  /** Three-way matching: a document dated after the Data Date cannot be an actual receipt or payment. */
+  const invoiceChronology = useMemo(() => {
+    const rows = invoices.map((inv) => {
+      const futureDocuments = [
+        { label: 'PO', date: inv.poDate },
+        { label: 'GRN', date: inv.grnDate },
+        { label: 'Invoice', date: inv.invoiceDate },
+      ].filter((doc) => isAfterDataDate(doc.date, dataDate));
+      return { ...inv, futureDocuments, isFutureDated: futureDocuments.length > 0 };
+    });
+    const actualRows = rows.filter((r) => !r.isFutureDated);
+    const futureRows = rows.filter((r) => r.isFutureDated);
+    return {
+      rows,
+      actualCount: actualRows.length,
+      futureCount: futureRows.length,
+      actualInvoiceSar: sumNumeric(actualRows, (r) => r.invoiceAmountSar),
+      futureInvoiceSar: sumNumeric(futureRows, (r) => r.invoiceAmountSar),
+    };
+  }, [invoices, dataDate]);
+
   return (
     <div className="space-y-6 select-none">
       {/* Header */}
@@ -410,9 +553,23 @@ export default function FinancialControlsView({ project }: FinancialControlsView
           </div>
         </div>
 
-        <div className="flex items-center gap-2 text-xs font-bold text-slate-700 bg-slate-50 px-3 py-1.5 rounded-xl border border-slate-200">
-          <Shield size={15} className="text-emerald-600" />
-          <span>مطابقة فيديك: <strong className="text-emerald-700">100% متوافق نظامياً</strong></span>
+        <div className="flex flex-wrap items-center gap-2 text-[11px] font-bold">
+          <div className="flex items-center gap-2 text-slate-700 bg-slate-50 px-3 py-1.5 rounded-xl border border-slate-200">
+            <Clock size={15} className="text-blue-600" />
+            <span>
+              {lang === 'ar' ? 'تاريخ خط الحالة الحاكم: ' : 'Governing Data Date: '}
+              <strong className="font-mono text-slate-900">{dataDate}</strong>
+            </span>
+          </div>
+          {/* The former "100% compliant" badge asserted a compliance score no record supports. */}
+          <div className="flex items-center gap-2 text-amber-900 bg-amber-50 px-3 py-1.5 rounded-xl border border-amber-300">
+            <ShieldAlert size={15} className="text-amber-600" />
+            <span>
+              {lang === 'ar'
+                ? 'وحدات هذه الشاشة بلا جداول في قاعدة البيانات — السجلات المعروضة عيّنة (DEMO) ولا تدخل في أي مؤشر مالي حي'
+                : 'These modules have no database tables — the rows shown are DEMO samples and feed no live financial KPI'}
+            </span>
+          </div>
         </div>
       </div>
 
@@ -484,27 +641,55 @@ export default function FinancialControlsView({ project }: FinancialControlsView
       {/* -------------------------------------------------------------------------------- */}
       {activeTab === 'bank_guarantees' && (
         <div className="space-y-5">
+          <DemoSourceNotice
+            lang={lang}
+            dataDate={dataDate}
+            domainAr="الضمانات البنكية والاعتمادات المستندية"
+            domainEn="Bank Guarantees & Letters of Credit"
+            detailAr={`الصادر فعلاً حتى تاريخ خط الحالة: ${guaranteeChronology.issuedCount} — والإصدار المخطط بعده: ${guaranteeChronology.plannedCount} (لا يُحتسب ضماناً قائماً).`}
+            detailEn={`Issued by the Data Date: ${guaranteeChronology.issuedCount} — planned issuance after it: ${guaranteeChronology.plannedCount} (not counted as an existing guarantee).`}
+          />
+
           {/* Top KPI Ribbon */}
           <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
             <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
-              <span className="text-[11px] text-slate-400 block mb-1">إجمالي الضمانات البنكية النشطة</span>
-              <div className="text-xl font-black text-slate-900">{guarantees.length} خطابات ضمان</div>
-            </div>
-
-            <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
-              <span className="text-[11px] text-slate-400 block mb-1">القيمة الأصلية للضمانات الصادرة</span>
-              <div className="text-xl font-black text-slate-900 font-mono">
-                {guarantees.reduce((s, g) => s + g.initialAmountSar, 0).toLocaleString()} SAR
+              <span className="text-[11px] text-slate-400 block mb-1">
+                {lang === 'ar' ? 'الضمانات الصادرة فعلياً (حتى تاريخ خط الحالة)' : 'Guarantees actually issued (up to the Data Date)'}
+              </span>
+              <div className="text-xl font-black text-slate-900">
+                {guaranteeChronology.issuedCount} {lang === 'ar' ? 'خطاب ضمان' : 'issued'}
               </div>
+              <span className="text-[10px] text-slate-500 font-semibold">
+                {lang === 'ar'
+                  ? `إصدار مخطط بعد ${dataDate}: ${guaranteeChronology.plannedCount}`
+                  : `Planned issuance after ${dataDate}: ${guaranteeChronology.plannedCount}`}
+              </span>
             </div>
 
             <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
-              <span className="text-[11px] text-slate-400 block mb-1">القيمة الحالية المحجوزة لدى البنوك</span>
+              <span className="text-[11px] text-slate-400 block mb-1">
+                {lang === 'ar' ? 'القيمة الأصلية للضمانات الصادرة فعلياً' : 'Initial value of issued guarantees'}
+              </span>
+              <div className="text-xl font-black text-slate-900 font-mono">
+                {guaranteeChronology.issuedInitialSar.toLocaleString()} SAR
+              </div>
+              <span className="text-[10px] text-slate-500 font-semibold">
+                {lang === 'ar'
+                  ? `مخطط للإصدار لاحقاً: ${guaranteeChronology.plannedInitialSar.toLocaleString()} SAR (خارج القائم)`
+                  : `Planned for later issuance: ${guaranteeChronology.plannedInitialSar.toLocaleString()} SAR (excluded)`}
+              </span>
+            </div>
+
+            <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
+              <span className="text-[11px] text-slate-400 block mb-1">
+                {lang === 'ar' ? 'القيمة الحالية المحجوزة لدى البنوك (ضمانات صادرة)' : 'Current amount held by banks (issued guarantees)'}
+              </span>
               <div className="text-xl font-black text-amber-900 font-mono">
-                {guarantees.reduce((s, g) => s + g.currentAmountSar, 0).toLocaleString()} SAR
+                {guaranteeChronology.issuedCurrentSar.toLocaleString()} SAR
               </div>
               <span className="text-[10px] text-emerald-600 font-bold">
-                وفر تخفيض الضمان: {((guarantees.reduce((s, g) => s + (g.initialAmountSar - g.currentAmountSar), 0))).toLocaleString()} SAR
+                {lang === 'ar' ? 'وفر تخفيض الضمان: ' : 'Guarantee reduction saving: '}
+                {guaranteeChronology.issuedReductionSar.toLocaleString()} SAR
               </span>
             </div>
 
@@ -545,7 +730,7 @@ export default function FinancialControlsView({ project }: FinancialControlsView
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 font-medium">
-                  {guarantees.map((g) => (
+                  {guaranteeChronology.rows.map((g) => (
                     <tr key={g.id} className="hover:bg-slate-50 transition-colors">
                       <td className="p-3">
                         <div className="font-mono font-bold text-slate-900">{g.bondNumber}</div>
@@ -563,6 +748,11 @@ export default function FinancialControlsView({ project }: FinancialControlsView
                       </td>
                       <td className="p-3 text-center font-mono text-slate-600 whitespace-nowrap">
                         {g.issueDate} ← <strong className="text-slate-900">{g.expiryDate}</strong>
+                        {!g.issued && (
+                          <span className="block text-[9.5px] font-bold text-amber-800 bg-amber-50 border border-amber-200 rounded px-1.5 mt-1">
+                            {lang === 'ar' ? 'إصدار مخطط بعد خط الحالة' : 'Planned issuance after the Data Date'}
+                          </span>
+                        )}
                       </td>
                       <td className="p-3 text-right font-mono text-slate-800">{g.initialAmountSar.toLocaleString()} SAR</td>
                       <td className="p-3 text-right font-mono font-black text-amber-900">{g.currentAmountSar.toLocaleString()} SAR</td>
@@ -570,19 +760,36 @@ export default function FinancialControlsView({ project }: FinancialControlsView
                         <span className="font-mono font-bold text-emerald-700">%{g.reductionPercentage}</span>
                       </td>
                       <td className="p-3 text-center font-mono font-bold">
-                        <span className={g.daysUntilExpiry <= 30 ? 'text-rose-700 bg-rose-50 px-2 py-0.5 rounded border border-rose-200' : 'text-slate-700'}>
-                          {g.daysUntilExpiry} يوم
+                        {/* Derived from the governed Data Date, so the countdown cannot go stale. */}
+                        <span className={
+                          g.daysUntilExpiryLive === null
+                            ? 'text-slate-400'
+                            : g.daysUntilExpiryLive <= 30
+                              ? 'text-rose-700 bg-rose-50 px-2 py-0.5 rounded border border-rose-200'
+                              : 'text-slate-700'
+                        }>
+                          {g.daysUntilExpiryLive === null
+                            ? (lang === 'ar' ? 'غير متاح (N/A)' : 'N/A')
+                            : `${g.daysUntilExpiryLive} ${lang === 'ar' ? 'يوم' : 'd'}`}
                         </span>
                       </td>
                       <td className="p-3 text-center">
                         <span className={`px-2.5 py-1 rounded-full text-[10px] font-bold ${
-                          g.status === 'active'
-                            ? 'bg-emerald-100 text-emerald-800'
-                            : g.status === 'expiring_soon'
-                            ? 'bg-amber-100 text-amber-800'
-                            : 'bg-slate-100 text-slate-800'
+                          g.displayStatus === 'planned'
+                            ? 'bg-slate-200 text-slate-700'
+                            : g.displayStatus === 'active'
+                              ? 'bg-emerald-100 text-emerald-800'
+                              : g.displayStatus === 'expiring_soon'
+                                ? 'bg-amber-100 text-amber-800'
+                                : 'bg-rose-100 text-rose-800'
                         }`}>
-                          {g.status === 'active' ? 'ساري ومطابق ✓' : g.status === 'expiring_soon' ? 'قرب الانتهاء ⚠️' : 'تم الإفراج'}
+                          {g.displayStatus === 'planned'
+                            ? (lang === 'ar' ? 'إصدار مخطط (لم يصدر بعد)' : 'Planned — not issued yet')
+                            : g.displayStatus === 'active'
+                              ? (lang === 'ar' ? 'ساري ✓' : 'Active ✓')
+                              : g.displayStatus === 'expiring_soon'
+                                ? (lang === 'ar' ? 'قرب الانتهاء ⚠️' : 'Expiring soon ⚠️')
+                                : (lang === 'ar' ? 'منتهي الصلاحية' : 'Expired')}
                         </span>
                       </td>
                     </tr>
@@ -599,30 +806,55 @@ export default function FinancialControlsView({ project }: FinancialControlsView
       {/* -------------------------------------------------------------------------------- */}
       {activeTab === 'materials_on_site' && (
         <div className="space-y-5">
+          <DemoSourceNotice
+            lang={lang}
+            dataDate={dataDate}
+            domainAr="المواد المشونة بالموقع (MOS)"
+            domainEn="Materials On Site (MOS)"
+            detailAr={`المستلم فعلياً حتى ${dataDate}: ${mosChronology.deliveredCount} بند — وتوريد مخطط بعده: ${mosChronology.plannedCount} بند لا يدخل في قيمة التشوينات أو المستخلص المعتمد.`}
+            detailEn={`Actually delivered by ${dataDate}: ${mosChronology.deliveredCount} item(s) — planned delivery after it: ${mosChronology.plannedCount} item(s), excluded from the on-site and certified totals.`}
+          />
+
           {/* MOS Highlights */}
           <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
             <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
-              <span className="text-[11px] text-slate-400 block mb-1">إجمالي قيمة التشوينات بالموقع</span>
+              <span className="text-[11px] text-slate-400 block mb-1">
+                {lang === 'ar' ? `قيمة التشوينات المستلمة فعلياً (حتى ${dataDate})` : `Materials actually delivered (up to ${dataDate})`}
+              </span>
               <div className="text-xl font-black text-slate-900 font-mono">
-                {mosItems.reduce((s, m) => s + m.totalDeliveredValueSar, 0).toLocaleString()} SAR
+                {mosChronology.deliveredValueSar.toLocaleString()} SAR
               </div>
-              <span className="text-[10px] text-slate-500">مواد مفحوصة ومعتمدة بمحاضر MIR</span>
+              <span className="text-[10px] text-slate-500">
+                {lang === 'ar'
+                  ? `توريد مخطط بعد خط الحالة: ${mosChronology.plannedValueSar.toLocaleString()} SAR (${mosChronology.plannedCount} بند) — غير مستلم`
+                  : `Planned delivery after the Data Date: ${mosChronology.plannedValueSar.toLocaleString()} SAR (${mosChronology.plannedCount} item(s)) — not received`}
+              </span>
             </div>
 
             <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
-              <span className="text-[11px] text-slate-400 block mb-1">المستحق المعتمد بالمستخلصات (75-80%)</span>
+              <span className="text-[11px] text-slate-400 block mb-1">
+                {lang === 'ar' ? 'المعتمد فعلاً بالمستخلصات عن تشوينات مستلمة' : 'Certified in IPCs for delivered materials'}
+              </span>
               <div className="text-xl font-black text-emerald-700 font-mono">
-                {mosItems.reduce((s, m) => s + m.certifiedAmountSar, 0).toLocaleString()} SAR
+                {mosChronology.certifiedActualSar.toLocaleString()} SAR
               </div>
-              <span className="text-[10px] text-emerald-600 font-semibold">دفعة تشوينات مدفوعة من المالك</span>
+              <span className="text-[10px] text-emerald-600 font-semibold">
+                {lang === 'ar'
+                  ? `متوقع عند التوريد المخطط: ${mosChronology.certifiedPlannedSar.toLocaleString()} SAR (ليس مستحقاً بعد)`
+                  : `Expected on planned delivery: ${mosChronology.certifiedPlannedSar.toLocaleString()} SAR (not yet due)`}
+              </span>
             </div>
 
             <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
-              <span className="text-[11px] text-slate-400 block mb-1">المقاصة المستردة بعد التركيب</span>
+              <span className="text-[11px] text-slate-400 block mb-1">
+                {lang === 'ar' ? 'المقاصة المستردة بعد التركيب (مواد مستلمة فعلياً)' : 'Recovered after installation (delivered materials only)'}
+              </span>
               <div className="text-xl font-black text-blue-700 font-mono">
-                {(mosItems.reduce((s, m) => s + (m.certifiedAmountSar - m.remainingCertifiedBalanceSar), 0)).toLocaleString()} SAR
+                {mosChronology.recoveredActualSar.toLocaleString()} SAR
               </div>
-              <span className="text-[10px] text-blue-600 font-semibold">تم دمجها في الأعمال الدائمة</span>
+              <span className="text-[10px] text-blue-600 font-semibold">
+                {lang === 'ar' ? 'مواد دُمجت في الأعمال الدائمة بموجب محاضر فحص' : 'Materials incorporated into the permanent works against inspection records'}
+              </span>
             </div>
 
             <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex items-center justify-between">
@@ -668,13 +900,21 @@ export default function FinancialControlsView({ project }: FinancialControlsView
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 font-medium">
-                  {mosItems.map((m) => (
+                  {mosChronology.rows.map((m) => (
                     <tr key={m.id} className="hover:bg-slate-50 transition-colors">
                       <td className="p-3">
                         <span className="font-mono font-bold text-slate-900 block">{m.code}</span>
                         <span className="text-slate-600 max-w-xs block truncate">{m.description}</span>
                       </td>
-                      <td className="p-3 text-center font-mono font-bold text-blue-700">{m.inspectionReportNo}</td>
+                      <td className="p-3 text-center font-mono font-bold text-blue-700">
+                        {m.inspectionReportNo}
+                        <span className="block text-[9.5px] text-slate-400">{m.deliveryDate}</span>
+                        {!m.delivered && (
+                          <span className="block text-[9.5px] font-bold text-amber-800 bg-amber-50 border border-amber-200 rounded px-1.5 mt-1">
+                            {lang === 'ar' ? 'توريد مخطط — لم يُستلم' : 'Planned delivery — not received'}
+                          </span>
+                        )}
+                      </td>
                       <td className="p-3 text-center font-mono font-bold text-slate-900">{m.deliveredQuantity} {m.unit}</td>
                       <td className="p-3 text-right font-mono text-slate-700">{m.unitRateSar.toLocaleString()} SAR</td>
                       <td className="p-3 text-right font-mono text-slate-900">{m.totalDeliveredValueSar.toLocaleString()} SAR</td>
@@ -688,9 +928,17 @@ export default function FinancialControlsView({ project }: FinancialControlsView
                       </td>
                       <td className="p-3 text-center">
                         <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
-                          m.status === 'stored_on_site' ? 'bg-amber-100 text-amber-800' : 'bg-blue-100 text-blue-800'
+                          !m.delivered
+                            ? 'bg-slate-200 text-slate-700'
+                            : m.status === 'stored_on_site'
+                              ? 'bg-amber-100 text-amber-800'
+                              : 'bg-blue-100 text-blue-800'
                         }`}>
-                          {m.status === 'stored_on_site' ? 'مشون بالكامل' : 'مركب جزئياً ومقاص'}
+                          {!m.delivered
+                            ? (lang === 'ar' ? 'مخطط بعد خط الحالة (ليس تشويناً قائماً)' : 'Planned after the Data Date (not on site)')
+                            : m.status === 'stored_on_site'
+                              ? (lang === 'ar' ? 'مشون بالكامل' : 'Stored on site')
+                              : (lang === 'ar' ? 'مركب جزئياً ومقاص' : 'Partially installed')}
                         </span>
                       </td>
                     </tr>
@@ -707,6 +955,15 @@ export default function FinancialControlsView({ project }: FinancialControlsView
       {/* -------------------------------------------------------------------------------- */}
       {activeTab === 'prolongation_ld' && (
         <div className="space-y-6">
+          <DemoSourceNotice
+            lang={lang}
+            dataDate={dataDate}
+            domainAr="تكاليف الإطالة وغرامات التأخير (Prolongation & LDs)"
+            domainEn="Prolongation cost & Liquidated Damages"
+            detailAr="حاسبة سيناريو بمدخلات تجريبية قابلة للتعديل: أيام التمديد المعتمدة تعاقدياً لا يوجد لها جدول في قاعدة البيانات (لا delay_claims ضمن الـ migrations)، لذلك لا يُعرض رقم معتمد — النتيجة أدناه تقدير what-if وليست مطالبة مستحقة."
+            detailEn="Scenario calculator with editable demo inputs: contractually approved EOT days have no table in the database (no delay_claims migration), so no approved figure is shown — the result below is a what-if estimate, not a due claim."
+          />
+
           {/* Prolongation vs LDs Comparison Result Card */}
           <div className="bg-gradient-to-br from-slate-900 to-indigo-950 text-white p-6 rounded-2xl shadow-sm border border-slate-700 space-y-4">
             <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-700 pb-4">
@@ -714,13 +971,18 @@ export default function FinancialControlsView({ project }: FinancialControlsView
                 <span className="text-[11px] font-mono font-bold text-amber-400 bg-slate-800 px-2.5 py-1 rounded-md border border-amber-500/30">
                   Delay & Prolongation Quantum Analysis (SCL / FIDIC)
                 </span>
+                <span className="text-[10px] font-bold text-slate-300 bg-slate-800/70 px-2 py-0.5 rounded-md border border-slate-600 ml-1">
+                  {lang === 'ar' ? 'سيناريو تقديري (DEMO inputs) — ليس مطالبة معتمدة' : 'Illustrative scenario (DEMO inputs) — not an approved claim'}
+                </span>
                 <h3 className="text-lg font-black text-white mt-1.5">
                   حاسبة التكاليف غير المباشرة للإطالة وغرامات التأخير التعاقدية (Prolongation & LDs)
                 </h3>
               </div>
 
               <div className="text-left">
-                <span className="text-[11px] text-slate-400 block font-semibold">صافي الأثر المالي للتأخير:</span>
+                <span className="text-[11px] text-slate-400 block font-semibold">
+                  {lang === 'ar' ? 'صافي الأثر المالي لهذا السيناريو (تقديري):' : 'Net financial impact of this scenario (estimate):'}
+                </span>
                 <span className={`text-xl font-black font-mono ${prolongationCalculation.netDelayFinancialImpactSar >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                   {prolongationCalculation.netDelayFinancialImpactSar >= 0 ? `+${prolongationCalculation.netDelayFinancialImpactSar.toLocaleString()}` : prolongationCalculation.netDelayFinancialImpactSar.toLocaleString()} SAR
                 </span>
@@ -741,7 +1003,11 @@ export default function FinancialControlsView({ project }: FinancialControlsView
                 <div className="text-xl font-black text-emerald-400 font-mono">
                   +{prolongationCalculation.totalProlongationCostClaimSar.toLocaleString()} SAR
                 </div>
-                <p className="text-[11px] text-slate-300">مستحق للمقاول عن ({eotCompensableDays}) يوم تمديد معتمد EOT.</p>
+                <p className="text-[11px] text-slate-300">
+                  {lang === 'ar'
+                    ? `محسوب على ({eotCompensableDays}) يوم تمديد مُدخل يدوياً في هذا السيناريو — لا يوجد مصدر بيانات لأيام EOT معتمدة تعاقدياً (N/A).`
+                    : `Computed on (${eotCompensableDays}) manually entered EOT day(s) for this scenario — there is no data source for contractually approved EOT days (N/A).`}
+                </p>
               </div>
 
               <div className="bg-slate-800/80 p-4 rounded-xl border border-slate-700 space-y-1">
@@ -857,6 +1123,15 @@ export default function FinancialControlsView({ project }: FinancialControlsView
       {/* -------------------------------------------------------------------------------- */}
       {activeTab === 'price_escalation' && (
         <div className="space-y-6">
+          <DemoSourceNotice
+            lang={lang}
+            dataDate={dataDate}
+            domainAr="تعديل الأسعار والأرقام القياسية (FIDIC 13.8)"
+            domainEn="Price escalation indices (FIDIC Clause 13.8)"
+            detailAr={`قراءة الرقم القياسي بتاريخ لاحق لتاريخ خط الحالة ${dataDate} هي قراءة متوقعة وليست قياساً صادراً: ${escalationChronology.projectedCount} من ${escalationChronology.rows.length} صفوف أدناه مبنية على أرقام مستقبلية، ومبالغها لا تُحتسب مستحقة.`}
+            detailEn={`An index reading dated after the Data Date ${dataDate} is projected, not published: ${escalationChronology.projectedCount} of ${escalationChronology.rows.length} rows below rest on future readings, and their amounts are not due.`}
+          />
+
           {/* Escalation Formula Banner */}
           <div className="p-4 bg-gradient-to-r from-amber-50 to-orange-50 border border-amber-200 rounded-xl space-y-2">
             <div className="flex items-center justify-between">
@@ -866,9 +1141,16 @@ export default function FinancialControlsView({ project }: FinancialControlsView
                   محرك احتساب تعديل وفروقات الأسعار وتضخم المواد (FIDIC Clause 13.8 & GaStat Indices)
                 </h3>
               </div>
-              <span className="font-mono text-xs font-black bg-white px-3 py-1 rounded border border-amber-300 text-amber-950">
-                صافي التعويض: +{totalNetEscalationClaimSar.toLocaleString()} SAR
-              </span>
+              <div className="text-left space-y-1">
+                <span className="font-mono text-xs font-black bg-white px-3 py-1 rounded border border-emerald-300 text-emerald-900 block">
+                  {lang === 'ar' ? 'مبني على أرقام قياسية صادرة حتى خط الحالة: ' : 'Based on indices published by the Data Date: '}
+                  +{escalationChronology.measuredClaimSar.toLocaleString()} SAR
+                </span>
+                <span className="font-mono text-[11px] font-bold bg-white px-3 py-1 rounded border border-amber-300 text-amber-900 block">
+                  {lang === 'ar' ? 'متوقع بعد خط الحالة (غير مستحق): ' : 'Projected after the Data Date (not due): '}
+                  +{escalationChronology.projectedClaimSar.toLocaleString()} SAR
+                </span>
+              </div>
             </div>
             <p className="text-xs text-slate-600 leading-relaxed font-mono">
               Pn = P0 × [ a + b(Ln/L0) + c(Mn/M0) + d(En/E0) ] · تعويض مباشر للمقاول لتغطية الارتفاعات السعرية للحديد والخرسانة والمحروقات.
@@ -897,27 +1179,60 @@ export default function FinancialControlsView({ project }: FinancialControlsView
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 font-medium">
-                  {escalationItems.map((item) => (
+                  {escalationChronology.rows.map((item) => (
                     <tr key={item.id} className="hover:bg-slate-50 transition-colors">
                       <td className="p-3 font-bold text-slate-900">{item.nameAr}</td>
                       <td className="p-3 text-center font-mono font-bold">{item.weightCoefficient}</td>
                       <td className="p-3 text-center font-mono text-slate-600">{item.baselineIndexValue.toFixed(1)}</td>
-                      <td className="p-3 text-center font-mono font-black text-amber-900">{item.currentIndexValue.toFixed(1)}</td>
+                      <td className="p-3 text-center font-mono font-black text-amber-900">
+                        {item.currentIndexValue.toFixed(1)}
+                        <span className="block text-[9.5px] text-slate-400 font-semibold">{item.currentIndexDate}</span>
+                        {!item.measured && (
+                          <span className="block text-[9.5px] font-bold text-amber-800 bg-amber-50 border border-amber-200 rounded px-1.5 mt-1">
+                            {lang === 'ar' ? 'قراءة متوقعة بعد خط الحالة' : 'Projected reading after the Data Date'}
+                          </span>
+                        )}
+                      </td>
                       <td className="p-3 text-center font-mono font-bold text-rose-700">
                         +{(item.escalationRatio * 100).toFixed(1)}%
                       </td>
                       <td className="p-3 text-center font-mono font-bold text-slate-900">{item.quantityConsumed.toLocaleString()} {item.unit}</td>
                       <td className="p-3 text-right font-mono text-slate-600">{item.baselineUnitRateSar.toLocaleString()} SAR</td>
-                      <td className="p-3 text-right font-mono font-black text-emerald-700 text-sm">
-                        +{item.escalationAdjustmentSar.toLocaleString()} SAR
+                      <td className="p-3 text-right font-mono font-black text-sm">
+                        <span className={item.measured ? 'text-emerald-700' : 'text-slate-400'}>
+                          +{item.escalationAdjustmentSar.toLocaleString()} SAR
+                        </span>
+                        {!item.measured && (
+                          <span className="block text-[9.5px] text-amber-800 font-bold">
+                            {lang === 'ar' ? 'غير مستحق — رقم قياسي مستقبلي' : 'Not due — future index'}
+                          </span>
+                        )}
                       </td>
                     </tr>
                   ))}
                 </tbody>
                 <tfoot className="bg-slate-50 font-black text-slate-900 border-t">
                   <tr>
-                    <td colSpan={7} className="p-3 text-left">إجمالي مبالغ فروقات الأسعار المستحقة للمقاول بالمستخلص القادم:</td>
-                    <td className="p-3 text-right font-mono text-emerald-800 text-sm">+{totalNetEscalationClaimSar.toLocaleString()} SAR</td>
+                    <td colSpan={7} className="p-3 text-left">
+                      {lang === 'ar'
+                        ? `فروقات الأسعار المدعومة بأرقام قياسية صادرة حتى ${dataDate} (عيّنة DEMO):`
+                        : `Escalation supported by indices published up to ${dataDate} (DEMO sample):`}
+                    </td>
+                    <td className="p-3 text-right font-mono text-emerald-800 text-sm">+{escalationChronology.measuredClaimSar.toLocaleString()} SAR</td>
+                  </tr>
+                  <tr>
+                    <td colSpan={7} className="p-3 text-left text-slate-500">
+                      {lang === 'ar'
+                        ? `مبنية على أرقام قياسية متوقعة بعد ${dataDate} — تُعرض للتقدير ولا تدخل في أي مستحق:`
+                        : `Based on index readings projected after ${dataDate} — shown for estimation only, excluded from any amount due:`}
+                    </td>
+                    <td className="p-3 text-right font-mono text-slate-500 text-sm">+{escalationChronology.projectedClaimSar.toLocaleString()} SAR</td>
+                  </tr>
+                  <tr>
+                    <td colSpan={7} className="p-3 text-left text-slate-400 text-[11px]">
+                      {lang === 'ar' ? 'مجموع صفقات العيّنة (لا يمثل مستحقاً تعاقدياً):' : 'Sum of the sample rows (not a contractual entitlement):'}
+                    </td>
+                    <td className="p-3 text-right font-mono text-slate-400 text-[11px]">+{totalNetEscalationClaimSar.toLocaleString()} SAR</td>
                   </tr>
                 </tfoot>
               </table>
@@ -931,6 +1246,40 @@ export default function FinancialControlsView({ project }: FinancialControlsView
       {/* -------------------------------------------------------------------------------- */}
       {activeTab === 'three_way_matching' && (
         <div className="space-y-6">
+          <DemoSourceNotice
+            lang={lang}
+            dataDate={dataDate}
+            domainAr="المطابقة الثلاثية للفواتير (PO / GRN / Invoice)"
+            domainEn="Three-way invoice matching (PO / GRN / Invoice)"
+            detailAr={`لا توجد جداول لأوامر الشراء أو أذون الاستلام أو فواتير الموردين (العمود المتاح هو cost_transactions.invoice_number فقط). ${invoiceChronology.futureCount} من ${invoiceChronology.rows.length} مستندات أدناه بتاريخ لاحق لتاريخ خط الحالة ${dataDate}، فهي مستندات مخططة وليست صرفاً فعلياً.`}
+            detailEn={`There are no tables for purchase orders, goods receipts or vendor invoices (only cost_transactions.invoice_number exists). ${invoiceChronology.futureCount} of ${invoiceChronology.rows.length} documents below are dated after the Data Date ${dataDate}, so they are planned documents, not actual payments.`}
+          />
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-[11px]">
+            <div className="p-3 bg-white rounded-xl border border-slate-200">
+              <span className="text-slate-400 block">
+                {lang === 'ar' ? `مستندات مكتملة بتاريخ لا يتجاوز ${dataDate}` : `Documents dated on or before ${dataDate}`}
+              </span>
+              <span className="font-mono font-black text-slate-900 text-base">{invoiceChronology.actualCount}</span>
+              <span className="text-slate-500 font-mono block">{invoiceChronology.actualInvoiceSar.toLocaleString()} SAR</span>
+            </div>
+            <div className="p-3 bg-white rounded-xl border border-amber-200">
+              <span className="text-slate-400 block">
+                {lang === 'ar' ? 'مستندات بتاريخ لاحق (مخططة / متوقعة)' : 'Documents dated later (planned / forecast)'}
+              </span>
+              <span className="font-mono font-black text-amber-800 text-base">{invoiceChronology.futureCount}</span>
+              <span className="text-amber-700 font-mono block">{invoiceChronology.futureInvoiceSar.toLocaleString()} SAR</span>
+            </div>
+            <div className="p-3 bg-white rounded-xl border border-slate-200">
+              <span className="text-slate-400 block">
+                {lang === 'ar' ? 'الأثر على التكلفة الفعلية للمشروع' : 'Effect on the project actual cost'}
+              </span>
+              <span className="font-black text-slate-700">
+                {lang === 'ar' ? 'صفر — لا يُرحّل أي مبلغ من هذه العيّنة إلى AC' : 'None — no sample amount is posted to AC'}
+              </span>
+            </div>
+          </div>
+
           <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden p-5 space-y-4">
             <div className="flex flex-wrap items-center justify-between gap-3 border-b pb-3">
               <div>
@@ -960,19 +1309,30 @@ export default function FinancialControlsView({ project }: FinancialControlsView
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 font-medium">
-                  {invoices.map((inv) => (
+                  {invoiceChronology.rows.map((inv) => (
                     <tr key={inv.id} className="hover:bg-slate-50 transition-colors">
                       <td className="p-3">
                         <span className="font-mono font-bold text-slate-900 block">{inv.poNumber}</span>
                         <span className="text-[10px] text-slate-400">{inv.poDate}</span>
+                        {inv.futureDocuments.some((doc) => doc.label === 'PO') && (
+                          <span className="block text-[9.5px] font-bold text-amber-800 bg-amber-50 border border-amber-200 rounded px-1.5 mt-1">
+                            {lang === 'ar' ? 'أمر شراء مستقبلي' : 'Future PO'}
+                          </span>
+                        )}
                       </td>
                       <td className="p-3">
                         <span className="font-mono font-bold text-blue-700 block">{inv.grnInspectionNumber}</span>
                         <span className="text-[10px] text-slate-400">{inv.grnDate}</span>
+                        {inv.futureDocuments.some((doc) => doc.label === 'GRN') && (
+                          <span className="block text-[9.5px] font-bold text-amber-800 bg-amber-50 border border-amber-200 rounded px-1.5 mt-1">
+                            {lang === 'ar' ? 'استلام لم يقع بعد' : 'Receipt not yet occurred'}
+                          </span>
+                        )}
                       </td>
                       <td className="p-3">
                         <span className="font-mono font-bold text-slate-800 block">{inv.invoiceNumber}</span>
-                        <span className="text-[11px] text-slate-500 font-semibold">{inv.vendorName}</span>
+                        <span className="text-[10px] text-slate-400">{inv.invoiceDate}</span>
+                        <span className="text-[11px] text-slate-500 font-semibold block">{inv.vendorName}</span>
                       </td>
                       <td className="p-3 text-right font-mono text-slate-700">{inv.poAmountSar.toLocaleString()} SAR</td>
                       <td className="p-3 text-right font-mono text-blue-800 font-bold">{inv.grnInspectedAmountSar.toLocaleString()} SAR</td>
@@ -1001,11 +1361,17 @@ export default function FinancialControlsView({ project }: FinancialControlsView
                       </td>
                       <td className="p-3 text-center">
                         <span className={`px-2 py-0.5 rounded text-[10px] font-black ${
-                          inv.approvalStatus === 'approved_for_payment'
-                            ? 'bg-emerald-600 text-white'
-                            : 'bg-rose-600 text-white'
+                          inv.isFutureDated
+                            ? 'bg-slate-400 text-white'
+                            : inv.approvalStatus === 'approved_for_payment'
+                              ? 'bg-emerald-600 text-white'
+                              : 'bg-rose-600 text-white'
                         }`}>
-                          {inv.approvalStatus === 'approved_for_payment' ? 'معتمد للصرف' : 'موقوف إلكترونياً (Block)'}
+                          {inv.isFutureDated
+                            ? (lang === 'ar' ? 'مستند مستقبلي — ليس صرفاً فعلياً' : 'Future document — not an actual payment')
+                            : inv.approvalStatus === 'approved_for_payment'
+                              ? (lang === 'ar' ? 'معتمد للصرف' : 'Approved for payment')
+                              : (lang === 'ar' ? 'موقوف إلكترونياً (Block)' : 'Blocked electronically')}
                         </span>
                       </td>
                     </tr>

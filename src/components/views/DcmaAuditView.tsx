@@ -2,6 +2,8 @@ import { useState, useEffect, useMemo } from 'react';
 import { supabase } from '@/lib/supabase';
 import type { Project, Activity, ActivityLink, BaselineActivity, ActivityResource, DcmaAuditResult } from '@/types';
 import { runDcma14PointAudit, autoFixDcmaIssues } from '@/lib/scheduleQualityEngine';
+// GAP-010: one governed Data Date for the audit and for the label that reports it.
+import { resolveDataDate } from '@/lib/chronologyGuard';
 import { getLanguage, translations, type Language } from '@/lib/i18n';
 import {
   ShieldCheck,
@@ -60,15 +62,20 @@ export default function DcmaAuditView({ project }: DcmaAuditViewProps) {
     setLoading(false);
   }
 
+  // The audit runs at the governed Data Date (`project.data_date` or DEFAULT_DATA_DATE), the same
+  // resolution the canonical EVM engine uses. The runtime clock is not a project status date, so it
+  // can no longer decide which activities are late, and the displayed Data Date is the very date the
+  // audit used instead of a second, unrelated literal.
+  const dcmaDataDate = resolveDataDate(project);
   const audit: DcmaAuditResult = useMemo(() => {
     return runDcma14PointAudit(
       activities,
       links,
       baselineActivities,
       assignments,
-      project?.data_date || new Date().toISOString().split('T')[0],
+      dcmaDataDate,
     );
-  }, [activities, links, baselineActivities, assignments, project?.data_date]);
+  }, [activities, links, baselineActivities, assignments, dcmaDataDate]);
 
   async function handleAutoFix(fixType: any = 'all') {
     if (!project) return;
@@ -306,7 +313,7 @@ export default function DcmaAuditView({ project }: DcmaAuditViewProps) {
               ? 'تفاصيل المعايير الأربعة عشر ومقترحات التصحيح (DCMA 14-Point & Corrective Proposals)'
               : '14-Point Checklist & Engineering Recommendations'}
           </h3>
-          <span className="text-xs text-slate-500 font-bold">{lang === 'ar' ? 'تاريخ خط الحالة:' : 'Data Date:'} {project?.data_date || '2026-11-15'}</span>
+          <span className="text-xs text-slate-500 font-bold">{lang === 'ar' ? 'تاريخ خط الحالة:' : 'Data Date:'} {dcmaDataDate}</span>
         </div>
 
         <div className="divide-y divide-slate-100">

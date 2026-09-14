@@ -1651,7 +1651,8 @@ export default function PaymentCertificatesView({ project }: PaymentCertificates
                     </td>
                     <td className="p-3 text-center font-mono text-slate-600 whitespace-nowrap">
                       <span className="px-2 py-0.5 rounded bg-slate-100 font-semibold text-[11px]">
-                        {vo.submissionDate || '2026-10-15'}
+                        {/* A missing submission date is shown as missing: no date is invented. */}
+                        {vo.submissionDate || (lang === 'ar' ? 'غير مُقدّم (N/A)' : 'Not submitted (N/A)')}
                       </span>
                     </td>
                     <td className="p-3 text-center font-mono whitespace-nowrap">

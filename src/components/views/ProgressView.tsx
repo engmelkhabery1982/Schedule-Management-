@@ -12,6 +12,15 @@ import type {
   CostTransaction,
 } from '@/types';
 import { calculateEarnedSchedule } from '@/lib/earnedScheduleEngine';
+// GAP-026: physical commodity progress is derived in `src/lib` (one unit per row, evidence-based
+// rates) so this view renders a result instead of owning a second calculation path.
+import {
+  summarizeCommodityProgress,
+  UNSPECIFIED_UNIT_KEY,
+  type CommodityRateVerdict,
+} from '@/lib/commodityProgressEngine';
+// GAP-010: one governed Data Date resolution and one definition of "may this record count as actual".
+import { isAfterDataDate, latestDate, resolveDataDate } from '@/lib/chronologyGuard';
 import {
   calculateActivityCompletionAverage,
   calculateProjectEvmAtDataDate,
@@ -121,6 +130,70 @@ interface CommercialRecordFields {
   retention_deducted?: number | null;
 }
 
+/**
+ * Presentation helpers for the derived commodity cards (GAP-026). They only decide colours, labels
+ * and number formatting — every quantity, rate and verdict comes from `summarizeCommodityProgress`.
+ */
+const COMMODITY_PALETTE = [
+  { dot: 'bg-blue-600', chip: 'bg-blue-100 text-blue-900', box: 'bg-blue-50/80 border-blue-200', title: 'text-blue-950', rate: 'text-blue-900', bar: 'bg-blue-600', pct: 'text-blue-700' },
+  { dot: 'bg-rose-600', chip: 'bg-rose-100 text-rose-900', box: 'bg-rose-50/80 border-rose-200', title: 'text-rose-950', rate: 'text-rose-900', bar: 'bg-rose-600', pct: 'text-rose-700' },
+  { dot: 'bg-amber-600', chip: 'bg-amber-100 text-amber-900', box: 'bg-amber-50/80 border-amber-200', title: 'text-amber-950', rate: 'text-amber-900', bar: 'bg-amber-600', pct: 'text-amber-700' },
+  { dot: 'bg-purple-600', chip: 'bg-purple-100 text-purple-900', box: 'bg-purple-50/80 border-purple-200', title: 'text-purple-950', rate: 'text-purple-900', bar: 'bg-purple-600', pct: 'text-purple-700' },
+  { dot: 'bg-emerald-600', chip: 'bg-emerald-100 text-emerald-900', box: 'bg-emerald-50/80 border-emerald-200', title: 'text-emerald-950', rate: 'text-emerald-900', bar: 'bg-emerald-600', pct: 'text-emerald-700' },
+  { dot: 'bg-cyan-600', chip: 'bg-cyan-100 text-cyan-900', box: 'bg-cyan-50/80 border-cyan-200', title: 'text-cyan-950', rate: 'text-cyan-900', bar: 'bg-cyan-600', pct: 'text-cyan-700' },
+];
+
+const COMMODITY_VERDICTS: Record<CommodityRateVerdict, { labelAr: string; className: string; icon: JSX.Element }> = {
+  complete: {
+    labelAr: 'مكتمل وفق السجلات المعتمدة ✓',
+    className: 'bg-emerald-100 text-emerald-800',
+    icon: <Check size={12} />,
+  },
+  achievable: {
+    labelAr: 'ممكن تحقيقه بالمعدل المقاس ✓',
+    className: 'bg-emerald-100 text-emerald-800',
+    icon: <Check size={12} />,
+  },
+  at_risk: {
+    labelAr: 'المعدل المقاس أقل من المطلوب ⚠️',
+    className: 'bg-amber-100 text-amber-900',
+    icon: <AlertTriangle size={12} />,
+  },
+  window_expired: {
+    labelAr: 'انتهت النافذة الزمنية المخططة ⚠️',
+    className: 'bg-rose-100 text-rose-800',
+    icon: <AlertTriangle size={12} />,
+  },
+  insufficient_data: {
+    labelAr: 'بيانات غير كافية (N/A)',
+    className: 'bg-slate-200 text-slate-700',
+    icon: <HelpCircle size={12} />,
+  },
+};
+
+/** Quantity formatting shared by the commodity cards: null is rendered as N/A, never as zero. */
+function formatQuantity(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) return 'غير متاح (N/A)';
+  return value.toLocaleString('en-US', { maximumFractionDigits: 2 });
+}
+
+const ARABIC_MONTH_NAMES = [
+  'يناير', 'فبراير', 'مارس', 'أبريل', 'مايو', 'يونيو',
+  'يوليو', 'أغسطس', 'سبتمبر', 'أكتوبر', 'نوفمبر', 'ديسمبر',
+];
+
+/**
+ * Default label of a monthly cut-off snapshot, derived from the chosen Data Date. It replaces the
+ * former fixed "November 2026" text, which named a month that no record in the project supported.
+ */
+function buildCutoffRevisionLabel(dateStr: string): string {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return 'Rev 01 - إقفال الموقف التنفيذي';
+  const year = dateStr.slice(0, 4);
+  const monthIndex = Number(dateStr.slice(5, 7)) - 1;
+  const monthName = ARABIC_MONTH_NAMES[monthIndex] || dateStr.slice(5, 7);
+  return `Rev 01 - إقفال الموقف التنفيذي (${monthName} ${year})`;
+}
+
 type TabType =
   | 'daily_entry_sheet'
   | 'single_activity_log'
@@ -195,9 +268,17 @@ export default function ProgressView({ project }: ProgressViewProps) {
   const [statusFilterWir, setStatusFilterWir] = useState<'all' | 'approved' | 'submitted' | 'rejected'>('all');
   const [searchHistory, setSearchHistory] = useState('');
 
-  // Cutoff Wizard States
-  const [cutoffDate, setCutoffDate] = useState('2026-11-30');
-  const [revisionName, setRevisionName] = useState('Rev 01 - تحديث شهر نوفمبر 2026');
+  // Cutoff Wizard States.
+  // Chronology (GAP-010): this wizard writes `projects.data_date`, so it opens ON the governed Data
+  // Date instead of a hardcoded future month, and the snapshot label follows the chosen date.
+  const governedDataDate = useMemo(() => resolveDataDate(project), [project]);
+  const [cutoffDate, setCutoffDate] = useState(governedDataDate);
+  const [revisionNameOverride, setRevisionNameOverride] = useState<string | null>(null);
+  const revisionName = revisionNameOverride ?? buildCutoffRevisionLabel(cutoffDate);
+  useEffect(() => {
+    setCutoffDate(governedDataDate);
+    setRevisionNameOverride(null);
+  }, [governedDataDate]);
   const [outOfSequenceMode, setOutOfSequenceMode] = useState<'retained_logic' | 'progress_override'>('retained_logic');
   const [wizardStep, setWizardStep] = useState<1 | 2 | 3>(1);
   const [cutoffProcessing, setCutoffProcessing] = useState(false);
@@ -434,6 +515,34 @@ export default function ProgressView({ project }: ProgressViewProps) {
       ),
     };
   }, [evm, activities]);
+
+  // Physical commodity progress (GAP-026): one row per unit of measure, derived only from BOQ rows,
+  // activity planned quantities and approved progress updates dated on or before the Data Date. The
+  // former hardcoded concrete / rebar / earthworks / pipes cards are gone — a figure with no
+  // supporting record is N/A here instead of a plausible sample.
+  const commoditySummary = useMemo(
+    () =>
+      summarizeCommodityProgress({
+        project,
+        activities,
+        boqItems,
+        progressUpdates: updates,
+      }),
+    [project, activities, boqItems, updates],
+  );
+
+  // Chronology evidence for the cut-off wizard: the newest approved field record. Closing the month
+  // past it would open a period with no actuals behind it, so the wizard states that explicitly
+  // instead of letting a future date pass silently (GAP-010).
+  const latestApprovedEvidenceDate = useMemo(() => {
+    const approvedUpdateDates = updates
+      .filter((update) => update.status === 'approved')
+      .map((update) => update.update_date);
+    const approvedInspectionDates = inspections
+      .filter((req) => req.status === 'approved')
+      .map((req) => req.inspection_date);
+    return latestDate([...approvedUpdateDates, ...approvedInspectionDates], (date) => date);
+  }, [updates, inspections]);
 
   // Filtered Inspections for Archive & Historical Audit
   const filteredInspections = useMemo(() => {
@@ -2119,219 +2228,187 @@ export default function ProgressView({ project }: ProgressViewProps) {
               <div>
                 <h3 className="text-base font-black text-slate-900 flex items-center gap-2">
                   <TrendingUp className="text-amber-500" size={20} />
-                  <span>منحنيات الإنتاجية المادية والحجمية ومعدل الحرق اليومي المطلوب (Physical Quantity S-Curves & Run-Rate)</span>
+                  <span>الإنتاجية الحجمية ومعدل الإنتاج المطلوب (Physical Quantity Progress &amp; Required Run-Rate)</span>
                 </h3>
-                <p className="text-xs text-slate-500 mt-0.5">
-                  تتبع الإنتاجية الحجمية الملموسة في الموقع (خرسانة م3، حديد طن، حفريات م3، أنابيب م.ط) لحساب معدل الإنتاجية اليومي الإلزامي للاكتمال في الموعد التعاقدي.
+                <p className="text-xs text-slate-500 mt-0.5 leading-relaxed">
+                  كل بطاقة مشتقة من بنود جدول الكميات (boq_items) ومن طلبات الإنجاز المعتمدة (progress_updates)
+                  للأنشطة التي تحمل نفس وحدة القياس، وحتى تاريخ خط الحالة
+                  <strong className="font-mono text-slate-800"> {commoditySummary.dataDate} </strong>
+                  فقط. لا تُعرض أي قيمة نموذجية ثابتة: كل رقم لا يدعمه سجل حقيقي يظهر (N/A) مع سبب ذلك.
                 </p>
               </div>
-            </div>
-
-            {/* 4 Physical Commodities Grid */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-              {/* 1. Structural Concrete C35 */}
-              <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200 space-y-3">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <span className="w-3 h-3 rounded-full bg-blue-600" />
-                    <h4 className="text-sm font-black text-slate-900">الخرسانة المسلحة (Structural Concrete C35)</h4>
-                  </div>
-                  <span className="text-xs font-mono font-bold bg-blue-100 text-blue-900 px-2 py-0.5 rounded">
-                    م3 (Cubic Meters)
+              <div className="flex flex-wrap items-center gap-1.5 text-[10px] font-bold">
+                <span className="px-2 py-1 rounded-lg bg-emerald-50 text-emerald-800 border border-emerald-200 font-mono">
+                  طلبات إنجاز معتمدة: {commoditySummary.totalApprovedUpdates}
+                </span>
+                <span className="px-2 py-1 rounded-lg bg-slate-100 text-slate-700 border border-slate-200 font-mono">
+                  مستبعدة من الفعلي: {commoditySummary.totalExcludedUpdates}
+                </span>
+                {commoditySummary.totalFutureDatedUpdates > 0 && (
+                  <span className="px-2 py-1 rounded-lg bg-amber-50 text-amber-900 border border-amber-200 font-mono">
+                    منها بتاريخ لاحق لخط الحالة: {commoditySummary.totalFutureDatedUpdates}
                   </span>
-                </div>
-
-                <div className="grid grid-cols-3 gap-2 text-center text-xs">
-                  <div className="p-2.5 bg-white rounded-xl border border-slate-200">
-                    <span className="text-[10px] text-slate-400 block">المخطط الكلي:</span>
-                    <span className="font-mono font-black text-slate-900">2,800 م3</span>
-                  </div>
-                  <div className="p-2.5 bg-white rounded-xl border border-slate-200">
-                    <span className="text-[10px] text-slate-400 block">المنفذ التراكمي:</span>
-                    <span className="font-mono font-black text-emerald-700">1,680 م3 (60%)</span>
-                  </div>
-                  <div className="p-2.5 bg-white rounded-xl border border-slate-200">
-                    <span className="text-[10px] text-slate-400 block">المتبقي:</span>
-                    <span className="font-mono font-black text-amber-900">1,120 م3</span>
-                  </div>
-                </div>
-
-                {/* Progress Bar */}
-                <div className="space-y-1">
-                  <div className="flex justify-between text-[11px] font-bold">
-                    <span className="text-slate-500">نسبة الإنجاز الحجمي:</span>
-                    <span className="text-blue-700 font-mono">60.0%</span>
-                  </div>
-                  <div className="w-full h-2.5 bg-slate-200 rounded-full overflow-hidden">
-                    <div className="h-full bg-blue-600 rounded-full" style={{ width: '60%' }} />
-                  </div>
-                </div>
-
-                {/* Required Run-Rate Calculation Box */}
-                <div className="p-3 bg-blue-50/80 border border-blue-200 rounded-xl space-y-1.5 text-xs">
-                  <div className="flex items-center justify-between">
-                    <span className="font-bold text-blue-950">معدل الإنتاج اليومي المطلوب (Required Run-Rate):</span>
-                    <span className="font-mono font-black text-blue-900 text-sm">32.0 م3 / يوم</span>
-                  </div>
-                  <div className="flex items-center justify-between text-[11px] text-blue-800">
-                    <span>معدل الإنتاج الفعلي الحالي: 28.0 م3/يوم</span>
-                    <span className="px-2 py-0.5 rounded bg-emerald-100 text-emerald-800 font-bold">
-                      ممكن تحقيقه بزيادة وردية نصف ساعة ✓
-                    </span>
-                  </div>
-                </div>
-              </div>
-
-              {/* 2. Steel Rebar */}
-              <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200 space-y-3">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <span className="w-3 h-3 rounded-full bg-rose-600" />
-                    <h4 className="text-sm font-black text-slate-900">حديد التسليح عالي المقاومة (High-Yield Rebar)</h4>
-                  </div>
-                  <span className="text-xs font-mono font-bold bg-rose-100 text-rose-900 px-2 py-0.5 rounded">
-                    طن (Metric Tons)
-                  </span>
-                </div>
-
-                <div className="grid grid-cols-3 gap-2 text-center text-xs">
-                  <div className="p-2.5 bg-white rounded-xl border border-slate-200">
-                    <span className="text-[10px] text-slate-400 block">المخطط الكلي:</span>
-                    <span className="font-mono font-black text-slate-900">350 طن</span>
-                  </div>
-                  <div className="p-2.5 bg-white rounded-xl border border-slate-200">
-                    <span className="text-[10px] text-slate-400 block">المنفذ التراكمي:</span>
-                    <span className="font-mono font-black text-emerald-700">210 طن (60%)</span>
-                  </div>
-                  <div className="p-2.5 bg-white rounded-xl border border-slate-200">
-                    <span className="text-[10px] text-slate-400 block">المتبقي:</span>
-                    <span className="font-mono font-black text-amber-900">140 طن</span>
-                  </div>
-                </div>
-
-                {/* Progress Bar */}
-                <div className="space-y-1">
-                  <div className="flex justify-between text-[11px] font-bold">
-                    <span className="text-slate-500">نسبة الإنجاز الحجمي:</span>
-                    <span className="text-rose-700 font-mono">60.0%</span>
-                  </div>
-                  <div className="w-full h-2.5 bg-slate-200 rounded-full overflow-hidden">
-                    <div className="h-full bg-rose-600 rounded-full" style={{ width: '60%' }} />
-                  </div>
-                </div>
-
-                {/* Required Run-Rate Calculation Box */}
-                <div className="p-3 bg-rose-50/80 border border-rose-200 rounded-xl space-y-1.5 text-xs">
-                  <div className="flex items-center justify-between">
-                    <span className="font-bold text-rose-950">معدل الإنتاج اليومي المطلوب (Required Run-Rate):</span>
-                    <span className="font-mono font-black text-rose-900 text-sm">4.0 طن / يوم</span>
-                  </div>
-                  <div className="flex items-center justify-between text-[11px] text-rose-800">
-                    <span>معدل الإنتاج الفعلي الحالي: 3.5 طن/يوم</span>
-                    <span className="px-2 py-0.5 rounded bg-emerald-100 text-emerald-800 font-bold">
-                      ضمن الطاقة الإنتاجية للفرقة ✓
-                    </span>
-                  </div>
-                </div>
-              </div>
-
-              {/* 3. Bulk Earthwork Excavation */}
-              <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200 space-y-3">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <span className="w-3 h-3 rounded-full bg-amber-600" />
-                    <h4 className="text-sm font-black text-slate-900">أعمال الحفريات والإحلال (Bulk Earthworks)</h4>
-                  </div>
-                  <span className="text-xs font-mono font-bold bg-amber-100 text-amber-900 px-2 py-0.5 rounded">
-                    م3 (Cubic Meters)
-                  </span>
-                </div>
-
-                <div className="grid grid-cols-3 gap-2 text-center text-xs">
-                  <div className="p-2.5 bg-white rounded-xl border border-slate-200">
-                    <span className="text-[10px] text-slate-400 block">المخطط الكلي:</span>
-                    <span className="font-mono font-black text-slate-900">4,500 م3</span>
-                  </div>
-                  <div className="p-2.5 bg-white rounded-xl border border-slate-200">
-                    <span className="text-[10px] text-slate-400 block">المنفذ التراكمي:</span>
-                    <span className="font-mono font-black text-emerald-700">4,500 م3 (100%)</span>
-                  </div>
-                  <div className="p-2.5 bg-white rounded-xl border border-slate-200">
-                    <span className="text-[10px] text-slate-400 block">المتبقي:</span>
-                    <span className="font-mono font-black text-emerald-700">0 م3</span>
-                  </div>
-                </div>
-
-                {/* Progress Bar */}
-                <div className="space-y-1">
-                  <div className="flex justify-between text-[11px] font-bold">
-                    <span className="text-slate-500">نسبة الإنجاز الحجمي:</span>
-                    <span className="text-emerald-700 font-mono">100.0%</span>
-                  </div>
-                  <div className="w-full h-2.5 bg-slate-200 rounded-full overflow-hidden">
-                    <div className="h-full bg-emerald-600 rounded-full" style={{ width: '100%' }} />
-                  </div>
-                </div>
-
-                <div className="p-3 bg-emerald-50/80 border border-emerald-200 rounded-xl text-xs text-emerald-900 font-bold flex items-center gap-1.5">
-                  <Check size={14} className="text-emerald-700" />
-                  <span>اكتملت أعمال الحفريات بنجاح ومطابقة لمحاضر الاستلام الموقعي بالكامل.</span>
-                </div>
-              </div>
-
-              {/* 4. Drainage Pipes & MEP Ductwork */}
-              <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200 space-y-3">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <span className="w-3 h-3 rounded-full bg-purple-600" />
-                    <h4 className="text-sm font-black text-slate-900">مسارات الدكت والأنابيب (MEP Piping & Ductwork)</h4>
-                  </div>
-                  <span className="text-xs font-mono font-bold bg-purple-100 text-purple-900 px-2 py-0.5 rounded">
-                    م.ط (Linear Meters)
-                  </span>
-                </div>
-
-                <div className="grid grid-cols-3 gap-2 text-center text-xs">
-                  <div className="p-2.5 bg-white rounded-xl border border-slate-200">
-                    <span className="text-[10px] text-slate-400 block">المخطط الكلي:</span>
-                    <span className="font-mono font-black text-slate-900">1,800 م.ط</span>
-                  </div>
-                  <div className="p-2.5 bg-white rounded-xl border border-slate-200">
-                    <span className="text-[10px] text-slate-400 block">المنفذ التراكمي:</span>
-                    <span className="font-mono font-black text-emerald-700">650 م.ط (36.1%)</span>
-                  </div>
-                  <div className="p-2.5 bg-white rounded-xl border border-slate-200">
-                    <span className="text-[10px] text-slate-400 block">المتبقي:</span>
-                    <span className="font-mono font-black text-amber-900">1,150 م.ط</span>
-                  </div>
-                </div>
-
-                {/* Progress Bar */}
-                <div className="space-y-1">
-                  <div className="flex justify-between text-[11px] font-bold">
-                    <span className="text-slate-500">نسبة الإنجاز الحجمي:</span>
-                    <span className="text-purple-700 font-mono">36.1%</span>
-                  </div>
-                  <div className="w-full h-2.5 bg-slate-200 rounded-full overflow-hidden">
-                    <div className="h-full bg-purple-600 rounded-full" style={{ width: '36.1%' }} />
-                  </div>
-                </div>
-
-                {/* Required Run-Rate Calculation Box */}
-                <div className="p-3 bg-purple-50/80 border border-purple-200 rounded-xl space-y-1.5 text-xs">
-                  <div className="flex items-center justify-between">
-                    <span className="font-bold text-purple-950">معدل الإنتاج اليومي المطلوب (Required Run-Rate):</span>
-                    <span className="font-mono font-black text-purple-900 text-sm">24.5 م.ط / يوم</span>
-                  </div>
-                  <div className="flex items-center justify-between text-[11px] text-purple-800">
-                    <span>معدل الإنتاج الفعلي الحالي: 18.0 م.ط/يوم</span>
-                    <span className="px-2 py-0.5 rounded bg-amber-100 text-amber-900 font-bold">
-                      ⚠️ يوصى بإضافة فنيين لزيادة الإنتاج اليومي
-                    </span>
-                  </div>
-                </div>
+                )}
               </div>
             </div>
+
+            {commoditySummary.groups.length === 0 ? (
+              <div className="p-8 rounded-2xl border border-dashed border-slate-300 bg-slate-50 text-center space-y-2">
+                <Layers className="mx-auto text-slate-400" size={28} />
+                <p className="text-sm font-black text-slate-700">لا توجد وحدات قياس موثقة لعرض الإنتاجية الحجمية</p>
+                <p className="text-xs text-slate-500 max-w-2xl mx-auto leading-relaxed">
+                  يلزم وجود بنود في جدول الكميات أو أنشطة تحمل وحدة قياس (م3، طن، م2، م.ط، نقطة …) مع طلبات إنجاز
+                  معتمدة. لا يتم عرض كميات أو معدلات تقديرية بديلة.
+                </p>
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+                {commoditySummary.groups.map((group, index) => {
+                  const palette = COMMODITY_PALETTE[index % COMMODITY_PALETTE.length];
+                  const unitText = group.unitLabelAr;
+                  const plannedText = group.plannedQuantity === null
+                    ? 'غير موثقة (N/A)'
+                    : `${formatQuantity(group.plannedQuantity)} ${unitText}`;
+                  const executedText = `${formatQuantity(group.executedQuantity)} ${unitText}`;
+                  const remainingText = group.remainingQuantity === null
+                    ? 'غير قابل للحساب (N/A)'
+                    : `${formatQuantity(group.remainingQuantity)} ${unitText}`;
+                  const percentText = group.progressPercent === null
+                    ? 'غير قابل للحساب (N/A)'
+                    : `${group.progressPercent.toFixed(1)}%`;
+                  const barWidth = group.progressPercent === null
+                    ? 0
+                    : Math.min(100, Math.max(0, group.progressPercent));
+                  const verdict = COMMODITY_VERDICTS[group.rateVerdict];
+                  return (
+                    <div key={group.unitKey} className="p-4 bg-slate-50 rounded-2xl border border-slate-200 space-y-3">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <span className={`w-3 h-3 rounded-full ${palette.dot}`} />
+                          <h4 className="text-sm font-black text-slate-900">
+                            {group.unitKey === UNSPECIFIED_UNIT_KEY
+                              ? 'بنود وأنشطة بدون وحدة قياس محددة'
+                              : `إنتاجية وحدة القياس: ${unitText}`}
+                          </h4>
+                        </div>
+                        <span className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded ${palette.chip}`}>
+                          {group.unitLabelEn}
+                        </span>
+                      </div>
+
+                      <div className="grid grid-cols-3 gap-2 text-center text-xs">
+                        <div className="p-2.5 bg-white rounded-xl border border-slate-200">
+                          <span className="text-[10px] text-slate-400 block">المخطط الكلي:</span>
+                          <span className="font-mono font-black text-slate-900">{plannedText}</span>
+                          <span className="text-[9px] text-slate-400 block mt-0.5">
+                            {group.plannedSource === 'boq_items'
+                              ? `المصدر: جدول الكميات (${group.boqItemCount} بند)`
+                              : group.plannedSource === 'activities'
+                                ? `المصدر: الكميات المخططة على الأنشطة (${group.activityCount} نشاط)`
+                                : 'المصدر: لا يوجد'}
+                          </span>
+                        </div>
+                        <div className="p-2.5 bg-white rounded-xl border border-slate-200">
+                          <span className="text-[10px] text-slate-400 block">المنفذ التراكمي المعتمد:</span>
+                          <span className="font-mono font-black text-emerald-700">{executedText}</span>
+                          <span className="text-[9px] text-slate-400 block mt-0.5">
+                            {group.approvedUpdateCount} طلب معتمد
+                            {group.executedFromActivityRecords > 0 ? ' + سجلات أنشطة' : ''}
+                          </span>
+                        </div>
+                        <div className="p-2.5 bg-white rounded-xl border border-slate-200">
+                          <span className="text-[10px] text-slate-400 block">المتبقي:</span>
+                          <span className={`font-mono font-black ${
+                            group.remainingQuantity !== null && group.remainingQuantity < 0 ? 'text-rose-700' : 'text-amber-900'
+                          }`}>
+                            {remainingText}
+                          </span>
+                          <span className="text-[9px] text-slate-400 block mt-0.5">
+                            {group.remainingQuantity !== null && group.remainingQuantity < 0 ? 'تجاوز في التنفيذ' : 'المخطط − المنفذ'}
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className="space-y-1">
+                        <div className="flex justify-between text-[11px] font-bold">
+                          <span className="text-slate-500">نسبة الإنجاز الحجمي:</span>
+                          <span className={`font-mono ${group.progressPercent === null ? 'text-slate-500' : palette.pct}`}>
+                            {percentText}
+                          </span>
+                        </div>
+                        <div className="w-full h-2.5 bg-slate-200 rounded-full overflow-hidden">
+                          <div className={`h-full rounded-full ${palette.bar}`} style={{ width: `${barWidth}%` }} />
+                        </div>
+                      </div>
+
+                      <div className={`p-3 border rounded-xl space-y-1.5 text-xs ${palette.box}`}>
+                        <div className="flex items-center justify-between gap-2">
+                          <span className={`font-bold ${palette.title}`}>معدل الإنتاج اليومي المطلوب (Required Run-Rate):</span>
+                          <span className={`font-mono font-black text-sm ${palette.rate}`}>
+                            {group.requiredRatePerDay === null
+                              ? 'غير قابل للحساب (N/A)'
+                              : `${formatQuantity(group.requiredRatePerDay)} ${unitText} / يوم عمل`}
+                          </span>
+                        </div>
+                        {group.requiredRateBasisAr && (
+                          <p className="text-[10px] text-slate-600 font-mono">{group.requiredRateBasisAr}</p>
+                        )}
+                        <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                          <span className="text-slate-700 font-mono">
+                            معدل الإنتاج الفعلي المقاس:
+                            <strong className="mx-1">
+                              {group.actualRatePerDay === null
+                                ? 'غير قابل للحساب (N/A)'
+                                : `${formatQuantity(group.actualRatePerDay)} ${unitText} / يوم عمل`}
+                            </strong>
+                          </span>
+                          <span className={`px-2 py-0.5 rounded font-bold flex items-center gap-1 ${verdict.className}`}>
+                            {verdict.icon}
+                            {verdict.labelAr}
+                          </span>
+                        </div>
+                        {group.actualRateBasisAr && (
+                          <p className="text-[10px] text-slate-600 font-mono">{group.actualRateBasisAr}</p>
+                        )}
+                        <p className="text-[10px] text-slate-600 leading-relaxed">{group.verdictNoteAr}</p>
+                      </div>
+
+                      {group.status !== 'ok' && (
+                        <div className="p-2.5 bg-white border border-slate-200 rounded-xl text-[10px] text-slate-600 leading-relaxed flex items-start gap-1.5">
+                          <HelpCircle size={13} className="text-slate-400 flex-shrink-0 mt-0.5" />
+                          <span>{group.statusNoteAr}</span>
+                        </div>
+                      )}
+
+                      <div className="pt-1 border-t border-slate-200 text-[9.5px] text-slate-400 font-mono space-y-0.5">
+                        <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5">
+                          <span>تاريخ خط الحالة: {commoditySummary.dataDate}</span>
+                          <span>أيام عمل منجزة: {group.elapsedWorkingDays === null ? 'N/A' : group.elapsedWorkingDays}</span>
+                          <span>أيام عمل متبقية: {group.remainingWorkingDays === null ? 'N/A' : group.remainingWorkingDays}</span>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5">
+                          <span>بداية دليل الإنتاج: {group.productionWindowStart || 'N/A'}</span>
+                          <span>نهاية النافذة المخططة: {group.commodityWindowEnd || 'N/A'}</span>
+                          <span>آخر إنجاز معتمد: {group.lastApprovedUpdateDate || 'N/A'}</span>
+                        </div>
+                        {group.excludedUpdateCount > 0 && (
+                          <div>
+                            سجلات مستبعدة من المنفذ: {group.excludedUpdateCount}
+                            {' '}({group.excludedFutureUpdateCount} بتاريخ لاحق لخط الحالة،
+                            {' '}{group.excludedUnapprovedUpdateCount} غير معتمدة،
+                            {' '}{group.excludedUndatedUpdateCount} بدون تاريخ)
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            <p className="text-[10.5px] text-slate-500 leading-relaxed bg-slate-50 border border-slate-200 rounded-xl p-3">
+              {commoditySummary.noCrossUnitTotalReasonAr}
+            </p>
           </div>
         </div>
       )}
@@ -2882,6 +2959,30 @@ export default function ProgressView({ project }: ProgressViewProps) {
                   onChange={(e) => setCutoffDate(e.target.value)}
                   className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs"
                 />
+                <p className="text-[10px] text-slate-500 mt-1 leading-relaxed">
+                  تاريخ خط الحالة المعتمد حالياً: <strong className="font-mono text-slate-800">{governedDataDate}</strong>
+                  {latestApprovedEvidenceDate
+                    ? ` — آخر سجل ميداني معتمد: ${latestApprovedEvidenceDate}`
+                    : ' — لا توجد سجلات ميدانية معتمدة بعد'}
+                </p>
+                {isAfterDataDate(cutoffDate, governedDataDate) && (
+                  <div className="mt-2 p-2.5 rounded-lg bg-amber-50 border border-amber-200 text-[10.5px] text-amber-900 font-bold flex items-start gap-1.5">
+                    <AlertTriangle size={13} className="flex-shrink-0 mt-0.5" />
+                    <span>
+                      التاريخ المختار لاحق لتاريخ خط الحالة المعتمد: أي سجل بتاريخ بعد {governedDataDate} لا يُحتسب
+                      إنجازاً أو تكلفة فعلية، ولا يدخل في الإجماليات التراكمية ما لم يُعتمد بتاريخ لا يتجاوز خط الحالة.
+                    </span>
+                  </div>
+                )}
+                {latestApprovedEvidenceDate !== null && isAfterDataDate(cutoffDate, latestApprovedEvidenceDate) && (
+                  <div className="mt-2 p-2.5 rounded-lg bg-slate-50 border border-slate-200 text-[10.5px] text-slate-600 flex items-start gap-1.5">
+                    <Clock size={13} className="flex-shrink-0 mt-0.5" />
+                    <span>
+                      الإقفال على تاريخ بعد آخر دليل ميداني معتمد ({latestApprovedEvidenceDate}) يُنتج فترة بلا إنجاز فعلي
+                      مسجل، فتظهر المعدلات الفعلية (N/A) في بطاقة الإنتاجية الحجمية.
+                    </span>
+                  </div>
+                )}
               </div>
 
               <div>
@@ -2889,8 +2990,8 @@ export default function ProgressView({ project }: ProgressViewProps) {
                 <input
                   type="text"
                   value={revisionName}
-                  onChange={(e) => setRevisionName(e.target.value)}
-                  placeholder="مثال: Rev 02 - الموقف التنفيذي لشهر ديسمبر 2026"
+                  onChange={(e) => setRevisionNameOverride(e.target.value)}
+                  placeholder="مثال: Rev 02 - الموقف التنفيذي للشهر الحالي"
                   className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs"
                 />
               </div>

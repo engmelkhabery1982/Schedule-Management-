@@ -1,8 +1,11 @@
 import { useState, useMemo, useEffect } from 'react';
 import { supabase } from '@/lib/supabase';
 import { getLanguage, type Language } from '@/lib/i18n';
-import type { Project, ViewName, ProjectSector, Activity, BudgetLine, BoqItem, CostTransaction, ProgressUpdate, Risk, ActivityLink } from '@/types';
+import type { Project, ViewName, ProjectSector, Activity, BudgetLine, BoqItem, CostTransaction, ProgressUpdate, Risk, ActivityLink, BaselineActivity } from '@/types';
 import { calculateProjectEvmAtDataDate } from '@/lib/planningEngine';
+// Case N: the portfolio DCMA figure is the canonical 14-point audit result, not a constant.
+import { runDcma14PointAudit } from '@/lib/scheduleQualityEngine';
+import { DEFAULT_DATA_DATE } from '@/lib/projectControlsConstants';
 import {
   Briefcase,
   Building2,
@@ -37,6 +40,7 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
   const [allLinks, setAllLinks] = useState<ActivityLink[]>([]);
   const [allBoqs, setAllBoqs] = useState<BoqItem[]>([]);
   const [allProgress, setAllProgress] = useState<ProgressUpdate[]>([]);
+  const [allBaselines, setAllBaselines] = useState<BaselineActivity[]>([]);
   const [loading, setLoading] = useState(true);
   const [lang, setLang] = useState<Language>(getLanguage());
   const [sectorFilter, setSectorFilter] = useState<string>('all');
@@ -85,6 +89,7 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
         { data: lnkData },
         { data: boqData },
         { data: prgData },
+        { data: baselineData },
       ] = await Promise.all([
         supabase.from('projects').select('*').order('created_at', { ascending: false }),
         supabase.from('activities').select('*'),
@@ -93,6 +98,9 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
         supabase.from('risks').select('*'),
         supabase.from('activity_links').select('*'),
         supabase.from('boq_items').select('*'),
+        // Baseline rows are loaded so the DCMA audit of each project sees the same evidence the
+        // project screen sees; without them the baseline-variance points would be silently skipped.
+        supabase.from('baseline_activities').select('*'),
         supabase.from('progress_updates').select('*'),
       ]);
 
@@ -104,6 +112,7 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
       setAllLinks(lnkData || []);
       setAllBoqs(boqData || []);
       setAllProgress(prgData || []);
+      setAllBaselines((baselineData || []) as BaselineActivity[]);
     } catch (err) {
       console.error('Error loading portfolio:', err);
     } finally {
@@ -120,6 +129,11 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
       const pTxns = allCostTxns.filter((c) => c.project_id === p.id);
       const pPrgs = allProgress.filter((pr) => pr.project_id === p.id);
       const pRisks = allRisks.filter((r) => r.project_id === p.id && r.status === 'open');
+      const pLinks = allLinks.filter((l) => l.project_id === p.id);
+      // `baseline_activities` carries no project_id (it hangs off a baseline), so the project's
+      // baseline rows are selected through its own activity ids.
+      const pActivityIds = new Set(pActs.map((a) => a.id));
+      const pBaselines = allBaselines.filter((b) => pActivityIds.has(b.activity_id));
 
       const evm = calculateProjectEvmAtDataDate(
         p,
@@ -142,8 +156,17 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
       const ac = evm.ac;
       const spi = evm.spi;
       const cpi = evm.cpi;
-      const dcmaScore = pActs.length > 0 ? 100 : 90;
-      const eotDays = p.duration_days && p.duration_days > 300 ? 14 : 0;
+      // Case N (GAP-010 wave): the portfolio used to show a fabricated schedule-quality score
+      // (100 / 90 chosen by "does the project have activities") and fabricated EOT days
+      // (14 / 0 chosen by contract duration). The score now comes from the canonical DCMA 14-point
+      // engine at the project's governed Data Date, and it is N/A when there is nothing to audit.
+      // Approved EOT days have no table anywhere in `supabase/migrations` (no delay_claims), so no
+      // number is invented for them — the KPI is reported as N/A with that reason.
+      const dcmaAudit = pActs.length > 0
+        ? runDcma14PointAudit(pActs, pLinks, pBaselines, [], p.data_date || DEFAULT_DATA_DATE)
+        : null;
+      const dcmaScore = dcmaAudit ? dcmaAudit.score : null;
+      const dcmaStatus = dcmaAudit ? dcmaAudit.status : null;
       const activeRisks = pRisks.length;
 
       let sector: ProjectSector = p.sector || 'commercial_building';
@@ -155,7 +178,7 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
         spi,
         cpi,
         dcmaScore,
-        eotDays,
+        dcmaStatus,
         activeRisks,
         contractVal,
         pv,
@@ -163,7 +186,7 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
         ac,
       };
     });
-  }, [projects, allActivities, allBudgetLines, allBoqs, allCostTxns, allProgress, allRisks]);
+  }, [projects, allActivities, allBudgetLines, allBoqs, allCostTxns, allProgress, allRisks, allLinks, allBaselines]);
 
   // Filtered projects
   const filteredProjects = useMemo(() => {
@@ -184,7 +207,13 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
   const totalPortfolioAc = portfolioProjects.reduce((sum, p) => sum + p.ac, 0);
   const portfolioSpi = totalPortfolioPv > 0 ? Number((totalPortfolioEv / totalPortfolioPv).toFixed(2)) : 1.0;
   const portfolioCpi = totalPortfolioAc > 0 ? Number((totalPortfolioEv / totalPortfolioAc).toFixed(2)) : 1.0;
-  const totalEotDays = portfolioProjects.reduce((sum, p) => sum + p.eotDays, 0);
+  // Portfolio schedule quality is reported only where an audit was possible; the rest is N/A.
+  const auditedProjectCount = portfolioProjects.filter((p) => p.dcmaScore !== null).length;
+  const portfolioDcmaAverage = auditedProjectCount > 0
+    ? Math.round(
+        portfolioProjects.reduce((sum, p) => sum + (p.dcmaScore ?? 0), 0) / auditedProjectCount,
+      )
+    : null;
 
   const handleCreateProject = async () => {
     if (!newProjectForm.name) return;
@@ -201,7 +230,9 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
       status: 'active',
       calendar_type: '6_days',
       sector: newProjectForm.sector,
-      data_date: '2026-11-15',
+      // GAP-010: a newly created project starts at the governed Data Date, not at a hardcoded date
+      // two months beyond it (which would make every actual record of the new project "future").
+      data_date: DEFAULT_DATA_DATE,
       description: newProjectForm.description,
     }).select().single();
 
@@ -352,8 +383,13 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
             <Clock size={24} />
           </div>
           <div>
-            <div className="text-xl font-black text-rose-700">+{totalEotDays} {lang === 'ar' ? 'يوم' : 'd'}</div>
-            <span className="text-[11px] text-slate-500 font-semibold">{lang === 'ar' ? 'إجمالي مطالبات EOT' : 'Total EOT Days'}</span>
+            <div className="text-xl font-black text-slate-400">{lang === 'ar' ? 'غير متاح (N/A)' : 'Not available (N/A)'}</div>
+            <span className="text-[11px] text-slate-500 font-semibold">{lang === 'ar' ? 'إجمالي مطالبات EOT المعتمدة' : 'Total approved EOT days'}</span>
+            <span className="text-[9.5px] text-slate-400 block leading-snug">
+              {lang === 'ar'
+                ? 'لا يوجد جدول لمطالبات التأخير المعتمدة في قاعدة البيانات — لا يُعرض رقم مُقدّر.'
+                : 'No approved delay-claim table exists in the database — no estimated figure is shown.'}
+            </span>
           </div>
         </div>
       </div>
@@ -386,15 +422,28 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
           ))}
         </div>
 
-        <div className="relative">
-          <Search size={14} className="absolute right-3 top-2.5 text-slate-400" />
-          <input
-            type="text"
-            placeholder={lang === 'ar' ? 'بحث في مشاريع المحفظة...' : 'Search portfolio...'}
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            className="pr-8 pl-3 py-1.5 border border-slate-200 rounded-lg text-xs w-56 outline-none focus:border-amber-500 font-medium"
-          />
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="px-2.5 py-1.5 rounded-lg bg-slate-50 border border-slate-200 text-[10.5px] font-bold text-slate-600 flex items-center gap-1">
+            <ShieldCheck size={12} className="text-emerald-600" />
+            {lang === 'ar' ? 'متوسط جودة الجدول (DCMA):' : 'Average schedule quality (DCMA):'}
+            <span className="font-mono text-slate-900">
+              {portfolioDcmaAverage === null ? 'N/A' : `${portfolioDcmaAverage}%`}
+            </span>
+            <span className="font-mono text-slate-400">
+              ({auditedProjectCount}/{portfolioProjects.length})
+            </span>
+          </span>
+
+          <div className="relative">
+            <Search size={14} className="absolute right-3 top-2.5 text-slate-400" />
+            <input
+              type="text"
+              placeholder={lang === 'ar' ? 'بحث في مشاريع المحفظة...' : 'Search portfolio...'}
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="pr-8 pl-3 py-1.5 border border-slate-200 rounded-lg text-xs w-56 outline-none focus:border-amber-500 font-medium"
+            />
+          </div>
         </div>
       </div>
 
@@ -447,7 +496,17 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
                   </div>
                   <div className="p-2 bg-white rounded-lg border border-slate-200">
                     <span className="text-slate-400 block text-[10px]">DCMA</span>
-                    <span className="font-mono font-bold text-emerald-700">{p.dcmaScore}%</span>
+                    {p.dcmaScore === null ? (
+                      <span className="font-mono font-bold text-slate-400" title={lang === 'ar' ? 'لا توجد أنشطة قابلة للفحص' : 'No auditable activities'}>
+                        N/A
+                      </span>
+                    ) : (
+                      <span className={`font-mono font-bold ${
+                        p.dcmaScore >= 90 ? 'text-emerald-700' : p.dcmaScore >= 75 ? 'text-amber-700' : 'text-rose-700'
+                      }`}>
+                        {p.dcmaScore}%
+                      </span>
+                    )}
                   </div>
                 </div>
               </div>

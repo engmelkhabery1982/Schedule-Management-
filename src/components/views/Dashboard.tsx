@@ -29,6 +29,8 @@ import { calculateControlHealth } from '@/lib/controlHealthEngine';
 import { calculateRecoveryPlan } from '@/lib/recoveryEngine';
 import { simulateScenario } from '@/lib/scenarioEngine';
 import { generateSCurveData } from '@/lib/sCurveEngine';
+// GAP-010: the FIDIC 20.1 notice generator works on the governed Data Date, not on a literal clock.
+import { calendarDaysBetween, isAfterDataDate, isIsoDate, resolveDataDate } from '@/lib/chronologyGuard';
 import { getLanguage, translations, type Language } from '@/lib/i18n';
 import SCurveChart from './SCurveChart';
 import {
@@ -80,10 +82,16 @@ export default function Dashboard({ project, onNavigate }: DashboardProps) {
   // FIDIC Notice Modal State
   const [showNoticeModal, setShowNoticeModal] = useState(false);
   const [noticeCopied, setNoticeCopied] = useState(false);
+  // Chronology (GAP-010 / GAP-038): the incident date defaults to the governed Data Date. The former
+  // default dated the event — and the generated letter — after the Data Date, so the dashboard
+  // offered a claim for something that had not happened yet and counted the 28-day notice period
+  // from a hardcoded pseudo-today.
+  const governedDataDate = useMemo(() => resolveDataDate(project), [project]);
+
   const [noticeForm, setNoticeForm] = useState({
     eventType: 'delayed_drawings',
     eventTitle: 'تأخر اعتماد المخططات التنفيذية لمسارات دكت التكييف وشبكات الحريق',
-    incidentDate: '2026-11-10',
+    incidentDate: resolveDataDate(project),
     clauseReference: 'عقد الفيديك الأحمر (FIDIC Red Book) - المادة 8.4 [تمديد مدة الإنجاز] والمادة 20.1 [مطالبات المقاول]',
     timeExtensionDays: 14,
     financialClaimSar: 67200,
@@ -160,33 +168,35 @@ export default function Dashboard({ project, onNavigate }: DashboardProps) {
     }
   }
 
-  // Calculate 28-Day FIDIC 20.1 Deadline
-  const noticeDeadlineDate = useMemo(() => {
-    try {
-      const d = new Date(noticeForm.incidentDate);
-      d.setUTCDate(d.getUTCDate() + 28);
-      return d.toISOString().split('T')[0];
-    } catch {
-      return '2026-12-08';
-    }
+  // Re-anchor the incident date when another project becomes active, so a date from the previous
+  // project can never be carried into a new claim notice.
+  useEffect(() => {
+    setNoticeForm((prev) => ({ ...prev, incidentDate: governedDataDate }));
+  }, [governedDataDate]);
+
+  // 28-day FIDIC 20.1 deadline. An unusable incident date yields null (rendered as N/A) instead of a
+  // fabricated deadline.
+  const noticeDeadlineDate = useMemo<string | null>(() => {
+    if (!isIsoDate(noticeForm.incidentDate)) return null;
+    const deadline = new Date(`${noticeForm.incidentDate}T00:00:00Z`);
+    deadline.setUTCDate(deadline.getUTCDate() + 28);
+    return deadline.toISOString().split('T')[0];
   }, [noticeForm.incidentDate]);
 
-  const daysRemainingToClaim = useMemo(() => {
-    try {
-      const deadline = new Date(noticeDeadlineDate).getTime();
-      const today = new Date('2026-11-15').getTime();
-      return Math.max(0, Math.round((deadline - today) / 86400000));
-    } catch {
-      return 23;
-    }
-  }, [noticeDeadlineDate]);
+  // Days left of the notice period, counted from the governed Data Date — the only "today" a project
+  // control screen is allowed to use.
+  const daysRemainingToClaim = useMemo<number | null>(() => {
+    if (!noticeDeadlineDate) return null;
+    const remaining = calendarDaysBetween(governedDataDate, noticeDeadlineDate);
+    return remaining === null ? null : Math.max(0, remaining);
+  }, [noticeDeadlineDate, governedDataDate]);
 
   const generatedNoticeText = useMemo(() => {
     return `إلى: المهندس الاستشاري / ${noticeForm.engineerName}
 نسخة إلى: صاحب العمل / ${noticeForm.employerName}
 من: المقاول الرئيسي / ${noticeForm.contractorName}
 اسم المشروع: ${project?.name || 'مشروع البرج المكتبي التجاري'}
-التاريخ: 2026-11-15
+التاريخ: ${governedDataDate}
 المرجع: CONTRACT-NOTICE-FIDIC20.1-EOT-${noticeForm.incidentDate.replace(/-/g, '')}
 
 الموضوع: إخطار تعاقدي رسمي بوقوع حدث تأخير ومطالبة بتمديد الوقت والتكاليف غير المباشرة (Notice of Claim under FIDIC Red Book Clause 20.1 & Clause 8.4)
@@ -201,13 +211,13 @@ export default function Dashboard({ project, onNavigate }: DashboardProps) {
 4. الأثر الزمني المتوقع على المسار الحرج (CPM): تمديد مدة الإنجاز بمقدار ${noticeForm.timeExtensionDays} يوماً تقويمياً.
 5. التكاليف الإضافية غير المباشرة المطالب بها: ${noticeForm.financialClaimSar.toLocaleString()} ريال سعودي.
 
-نحيطكم علماً بأن المقاول ملتزم بالمهلة الزمنية التعاقدية (28 يوماً من تاريخ العلم بالحدث حتى تاريخ ${noticeDeadlineDate})، وسيقوم فريق التخطيط والتحليل بتقديم الملف التوثيقي التفصيلي وشبكة الأثر الزمني (Fragnet TIA Analysis) والسجلات المؤيدة خلال المهلة النظامية المحددة (42 يوماً).
+نحيطكم علماً بأن المقاول ملتزم بالمهلة الزمنية التعاقدية (28 يوماً من تاريخ العلم بالحدث حتى تاريخ ${noticeDeadlineDate ?? 'غير قابل للاحتساب (N/A)'})، وسيقوم فريق التخطيط والتحليل بتقديم الملف التوثيقي التفصيلي وشبكة الأثر الزمني (Fragnet TIA Analysis) والسجلات المؤيدة خلال المهلة النظامية المحددة (42 يوماً).
 
 وتفضلوا بقبول فائق الاحترام والتقدير،،،
 
 مدير المشروع / إدارة العقود والمطالبات
 ${noticeForm.contractorName}`;
-  }, [noticeForm, noticeDeadlineDate, project]);
+  }, [noticeForm, noticeDeadlineDate, governedDataDate, project]);
 
   const t = translations[lang];
 
@@ -691,11 +701,13 @@ ${noticeForm.contractorName}`;
                 <span className="px-1.5 py-0.2 rounded text-[10px] bg-purple-200 text-purple-900 font-black">ساري</span>
               </div>
               <p className="text-purple-900 text-[11px] leading-relaxed">
-                متبقي {daysRemainingToClaim} يوماً على المهلة القصوى (28 يوماً) لإرسال إخطار المطالبة رسمياً للاستشاري.
+                {daysRemainingToClaim === null
+                  ? 'المهلة غير قابلة للاحتساب (N/A): تاريخ وقوع الحدث غير صالح أو غير محدد.'
+                  : `متبقي ${daysRemainingToClaim} يوماً على المهلة القصوى (28 يوماً) لإرسال إخطار المطالبة رسمياً للاستشاري، محسوبة من تاريخ خط الحالة ${governedDataDate}.`}
               </p>
             </div>
             <div className="pt-2 flex flex-wrap items-center justify-between gap-1.5 text-[11px] text-purple-800 font-bold border-t border-purple-200">
-              <span>المهلة: {noticeDeadlineDate}</span>
+              <span>المهلة: {noticeDeadlineDate ?? 'غير قابلة للاحتساب (N/A)'}</span>
               <button onClick={() => setShowNoticeModal(true)} className="text-purple-900 hover:text-purple-950 font-black underline cursor-pointer">إصدار الإخطار ←</button>
             </div>
           </div>
@@ -941,6 +953,14 @@ ${noticeForm.contractorName}`;
                   onChange={(e) => setNoticeForm({ ...noticeForm, incidentDate: e.target.value })}
                   className="w-full p-2 border border-slate-300 rounded-lg text-xs font-mono"
                 />
+                <p className="text-[10px] text-slate-500 mt-1">
+                  تاريخ خط الحالة المعتمد: <strong className="font-mono text-slate-800">{governedDataDate}</strong> — يُعبّأ تاريخ الحدث به افتراضياً.
+                </p>
+                {isAfterDataDate(noticeForm.incidentDate, governedDataDate) && (
+                  <p className="text-[10px] font-bold text-amber-800 bg-amber-50 border border-amber-200 rounded px-2 py-1 mt-1">
+                    التاريخ المختار بعد تاريخ خط الحالة: الإخطار سيُصدر لحدث لم يقع بعد وفق بيانات المشروع، ولا يُحتسب أثراً فعلياً.
+                  </p>
+                )}
               </div>
 
               <div>

@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo } from 'react';
 import { supabase } from '@/lib/supabase';
 import { getLanguage, type Language } from '@/lib/i18n';
 import { calculateProjectEvmAtDataDate, deriveEvmFromScalars } from '@/lib/planningEngine';
+import { calculateEarnedSchedule, type EarnedScheduleResult } from '@/lib/earnedScheduleEngine';
 import {
   aggregateCbsCostCenters,
   calculateMultiEacForecast,
@@ -51,6 +52,20 @@ interface BudgetViewProps {
 }
 
 type BudgetTab = 'evm_tcpi' | 'cash_flow' | 'cbs_centers' | 'reserves' | 'transactions_table';
+
+/** Labels of the Earned Schedule status the canonical engine returns (no view-side status logic). */
+const ESM_STATUS_LABELS: Record<EarnedScheduleResult['status'], { ar: string; en: string; className: string }> = {
+  ahead: { ar: 'متقدم عن الخطة الزمنية', en: 'Ahead of the planned time', className: 'bg-emerald-100 text-emerald-800 border-emerald-200' },
+  on_track: { ar: 'على المسار الزمني المخطط', en: 'On the planned time track', className: 'bg-blue-100 text-blue-800 border-blue-200' },
+  delayed: { ar: 'تأخير زمني مقاس', en: 'Measured time delay', className: 'bg-amber-100 text-amber-900 border-amber-200' },
+  critical_delay: { ar: 'تأخير حرج — لا يوجد جدول مكتسب', en: 'Critical delay — no earned schedule', className: 'bg-rose-100 text-rose-800 border-rose-200' },
+};
+
+/** Day/month formatting for engine output: finite numbers only, everything else is N/A. */
+function formatEsmNumber(value: number | null | undefined, digits = 1): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 'غير قابل للحساب (N/A)';
+  return Number.isInteger(value) ? value.toLocaleString('en-US') : value.toFixed(digits);
+}
 
 export default function BudgetView({ project }: BudgetViewProps) {
   const [activeTab, setActiveTab] = useState<BudgetTab>('evm_tcpi');
@@ -188,6 +203,49 @@ export default function BudgetView({ project }: BudgetViewProps) {
     // `project` alone covers the resolved Data Date; the previous `project?.data_date` entry was an
     // unnecessary dependency once the local literal override was dropped.
   }, [project, activities, budgetLines, boqItems, transactions, progressUpdates]);
+
+  // Earned Schedule (ESM) — the SAME canonical engine ProgressView and the Executive Report use, so
+  // this card cannot present a competing forecast (GAP-008: one engine, many consumers). It consumes
+  // the canonical EVM above plus the same source rows, and derives the planned-value S-Curve from
+  // them internally because this view does not hold one.
+  const earnedSchedule = useMemo(
+    () =>
+      calculateEarnedSchedule({
+        project,
+        activities,
+        evm,
+        budgetLines,
+        boqItems,
+        costTransactions: transactions,
+        progressUpdates,
+      }),
+    [project, activities, evm, budgetLines, boqItems, transactions, progressUpdates],
+  );
+
+  // Case J: the engine returns zeros when there is nothing to measure. The card says N/A and names
+  // the missing input instead of rendering those zeros as a result.
+  const esmComputable =
+    project !== null &&
+    activities.length > 0 &&
+    earnedSchedule.plannedDurationDays > 0 &&
+    earnedSchedule.actualTimeElapsedDays > 0;
+  const esmIeacComputable = esmComputable && earnedSchedule.schedulePerformanceIndexTime > 0;
+  /** The Data Date every figure in this card was computed at — read from the canonical EVM result. */
+  const earnedScheduleDateLabel = evm.dataDate;
+  const esmMissingInputAr = !project
+    ? 'لا يوجد مشروع محدد.'
+    : activities.length === 0
+      ? 'لا توجد أنشطة مجدولة للمشروع.'
+      : earnedSchedule.plannedDurationDays <= 0
+        ? 'لا توجد مدة مخططة (PD = 0) أو تواريخ بداية/نهاية صالحة.'
+        : 'لم ينقضِ وقت فعلي حتى تاريخ خط الحالة (AT = 0).';
+  const esmMissingInputEn = !project
+    ? 'No project is selected.'
+    : activities.length === 0
+      ? 'The project has no scheduled activities.'
+      : earnedSchedule.plannedDurationDays <= 0
+        ? 'There is no planned duration (PD = 0) or no valid start / finish dates.'
+        : 'No actual time has elapsed by the Data Date (AT = 0).';
 
   // Committed cost provenance (UG-051): the stored `committed_cost` values, or an explicit
   // "no commitment data" state. The former `|| Math.round(planned * 0.75)` fabricated a commitment
@@ -769,37 +827,96 @@ export default function BudgetView({ project }: BudgetViewProps) {
                 <p className="text-xs text-slate-500 mt-0.5">
                   قياس كفاءة الوقت بالأشهر والأيام بدلاً من العملة لتفادي وهم مؤشر $SPI$ النقدي في نهاية المشروع.
                 </p>
-                {/* GAP-041: the four values below are a FIXED illustrative sample, not this
-                    project's Earned Schedule. They are labelled as such so this card cannot be read
-                    as a live IEAC(t) forecast competing with the computed one in the Executive
-                    Report and Progress screens. Replacing the card with the canonical engine result
-                    is a separate mock/demo cleanup item, deliberately not part of this wave. */}
-                <p className="text-[11px] text-rose-600 font-bold mt-1">
+                <p className="text-[11px] text-slate-500 mt-1 leading-relaxed">
                   {lang === 'ar'
-                    ? 'قيم هذه البطاقة عينة توضيحية ثابتة (Demo) وليست محسوبة من بيانات المشروع — التنبؤ الحي للجدول المكتسب معروض في التقرير التنفيذي وشاشة التقدم.'
-                    : 'The values in this card are a fixed illustrative sample (demo), not computed from this project. The live Earned Schedule forecast is shown in the Executive Report and Progress screens.'}
+                    ? `محسوبة بمحرك الجدول المكتسب المعتمد (calculateEarnedSchedule) من نفس بيانات المشروع المستخدمة في شاشة التقدم والتقرير التنفيذي، عند تاريخ خط الحالة ${earnedScheduleDateLabel}. لا توجد قيم نموذجية: أي مقياس بلا بيانات كافية يظهر (N/A) مع سببه.`
+                    : `Computed by the canonical Earned Schedule engine (calculateEarnedSchedule) from the same project data used by the Progress and Executive Report screens, at the Data Date ${earnedScheduleDateLabel}. No sample values: any metric without sufficient data is shown as N/A with its reason.`}
                 </p>
               </div>
+              <span className={`px-2.5 py-1 rounded-lg text-[10px] font-black border whitespace-nowrap ${ESM_STATUS_LABELS[earnedSchedule.status].className}`}>
+                {lang === 'ar' ? ESM_STATUS_LABELS[earnedSchedule.status].ar : ESM_STATUS_LABELS[earnedSchedule.status].en}
+              </span>
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-4 gap-4 text-xs">
               <div className="p-3 bg-slate-50 rounded-xl border border-slate-200">
-                <span className="text-slate-500 block text-[11px]">الوقت الفعلي المنقضي (AT):</span>
-                <span className="font-mono font-black text-slate-900 text-base">2.0 شهر (60 يوم)</span>
+                <span className="text-slate-500 block text-[11px]">{lang === 'ar' ? 'الوقت الفعلي المنقضي (AT):' : 'Actual Time (AT):'}</span>
+                <span className="font-mono font-black text-slate-900 text-base">
+                  {esmComputable
+                    ? `${formatEsmNumber(earnedSchedule.actualTimeElapsedMonths, 2)} ${lang === 'ar' ? 'شهر' : 'mo'} (${formatEsmNumber(earnedSchedule.actualTimeElapsedDays)} ${lang === 'ar' ? 'يوم' : 'd'})`
+                    : (lang === 'ar' ? 'غير قابل للحساب (N/A)' : 'Not computable (N/A)')}
+                </span>
               </div>
               <div className="p-3 bg-slate-50 rounded-xl border border-slate-200">
-                <span className="text-slate-500 block text-[11px]">الجدول المكتسب (ES):</span>
-                <span className="font-mono font-black text-blue-900 text-base">1.88 شهر (56.4 يوم)</span>
+                <span className="text-slate-500 block text-[11px]">{lang === 'ar' ? 'الجدول المكتسب (ES):' : 'Earned Schedule (ES):'}</span>
+                <span className="font-mono font-black text-blue-900 text-base">
+                  {esmComputable
+                    ? `${formatEsmNumber(earnedSchedule.earnedScheduleMonths, 2)} ${lang === 'ar' ? 'شهر' : 'mo'} (${formatEsmNumber(earnedSchedule.earnedScheduleDays)} ${lang === 'ar' ? 'يوم' : 'd'})`
+                    : (lang === 'ar' ? 'غير قابل للحساب (N/A)' : 'Not computable (N/A)')}
+                </span>
               </div>
               <div className="p-3 bg-slate-50 rounded-xl border border-slate-200">
-                <span className="text-slate-500 block text-[11px]">مؤشر الأداء الزمني (SPI_t):</span>
-                <span className="font-mono font-black text-amber-700 text-base">0.94 (SV_t = -3.6d)</span>
+                <span className="text-slate-500 block text-[11px]">{lang === 'ar' ? 'مؤشر الأداء الزمني SPI(t):' : 'Time-based SPI(t):'}</span>
+                <span className={`font-mono font-black text-base ${earnedSchedule.schedulePerformanceIndexTime >= 1 ? 'text-emerald-700' : 'text-amber-700'}`}>
+                  {esmComputable ? formatEsmNumber(earnedSchedule.schedulePerformanceIndexTime, 2) : (lang === 'ar' ? 'غير قابل للحساب (N/A)' : 'Not computable (N/A)')}
+                </span>
+                <span className="text-[10px] text-slate-500 font-mono block">
+                  {esmComputable
+                    ? `SV(t) = ${earnedSchedule.scheduleVarianceTimeDays >= 0 ? '+' : ''}${formatEsmNumber(earnedSchedule.scheduleVarianceTimeDays)} ${lang === 'ar' ? 'يوم' : 'd'}`
+                    : `SV(t) = N/A`}
+                </span>
               </div>
               <div className="p-3 bg-slate-50 rounded-xl border border-slate-200">
-                <span className="text-slate-500 block text-[11px]">التسليم المتوقع زمنياً (IEAC_t) — عينة ثابتة (Demo):</span>
-                <span className="font-mono font-black text-purple-900 text-base">2027-05-12 (+12d)</span>
+                <span className="text-slate-500 block text-[11px]">{lang === 'ar' ? 'التسليم المتوقع زمنياً IEAC(t):' : 'Time-based IEAC(t):'}</span>
+                <span className="font-mono font-black text-purple-900 text-base">
+                  {esmIeacComputable
+                    ? `${formatEsmNumber(earnedSchedule.estimatedDurationAtCompletionMonths, 2)} ${lang === 'ar' ? 'شهر' : 'mo'} (${formatEsmNumber(earnedSchedule.estimatedDurationAtCompletionDays)} ${lang === 'ar' ? 'يوم' : 'd'})`
+                    : (lang === 'ar' ? 'غير قابل للحساب (N/A)' : 'Not computable (N/A)')}
+                </span>
+                <span className="text-[10px] text-slate-500 font-mono block">
+                  {esmIeacComputable
+                    ? `${lang === 'ar' ? 'تاريخ الانتهاء المتوقع' : 'Forecast finish'}: ${earnedSchedule.forecastCompletionDate} · VAC(t) = ${earnedSchedule.varianceAtCompletionTimeDays >= 0 ? '+' : ''}${formatEsmNumber(earnedSchedule.varianceAtCompletionTimeDays)} ${lang === 'ar' ? 'يوم' : 'd'}`
+                    : (lang === 'ar' ? 'لا يُعرض تاريخ بديل عند تعذّر الحساب' : 'No substitute date is shown when it is not computable')}
+                </span>
               </div>
             </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-[11px]">
+              <div className="p-3 bg-white rounded-xl border border-slate-200 space-y-1">
+                <span className="text-slate-400 block font-bold">{lang === 'ar' ? 'المرجع الزمني المخطط (PD)' : 'Planned duration reference (PD)'}</span>
+                <span className="font-mono text-slate-800">
+                  {esmComputable
+                    ? `${formatEsmNumber(earnedSchedule.plannedDurationMonths, 2)} ${lang === 'ar' ? 'شهر' : 'mo'} (${formatEsmNumber(earnedSchedule.plannedDurationDays)} ${lang === 'ar' ? 'يوم' : 'd'}) · ${lang === 'ar' ? 'النهاية المخططة' : 'planned finish'} ${earnedSchedule.plannedCompletionDate}`
+                    : (lang === 'ar' ? 'غير قابل للحساب (N/A)' : 'Not computable (N/A)')}
+                </span>
+                <span className="text-slate-500 block">
+                  {lang === 'ar' ? 'تاريخ خط الحالة الحاكم: ' : 'Governing Data Date: '}
+                  <strong className="font-mono text-slate-800">{earnedScheduleDateLabel}</strong>
+                </span>
+              </div>
+              <div className="p-3 bg-white rounded-xl border border-slate-200 space-y-1">
+                <span className="text-slate-400 block font-bold">{lang === 'ar' ? 'مقارنة بالـ EVM النقدي (من نفس المحرك)' : 'Comparison with the money-based EVM (same engine)'}</span>
+                <span className="font-mono text-slate-800">
+                  SPI = {formatEsmNumber(earnedSchedule.comparisonWithTraditionalEvm.evmSpi, 2)} · SV = {Math.round(earnedSchedule.comparisonWithTraditionalEvm.evmSvAmount).toLocaleString('en-US')} SAR
+                </span>
+                <span className="text-slate-500 block leading-relaxed">{earnedSchedule.timeDivergenceNote}</span>
+              </div>
+            </div>
+
+            {!esmComputable && (
+              <div className="p-3 rounded-xl border border-rose-200 bg-rose-50 text-[11px] font-bold text-rose-800">
+                {lang === 'ar'
+                  ? `لا يمكن احتساب الجدول المكتسب: ${esmMissingInputAr} لا تُعرض قيم بديلة أو تقديرية.`
+                  : `Earned Schedule is not computable: ${esmMissingInputEn} No substitute or estimated values are shown.`}
+              </div>
+            )}
+            {esmComputable && !esmIeacComputable && (
+              <div className="p-3 rounded-xl border border-amber-200 bg-amber-50 text-[11px] font-bold text-amber-900">
+                {lang === 'ar'
+                  ? 'SPI(t) = 0: لا يوجد جدول مكتسب حتى تاريخ خط الحالة، لذلك IEAC(t) غير قابل للحساب ولا يُعرض تاريخ تسليم بديل.'
+                  : 'SPI(t) = 0: nothing has been earned by the Data Date, so IEAC(t) is not computable and no substitute finish date is shown.'}
+              </div>
+            )}
           </div>
         </div>
       )}

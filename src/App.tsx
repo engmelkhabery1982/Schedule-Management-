@@ -1,5 +1,7 @@
 import { useState, useEffect } from 'react';
 import { supabase } from '@/lib/supabase';
+// GAP-010: the global Data Date controller falls back to the governed constant, never to a literal.
+import { DEFAULT_DATA_DATE } from '@/lib/projectControlsConstants';
 import { getInitialSeedData } from '@/lib/mockSeed';
 import { getLanguage, setLanguage, type Language } from '@/lib/i18n';
 import type { Project, ViewName } from '@/types';
@@ -123,7 +125,7 @@ function App() {
               </span>
               <input
                 type="date"
-                value={project?.data_date || '2026-11-15'}
+                value={project?.data_date || DEFAULT_DATA_DATE}
                 onChange={async (e) => {
                   const newDate = e.target.value;
                   if (!newDate || !project) return;

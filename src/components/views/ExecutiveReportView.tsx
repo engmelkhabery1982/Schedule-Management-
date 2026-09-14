@@ -20,6 +20,7 @@ import {
   type ComprehensiveProjectEvm,
 } from '@/lib/planningEngine';
 import { reconcileFinishForecasts } from '@/lib/forecastReconciliation';
+import { DEFAULT_DATA_DATE } from '@/lib/projectControlsConstants';
 import SCurveChart from '@/components/views/SCurveChart';
 import {
   Printer,
@@ -84,15 +85,21 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
     setLoading(false);
   }
 
+  // GAP-010: the DCMA audit runs at the governed Data Date — `project.data_date` or the
+  // DEFAULT_DATA_DATE constant — which is exactly the resolution the canonical EVM engine applies
+  // (`overrideDataDate || project.data_date || DEFAULT_DATA_DATE`). The runtime clock is not a
+  // project status date: auditing against "today" would score activities as late or missing actuals
+  // relative to a date no figure in this report was computed at, and would drift every day.
+  const dcmaDataDate = project?.data_date || DEFAULT_DATA_DATE;
   const dcma = useMemo(() => {
     return runDcma14PointAudit(
       activities,
       links,
       baselineActivities,
       [],
-      project?.data_date || new Date().toISOString().split('T')[0],
+      dcmaDataDate,
     );
-  }, [activities, links, baselineActivities, project?.data_date]);
+  }, [activities, links, baselineActivities, dcmaDataDate]);
 
   // Compute EVM metrics using the unified engine.
   // Typed as the canonical `ComprehensiveProjectEvm` (it always was one at runtime): the legacy
@@ -162,9 +169,12 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
     [activities, earnedScheduleData],
   );
 
-  // Lookahead activities (next 3 weeks from data date)
+  // Lookahead activities (next 3 weeks from the canonical Data Date).
+  // GAP-010: the window is anchored on `evmMetrics.dataDate` — the governed date every figure in this
+  // report was computed at — instead of a local literal that could sit months beyond it and present
+  // work far in the future as the immediate lookahead.
   const lookaheadActivities = useMemo(() => {
-    const dataDate = project?.data_date || '2026-11-15';
+    const dataDate = evmMetrics.dataDate;
     const lookaheadEnd = new Date(dataDate);
     lookaheadEnd.setDate(lookaheadEnd.getDate() + 21);
     const lookaheadEndStr = lookaheadEnd.toISOString().split('T')[0];
@@ -174,7 +184,17 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
       if (!a.early_start) return false;
       return a.early_start <= lookaheadEndStr;
     });
-  }, [activities, project?.data_date]);
+  }, [activities, evmMetrics.dataDate]);
+
+  // Report-generation metadata. This is the moment the document was rendered — it is NOT a project
+  // status date, and it feeds no control calculation: BAC, PV, EV, AC, SPI(t), IEAC(t), the DCMA
+  // score and every forecast in this report stay anchored to `evmMetrics.dataDate`. Regenerating the
+  // report a day later changes this stamp only (Case L).
+  const reportGeneratedAt = useMemo(() => new Date(), []);
+  const reportGeneratedAtLabel = useMemo(() => {
+    const pad = (value: number) => String(value).padStart(2, '0');
+    return `${reportGeneratedAt.getFullYear()}-${pad(reportGeneratedAt.getMonth() + 1)}-${pad(reportGeneratedAt.getDate())} ${pad(reportGeneratedAt.getHours())}:${pad(reportGeneratedAt.getMinutes())}`;
+  }, [reportGeneratedAt]);
 
   const handlePrint = () => {
     window.print();
@@ -238,7 +258,14 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
                   null and made this report unreconcilable against the other screens. */}
               <div className="text-sm font-black font-mono text-slate-900">{evmMetrics.dataDate}</div>
             </div>
-            <div className="text-[10px] text-slate-400 font-mono text-left">Generated: 2026-09-09</div>
+            <div className="text-left space-y-0.5">
+              <div className="text-[10px] text-slate-400 font-mono">
+                {`توقيت إصدار التقرير (Report Generated At): ${reportGeneratedAtLabel}`}
+              </div>
+              <div className="text-[9px] text-slate-400 leading-snug max-w-[16rem]">
+                طابع زمني لحظي للتوثيق فقط — لا يغيّر أي حساب: كل الأرقام أعلاه مثبّتة على تاريخ خط الحالة.
+              </div>
+            </div>
           </div>
         </div>
 

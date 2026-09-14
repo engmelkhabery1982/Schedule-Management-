@@ -13,6 +13,7 @@ import type {
   Risk,
 } from '@/types';
 import { runDcma14PointAudit } from '@/lib/scheduleQualityEngine';
+import { resolveDataDate } from '@/lib/chronologyGuard';
 import { getSubcontractPackages, calculateSubcontractorLedger } from '@/lib/subcontractEngine';
 
 export interface GovernanceCheckItem {
@@ -97,7 +98,10 @@ export async function runComprehensiveGovernanceAudit(
   // -------------------------------------------------------------
   // PILLAR 1: CPM Network & Structural Integrity (DCMA 14-Point)
   // -------------------------------------------------------------
-  const dcmaAudit = runDcma14PointAudit(activities, links, [], activityResources, project.data_date || '2026-11-15');
+  // GAP-010: the governance audit uses the governed Data Date resolution
+  // (`project.data_date || DEFAULT_DATA_DATE`) so its DCMA pillar agrees with ExecutiveReportView,
+  // DcmaAuditView and PortfolioView instead of evaluating at a local literal two months beyond it.
+  const dcmaAudit = runDcma14PointAudit(activities, links, [], activityResources, resolveDataDate(project));
   const openEnds = dcmaAudit.points.find((r) => r.id === 1);
   const leads = dcmaAudit.points.find((r) => r.id === 3);
   const hardConstraints = dcmaAudit.points.find((r) => r.id === 5);
@@ -363,7 +367,11 @@ export async function runComprehensiveGovernanceAudit(
   // -------------------------------------------------------------
   // PILLAR 6: Temporal & Calendar Sequence Integrity
   // -------------------------------------------------------------
-  const dataDateStr = project.data_date || '2026-11-15';
+  // GAP-010: this pillar IS the chronology test ("no progress ahead of the Data Date"), so it must
+  // run against the governed Data Date. The former local literal sat two months beyond it, which
+  // meant a project without a stored data_date was audited against a cutoff that would happily pass
+  // records dated after the real status date.
+  const dataDateStr = resolveDataDate(project);
   const futureCompletedActs = activities.filter((a) => {
     return (a.percent_complete || 0) > 0 && a.early_start && a.early_start > dataDateStr;
   });

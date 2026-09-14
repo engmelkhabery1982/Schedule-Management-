@@ -10,6 +10,10 @@ import type {
   DelayResponsibility,
 } from '@/types';
 import { performTimeImpactAnalysis } from '@/lib/tiaEngine';
+// GAP-038 / GAP-010: the governed Data Date decides what a delay event may claim to be. A new
+// analysis never silently starts after it, and an event that does is a forward-looking scenario
+// rather than an occurred delay.
+import { isAfterDataDate, resolveDataDate } from '@/lib/chronologyGuard';
 import {
   Scale,
   Plus,
@@ -45,6 +49,8 @@ export default function TimeImpactAnalysisView({ project }: TimeImpactAnalysisVi
   const [loading, setLoading] = useState(true);
   const [showAddModal, setShowAddModal] = useState(false);
   const [expandedClaimId, setExpandedClaimId] = useState<string | null>(null);
+  /** Ids of claims this screen generated itself as a demonstration (no record behind them). */
+  const [sampleClaimIds, setSampleClaimIds] = useState<string[]>([]);
   const [lang, setLang] = useState<Language>(getLanguage());
 
   const [form, setForm] = useState<{
@@ -66,10 +72,21 @@ export default function TimeImpactAnalysisView({ project }: TimeImpactAnalysisVi
     responsibility: 'excusable_compensable',
     affectedActivityId: '',
     delayDurationDays: 14,
-    impactStartDate: '2026-11-10',
+    // GAP-038: the default impact date is the governed Data Date of the active project
+    // (`project.data_date` or DEFAULT_DATA_DATE), never a hardcoded future month. A claimant who
+    // means a future event has to move the date deliberately, and the modal says what that means.
+    impactStartDate: resolveDataDate(project),
     dailyIndirectCostRate: 4800,
     contractualClause: 'عقد فيديك الأحمر - المادة 8.4 (تمديد مدة الإنجاز) والمادة 20.1 (مطالبات المقاول)',
   });
+
+  const governedDataDate = useMemo(() => resolveDataDate(project), [project]);
+
+  // Re-anchor the impact date whenever another project becomes active, so a date carried over from a
+  // previous project can never be inherited silently.
+  useEffect(() => {
+    setForm((prev) => ({ ...prev, impactStartDate: governedDataDate }));
+  }, [governedDataDate]);
 
   useEffect(() => {
     if (project) loadData();
@@ -103,16 +120,18 @@ export default function TimeImpactAnalysisView({ project }: TimeImpactAnalysisVi
     // Default Seed Claim
     const fetchedClaims = (claimRes.data || []) as DelayClaimEvent[];
     if (fetchedClaims.length === 0 && acts.length > 0 && activeCrit) {
+      // The demonstration claim is dated AT the governed Data Date and is labelled as a sample: the
+      // engine returns it with status 'draft', so it can never be read as an occurred, approved delay.
       const defaultClaim = performTimeImpactAnalysis({
         projectId: project.id,
         claimNumber: 'EOT-001',
-        title: 'تأخر تسليم تصريح أعمال صب الخرسانة وتعديل مسارات الخدمات',
+        title: '[عيّنة توضيحية] تأخر تسليم تصريح أعمال صب الخرسانة وتعديل مسارات الخدمات',
         description: 'تأخر إصدار تصاريح الحفر وصب الخرسانة الجاهزة بسبب تعديل مسار كابلات الكهرباء التابعة لبلدية الرياض.',
         eventType: 'client_delay',
         responsibility: 'excusable_compensable',
         affectedActivityId: activeCrit.id,
         delayDurationDays: 14,
-        impactStartDate: '2026-11-10',
+        impactStartDate: governedDataDate,
         dailyIndirectCostRate: 4800,
         contractualClause: 'عقد فيديك الأحمر - المادة 8.4 (أ) والمادة 1.9 (تأخر الرسومات والتعليمات)',
         activities: acts,
@@ -121,6 +140,7 @@ export default function TimeImpactAnalysisView({ project }: TimeImpactAnalysisVi
       });
       setClaims([defaultClaim]);
       setExpandedClaimId(defaultClaim.id);
+      setSampleClaimIds([defaultClaim.id]);
     } else {
       setClaims(fetchedClaims);
       if (fetchedClaims.length > 0) setExpandedClaimId(fetchedClaims[0].id);
@@ -312,6 +332,15 @@ export default function TimeImpactAnalysisView({ project }: TimeImpactAnalysisVi
     );
   }
 
+  // Chronology (GAP-010 / GAP-038): a delay event only counts as an OCCURRED delay when it starts on
+  // or before the Data Date, and only an approved determination is an entitlement. Everything else
+  // stays visible as a claim or as a future scenario, but never enters the approved totals.
+  const occurredClaims = claims.filter((c) => !isAfterDataDate(c.start_date, governedDataDate));
+  const futureScenarioClaims = claims.filter((c) => isAfterDataDate(c.start_date, governedDataDate));
+  const approvedClaims = occurredClaims.filter((c) => c.status === 'approved_eot');
+  const approvedEotDays = approvedClaims.reduce((sum, c) => sum + c.eot_days_claimed, 0);
+  const approvedCompensationSar = approvedClaims.reduce((sum, c) => sum + c.compensation_claimed_sar, 0);
+  const pendingEotDays = occurredClaims.reduce((sum, c) => sum + c.eot_days_claimed, 0) - approvedEotDays;
   const totalEotDays = claims.reduce((sum, c) => sum + c.eot_days_claimed, 0);
   const totalFinancialClaim = claims.reduce((sum, c) => sum + c.compensation_claimed_sar, 0);
 
@@ -400,6 +429,13 @@ export default function TimeImpactAnalysisView({ project }: TimeImpactAnalysisVi
           <div>
             <div className="text-2xl font-bold text-slate-800">{claims.length}</div>
             <span className="text-xs text-slate-500">{lang === 'ar' ? 'إجمالي مطالبات التأخير المسجلة' : 'Registered Delay Claims'}</span>
+            {(futureScenarioClaims.length > 0 || sampleClaimIds.length > 0) && (
+              <span className="text-[10px] text-slate-400 font-semibold block">
+                {lang === 'ar'
+                  ? `منها ${futureScenarioClaims.length} سيناريو مستقبلي و ${sampleClaimIds.length} عيّنة توضيحية`
+                  : `${futureScenarioClaims.length} future scenario(s), ${sampleClaimIds.length} demo sample(s)`}
+              </span>
+            )}
           </div>
         </div>
 
@@ -408,8 +444,13 @@ export default function TimeImpactAnalysisView({ project }: TimeImpactAnalysisVi
             <Clock size={24} />
           </div>
           <div>
-            <div className="text-2xl font-bold text-amber-700">+{totalEotDays} {lang === 'ar' ? 'يوم' : 'days'}</div>
-            <span className="text-xs text-slate-500">{lang === 'ar' ? 'إجمالي تمديد الوقت المستحق (EOT Days)' : 'Total EOT Entitlement'}</span>
+            <div className="text-2xl font-bold text-amber-700">+{approvedEotDays} {lang === 'ar' ? 'يوم' : 'days'}</div>
+            <span className="text-xs text-slate-500">{lang === 'ar' ? 'تمديد الوقت المعتمد حتى تاريخ خط الحالة (Approved EOT)' : `Approved EOT up to the Data Date (${governedDataDate})`}</span>
+            <span className="text-[10px] text-slate-400 font-semibold block">
+              {lang === 'ar'
+                ? `مطالبات غير معتمدة بعد: +${pendingEotDays} يوم · إجمالي المُطالب به: +${totalEotDays} يوم`
+                : `Not yet determined: +${pendingEotDays} d · total claimed: +${totalEotDays} d`}
+            </span>
           </div>
         </div>
 
@@ -418,8 +459,11 @@ export default function TimeImpactAnalysisView({ project }: TimeImpactAnalysisVi
             <DollarSign size={24} />
           </div>
           <div>
-            <div className="text-2xl font-bold text-emerald-700">{totalFinancialClaim.toLocaleString()} SAR</div>
-            <span className="text-xs text-slate-500">{lang === 'ar' ? 'تعويضات التكاليف غير المباشرة المستحقة' : 'Prolongation Cost Claimed'}</span>
+            <div className="text-2xl font-bold text-emerald-700">{approvedCompensationSar.toLocaleString()} SAR</div>
+            <span className="text-xs text-slate-500">{lang === 'ar' ? 'تعويضات الإطالة المعتمدة (وقعت قبل خط الحالة)' : 'Approved prolongation compensation (occurred by the Data Date)'}</span>
+            <span className="text-[10px] text-slate-400 font-semibold block">
+              {lang === 'ar' ? `إجمالي المُطالب به: ${totalFinancialClaim.toLocaleString()} SAR` : `Total claimed: ${totalFinancialClaim.toLocaleString()} SAR`}
+            </span>
           </div>
         </div>
       </div>
@@ -447,6 +491,18 @@ export default function TimeImpactAnalysisView({ project }: TimeImpactAnalysisVi
                         {claim.claim_number}
                       </span>
                       <h3 className="text-sm font-bold text-slate-900">{claim.title}</h3>
+                      {sampleClaimIds.includes(claim.id) && (
+                        <span className="text-[9.5px] font-black px-2 py-0.5 rounded bg-amber-100 text-amber-900 border border-amber-300 whitespace-nowrap">
+                          {lang === 'ar' ? 'عيّنة توضيحية (DEMO) — لا يوجد سجل تعاقدي خلفها' : 'DEMO sample — no contractual record behind it'}
+                        </span>
+                      )}
+                      {isAfterDataDate(claim.start_date, governedDataDate) && (
+                        <span className="text-[9.5px] font-black px-2 py-0.5 rounded bg-slate-200 text-slate-700 border border-slate-300 whitespace-nowrap">
+                          {lang === 'ar'
+                            ? `سيناريو مستقبلي بعد خط الحالة (${governedDataDate}) — ليس تأخيراً واقعاً`
+                            : `Future scenario after the Data Date (${governedDataDate}) — not an occurred delay`}
+                        </span>
+                      )}
                     </div>
                     <p className="text-xs text-slate-500 max-w-2xl line-clamp-1">{claim.description}</p>
                   </div>
@@ -757,6 +813,21 @@ export default function TimeImpactAnalysisView({ project }: TimeImpactAnalysisVi
                     onChange={(e) => setForm({ ...form, impactStartDate: e.target.value })}
                     className="w-full p-2 border rounded-lg"
                   />
+                  <p className="text-[10px] text-slate-500 mt-1 leading-relaxed">
+                    {lang === 'ar'
+                      ? `تاريخ خط الحالة المعتمد: ${governedDataDate} — يُعبّأ تاريخ الأثر به افتراضياً.`
+                      : `Governing Data Date: ${governedDataDate} — the impact date defaults to it.`}
+                  </p>
+                  {isAfterDataDate(form.impactStartDate, governedDataDate) && (
+                    <div className="mt-1.5 p-2 rounded-lg bg-amber-50 border border-amber-200 text-[10px] text-amber-900 font-bold flex items-start gap-1.5">
+                      <AlertOctagon size={12} className="flex-shrink-0 mt-0.5" />
+                      <span>
+                        {lang === 'ar'
+                          ? 'التاريخ المختار بعد تاريخ خط الحالة: يُسجَّل الحدث كمسودة سيناريو مستقبلي، ولا يدخل في إجمالي التمديد أو التعويض المعتمد.'
+                          : 'The chosen date is after the Data Date: the event is recorded as a future-scenario draft and stays out of the approved EOT and compensation totals.'}
+                      </span>
+                    </div>
+                  )}
                 </div>
               </div>
 
