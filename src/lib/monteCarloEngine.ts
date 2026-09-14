@@ -24,7 +24,8 @@ import { DEFAULT_DATA_DATE } from './projectControlsConstants';
  *   NONE. Every activity is sampled independently in every iteration and no common-weather /
  *   common-market factor is applied. The schema carries no correlation data, so none is invented.
  *   Consequence: the simulated project-duration spread is narrower than a correlated model would
- *   produce. Reported in `validation` and in the wave report; deliberately not "fixed" here.
+ *   produce. Reported in the result (`correlationModel: 'independent_no_correlation_data'`), in
+ *   `validation` and in the wave report; deliberately not "fixed" here.
  *
  * Iterations
  *   Caller-supplied (RisksView uses 500 on load, 1000 on demand). `iterations <= 0` is a typed
@@ -69,7 +70,12 @@ import { DEFAULT_DATA_DATE } from './projectControlsConstants';
  *   Unchanged family: project cost = total budget x Triangular(0.95, 1.00, 1.15 + (risk loading-1)),
  *   i.e. a -5% / +15% base envelope widened by the same open-risk loading used for durations. The
  *   budget passed in is the caller's authoritative value (RisksView passes the contract value; the
- *   scenario simulator passes its deterministic scenario cost outcome).
+ *   scenario simulator passes its deterministic scenario cost outcome). The caller may pass `null`
+ *   when no authoritative budget exists: the run then sets `costAvailable: false` / `costBasis:
+ *   null`, leaves every cost figure at zero-with-flag (NEVER simulated around zero), and the
+ *   schedule simulation proceeds independently. Stored durations that are non-finite or negative
+ *   (non-milestones) are floored to the documented 1-day minimum AND reported in
+ *   `validation.invalidDurations` -- adjusted, never silently invented.
  * =====================================================================================
  */
 
@@ -119,6 +125,12 @@ export interface MonteCarloValidation {
   cycleCodes: string[] | null;
   /** Links whose predecessor or successor is not in the activity set: ignored, never guessed. */
   ignoredLinkIds: string[];
+  /**
+   * Non-milestone activities whose stored duration was not usable (non-finite or negative) and was
+   * therefore floored to the documented 1-day minimum. Reported by business code; the run continues
+   * on the floored value. Empty in the common case and on rejected runs.
+   */
+  invalidDurations: { activityId: string; activityCode: string }[];
   messageAr: string | null;
   messageEn: string | null;
 }
@@ -180,6 +192,7 @@ export interface MonteCarloResult {
   p50Days: number;
   p80Days: number;
   p90Days: number;
+  /** Cost percentiles; meaningful only when `costAvailable` is true (zero-with-flag otherwise). */
   p50Cost: number;
   p80Cost: number;
   p90Cost: number;
@@ -205,6 +218,23 @@ export interface MonteCarloResult {
   costSamples?: number[];
   seed: number | string | null;
   randomSource: 'seeded' | 'stochastic';
+  /**
+   * Sampling dependency model. The schema carries no correlation or common-cause data, so every
+   * activity is always sampled independently; correlated reality may spread wider than shown.
+   */
+  correlationModel: 'independent_no_correlation_data';
+  /**
+   * How open-risk loading is applied. No risk-to-activity mapping exists in the schema, so the
+   * register widens every activity's pessimistic bound equally (project level only).
+   */
+  riskAllocation: 'project_level_only';
+  /**
+   * False when the caller supplied no positive finite cost basis: the schedule simulation still
+   * runs, but every cost figure is then N/A (zero-with-flag, never simulated around zero).
+   */
+  costAvailable: boolean;
+  /** The authoritative budget the cost envelope was simulated around; null when unavailable. */
+  costBasis: number | null;
 }
 
 /** Sample from a triangular distribution using the supplied random source. */
@@ -385,6 +415,10 @@ function invalidResult(
     criticalityIndex: [],
     seed,
     randomSource,
+    correlationModel: 'independent_no_correlation_data',
+    riskAllocation: 'project_level_only',
+    costAvailable: false,
+    costBasis: null,
   };
 }
 
@@ -392,7 +426,7 @@ export function runMonteCarloSimulation(
   activities: Activity[],
   links: ActivityLink[],
   risks: Risk[],
-  totalBudget: number,
+  totalBudget: number | null,
   iterations = 500,
   calendarType: CalendarType = '6_days',
   options: MonteCarloOptions = {},
@@ -412,6 +446,7 @@ export function runMonteCarloSimulation(
         cycle: null,
         cycleCodes: null,
         ignoredLinkIds: [],
+        invalidDurations: [],
         messageAr: 'لا توجد أنشطة لمحاكاتها — لم يتم توليد أي نتائج احتمالية.',
         messageEn: 'No activities to simulate — no probabilistic result was generated.',
       },
@@ -429,6 +464,7 @@ export function runMonteCarloSimulation(
         cycle: null,
         cycleCodes: null,
         ignoredLinkIds: [],
+        invalidDurations: [],
         messageAr: `عدد دورات المحاكاة غير صالح (${iterations}) — لم يتم توليد أي نتائج احتمالية.`,
         messageEn: `Invalid iteration count (${iterations}) — no probabilistic result was generated.`,
       },
@@ -439,7 +475,12 @@ export function runMonteCarloSimulation(
   }
 
   // ---------------------------------------------------------------- network preparation
+  const invalidDurations: { activityId: string; activityCode: string }[] = [];
   const nodes: NetworkNode[] = activities.map((act, index) => {
+    const rawDuration = Number(act.duration_days);
+    if (!act.is_milestone && (!Number.isFinite(rawDuration) || rawDuration < 0)) {
+      invalidDurations.push({ activityId: String(act.id), activityCode: String(act.code || act.id) });
+    }
     const baseDuration = act.is_milestone ? 0 : Math.max(1, Number(act.duration_days) || 1);
     return {
       id: act.id,
@@ -511,6 +552,7 @@ export function runMonteCarloSimulation(
         cycle,
         cycleCodes,
         ignoredLinkIds,
+        invalidDurations,
         messageAr: `شبكة الأنشطة تحتوي على دورة منطقية مغلقة: ${cycleCodes.join(' ← ')}. لا يمكن تنفيذ المحاكاة الاحتمالية قبل فك التعارض، ولم يتم توليد أي مدد أو تواريخ.`,
         messageEn: `The activity network contains a logic cycle: ${cycleCodes.join(' <- ')}. Resolve the circular dependency before simulating; no durations or dates were generated.`,
       },
@@ -528,6 +570,12 @@ export function runMonteCarloSimulation(
     if (!candidate) return earliest;
     return !earliest || candidate < earliest ? candidate : earliest;
   }, '' as string) || dataDate;
+
+  // Cost basis: only a positive finite caller budget funds a cost envelope. Anything else
+  // (null, zero, negative, NaN) leaves cost unavailable while the schedule simulates alone.
+  const rawBudget = totalBudget === null ? NaN : Number(totalBudget);
+  const costAvailable = Number.isFinite(rawBudget) && rawBudget > 0;
+  const costBasis = costAvailable ? rawBudget : null;
 
   // ---------------------------------------------------------------- simulation loop
   const durationResults: number[] = [];
@@ -637,8 +685,11 @@ export function runMonteCarloSimulation(
     durationResults.push(projectDuration);
 
     // 4. Cost sample: documented envelope around the caller's authoritative budget.
+    //    Drawn only when a cost basis exists; otherwise no cost sample is fabricated.
     const costVariation = sampleTriangular(0.95, 1.0, 1.15 + (avgRiskMultiplier - 1), random);
-    costResults.push(Math.round(Number(totalBudget || 0) * costVariation));
+    if (costAvailable && costBasis !== null) {
+      costResults.push(Math.round(costBasis * costVariation));
+    }
   }
 
   const validIterations = durationResults.length;
@@ -705,6 +756,33 @@ export function runMonteCarloSimulation(
     })
     .sort((a, b) => b.probability - a.probability || a.activityCode.localeCompare(b.activityCode));
 
+  const okMessagePartsAr: string[] = [];
+  const okMessagePartsEn: string[] = [];
+  if (ignoredLinkIds.length) {
+    okMessagePartsAr.push(`تم تجاهل ${ignoredLinkIds.length} علاقة تربط أنشطة خارج نطاق مجموعة المحاكاة.`);
+    okMessagePartsEn.push(
+      `${ignoredLinkIds.length} link(s) referencing activities outside the simulated set were ignored.`,
+    );
+  }
+  if (invalidDurations.length) {
+    const codesAr = invalidDurations.map((d) => d.activityCode).join('، ');
+    const codesEn = invalidDurations.map((d) => d.activityCode).join(', ');
+    okMessagePartsAr.push(
+      `تم رصد ${invalidDurations.length} نشاط بمدد مخزنة غير صالحة فعُدّلت إلى الحد الأدنى (يوم واحد): ${codesAr}.`,
+    );
+    okMessagePartsEn.push(
+      `${invalidDurations.length} activit(y/ies) with invalid stored durations were floored to the 1-day minimum: ${codesEn}.`,
+    );
+  }
+  if (!costAvailable) {
+    okMessagePartsAr.push(
+      'لا يوجد أساس تكلفة معتمد — التكلفة غير متاحة (N/A) ونتائج المدد الزمنية مستقلة عنها.',
+    );
+    okMessagePartsEn.push(
+      'No authoritative cost basis — cost is unavailable (N/A); schedule results stand alone.',
+    );
+  }
+
   const result: MonteCarloResult = {
     iterations: validIterations,
     validIterations,
@@ -715,12 +793,9 @@ export function runMonteCarloSimulation(
       cycle: null,
       cycleCodes: null,
       ignoredLinkIds,
-      messageAr: ignoredLinkIds.length
-        ? `تم تجاهل ${ignoredLinkIds.length} علاقة تربط أنشطة خارج نطاق مجموعة المحاكاة.`
-        : null,
-      messageEn: ignoredLinkIds.length
-        ? `${ignoredLinkIds.length} link(s) referencing activities outside the simulated set were ignored.`
-        : null,
+      invalidDurations,
+      messageAr: okMessagePartsAr.length ? okMessagePartsAr.join(' ') : null,
+      messageEn: okMessagePartsEn.length ? okMessagePartsEn.join(' ') : null,
     },
     cycle: null,
     dataDate,
@@ -741,12 +816,16 @@ export function runMonteCarloSimulation(
     meanCost: Math.round(costResults.reduce((s, v) => s + v, 0) / Math.max(1, validIterations)),
     minDurationDays: validIterations > 0 ? durationResults[0] : 0,
     maxDurationDays: validIterations > 0 ? durationResults[validIterations - 1] : 0,
-    minCost: validIterations > 0 ? costResults[0] : 0,
-    maxCost: validIterations > 0 ? costResults[validIterations - 1] : 0,
+    minCost: costResults.length > 0 ? costResults[0] : 0,
+    maxCost: costResults.length > 0 ? costResults[costResults.length - 1] : 0,
     scheduleDistribution,
     criticalityIndex,
     seed,
     randomSource: randomSourceKind,
+    correlationModel: 'independent_no_correlation_data',
+    riskAllocation: 'project_level_only',
+    costAvailable,
+    costBasis,
   };
 
   if (options.includeSamples) {

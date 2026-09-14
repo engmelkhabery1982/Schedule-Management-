@@ -780,6 +780,11 @@ export interface ScenarioProbabilisticEnvelope {
   durationScaleFactor: number;
   /** Open risks that widened the pessimistic bound; 0 => dispersion is optimistic-side only. */
   openRiskCount: number;
+  /**
+   * False when the run had no positive cost basis: the duration percentiles still stand, but every
+   * cost percentile is null (N/A) and the published cost is the deterministic scenario outcome.
+   */
+  costAvailable: boolean;
   /** Reproducibility seed when the caller supplied one; null means a stochastic run. */
   seed: number | string | null;
   /** Validation failure or modelling caveat, bilingual. Null when there is nothing to qualify. */

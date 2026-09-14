@@ -53,7 +53,7 @@ export default function RisksView({ project }: RisksViewProps) {
 
     // Initial simulation
     if (acts.length > 0) {
-      const res = runMonteCarloSimulation(acts, lnks, rsk, project.contract_value || 1000000, 500, undefined, {
+      const res = runMonteCarloSimulation(acts, lnks, rsk, project.contract_value ?? null, 500, undefined, {
         dataDate: project.data_date || null,
       });
       setSimulationResult(res);
@@ -66,7 +66,7 @@ export default function RisksView({ project }: RisksViewProps) {
     if (!project) return;
     setIsSimulating(true);
     setTimeout(() => {
-      const res = runMonteCarloSimulation(activities, links, risks, project.contract_value || 1000000, 1000, undefined, {
+      const res = runMonteCarloSimulation(activities, links, risks, project.contract_value ?? null, 1000, undefined, {
         dataDate: project.data_date || null,
       });
       setSimulationResult(res);
@@ -501,7 +501,11 @@ export default function RisksView({ project }: RisksViewProps) {
                   </div>
                   <div className="mt-3 pt-3 border-t border-slate-100">
                     <span className="text-xs text-slate-400 block">التكلفة المتوقعة (P50)</span>
-                    <span className="text-sm font-semibold text-blue-700">{simulationResult.p50Cost.toLocaleString()} ريال</span>
+                    {simulationResult.costAvailable ? (
+                      <span className="text-sm font-semibold text-blue-700">{simulationResult.p50Cost.toLocaleString()} ريال</span>
+                    ) : (
+                      <span className="text-sm font-semibold text-slate-400">N/A — لا يوجد أساس تكلفة</span>
+                    )}
                   </div>
                 </div>
 
@@ -518,7 +522,11 @@ export default function RisksView({ project }: RisksViewProps) {
                   </div>
                   <div className="mt-3 pt-3 border-t border-slate-100">
                     <span className="text-xs text-slate-400 block">التكلفة مع الاحتياطي المالي</span>
-                    <span className="text-sm font-semibold text-purple-700">{simulationResult.p80Cost.toLocaleString()} ريال</span>
+                    {simulationResult.costAvailable ? (
+                      <span className="text-sm font-semibold text-purple-700">{simulationResult.p80Cost.toLocaleString()} ريال</span>
+                    ) : (
+                      <span className="text-sm font-semibold text-slate-400">N/A — لا يوجد أساس تكلفة</span>
+                    )}
                   </div>
                 </div>
 
@@ -535,7 +543,11 @@ export default function RisksView({ project }: RisksViewProps) {
                   </div>
                   <div className="mt-3 pt-3 border-t border-slate-100">
                     <span className="text-xs text-slate-400 block">التكلفة القصوى مع الطوارئ</span>
-                    <span className="text-sm font-semibold text-amber-700">{simulationResult.p90Cost.toLocaleString()} ريال</span>
+                    {simulationResult.costAvailable ? (
+                      <span className="text-sm font-semibold text-amber-700">{simulationResult.p90Cost.toLocaleString()} ريال</span>
+                    ) : (
+                      <span className="text-sm font-semibold text-slate-400">N/A — لا يوجد أساس تكلفة</span>
+                    )}
                   </div>
                 </div>
               </div>
@@ -604,6 +616,40 @@ export default function RisksView({ project }: RisksViewProps) {
                   <div>أطول مدة: <span className="font-mono font-bold text-slate-700">{simulationResult.maxDurationDays.toLocaleString()}</span> يوم</div>
                   <div>مصدر العشوائية: <span className="font-mono font-bold text-slate-700">{simulationResult.randomSource === 'seeded' ? `بذرة ${String(simulationResult.seed)}` : 'عشوائي (غير مبذر)'}</span></div>
                 </div>
+              </div>
+
+              {/* Methodology transparency: model limits disclosed as limitations, not errors */}
+              <div className="bg-slate-50 rounded-xl border border-slate-200 p-5">
+                <h4 className="font-semibold text-slate-800 text-sm mb-3 flex items-center gap-2">
+                  <Shield size={18} className="text-slate-500" />
+                  شفافية المنهجية وحدودها
+                </h4>
+                <dl className="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-2 text-xs text-slate-600">
+                  <div className="flex justify-between gap-3 border-b border-slate-100 pb-1.5">
+                    <dt className="text-slate-400">الدورات المشغلة</dt>
+                    <dd className="font-mono font-bold text-slate-700">{simulationResult.validIterations.toLocaleString()}</dd>
+                  </div>
+                  <div className="flex justify-between gap-3 border-b border-slate-100 pb-1.5">
+                    <dt className="text-slate-400">مصدر العشوائية</dt>
+                    <dd className="font-bold text-slate-700 text-left">{simulationResult.randomSource === 'seeded' ? `بذرة ${String(simulationResult.seed)} — قابلة لإعادة الإنتاج` : 'عشوائي — غير قابل لإعادة الإنتاج'}</dd>
+                  </div>
+                  <div className="flex justify-between gap-3 border-b border-slate-100 pb-1.5">
+                    <dt className="text-slate-400">توزيع أثر المخاطر</dt>
+                    <dd className="font-bold text-slate-700 text-left">{risks.filter((r) => r.status === 'open').length} مخاطر مفتوحة توسّع الحد المتشائم لجميع الأنشطة بالتساوي — لا يوجد تخصيص لكل نشاط</dd>
+                  </div>
+                  <div className="flex justify-between gap-3 border-b border-slate-100 pb-1.5">
+                    <dt className="text-slate-400">نموذج الارتباط</dt>
+                    <dd className="font-bold text-slate-700 text-left">عينات مستقلة — لا توجد بيانات ارتباط، وقد يكون التشتت الفعلي أكبر</dd>
+                  </div>
+                  <div className="flex justify-between gap-3 border-b border-slate-100 pb-1.5">
+                    <dt className="text-slate-400">أساس التكلفة</dt>
+                    <dd className="font-bold text-slate-700 text-left">{simulationResult.costAvailable && simulationResult.costBasis !== null ? `قيمة العقد: ${simulationResult.costBasis.toLocaleString()} ريال` : 'غير متوفر — التكلفة N/A والنتائج الزمنية مستقلة'}</dd>
+                  </div>
+                  <div className="flex justify-between gap-3 border-b border-slate-100 pb-1.5">
+                    <dt className="text-slate-400">حالة التحقق</dt>
+                    <dd className="font-bold text-slate-700 text-left">{simulationResult.validation.messageAr || 'صالحة — لا ملاحظات'}</dd>
+                  </div>
+                </dl>
               </div>
             </div>
           )}

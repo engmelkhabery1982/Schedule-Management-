@@ -359,6 +359,12 @@ export function simulateComplexProjectScenario(
       ? 'لا توجد مخاطر مفتوحة ممررة للمحاكاة: تشتت المدد يأتي من الحد المتفائل (0.85×) وحده، لذا قد يقل P80 عن مدة السيناريو الحتمية.'
       : `تم استخراج النسب من توزيع المحاكاة الفعلية (${simulation.validIterations} دورة) مع ${openRiskCount} خطراً مفتوحاً.`
     : 'تعذّر تشغيل المحاكاة الاحتمالية؛ القيم المعروضة هي ناتج السيناريو الحتمي وليست نسباً احتمالية.';
+  // When the schedule simulates but no cost basis exists, the published cost stays the
+  // deterministic scenario outcome and the caveat says so -- the duration percentiles are unaffected.
+  const costCaveatAr =
+    'لا يوجد أساس تكلفة للسيناريو — التكلفة المعروضة هي الناتج الحتمي وليست نسبة احتمالية.';
+  const costCaveatEn =
+    'The scenario has no cost basis — the cost shown is the deterministic outcome, not a percentile.';
   const envelopeCaveatEn = simulation.valid
     ? openRiskCount === 0
       ? 'No open risks were supplied to the simulation: duration dispersion comes from the optimistic bound (0.85x) alone, so P80 can sit below the deterministic scenario duration.'
@@ -372,32 +378,42 @@ export function simulateComplexProjectScenario(
     p50DurationDays: simulation.valid ? simulation.p50Days : null,
     p80DurationDays: simulation.valid ? simulation.p80Days : null,
     p90DurationDays: simulation.valid ? simulation.p90Days : null,
-    p50CostSar: simulation.valid ? simulation.p50Cost : null,
-    p80CostSar: simulation.valid ? simulation.p80Cost : null,
-    p90CostSar: simulation.valid ? simulation.p90Cost : null,
+    p50CostSar: simulation.valid && simulation.costAvailable ? simulation.p50Cost : null,
+    p80CostSar: simulation.valid && simulation.costAvailable ? simulation.p80Cost : null,
+    p90CostSar: simulation.valid && simulation.costAvailable ? simulation.p90Cost : null,
     p50FinishDate: simulation.valid ? addWorkingDays(startDate, simulation.p50Days, calendar) : null,
     p90FinishDate: simulation.valid ? addWorkingDays(startDate, simulation.p90Days, calendar) : null,
     minDurationDays: simulation.valid ? simulation.minDurationDays : null,
     maxDurationDays: simulation.valid ? simulation.maxDurationDays : null,
-    minCostSar: simulation.valid ? simulation.minCost : null,
-    maxCostSar: simulation.valid ? simulation.maxCost : null,
+    minCostSar: simulation.valid && simulation.costAvailable ? simulation.minCost : null,
+    maxCostSar: simulation.valid && simulation.costAvailable ? simulation.maxCost : null,
     deterministicNetworkDurationDays: deterministicNetwork.durationDays,
     durationScaleFactor: Number(durationScaleFactor.toFixed(6)),
     openRiskCount,
+    costAvailable: simulation.costAvailable,
     seed: simulation.seed,
-    noteAr: simulation.valid
-      ? envelopeCaveatAr
-      : `${envelopeCaveatAr} ${simulation.validation.messageAr || ''}`.trim(),
-    noteEn: simulation.valid
-      ? envelopeCaveatEn
-      : `${envelopeCaveatEn} ${simulation.validation.messageEn || ''}`.trim(),
+    noteAr:
+      simulation.valid && simulation.costAvailable
+        ? envelopeCaveatAr
+        : simulation.valid
+          ? `${envelopeCaveatAr} ${costCaveatAr}`
+          : `${envelopeCaveatAr} ${simulation.validation.messageAr || ''}`.trim(),
+    noteEn:
+      simulation.valid && simulation.costAvailable
+        ? envelopeCaveatEn
+        : simulation.valid
+          ? `${envelopeCaveatEn} ${costCaveatEn}`
+          : `${envelopeCaveatEn} ${simulation.validation.messageEn || ''}`.trim(),
   };
 
   // The published P80 pair: sampled when the envelope is valid, otherwise the deterministic outcome
   // with `probabilisticEnvelope.valid === false` telling the consumer which one it is looking at.
+  // Cost additionally falls back to the deterministic outcome when the run had no cost basis
+  // (`costAvailable === false` + the envelope caveat say so); durations are unaffected.
   const p80DurationDays = simulation.valid ? simulation.p80Days : totalSimulatedDurationDays;
   const p80FinishDate = addWorkingDays(startDate, p80DurationDays, calendar);
-  const p80CostSar = simulation.valid ? simulation.p80Cost : simulatedCostOutcomeSar;
+  const p80CostSar =
+    simulation.valid && simulation.costAvailable ? simulation.p80Cost : simulatedCostOutcomeSar;
 
   // 5. Feasibility Score & Risk Classification
   let feasibilityScore = 100;
@@ -576,11 +592,16 @@ export function runPrecisionWatchdogAudit(
     values.every((v): v is number => v !== null) &&
     (values[0] as number) <= (values[1] as number) &&
     (values[1] as number) <= (values[2] as number);
-  const monotonicityViolations = simulatedEnvelopes.filter(
-    (e) =>
+  const monotonicityViolations = simulatedEnvelopes.filter((e) => {
+    const costTriple = [e.p50CostSar, e.p80CostSar, e.p90CostSar];
+    // An all-null cost triple means "no cost basis" (reported on the envelope), not a violation;
+    // a partially-null triple would be a modelling bug and is still flagged.
+    const costAbsent = costTriple.every((v) => v === null);
+    return (
       !isMonotonic([e.p50DurationDays, e.p80DurationDays, e.p90DurationDays]) ||
-      !isMonotonic([e.p50CostSar, e.p80CostSar, e.p90CostSar]),
-  ).length;
+      (!costAbsent && !isMonotonic(costTriple))
+    );
+  }).length;
   const unavailableEnvelopes = envelopes.length - simulatedEnvelopes.length;
   const sampledIterations = simulatedEnvelopes.reduce((sum, e) => sum + e.iterations, 0);
   metrics.push({
