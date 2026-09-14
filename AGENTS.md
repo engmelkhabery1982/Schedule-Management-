@@ -24,7 +24,7 @@ before editing anything, and re-read it at the start of every new session.
 Rules that follow from this baseline:
 
 1. **`f16622d` is the baseline for this branch**, not `origin/main`. Every commit made here
-   must be a **descendant of `f16622d`** (verify with the guard checks in §7).
+   must be a **descendant of `f1662d`** (verify with the guard checks in §8).
 2. **This branch history is unrelated to `origin/main`.** `git merge-base f16622d origin/main`
    returns *no common ancestor*. Therefore:
    - Never `git pull --rebase origin main` here.
@@ -39,7 +39,7 @@ Rules that follow from this baseline:
 
 1. Check the working tree with `git status --short`.
 2. If local uncommitted changes exist, stop and report them before editing.
-3. Synchronize remote references: `git fetch --prune origin` (see §7 for the refspec caveat —
+3. Synchronize remote references: `git fetch --prune origin` (see §8 for the refspec caveat —
    the local clone tracks `main` only, so use `git ls-remote --heads origin` to read the tips of
    the `arena/*` branches).
 4. Confirm you are on the session branch and that the base is still in your ancestry:

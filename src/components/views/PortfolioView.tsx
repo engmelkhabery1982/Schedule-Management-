@@ -163,7 +163,11 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
       // Approved EOT days have no table anywhere in `supabase/migrations` (no delay_claims), so no
       // number is invented for them — the KPI is reported as N/A with that reason.
       const dcmaAudit = pActs.length > 0
-        ? runDcma14PointAudit(pActs, pLinks, pBaselines, [], p.data_date || DEFAULT_DATA_DATE)
+        ? runDcma14PointAudit(pActs, pLinks, pBaselines, [], p.data_date || DEFAULT_DATA_DATE, {
+          // GAP-015: Point 11 recomputes CPM on each project's own calendar and status logic.
+          calendarType: p.calendar_type,
+          statusLogic: p.status_logic,
+        })
         : null;
       const dcmaScore = dcmaAudit ? dcmaAudit.score : null;
       const dcmaStatus = dcmaAudit ? dcmaAudit.status : null;

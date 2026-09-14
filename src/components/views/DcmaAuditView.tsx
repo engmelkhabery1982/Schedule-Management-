@@ -74,8 +74,11 @@ export default function DcmaAuditView({ project }: DcmaAuditViewProps) {
       baselineActivities,
       assignments,
       dcmaDataDate,
+      // GAP-015: Point 11 recomputes the network with the CPM engine, so it must run on the
+      // project's own calendar and status logic instead of the engine defaults.
+      { calendarType: project?.calendar_type, statusLogic: project?.status_logic },
     );
-  }, [activities, links, baselineActivities, assignments, dcmaDataDate]);
+  }, [activities, links, baselineActivities, assignments, dcmaDataDate, project?.calendar_type, project?.status_logic]);
 
   async function handleAutoFix(fixType: any = 'all') {
     if (!project) return;

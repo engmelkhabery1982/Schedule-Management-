@@ -1,7 +1,230 @@
-import type { Activity, ActivityLink, BaselineActivity, ActivityResource, DcmaAuditResult, DcmaPointResult } from '@/types';
+import type { Activity, ActivityLink, BaselineActivity, ActivityResource, CalendarType, DcmaAuditResult, DcmaPointResult } from '@/types';
 import type { GeneratedAlert } from '@/lib/alertEngine';
+import type { CpmResult, LinkDrivingResult } from '@/lib/cpmEngine';
 import { supabase } from '@/lib/supabase';
 import { calculateCpm } from '@/lib/cpmEngine';
+import { resolveDataDate } from '@/lib/chronologyGuard';
+
+/** Activity types the network treats as milestone anchors (same predicate the CPM engine uses). */
+function isMilestoneActivity(activity: Activity): boolean {
+  return Boolean(activity.is_milestone)
+    || activity.activity_type === 'start_milestone'
+    || activity.activity_type === 'finish_milestone';
+}
+
+/**
+ * The date an activity actually starts at, honouring recorded progress before planned dates.
+ * Mirrors the CPM forward pass, which anchors on `actual_start || early_start`.
+ */
+export function effectiveActivityStart(activity: Activity): string | null {
+  return activity.actual_start || activity.early_start || null;
+}
+
+/** The date an activity actually finishes at (`actual_finish || early_finish || its start`). */
+export function effectiveActivityFinish(activity: Activity): string | null {
+  return activity.actual_finish || activity.early_finish || effectiveActivityStart(activity);
+}
+
+export interface OpenEndAssessment {
+  /** Earliest effective start across the whole network (milestones included). */
+  startBoundaryDate: string | null;
+  /** Latest effective finish across the whole network (milestones included). */
+  finishBoundaryDate: string | null;
+  /** True when the schedule owns a milestone with no predecessor sitting on the start boundary. */
+  hasStartBoundaryMilestone: boolean;
+  /** True when the schedule owns a milestone with no successor sitting on the finish boundary. */
+  hasFinishBoundaryMilestone: boolean;
+  /** Non-milestone activities whose missing predecessor is a genuine defect (Point 1). */
+  openStartDefects: Activity[];
+  /** Non-milestone activities whose missing successor is a genuine defect (Point 1). */
+  openFinishDefects: Activity[];
+  /** Per-activity Arabic reason for each open-start defect. */
+  openStartReasons: Map<string, string>;
+  /** Per-activity Arabic reason for each open-finish defect. */
+  openFinishReasons: Map<string, string>;
+  /** Every activity (milestones included) that legitimately carries no predecessor. */
+  legitimateStartIds: Set<string>;
+  /** Every activity (milestones included) that legitimately carries no successor. */
+  legitimateFinishIds: Set<string>;
+}
+
+/**
+ * GAP-014 — open starts / open finishes resolved from network and status data only.
+ *
+ * The previous implementation exempted the FIRST and the LAST element of the activity array from
+ * the open-end test (`index > 0`, `index < length - 1`). Array position carries no schedule
+ * meaning: rows arrive ordered by `sort_order` / import order, so the exemption followed the order
+ * a file happened to be loaded in — an activity that really was the network start but was stored
+ * second was reported as a defect, while an unlinked row stored first was silently excused.
+ *
+ * The rule applied from here on (the rule an auditor can reproduce from the schedule itself):
+ *
+ *  1. Population — non-milestone activities, unchanged (milestones are the anchors the logic hangs
+ *     from, so they are not themselves "open ends" for Point 1).
+ *  2. Boundaries — the start boundary is the earliest effective start (`actual_start ||
+ *     early_start`) over ALL activities; the finish boundary is the latest effective finish
+ *     (`actual_finish || early_finish || effective start`) over ALL activities.
+ *  3. Start legitimacy — an activity with no predecessor is a legitimate project start ONLY when it
+ *     sits on the start boundary AND the network does not own a start-boundary milestone (a
+ *     milestone with no predecessor on that same boundary date). When such a milestone exists it is
+ *     the single project-start anchor, so every other unlinked activity is an internal open start.
+ *  4. Finish legitimacy — mirrored on the finish boundary / finish-boundary milestone.
+ *  5. Undated rows — an activity with neither dates nor logic cannot be located on the network at
+ *     all; it is reported as a defect with its own reason instead of being exempted by position.
+ *
+ * Point 11 (critical-path continuity) reuses `legitimateStartIds` / `legitimateFinishIds`, so both
+ * checks agree on what a real network boundary is.
+ */
+export function assessOpenEnds(activities: Activity[], links: ActivityLink[]): OpenEndAssessment {
+  const hasPredecessor = new Set(links.map((l) => l.successor_id));
+  const hasSuccessor = new Set(links.map((l) => l.predecessor_id));
+
+  const startDates = activities.map(effectiveActivityStart).filter((d): d is string => Boolean(d));
+  const finishDates = activities.map(effectiveActivityFinish).filter((d): d is string => Boolean(d));
+  const startBoundaryDate = startDates.length ? startDates.reduce((min, d) => (d < min ? d : min)) : null;
+  const finishBoundaryDate = finishDates.length ? finishDates.reduce((max, d) => (d > max ? d : max)) : null;
+
+  const hasStartBoundaryMilestone = activities.some((a) =>
+    isMilestoneActivity(a) && !hasPredecessor.has(a.id) && effectiveActivityStart(a) === startBoundaryDate && startBoundaryDate !== null);
+  const hasFinishBoundaryMilestone = activities.some((a) =>
+    isMilestoneActivity(a) && !hasSuccessor.has(a.id) && effectiveActivityFinish(a) === finishBoundaryDate && finishBoundaryDate !== null);
+
+  const openStartDefects: Activity[] = [];
+  const openFinishDefects: Activity[] = [];
+  const openStartReasons = new Map<string, string>();
+  const openFinishReasons = new Map<string, string>();
+  const legitimateStartIds = new Set<string>();
+  const legitimateFinishIds = new Set<string>();
+
+  activities.forEach((activity) => {
+    const milestone = isMilestoneActivity(activity);
+    const actStart = effectiveActivityStart(activity);
+    const actFinish = effectiveActivityFinish(activity);
+
+    // --- predecessor side -------------------------------------------------------------
+    if (!hasPredecessor.has(activity.id)) {
+      const onBoundary = startBoundaryDate !== null && actStart === startBoundaryDate;
+      if (milestone) {
+        // A milestone anchor with no predecessor is legitimate only on the start boundary.
+        if (onBoundary) legitimateStartIds.add(activity.id);
+      } else if (actStart === null) {
+        openStartDefects.push(activity);
+        openStartReasons.set(activity.id, 'بداية مفتوحة: لا توجد تواريخ ولا سوابق، وتعذّر إثبات موقع النشاط على الشبكة.');
+      } else if (onBoundary && !hasStartBoundaryMilestone) {
+        legitimateStartIds.add(activity.id);
+      } else if (onBoundary) {
+        openStartDefects.push(activity);
+        openStartReasons.set(
+          activity.id,
+          `بداية مفتوحة داخلية: لا يوجد سابق رغم وجود معلم بدء المشروع على نفس حد البداية (${startBoundaryDate}).`,
+        );
+      } else {
+        openStartDefects.push(activity);
+        openStartReasons.set(
+          activity.id,
+          `بداية مفتوحة داخلية: لا يوجد سابق والنشاط ليس على حد بداية الشبكة (${startBoundaryDate}).`,
+        );
+      }
+    }
+
+    // --- successor side ---------------------------------------------------------------
+    if (!hasSuccessor.has(activity.id)) {
+      const onBoundary = finishBoundaryDate !== null && actFinish === finishBoundaryDate;
+      if (milestone) {
+        if (onBoundary) legitimateFinishIds.add(activity.id);
+      } else if (actFinish === null) {
+        openFinishDefects.push(activity);
+        openFinishReasons.set(activity.id, 'نهاية مفتوحة: لا توجد تواريخ ولا لواحق، وتعذّر إثبات موقع النشاط على الشبكة.');
+      } else if (onBoundary && !hasFinishBoundaryMilestone) {
+        legitimateFinishIds.add(activity.id);
+      } else if (onBoundary) {
+        openFinishDefects.push(activity);
+        openFinishReasons.set(
+          activity.id,
+          `نهاية مفتوحة داخلية: لا يوجد لاحق رغم وجود معلم الإنجاز على نفس حد النهاية (${finishBoundaryDate}).`,
+        );
+      } else {
+        openFinishDefects.push(activity);
+        openFinishReasons.set(
+          activity.id,
+          `نهاية مفتوحة داخلية: لا يوجد لاحق والنشاط ليس على حد نهاية الشبكة (${finishBoundaryDate}).`,
+        );
+      }
+    }
+  });
+
+  return {
+    startBoundaryDate,
+    finishBoundaryDate,
+    hasStartBoundaryMilestone,
+    hasFinishBoundaryMilestone,
+    openStartDefects,
+    openFinishDefects,
+    openStartReasons,
+    openFinishReasons,
+    legitimateStartIds,
+    legitimateFinishIds,
+  };
+}
+
+/**
+ * The activity an open end is repaired to: the network's own boundary anchor (GAP-014).
+ *
+ * Preference order — the boundary milestone that owns the limit when the schedule has one, then the
+ * earliest (start side) / latest (finish side) legitimate boundary activity, then the activity code
+ * as a deterministic tie-break. Never an array position.
+ */
+export function resolveBoundaryAnchor(
+  activities: Activity[],
+  assessment: OpenEndAssessment,
+  side: 'start' | 'finish',
+): Activity | null {
+  const ids = side === 'start' ? assessment.legitimateStartIds : assessment.legitimateFinishIds;
+  const boundaryDate = side === 'start' ? assessment.startBoundaryDate : assessment.finishBoundaryDate;
+  const dateOf = (a: Activity) =>
+    (side === 'start' ? effectiveActivityStart(a) : effectiveActivityFinish(a)) || boundaryDate || '';
+  const candidates = activities
+    .filter((a) => ids.has(a.id))
+    .sort((x, y) => {
+      const xm = isMilestoneActivity(x) ? 0 : 1;
+      const ym = isMilestoneActivity(y) ? 0 : 1;
+      if (xm !== ym) return xm - ym;
+      if (dateOf(x) !== dateOf(y)) return side === 'start' ? dateOf(x).localeCompare(dateOf(y)) : dateOf(y).localeCompare(dateOf(x));
+      return String(x.code || '').localeCompare(String(y.code || ''));
+    });
+  return candidates[0] || null;
+}
+
+/**
+ * True when adding a link `fromId -> toId` would close a loop in the existing network (or link an
+ * activity to itself), so the autofix can never introduce a cycle while repairing open ends.
+ */
+function closesCycle(links: ActivityLink[], fromId: string, toId: string): boolean {
+  if (fromId === toId) return true;
+  const successorsOf = new Map<string, string[]>();
+  links.forEach((l) => {
+    successorsOf.set(l.predecessor_id, [...(successorsOf.get(l.predecessor_id) || []), l.successor_id]);
+  });
+  const queue = [toId];
+  const seen = new Set<string>();
+  while (queue.length) {
+    const current = queue.shift() as string;
+    if (current === fromId) return true;
+    if (seen.has(current)) continue;
+    seen.add(current);
+    (successorsOf.get(current) || []).forEach((next) => queue.push(next));
+  }
+  return false;
+}
+
+/**
+ * Project-level CPM context for the audit (GAP-015). Optional and backwards compatible: without it
+ * the CPM engine falls back to its own governed defaults (`6_days`, `retained_logic`).
+ */
+export interface DcmaAuditOptions {
+  calendarType?: CalendarType;
+  statusLogic?: 'retained_logic' | 'progress_override';
+}
 
 export function runDcma14PointAudit(
   activities: Activity[],
@@ -9,6 +232,7 @@ export function runDcma14PointAudit(
   baselineActivities: BaselineActivity[] = [],
   assignments: ActivityResource[] = [],
   dataDate: string = new Date().toISOString().split('T')[0],
+  options: DcmaAuditOptions = {},
 ): DcmaAuditResult {
   if (!activities.length) {
     return {
@@ -38,23 +262,37 @@ export function runDcma14PointAudit(
 
   const points: DcmaPointResult[] = [];
 
-  // Point 1: Logic (Missing Predecessors or Successors)
-  const openStart = nonMilestones.filter((a, index) => index > 0 && !predecessorsMap.has(a.id));
-  const openFinish = nonMilestones.filter((a, index) => index < nonMilestones.length - 1 && !successorsMap.has(a.id));
-  const missingLogicActivities = new Set([...openStart.map((a) => a.id), ...openFinish.map((a) => a.id)]);
+  // Point 1: Logic (Missing Predecessors or Successors) — GAP-014
+  // Open ends are resolved by `assessOpenEnds` from the network + recorded status only. No activity
+  // is exempted because of where it happens to sit in the array, and a legitimate project start /
+  // finish is proven by the network boundary (or by the start / finish milestone that owns it).
+  const openEnds = assessOpenEnds(activities, links);
+  const missingLogicActivities = new Set([
+    ...openEnds.openStartDefects.map((a) => a.id),
+    ...openEnds.openFinishDefects.map((a) => a.id),
+  ]);
   const missingLogicPct = (missingLogicActivities.size / nonMilestoneCount) * 100;
+  // Sorted by code so the note is identical no matter what order the rows arrived in (GAP-014:
+  // nothing in this point may depend on array position, including its own report text).
+  const legitimateBoundaryActs = activities
+    .filter((a) => openEnds.legitimateStartIds.has(a.id) || openEnds.legitimateFinishIds.has(a.id))
+    .slice()
+    .sort((x, y) => String(x.code || '').localeCompare(String(y.code || '')));
   points.push({
     id: 1,
     name: 'Logic Links Integrity',
     nameAr: 'اكتمال الروابط المنطقية (Missing Predecessors/Successors)',
-    description: 'يجب ألا تزيد نسبة الأنشطة غير المربوطة بسابق أو لاحق عن 5% (Open Starts & Finishes).',
+    description: 'يجب ألا تزيد نسبة الأنشطة غير المربوطة بسابق أو لاحق عن 5% (Open Starts & Finishes). يُستثنى فقط ما تثبت الشبكة أنه حد مشروع: نشاط بلا سابق يقع على حد بداية الشبكة (أقرب early/actual start) ولا يوجد معلم بدء يملك ذلك الحد، ونشاط بلا لاحق يقع على حد نهاية الشبكة (أبعد early/actual finish) ولا يوجد معلم إنجاز يملكه. لا علاقة لترتيب الصفوف في القائمة بهذا الحكم.',
     target: '≤ 5.0%',
     actualValue: `${missingLogicPct.toFixed(1)}% (${missingLogicActivities.size} نشاط مفتوح)`,
     passRatio: missingLogicPct <= 5 ? 1 : Math.max(0, 1 - (missingLogicPct - 5) / 20),
     status: missingLogicPct <= 5 ? 'pass' : missingLogicPct <= 10 ? 'warning' : 'fail',
     details: [
-      ...openStart.map((a) => `النشاط [${a.code}] ليس له سوابق (Open Start).`),
-      ...openFinish.map((a) => `النشاط [${a.code}] ليس له لواحق (Open Finish).`),
+      ...openEnds.openStartDefects.map((a) => `النشاط [${a.code}] ${openEnds.openStartReasons.get(a.id) || 'ليس له سوابق (Open Start).'}`),
+      ...openEnds.openFinishDefects.map((a) => `النشاط [${a.code}] ${openEnds.openFinishReasons.get(a.id) || 'ليس له لواحق (Open Finish).'}`),
+      ...(legitimateBoundaryActs.length
+        ? [`حدود الشبكة المعتمدة: البداية ${openEnds.startBoundaryDate || 'غير محددة'} · النهاية ${openEnds.finishBoundaryDate || 'غير محددة'} — أنشطة مشروعة بلا روابط لأنها تملك الحد: [${legitimateBoundaryActs.map((a) => a.code).join('، ')}].`]
+        : []),
     ],
     recommendation: 'وفق معيار DCMA 14-Point، يجب ربط جميع الأنشطة المفتوحة بسابق أو لاحق منطقي (ربط البدايات بمعلم بدء المشروع، والنهايات المفتوحة بمعلم التسليم النهائي أو النشاط التالي في الحزمة).',
     autoFixType: 'fix_missing_logic',
@@ -227,21 +465,128 @@ export function runDcma14PointAudit(
     weight: 7,
   });
 
-  // Point 11: Critical Path Continuity
-  const criticalActs = activities.filter((a) => a.is_critical);
-  const criticalHasPred = criticalActs.filter((a) => predecessorsMap.has(a.id) || a.is_milestone).length;
-  const criticalPathRatio = criticalActs.length > 0 ? criticalHasPred / criticalActs.length : 1;
+  // Point 11: Critical Path Continuity — GAP-015
+  //
+  // The previous test counted a critical activity as "continuous" when it had ANY predecessor
+  // (`predecessorsMap.has(a.id)`), which proves nothing: a predecessor whose dates do not determine
+  // the successor's start leaves the critical path floating, and the stored `is_critical` flag can
+  // be stale. Continuity is now evaluated on the CPM output of THIS network at THIS Data Date:
+  //
+  //   1. Critical population — `calculateCpm(...).results.filter(r => r.isCritical)` (total float
+  //      <= 0 and not complete). When the engine reports a cycle it cannot produce results, so the
+  //      point fails explicitly and names the cycle instead of falling back to a stored flag.
+  //   2. Driving relationships — a link P -> S drives S when the engine's own event equation holds
+  //      for its type and signed lag (FS/SS/FF/SF), i.e. `linkResults[].isDriving`. A driving
+  //      successor of X is a link where X is the predecessor and `isDriving` is true.
+  //   3. Test — every critical activity that is not a proven network start (see `assessOpenEnds`,
+  //      the same legitimacy Point 1 uses) must have >= 1 driving predecessor, and that predecessor
+  //      must itself be critical; every critical activity that is not a proven network finish must
+  //      have >= 1 driving successor which is itself critical. Parallel critical paths pass as long
+  //      as each activity sits on at least one fully driving route.
+  //   4. Non-driving predecessors are NOT continuity: they are reported as a break with the reason
+  //      (no predecessor at all / predecessors exist but none drives / the driving neighbour is off
+  //      the critical path), plus a constraint note when a constraint date may have set the dates
+  //      instead of the logic.
+  const cpmAudit = calculateCpm(activities, links, {
+    calendarType: options.calendarType,
+    statusLogic: options.statusLogic,
+    dataDate,
+  });
+  const cpmUsable = cpmAudit.cycle === null && cpmAudit.results.length > 0;
+  const cpmById = new Map<string, CpmResult>(cpmAudit.results.map((r) => [r.activityId, r]));
+
+  const drivingPredsByActivity = new Map<string, LinkDrivingResult[]>();
+  const drivingSuccsByActivity = new Map<string, LinkDrivingResult[]>();
+  cpmAudit.linkResults.forEach((lr) => {
+    if (!lr.isDriving) return;
+    drivingPredsByActivity.set(lr.successorId, [...(drivingPredsByActivity.get(lr.successorId) || []), lr]);
+    drivingSuccsByActivity.set(lr.predecessorId, [...(drivingSuccsByActivity.get(lr.predecessorId) || []), lr]);
+  });
+
+  const criticalActs = cpmUsable
+    ? activities.filter((a) => cpmById.get(a.id)?.isCritical)
+    : activities.filter((a) => a.is_critical);
+
+  const continuityBreaks: { activity: Activity; reasons: string[] }[] = [];
+  const factualStartCriticals: Activity[] = [];
+  if (cpmUsable) {
+    criticalActs.forEach((activity) => {
+      const reasons: string[] = [];
+      // An activity that has already started owns a FACTUAL start (`actual_start`, or progress
+      // recorded against it). The CPM forward pass anchors such an activity on that fact, so no
+      // predecessor link can be "driving" by construction — demanding one would flag every honestly
+      // updated schedule at every status update. Continuity for it is therefore evaluated from its
+      // remaining work onwards: it still needs a driving critical successor, and the exemption is
+      // reported instead of being silently applied.
+      const startIsRecordedFact = Boolean(activity.actual_start) || Number(activity.percent_complete || 0) > 0;
+      const isProvenNetworkStart = openEnds.legitimateStartIds.has(activity.id);
+      const needsDrivingPred = !isProvenNetworkStart && !startIsRecordedFact;
+      if (startIsRecordedFact && !isProvenNetworkStart) factualStartCriticals.push(activity);
+      const needsDrivingSucc = !openEnds.legitimateFinishIds.has(activity.id);
+      const drivingPreds = drivingPredsByActivity.get(activity.id) || [];
+      const drivingSuccs = drivingSuccsByActivity.get(activity.id) || [];
+
+      if (needsDrivingPred) {
+        const preds = predecessorsMap.get(activity.id) || [];
+        if (drivingPreds.length === 0) {
+          reasons.push(preds.length === 0
+            ? 'انقطاع: نشاط حرج بلا أي سابق منطقي.'
+            : `انقطاع: له ${preds.length} سابق لكنها غير مُحَرِّكة (Non-Driving) — لا يوجد سابق يفرض تاريخ بدايته المبكرة وفق معادلة العلاقة ونوعها والـ Lag الموقع.`);
+        } else if (!drivingPreds.some((lr) => cpmById.get(lr.predecessorId)?.isCritical)) {
+          reasons.push('انقطاع: السابق المُحَرِّك ليس نشاطاً حرجاً (هامشه الكلي أكبر من صفر)، فالمسار الحرج يصل إليه من خارج المسار الحرج.');
+        }
+      }
+
+      if (needsDrivingSucc) {
+        const succs = successorsMap.get(activity.id) || [];
+        if (drivingSuccs.length === 0) {
+          reasons.push(succs.length === 0
+            ? 'انقطاع: نشاط حرج بلا أي لاحق منطقي.'
+            : `انقطاع: له ${succs.length} لاحق لكنها غير مُحَرِّكة (Non-Driving) — لا يوجد لاحق تفرض تواريخه استمرار المسار الحرج منه.`);
+        } else if (!drivingSuccs.some((lr) => cpmById.get(lr.successorId)?.isCritical)) {
+          reasons.push('انقطاع: اللاحق المُحَرِّك ليس نشاطاً حرجاً (هامشه الكلي أكبر من صفر)، فالمسار الحرج ينقطع بعد هذا النشاط.');
+        }
+      }
+
+      if (reasons.length && activity.constraint_type && activity.constraint_date) {
+        reasons.push(`ملاحظة: النشاط مقيّد بـ (${activity.constraint_type} @ ${activity.constraint_date})، وقد يكون القيد هو الذي حدد تاريخه بدل العلاقة المنطقية.`);
+      }
+
+      if (reasons.length) continuityBreaks.push({ activity, reasons });
+    });
+  }
+
+  const criticalPathRatio = !cpmUsable
+    ? 0
+    : criticalActs.length === 0
+      ? 1
+      : (criticalActs.length - continuityBreaks.length) / criticalActs.length;
+  const continuousCount = cpmUsable ? criticalActs.length - continuityBreaks.length : 0;
   points.push({
     id: 11,
     name: 'Critical Path Continuity',
     nameAr: 'استمرارية وترابط المسار الحرج (Critical Path Test)',
-    description: 'التأكد من أن المسار الحرج يشكل سلسلة متصلة غير منقطعة من البداية إلى الإنجاز.',
-    target: '100% مسار متصل',
-    actualValue: `${(criticalPathRatio * 100).toFixed(0)}% مترابط`,
+    description: 'يُقيَّم الترابط على العلاقات المُحَرِّكة (Driving) الناتجة من حساب CPM للشبكة عند تاريخ البيانات: كل نشاط حرج ليس بداية مشروعة للشبكة يجب أن يملك سابقاً مُحَرِّكاً حرجاً واحداً على الأقل، وكل نشاط حرج ليس نهاية مشروعة يجب أن يملك لاحقاً مُحَرِّكاً حرجاً واحداً على الأقل، مع احترام أنواع العلاقات (FS/SS/FF/SF) والـ Lag الموقع. وجود سابق غير مُحَرِّك لا يُعد دليلاً على الاتصال. يُستثنى من شرط السابق المُحَرِّك النشاط الحرج الذي بدأ فعلاً (actual_start أو نسبة إنجاز > 0) لأن بدايته فعل مسجّل لا نتيجة منطقية، وتُقاس استمراريته من عمله المتبقي (لاحق مُحَرِّك حرج)، ويُذكر هذا الاستثناء صراحة في التفاصيل.',
+    target: '100% مسار متصل بعلاقات مُحَرِّكة',
+    actualValue: cpmUsable
+      ? `${(criticalPathRatio * 100).toFixed(0)}% مترابط (${continuousCount}/${criticalActs.length} نشاط حرج متصل بعلاقة مُحَرِّكة)`
+      : '0% مترابط (تعذر حساب CPM)',
     passRatio: criticalPathRatio,
     status: criticalPathRatio >= 0.85 ? 'pass' : 'fail',
-    details: criticalActs.length === 0 ? ['لم يتم العثور على أنشطة حرجة.'] : [`يوجد ${criticalActs.length} نشاط حرج في الشبكة.`],
-    recommendation: 'الحفاظ على تسلسل الأنشطة الحرجة دون انقطاع لتأكيد مسار الإنجاز الحرج للمشروع.',
+    details: !cpmUsable
+      ? [`تعذر تقييم استمرارية المسار الحرج: ${cpmAudit.cycle ? `توجد حلقة علاقات دائرية بين ${cpmAudit.cycle.join(' ← ')}` : 'لا توجد نتائج CPM لهذه الشبكة'}.`]
+      : criticalActs.length === 0
+        ? ['لم يتم العثور على أنشطة حرجة.']
+        : [
+          ...continuityBreaks.map((b) => `النشاط الحرج [${b.activity.code}] ${b.reasons.join(' ')}`),
+          ...(factualStartCriticals.length
+            ? [`أنشطة حرجة قيد التنفيذ: بدايتها فعل مسجّل (actual start / نسبة إنجاز) وليست نتيجة علاقة منطقية، لذلك قِيّمت استمراريتها من العمل المتبقي: [${factualStartCriticals.slice().sort((x, y) => String(x.code || '').localeCompare(String(y.code || ''))).map((a) => a.code).join('، ')}].`]
+            : []),
+          ...(continuityBreaks.length === 0
+            ? [`المسار الحرج متصل بالكامل عبر علاقات مُحَرِّكة: ${criticalActs.length} نشاط حرج من ${cpmAudit.projectEarlyStart} إلى ${cpmAudit.projectEarlyFinish}.`]
+            : [`${continuityBreaks.length} انقطاع في المسار الحرج من أصل ${criticalActs.length} نشاط حرج.`]),
+        ],
+    recommendation: 'الحفاظ على تسلسل الأنشطة الحرجة دون انقطاع لتأكيد مسار الإنجاز الحرج للمشروع: ربط كل نشاط حرج بسابق ولاحق مُحَرِّكين (Driving) من داخل المسار الحرج نفسه، ومعالجة القيود الصارمة التي تقطع سلسلة التواريخ.',
     weight: 9,
   });
 
@@ -363,106 +708,62 @@ export async function autoFixDcmaIssues(
   let updatedLinks = links.map((l) => ({ ...l }));
   let updatedAssignments: ActivityResource[] = [];
 
-  // Load project for data_date
+  // Load project for data_date — resolved through the governed chronology helper
+  // (`project.data_date || DEFAULT_DATA_DATE`) instead of a local literal, so the autofix clamps
+  // actuals against the same Data Date every engine and screen uses (GAP-007 / Wave 11).
   const { data: projData } = await supabase.from('projects').select('*').eq('id', projectId).single();
-  const dataDate = projData?.data_date || '2026-11-15';
+  const dataDate = resolveDataDate(projData);
 
   // Load existing assignments
   const { data: currentAssignments } = await supabase.from('activity_resources').select('*').eq('project_id', projectId);
   updatedAssignments = (currentAssignments || []) as ActivityResource[];
 
-  // 1. Fix Missing Logic (Open Start / Open Finish) & Tighten Network Logic
+  // 1. Fix Missing Logic (Open Start / Open Finish) — GAP-014 aligned
+  //
+  // Both the defect list and the anchor each defect is repaired to now come from the network, never
+  // from array positions. The previous code walked the activity array and hung every unlinked row
+  // off its array neighbour (`nonMilestones[i - 1]`, `nonMilestones[i + 1]`), exempting the first and
+  // last rows, and then added two links between hardcoded demo identities (act-04 -> act-05 and
+  // act-07 -> act-09) regardless of their dates. Array order is an artefact of import/`sort_order`,
+  // so that remediation could invent relationships the schedule never implied.
+  //
+  // Now: Point 1's `assessOpenEnds` decides which activities are genuinely open, and each one is
+  // hung FS off the network's own boundary anchor (its start-boundary milestone when the schedule
+  // owns one, otherwise the activity that holds the start boundary) — exactly the remediation Point
+  // 1 recommends. A link that would close a cycle is skipped rather than written.
   if (fixType === 'all' || fixType === 'fix_missing_logic' || fixType === 'fix_high_float') {
-    const nonMilestones = updatedActivities.filter((a) => !a.is_milestone);
-    const predsMap = new Set(updatedLinks.map((l) => l.successor_id));
-    const succsMap = new Set(updatedLinks.map((l) => l.predecessor_id));
+    const openEnds = assessOpenEnds(updatedActivities, updatedLinks);
+    const startAnchor = resolveBoundaryAnchor(updatedActivities, openEnds, 'start');
+    const finishAnchor = resolveBoundaryAnchor(updatedActivities, openEnds, 'finish');
 
-    const startAct = nonMilestones[0];
-    const endAct = nonMilestones[nonMilestones.length - 1];
+    const repairOpenEnd = async (act: Activity, anchor: Activity | null, direction: 'predecessor' | 'successor') => {
+      if (!anchor || anchor.id === act.id) return;
+      const predecessorId = direction === 'predecessor' ? anchor.id : act.id;
+      const successorId = direction === 'predecessor' ? act.id : anchor.id;
+      const alreadyLinked = updatedLinks.some(
+        (l) => l.predecessor_id === predecessorId && l.successor_id === successorId,
+      );
+      if (alreadyLinked || closesCycle(updatedLinks, predecessorId, successorId)) return;
 
-    for (let i = 0; i < nonMilestones.length; i++) {
-      const act = nonMilestones[i];
+      const newLink: ActivityLink = {
+        id: `lnk-fix-${direction === 'predecessor' ? 'pred' : 'succ'}-${act.id.slice(0, 8)}`,
+        project_id: projectId,
+        predecessor_id: predecessorId,
+        successor_id: successorId,
+        link_type: 'FS',
+        lag_days: 0,
+        created_at: new Date().toISOString(),
+      };
+      await supabase.from('activity_links').upsert(newLink);
+      updatedLinks.push(newLink);
+      fixedCount++;
+    };
 
-      // Missing predecessor
-      if (i > 0 && !predsMap.has(act.id)) {
-        const prevAct = nonMilestones[i - 1] || startAct;
-        if (prevAct && prevAct.id !== act.id) {
-          const newLink: ActivityLink = {
-            id: `lnk-fix-pred-${act.id.slice(0, 8)}`,
-            project_id: projectId,
-            predecessor_id: prevAct.id,
-            successor_id: act.id,
-            link_type: 'FS',
-            lag_days: 0,
-            created_at: new Date().toISOString(),
-          };
-          await supabase.from('activity_links').upsert(newLink);
-          updatedLinks.push(newLink);
-          predsMap.add(act.id);
-          fixedCount++;
-        }
-      }
-
-      // Missing successor
-      if (i < nonMilestones.length - 1 && !succsMap.has(act.id)) {
-        const nextAct = nonMilestones[i + 1] || endAct;
-        if (nextAct && nextAct.id !== act.id) {
-          const newLink: ActivityLink = {
-            id: `lnk-fix-succ-${act.id.slice(0, 8)}`,
-            project_id: projectId,
-            predecessor_id: act.id,
-            successor_id: nextAct.id,
-            link_type: 'FS',
-            lag_days: 0,
-            created_at: new Date().toISOString(),
-          };
-          await supabase.from('activity_links').upsert(newLink);
-          updatedLinks.push(newLink);
-          succsMap.add(act.id);
-          fixedCount++;
-        }
-      }
+    for (const act of openEnds.openStartDefects) {
+      await repairOpenEnd(act, startAnchor, 'predecessor');
     }
-
-    // Connect specific parallel/intermediate activities to prevent loose floats
-    const act04 = updatedActivities.find((a) => a.code === 'ACT-130' || a.id === 'act-04');
-    const act05 = updatedActivities.find((a) => a.code === 'ACT-200' || a.id === 'act-05');
-    if (act04 && act05) {
-      const hasLink = updatedLinks.some((l) => l.predecessor_id === act04.id && l.successor_id === act05.id);
-      if (!hasLink) {
-        const newLink: ActivityLink = {
-          id: `lnk-fix-act04-${act04.id.slice(0, 6)}`,
-          project_id: projectId,
-          predecessor_id: act04.id,
-          successor_id: act05.id,
-          link_type: 'FS',
-          lag_days: 0,
-          created_at: new Date().toISOString(),
-        };
-        await supabase.from('activity_links').upsert(newLink);
-        updatedLinks.push(newLink);
-        fixedCount++;
-      }
-    }
-
-    const act07 = updatedActivities.find((a) => a.code === 'ACT-300' || a.id === 'act-07');
-    const act09 = updatedActivities.find((a) => a.code === 'ACT-310' || a.id === 'act-09');
-    if (act07 && act09) {
-      const hasLink = updatedLinks.some((l) => l.predecessor_id === act07.id && l.successor_id === act09.id);
-      if (!hasLink) {
-        const newLink: ActivityLink = {
-          id: `lnk-fix-act07-${act07.id.slice(0, 6)}`,
-          project_id: projectId,
-          predecessor_id: act07.id,
-          successor_id: act09.id,
-          link_type: 'FS',
-          lag_days: 0,
-          created_at: new Date().toISOString(),
-        };
-        await supabase.from('activity_links').upsert(newLink);
-        updatedLinks.push(newLink);
-        fixedCount++;
-      }
+    for (const act of openEnds.openFinishDefects) {
+      await repairOpenEnd(act, finishAnchor, 'successor');
     }
   }
 

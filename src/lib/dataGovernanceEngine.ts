@@ -63,14 +63,20 @@ export interface GovernanceAuditResult {
     isPerfectMatch: boolean;
     maxVarianceSar: number;
   };
+  /**
+   * EVM parity snapshot. Every field except `ac` is null when the project has no budget to derive
+   * earned value from (GAP-041) — no fabricated progress percentage stands in for it any more.
+   */
   evmParity: {
-    pv: number;
-    ev: number;
+    pv: number | null;
+    ev: number | null;
     ac: number;
-    spi: number;
-    cpi: number;
-    eac: number;
-    tcpi: number;
+    spi: number | null;
+    cpi: number | null;
+    eac: number | null;
+    tcpi: number | null;
+    /** Canonical earned progress used by this pillar, or null when it is not derivable. */
+    earnedProgressPercent: number | null;
     isRigorous: boolean;
   };
   summaryAr: string;
@@ -101,7 +107,12 @@ export async function runComprehensiveGovernanceAudit(
   // GAP-010: the governance audit uses the governed Data Date resolution
   // (`project.data_date || DEFAULT_DATA_DATE`) so its DCMA pillar agrees with ExecutiveReportView,
   // DcmaAuditView and PortfolioView instead of evaluating at a local literal two months beyond it.
-  const dcmaAudit = runDcma14PointAudit(activities, links, [], activityResources, resolveDataDate(project));
+  // GAP-015: the audit's critical-path continuity point recomputes CPM, so the governance pillar
+  // passes the project's own calendar and status logic rather than leaving the engine defaults.
+  const dcmaAudit = runDcma14PointAudit(activities, links, [], activityResources, resolveDataDate(project), {
+    calendarType: project.calendar_type,
+    statusLogic: project.status_logic,
+  });
   const openEnds = dcmaAudit.points.find((r) => r.id === 1);
   const leads = dcmaAudit.points.find((r) => r.id === 3);
   const hardConstraints = dcmaAudit.points.find((r) => r.id === 5);
@@ -268,20 +279,45 @@ export async function runComprehensiveGovernanceAudit(
   // Calculate project progress
   const plannedProgressRatio = 0.40; // 40.0% planned
   const actualProgressWeighted = activities.reduce((sum, act) => sum + (Number(act.percent_complete || 0) / 100) * (budgetBac / totalActCount), 0);
-  const actualProgressPercent = budgetBac > 0 ? (actualProgressWeighted / budgetBac) * 100 : 40.5;
+  // GAP-041: earned progress is only derivable when the project carries a budget to weight it. The
+  // hardcoded progress literal this line used to fall back on invented a percentage for every
+  // project with BAC <= 0, and that fabricated figure then flowed into EV, SPI, CPI, EAC, VAC and
+  // TCPI as though it had been measured — while this very pillar reported the result as
+  // mathematically rigorous. Nothing here replaces it with a second formula: when the canonical
+  // earned-progress input is unavailable the metrics are reported as unavailable (null) and the
+  // pillar says so. When a budget exists the arithmetic is byte-for-byte the one that was already
+  // frozen (EV = BAC x earned progress).
+  const earnedProgressAvailable = budgetBac > 0;
+  const earnedProgressPercent: number | null = earnedProgressAvailable
+    ? (actualProgressWeighted / budgetBac) * 100
+    : null;
 
-  const theoreticalPv = budgetBac * plannedProgressRatio;
-  const theoreticalEv = budgetBac * (actualProgressPercent / 100);
+  const theoreticalPv: number | null = earnedProgressAvailable ? budgetBac * plannedProgressRatio : null;
+  const theoreticalEv: number | null = earnedProgressPercent === null ? null : budgetBac * (earnedProgressPercent / 100);
   
   const actualCostApproved = transactions
     .filter((t) => t.status === 'approved')
     .reduce((sum, t) => sum + Number(t.amount || 0), 0) || budgetLines.reduce((s, l) => s + Number(l.actual_cost || 0), 0);
 
-  const theoreticalSpi = theoreticalPv > 0 ? theoreticalEv / theoreticalPv : 1;
-  const theoreticalCpi = actualCostApproved > 0 ? theoreticalEv / actualCostApproved : 1;
-  const theoreticalEac = theoreticalCpi > 0 ? budgetBac / theoreticalCpi : budgetBac;
-  const theoreticalVac = budgetBac - theoreticalEac;
-  const theoreticalTcpi = (budgetBac - actualCostApproved) > 0 ? (budgetBac - theoreticalEv) / (budgetBac - actualCostApproved) : 1;
+  // Zero-denominator policies are unchanged for a project that does have a budget; only the
+  // "no earned progress at all" case becomes null instead of a number (GAP-041).
+  const theoreticalSpi: number | null = theoreticalPv === null || theoreticalEv === null
+    ? null
+    : (theoreticalPv > 0 ? theoreticalEv / theoreticalPv : 1);
+  const theoreticalCpi: number | null = theoreticalEv === null
+    ? null
+    : (actualCostApproved > 0 ? theoreticalEv / actualCostApproved : 1);
+  const theoreticalEac: number | null = theoreticalCpi === null
+    ? null
+    : (theoreticalCpi > 0 ? budgetBac / theoreticalCpi : budgetBac);
+  const theoreticalVac: number | null = theoreticalEac === null ? null : budgetBac - theoreticalEac;
+  const theoreticalTcpi: number | null = theoreticalEv === null
+    ? null
+    : ((budgetBac - actualCostApproved) > 0 ? (budgetBac - theoreticalEv) / (budgetBac - actualCostApproved) : 1);
+  const formatIndex = (value: number | null) => (value === null ? 'N/A' : value.toFixed(3));
+  const formatSar = (value: number | null) => (value === null ? 'N/A' : `${Math.round(value).toLocaleString()} ر.س`);
+  const evmUnavailableAr = 'N/A — لا توجد ميزانية معتمدة (BAC = 0) لاشتقاق القيمة المكتسبة';
+  const evmUnavailableEn = 'N/A — no approved budget (BAC = 0), so earned value cannot be derived';
 
   checks.push({
     id: 'GOV-EVM-01',
@@ -294,10 +330,14 @@ export async function runComprehensiveGovernanceAudit(
     descriptionAr: 'التأكد من أن مؤشرات الأداء (SPI/CPI) وتوقعات الإنجاز (EAC/VAC) تتطابق 100% مع معادلات PMI القياسية دون تقريب شاذ.',
     descriptionEn: 'Validates performance indices (SPI/CPI) and forecasts (EAC/VAC) strictly obey standard PMI formulas.',
     severity: 'critical',
-    status: 'passed',
-    expectedValue: `SPI: ${theoreticalSpi.toFixed(3)} | CPI: ${theoreticalCpi.toFixed(3)} | EAC: ${Math.round(theoreticalEac).toLocaleString()} ر.س`,
-    actualValue: `SPI: ${theoreticalSpi.toFixed(3)} | CPI: ${theoreticalCpi.toFixed(3)} | EAC: ${Math.round(theoreticalEac).toLocaleString()} ر.س`,
-    variance: '0.00 ر.س (مطابقة تامة)',
+    status: earnedProgressAvailable ? 'passed' : 'warning',
+    expectedValue: earnedProgressAvailable
+      ? `SPI: ${formatIndex(theoreticalSpi)} | CPI: ${formatIndex(theoreticalCpi)} | EAC: ${formatSar(theoreticalEac)}`
+      : `${evmUnavailableAr} (${evmUnavailableEn})`,
+    actualValue: earnedProgressAvailable
+      ? `SPI: ${formatIndex(theoreticalSpi)} | CPI: ${formatIndex(theoreticalCpi)} | EAC: ${formatSar(theoreticalEac)}`
+      : 'N/A — لا يوجد أي رقم تقدم مُختلق؛ التقدم الفعلي غير قابل للاشتقاق بدون ميزانية',
+    variance: earnedProgressAvailable ? '0.00 ر.س (مطابقة تامة)' : 'N/A (لا قيمة مكتسبة قابلة للمقارنة)',
     impactAr: 'تقديم تقارير أداء ومؤشرات دقيقة لا تقبل التشكيك أمام مجلس الإدارة والممولين.',
     impactEn: 'Delivers unassailable financial performance reports to Executive Board and stakeholders.',
   });
@@ -458,7 +498,8 @@ export async function runComprehensiveGovernanceAudit(
       cpi: theoreticalCpi,
       eac: theoreticalEac,
       tcpi: theoreticalTcpi,
-      isRigorous: true,
+      earnedProgressPercent,
+      isRigorous: earnedProgressAvailable,
     },
     summaryAr: `تم إنجاز فحص الحوكمة الشامل بنجاح بنسبة مطابقة ${overallScore}% وبتقدير معتمد (${ratingGrade}). كافة المرجعيات المالية، الرياضية، وشبكة CPM متسقة بالكامل دون أي تعارض في الأرقام.`,
     summaryEn: `Comprehensive Enterprise Data Governance Audit completed with a ${overallScore}% conformance score (Grade ${ratingGrade}). All financial, mathematical, and CPM network references are 100% reconciled with zero discrepancies.`,

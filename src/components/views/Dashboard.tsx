@@ -277,9 +277,10 @@ ${noticeForm.contractorName}`;
   }, [project, activities, budgetLines, boqItems, costTransactions, progressUpdates, project?.data_date]);
 
   // GAP-039: the primary project progress metric on this dashboard is the canonical earned
-  // progress (EV / BAC) from the shared engine — read through its canonical field name rather than
-  // the deprecated `actualProgressPercent` alias. Same value, unambiguous provenance, and identical
-  // to what ProgressView / BudgetView / ExecutiveReportView / PortfolioView read.
+  // progress (EV / BAC) from the shared engine. The deprecated `actualProgressPercent` alias it used
+  // to be read through no longer exists (Wave 11 removed the duplicate field), so this is now the
+  // only name for the value — identical to what ProgressView / BudgetView / ExecutiveReportView /
+  // PortfolioView read.
   const overallProgress = evm.earnedProgressPercent;
   const plannedProgress = evm.plannedProgressPercent / 100;
   const plannedBudget = evm.bac;

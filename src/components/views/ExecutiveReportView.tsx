@@ -98,8 +98,11 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
       baselineActivities,
       [],
       dcmaDataDate,
+      // GAP-015: the critical-path continuity point recomputes CPM, so the audit is told which
+      // calendar and status logic this project is actually scheduled with.
+      { calendarType: project?.calendar_type, statusLogic: project?.status_logic },
     );
-  }, [activities, links, baselineActivities, dcmaDataDate]);
+  }, [activities, links, baselineActivities, dcmaDataDate, project?.calendar_type, project?.status_logic]);
 
   // Compute EVM metrics using the unified engine.
   // Typed as the canonical `ComprehensiveProjectEvm` (it always was one at runtime): the legacy

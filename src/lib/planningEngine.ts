@@ -104,8 +104,9 @@ export function generateSmartActivityPlans(
  * Canonical result of the project-control EVM engine (SSOT — GAP-044).
  *
  * Every derived index in this shape is produced by `assessEvmRatios`; no other module may
- * re-implement these formulas. Fields marked as compatibility aliases keep existing consumers
- * compiling and are scheduled for migration in a later wave.
+ * re-implement these formulas. This shape carries no compatibility aliases: the deprecated
+ * `actualProgressPercent` duplicate of `earnedProgressPercent` was removed once its last reader had
+ * migrated (Wave 11), so every consumer reads one canonical field name.
  */
 export interface ComprehensiveProjectEvm {
   bac: number;
@@ -115,11 +116,6 @@ export interface ComprehensiveProjectEvm {
    * This — not an activity `percent_complete` average — is the project-control progress metric.
    */
   earnedProgressPercent: number;
-  /**
-   * @deprecated Compatibility alias of `earnedProgressPercent` (identical value, kept so current
-   * consumers keep compiling). Migrate reads to `earnedProgressPercent`.
-   */
-  actualProgressPercent: number;
   /** Planned progress: `PV / BAC * 100` when `BAC > 0`, otherwise 0. */
   plannedProgressPercent: number;
   pv: number;
@@ -494,8 +490,6 @@ export function calculateProjectEvmAtDataDate(
     bac,
     dataDate: dataDateStr,
     earnedProgressPercent: assessment.earnedProgressPercent,
-    // Compatibility alias carrying the same canonical value (GAP-045); consumers migrate later.
-    actualProgressPercent: assessment.earnedProgressPercent,
     plannedProgressPercent: assessment.plannedProgressPercent,
     pv,
     ev,
@@ -544,7 +538,6 @@ export function deriveEvmFromScalars(
     bac,
     dataDate,
     earnedProgressPercent: assessment.earnedProgressPercent,
-    actualProgressPercent: assessment.earnedProgressPercent,
     plannedProgressPercent: assessment.plannedProgressPercent,
     pv,
     ev,

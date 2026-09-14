@@ -29,6 +29,15 @@ import {
   Trash2,
 } from 'lucide-react';
 
+/**
+ * Bucket label for BOQ rows that carry no unit at all (GAP-022).
+ *
+ * Module scope on purpose: the grouped-quantity memo below must not depend on a value recreated on
+ * every render, and an item with a missing unit is still reported — as its own bucket — rather than
+ * being silently merged into another unit's total.
+ */
+const UNASSIGNED_UNIT_LABEL = 'بدون وحدة';
+
 interface BoqViewProps {
   project: Project | null;
 }
@@ -124,7 +133,26 @@ export default function BoqView({ project }: BoqViewProps) {
   }, [items, search, categoryFilter]);
 
   const totalValue = filteredItems.reduce((sum, i) => sum + (i.total_price || 0), 0);
-  const totalQty = filteredItems.reduce((sum, i) => sum + (i.quantity || 0), 0);
+
+  // GAP-022: BOQ quantities are heterogeneous. This table mixes م3 / م2 / طن / وحدة / نقطة / lot,
+  // and the footer used to sum every `quantity` into one scalar regardless of `unit` — presenting
+  // "310" for 100 m3 + 200 m2 + 10 ton as though it were a physical amount of something. Physical
+  // quantities are now grouped by their own unit and never converted into one another; the money
+  // total stays a single aggregate in SAR because that IS the one additive figure in this table.
+  const quantityTotalsByUnit = useMemo(() => {
+    const grouped = new Map<string, { unit: string; totalQuantity: number; itemCount: number }>();
+    filteredItems.forEach((item) => {
+      const unit = (item.unit || '').trim() || UNASSIGNED_UNIT_LABEL;
+      const bucket = grouped.get(unit) || { unit, totalQuantity: 0, itemCount: 0 };
+      bucket.totalQuantity += Number(item.quantity || 0);
+      bucket.itemCount += 1;
+      grouped.set(unit, bucket);
+    });
+    return Array.from(grouped.values()).sort((a, b) => a.unit.localeCompare(b.unit, 'ar'));
+  }, [filteredItems]);
+  const distinctUnitCount = quantityTotalsByUnit.length;
+  // A single-unit filter/table may still show one physical total — it is then unambiguous.
+  const singleUnitTotal = distinctUnitCount === 1 ? quantityTotalsByUnit[0] : null;
 
   // Subcontract Aggregates
   const totalSubcontractsValue = subcontracts.reduce((sum, s) => sum + s.totalSubcontractValueSar, 0);
@@ -416,7 +444,18 @@ export default function BoqView({ project }: BoqViewProps) {
                 <tfoot className="bg-slate-50 font-black text-slate-900 border-t">
                   <tr>
                     <td colSpan={3} className="p-3 text-left">الإجمالي ({filteredItems.length} بند):</td>
-                    <td className="p-3 text-center font-mono">{totalQty.toLocaleString()}</td>
+                    <td
+                      className="p-3 text-center font-mono"
+                      title={
+                        singleUnitTotal
+                          ? `إجمالي الكمية بوحدة واحدة: ${singleUnitTotal.unit}`
+                          : 'لا يمكن جمع كميات بوحدات قياس مختلفة (م3 / م2 / طن / وحدة / lot) — راجع ملخص الكميات حسب الوحدة أسفل الجدول'
+                      }
+                    >
+                      {singleUnitTotal
+                        ? `${singleUnitTotal.totalQuantity.toLocaleString()} ${singleUnitTotal.unit}`
+                        : 'N/A'}
+                    </td>
                     <td></td>
                     <td className="p-3 text-right font-mono text-emerald-800 text-sm">{totalValue.toLocaleString()} SAR</td>
                     <td></td>
@@ -424,6 +463,39 @@ export default function BoqView({ project }: BoqViewProps) {
                 </tfoot>
               </table>
             </div>
+          </div>
+
+          {/* GAP-022: unit-aware quantity totals — grouped by unit, no cross-unit conversion. */}
+          <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-4">
+            <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+              <h3 className="text-sm font-black text-slate-900">
+                ملخص الكميات حسب وحدة القياس (Unit-Aware Quantity Totals)
+              </h3>
+              <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-100 text-slate-600 border border-slate-200">
+                {distinctUnitCount} وحدة قياس · لا يتم تحويل أو جمع الوحدات المختلفة
+              </span>
+            </div>
+
+            {quantityTotalsByUnit.length === 0 ? (
+              <p className="text-xs text-slate-500">لا توجد بنود مطابقة لعوامل التصفية الحالية.</p>
+            ) : (
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2">
+                {quantityTotalsByUnit.map((group) => (
+                  <div key={group.unit} className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                    <div className="text-[10px] font-bold text-slate-500">{group.unit}</div>
+                    <div className="text-lg font-black font-mono text-slate-900">
+                      {group.totalQuantity.toLocaleString()}
+                    </div>
+                    <div className="text-[10px] text-slate-500">{group.itemCount} بند</div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <p className="text-[11px] text-slate-500 mt-3">
+              الإجمالي المالي الوحيد القابل للجمع (بعملة العقد):{' '}
+              <span className="font-mono font-black text-emerald-800">{totalValue.toLocaleString()} SAR</span>
+            </p>
           </div>
         </div>
       )}
