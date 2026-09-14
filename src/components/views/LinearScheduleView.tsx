@@ -2,11 +2,10 @@ import { useState, useMemo, useEffect } from 'react';
 import { supabase } from '@/lib/supabase';
 import { resolveDataDate } from '@/lib/chronologyGuard';
 import { getLanguage, type Language } from '@/lib/i18n';
-import type { Project, LinearTask, LinearSpatialClash } from '@/types';
+import type { Project, LinearTask } from '@/types';
 import {
   Activity as ActivitySquare,
   TrendingUp,
-  AlertTriangle,
   Plus,
   Compass,
   Gauge,
@@ -28,23 +27,25 @@ export default function LinearScheduleView({ project }: LinearScheduleViewProps)
   const governedDataDate = resolveDataDate(project);
   const [selectedTaskCode, setSelectedTaskCode] = useState<string | null>(null);
   const [filterCriticalOnly, setFilterCriticalOnly] = useState(false);
-  const [highlightClashes, setHighlightClashes] = useState(true);
   const [showAddTaskModal, setShowAddTaskModal] = useState(false);
   const [maxChainageKm, setMaxChainageKm] = useState<number>(5.0);
 
   // New Linear Task Form
+  // Neutral entry defaults: the form used to prefill a demo cable-laying task (code, stations,
+  // dates, rate, crew) that one click would plot as project data. Nothing is prefilled now —
+  // every value on the diagram is explicitly typed by the user.
   const [newTaskForm, setNewTaskForm] = useState({
-    code: 'LIN-CBL-01',
-    name: 'MV Cables & Duct Bank Installation',
-    nameAr: 'تمديد كابلات الجهد المتوسط وغرف التفتيش',
-    startStationKm: 0.5,
-    endStationKm: 4.5,
-    startDate: '2026-10-15',
-    finishDate: '2027-01-20',
+    code: '',
+    name: '',
+    nameAr: '',
+    startStationKm: 0,
+    endStationKm: 0,
+    startDate: '',
+    finishDate: '',
     direction: 'forward' as 'forward' | 'backward',
-    dailyProductionRateMeters: 45.0,
+    dailyProductionRateMeters: 0,
     color: '#8b5cf6',
-    crewName: 'فرقة التمديدات الكهربائية وشبكات الطاقة',
+    crewName: '',
     isCritical: false,
   });
 
@@ -56,99 +57,15 @@ export default function LinearScheduleView({ project }: LinearScheduleViewProps)
     return () => window.removeEventListener('app-language-changed', handleLangChange);
   }, []);
 
-  // Default Linear Activities for Infrastructure / Pipeline / Highway Project
-  const [linearTasks, setLinearTasks] = useState<LinearTask[]>([
-    {
-      id: 'LT-01',
-      code: 'LIN-TR-01',
-      name: 'Trenching & Excavation (Crew A)',
-      nameAr: 'حفر الخندق وتجهيز المنسوب (فريق أ)',
-      startStationKm: 0.0,
-      endStationKm: 5.0,
-      startDate: '2026-09-01',
-      finishDate: '2026-11-15',
-      direction: 'forward',
-      dailyProductionRateMeters: 66.6,
-      color: '#e11d48', // Red Critical
-      crewName: 'فرقة الحفريات الثقيلة',
-      isCritical: true,
-    },
-    {
-      id: 'LT-02',
-      code: 'LIN-PIPE-01',
-      name: 'GRP Pipe Laying & Jointing',
-      nameAr: 'تمديد وتركيب أنابيب GRP قطر 1200 مم',
-      startStationKm: 0.2,
-      endStationKm: 5.0,
-      startDate: '2026-09-20',
-      finishDate: '2026-12-10',
-      direction: 'forward',
-      dailyProductionRateMeters: 58.5,
-      color: '#2563eb', // Blue
-      crewName: 'فرقة تركيب الأنابيب الهيدروليكية',
-      isCritical: true,
-    },
-    {
-      id: 'LT-03',
-      code: 'LIN-BACK-01',
-      name: 'Sand Bedding & Trench Backfilling',
-      nameAr: 'فرش الرمل والردم على طبقات مع الدك',
-      startStationKm: 0.4,
-      endStationKm: 5.0,
-      startDate: '2026-10-05',
-      finishDate: '2026-12-30',
-      direction: 'forward',
-      dailyProductionRateMeters: 53.4,
-      color: '#d97706', // Amber
-      crewName: 'فرقة الردم والاختبارات الجيوتقنية',
-      isCritical: false,
-    },
-    {
-      id: 'LT-04',
-      code: 'LIN-ASPH-01',
-      name: 'Sub-base & Asphalt Wearing Course',
-      nameAr: 'طبقات الأساس الحجري والأسفلت السطحي',
-      startStationKm: 0.0,
-      endStationKm: 5.0,
-      startDate: '2026-11-20',
-      finishDate: '2027-02-15',
-      direction: 'forward',
-      dailyProductionRateMeters: 57.4,
-      color: '#475569', // Dark Slate
-      crewName: 'فرقة السفلتة والإنشاءات الطرقية',
-      isCritical: false,
-    },
-    {
-      id: 'LT-05',
-      code: 'LIN-TEST-01',
-      name: 'Hydrostatic Pressure Testing (Backward)',
-      nameAr: 'الاختبار الهيدروستاتيكي للضغط (عكسي)',
-      startStationKm: 5.0,
-      endStationKm: 0.0,
-      startDate: '2027-01-10',
-      finishDate: '2027-02-28',
-      direction: 'backward',
-      dailyProductionRateMeters: 102.0,
-      color: '#059669', // Green
-      crewName: 'فرقة الفحص وضمان الجودة QC',
-      isCritical: true,
-    },
-  ]);
-
-  // Spatial Clashes Detection
-  const spatialClashes: LinearSpatialClash[] = useMemo(() => {
-    return [
-      {
-        id: 'CLASH-01',
-        task1Code: 'LIN-PIPE-01',
-        task2Code: 'LIN-BACK-01',
-        stationKm: 2.35,
-        clashDate: '2026-10-28',
-        descriptionAr: 'تداخل مكاني محتمل بين فرقة الردم وفرقة تركيب الأنابيب عند المحطة 2+350 كم.',
-        descriptionEn: 'Spatial proximity clash between pipe laying crew and backfilling crew at Station 2+350 km.',
-      },
-    ];
-  }, []);
+  // Linear tasks (Phase D — no fixtures).
+  //
+  // The schema carries no linear positioning: activities have no chainage / station / distance
+  // columns, so task locations cannot be derived from project data. The previous revision
+  // hardcoded 5 demo pipeline tasks (LT-01..LT-05 with invented stations, dates, rates, crews)
+  // and drew them as the project — those fixtures are removed and chainage is never invented.
+  // Tasks below can only come from explicit user entry (the Add modal); an empty register
+  // renders the "location data unavailable" state instead of a fabricated diagram.
+  const [linearTasks, setLinearTasks] = useState<LinearTask[]>([]);
 
   // Time & Distance Scale Coordinate Converters
   const minKm = 0.0;
@@ -204,8 +121,8 @@ export default function LinearScheduleView({ project }: LinearScheduleViewProps)
           </div>
           <p className="text-xs text-slate-500 mt-1">
             {lang === 'ar'
-              ? 'تخطيط ومتابعة مشاريع البنية التحتية وخطوط الأنابيب والطرق برسم المسافة (Chainage) مقابل الزمن واكتشاف تعارض الفرق الإنشائية.'
-              : 'Linear schedule for highways, pipelines, and rail: Station vs Time slope rates and spatial crew clash detection.'}
+              ? 'تخطيط ومتابعة مشاريع البنية التحتية وخطوط الأنابيب والطرق برسم المسافة (Chainage) مقابل الزمن للمهام المدخلة يدويًا.'
+              : 'Linear schedule for highways, pipelines, and rail: Station vs Time slopes for user-entered tasks.'}
           </p>
         </div>
 
@@ -227,14 +144,6 @@ export default function LinearScheduleView({ project }: LinearScheduleViewProps)
           >
             {lang === 'ar' ? 'المسار الخطي الحرج فقط' : 'Critical Linear Path'}
           </button>
-          <button
-            onClick={() => setHighlightClashes(!highlightClashes)}
-            className={`px-3 py-1.5 rounded-lg border font-bold transition-all cursor-pointer ${
-              highlightClashes ? 'bg-amber-50 text-amber-900 border-amber-300' : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
-            }`}
-          >
-            {lang === 'ar' ? 'تنبيه التداخل المكاني (Clashes)' : 'Highlight Spatial Clashes'}
-          </button>
         </div>
       </div>
 
@@ -244,11 +153,11 @@ export default function LinearScheduleView({ project }: LinearScheduleViewProps)
           <Sparkles size={18} className="text-blue-600 flex-shrink-0" />
           <div>
             <span className="font-bold block">
-              {lang === 'ar' ? `المشروع النشط الحالي: [${project?.name || 'مشروع تجريبي'}]` : `Active Linked Project: [${project?.name || 'Project'}]`}
+              {lang === 'ar' ? `المشروع النشط الحالي: [${project?.name || 'بدون مشروع'}]` : `Active Linked Project: [${project?.name || 'No project'}]`}
             </span>
             <span className="text-[11px] text-blue-800">
               {project?.sector === 'infrastructure_highway'
-                ? (lang === 'ar' ? '✓ هذا المشروع مصنف كـ "مشروع بنية تحتية وطرق"، والبيانات مرتبطة بالمسار والمحطات الكيلومترية ومعدلات إنتاجية الفرق.' : '✓ Sector: Infrastructure & Highway EPC linked.')
+                ? (lang === 'ar' ? '✓ هذا المشروع مصنف كـ "مشروع بنية تحتية وطرق". لا توجد محطات كيلومترية مربوطة بأنشطة المشروع — أدخل المهام الطولية يدويًا.' : '✓ Sector: Infrastructure & Highway EPC. No chainage is linked to project activities — add linear tasks manually.')
                 : (lang === 'ar' ? '💡 المخطط الخطي (TILOS) مخصص هندسياً لمشاريع الطرق وخطوط الأنابيب والسكك الحديدية (أو تكرار الطوابق الرأسية بالأبراج).' : 'Linear Time-Location method applies directly to horizontal infrastructure, pipelines, and vertical high-rises.')}
             </span>
           </div>
@@ -268,22 +177,6 @@ export default function LinearScheduleView({ project }: LinearScheduleViewProps)
         </div>
       </div>
 
-      {/* Spatial Clash Banner if active */}
-      {highlightClashes && spatialClashes.length > 0 && (
-        <div className="p-3.5 bg-amber-50 border border-amber-300 rounded-xl flex items-center justify-between text-xs text-amber-900 shadow-sm animate-fadeIn">
-          <div className="flex items-center gap-2">
-            <AlertTriangle size={16} className="text-amber-600 flex-shrink-0" />
-            <span className="font-bold">
-              {lang === 'ar' ? 'تم رصد تداخل مكاني بين الفرق (Spatial Interference):' : 'Spatial Interference Detected:'}
-            </span>
-            <span>{lang === 'ar' ? spatialClashes[0].descriptionAr : spatialClashes[0].descriptionEn}</span>
-          </div>
-          <span className="font-mono bg-amber-200 px-2 py-0.5 rounded font-black text-[11px]">
-            Station 2+350
-          </span>
-        </div>
-      )}
-
       {/* Main Time-Location Canvas */}
       <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
         <div className="p-4 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
@@ -300,7 +193,7 @@ export default function LinearScheduleView({ project }: LinearScheduleViewProps)
           </div>
         </div>
 
-        <div className="p-5 overflow-x-auto flex justify-center bg-white">
+        <div className="p-5 overflow-x-auto flex justify-center bg-white relative">
           <svg viewBox={`0 0 ${svgWidth} ${svgHeight}`} className="w-full max-w-4xl drop-shadow-xs">
             {/* Grid Background */}
             <rect
@@ -398,17 +291,24 @@ export default function LinearScheduleView({ project }: LinearScheduleViewProps)
               );
             })}
 
-            {/* Spatial Clash Highlight Marker */}
-            {highlightClashes && (
-              <g className="animate-pulse">
-                <circle cx={kmToPx(2.35)} cy={dateToPx('2026-10-28')} r="14" fill="#f59e0b" fillOpacity="0.3" stroke="#d97706" strokeWidth="2" />
-                <circle cx={kmToPx(2.35)} cy={dateToPx('2026-10-28')} r="4" fill="#d97706" />
-                <text x={kmToPx(2.35)} y={dateToPx('2026-10-28') - 18} fill="#b45309" fontSize="9" fontWeight="bold" textAnchor="middle">
-                  ⚠ Clash Zone (2+350)
-                </text>
-              </g>
-            )}
           </svg>
+
+            {/* No-location-data empty state: no chainage/station exists on project activities,
+                so nothing is drawn as the project. User-entered tasks (Add modal) render here. */}
+            {linearTasks.length === 0 && (
+              <div className="absolute inset-0 flex items-center justify-center p-6 pointer-events-none">
+                <div className="pointer-events-auto max-w-md w-full text-center bg-white/95 border border-slate-200 rounded-2xl p-6 shadow-xl">
+                  <h3 className="font-black text-slate-900 text-sm">
+                    {lang === 'ar' ? 'بيانات المواقع الخطية غير متوفرة (N/A)' : 'Linear location data unavailable (N/A)'}
+                  </h3>
+                  <p className="text-[11px] text-slate-500 mt-1.5 leading-relaxed">
+                    {lang === 'ar'
+                      ? 'لا تحمل أنشطة المشروع أي محطات/مسافات، لذا لا يُرسم أي مخطط مختلق. أدخل المهام الطولية يدويًا من زر الإضافة لعرضها هنا.'
+                      : 'Project activities carry no stations/distances, so no diagram is fabricated. Add linear tasks manually to render them here.'}
+                  </p>
+                </div>
+              </div>
+            )}
         </div>
       </div>
 
@@ -433,6 +333,13 @@ export default function LinearScheduleView({ project }: LinearScheduleViewProps)
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
+              {linearTasks.length === 0 && (
+                <tr>
+                  <td colSpan={7} className="p-6 text-center text-slate-400">
+                    {lang === 'ar' ? 'لا توجد مهام طولية — بيانات المواقع غير متوفرة (N/A). أضفها يدويًا من الأعلى.' : 'No linear tasks — location data unavailable (N/A). Add them manually above.'}
+                  </td>
+                </tr>
+              )}
               {linearTasks.map((t) => (
                 <tr key={t.id} className="hover:bg-slate-50 transition-colors">
                   <td className="p-3 font-mono font-bold text-slate-700">{t.code}</td>
