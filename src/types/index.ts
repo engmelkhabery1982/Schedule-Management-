@@ -105,13 +105,6 @@ export interface Activity {
   name: string;
   activity_type?: ActivityType;
   calendar_type?: CalendarType;
-  /**
-   * Optional reference to a ProjectCalendar id.
-   * Compatibility field: used by the seed data (`src/lib/mockSeed.ts`) and by import paths,
-   * but there is no `calendar_id` column in `supabase/migrations` for `activities`.
-   * Kept optional so records that only carry `calendar_type` stay valid.
-   */
-  calendar_id?: string;
   early_start: string | null;
   early_finish: string | null;
   late_start: string | null;
@@ -323,20 +316,6 @@ export interface ProjectBaseline {
   /** SQL `created_at timestamptz DEFAULT now()`. */
   created_at: string;
 
-  // ---------------------------------------------------------------------------------------
-  // Temporary compatibility fields — these are NOT columns of `project_baselines`.
-  // They are kept optional (instead of being deleted) so current consumers and seed data keep
-  // compiling. Each one must be migrated to a real schema column or dropped in a dedicated
-  // later wave; do not add new code that depends on them.
-  // ---------------------------------------------------------------------------------------
-  /** @deprecated compatibility field — seed data labels baselines with `baseline_name`; SQL stores the label in `name`. */
-  baseline_name?: string;
-  /** @deprecated compatibility field — no `code` column exists on `project_baselines`. */
-  code?: string;
-  /** @deprecated compatibility field — no `description` column exists on `project_baselines`. */
-  description?: string | null;
-  /** @deprecated compatibility field — no `snapshot_date` column exists; the data date lives on `Project.data_date`. */
-  snapshot_date?: string;
   /** Derived aggregate (computed from `baseline_activities`), not persisted on `project_baselines`. */
   total_duration_days?: number;
   /** Derived aggregate (computed from `baseline_activities`), not persisted on `project_baselines`. */

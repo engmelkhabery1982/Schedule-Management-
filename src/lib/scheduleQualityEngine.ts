@@ -226,12 +226,15 @@ export interface DcmaAuditOptions {
   statusLogic?: 'retained_logic' | 'progress_override';
 }
 
+// Phase A: `dataDate` is required — the audit never falls back to the machine clock. Every
+// caller passes the governed date explicitly (`resolveDataDate(project)` or
+// `project.data_date || DEFAULT_DATA_DATE`); DCMA rules below are untouched.
 export function runDcma14PointAudit(
   activities: Activity[],
   links: ActivityLink[],
   baselineActivities: BaselineActivity[] = [],
   assignments: ActivityResource[] = [],
-  dataDate: string = new Date().toISOString().split('T')[0],
+  dataDate: string,
   options: DcmaAuditOptions = {},
 ): DcmaAuditResult {
   if (!activities.length) {

@@ -743,12 +743,14 @@ export interface ForecastAnalysis {
   };
 }
 
+// Phase A: `today` is required — the finish scenarios anchor on the governed Data Date passed by
+// the caller (Dashboard), never on the machine clock. There is no default on purpose.
 export function forecastFinishScenarios(
   plannedStart: string | null,
   plannedFinish: string | null,
   actualProgress: number,
   spi: number,
-  today = new Date(),
+  today: Date,
 ): ForecastScenarios {
   if (!plannedStart || !plannedFinish || actualProgress >= 1) {
     return { optimistic: plannedFinish, realistic: plannedFinish, pessimistic: plannedFinish };
@@ -770,6 +772,8 @@ export function forecastFinishScenarios(
   };
 }
 
+// Phase A: `dataDate` (governed, 'YYYY-MM-DD') is required and is the only anchor for the finish
+// scenarios. Equations unchanged — only the date source moved from machine clock to caller.
 export function analyzeForecast(
   plannedStart: string | null,
   plannedFinish: string | null,
@@ -780,6 +784,7 @@ export function analyzeForecast(
   cpi: number,
   criticalCount: number,
   nearCriticalCount: number,
+  dataDate: string,
   risks: Risk[] = [],
 ): ForecastAnalysis {
   const safeCpi = Math.max(0.25, cpi || 1);
@@ -795,7 +800,7 @@ export function analyzeForecast(
       * (Math.max(0, Math.min(5, Number(risk.impact || 0))) / 5) * 5,
   }), { cost: 0, days: 0 });
   return {
-    scenarios: forecastFinishScenarios(plannedStart, plannedFinish, actualProgress, safeSpi),
+    scenarios: forecastFinishScenarios(plannedStart, plannedFinish, actualProgress, safeSpi, new Date(`${dataDate}T00:00:00Z`)),
     cost: {
       optimistic: actualCost + (bac * remaining) / Math.max(1, safeCpi * 1.15),
       realistic: actualCost + (bac * remaining) / safeCpi,

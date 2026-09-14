@@ -293,6 +293,8 @@ ${noticeForm.contractorName}`;
   const remainingBudget = plannedBudget - actualCost;
   const budgetUtilization = plannedBudget > 0 ? (actualCost / plannedBudget) * 100 : 0;
 
+  // Phase A: the forecast anchors on the governed Data Date, passed explicitly. The machine
+  // clock no longer participates: same project + same Data Date => same forecast, always.
   const forecast = useMemo(() => {
     return analyzeForecast(
       startDate,
@@ -304,9 +306,10 @@ ${noticeForm.contractorName}`;
       evm.cpi,
       criticalActivities,
       nearCriticalActivities,
+      governedDataDate,
       risks,
     );
-  }, [startDate, endDate, plannedBudget, actualCost, overallProgress, evm.spi, evm.cpi, criticalActivities, nearCriticalActivities, risks]);
+  }, [startDate, endDate, plannedBudget, actualCost, overallProgress, evm.spi, evm.cpi, criticalActivities, nearCriticalActivities, governedDataDate, risks]);
 
   const baselineVariances = useMemo(() => calculateBaselineVariances(activities, baselineActivities), [activities, baselineActivities]);
   const behindBaselineCount = baselineVariances.filter((item) => item.status === 'behind').length;
