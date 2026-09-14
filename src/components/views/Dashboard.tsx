@@ -35,6 +35,7 @@ import { simulateScenario } from '@/lib/scenarioEngine';
 import { generateSCurveData } from '@/lib/sCurveEngine';
 import { analyzeScheduleControl } from '@/lib/scheduleControlEngine';
 import { analyzeCostControl } from '@/lib/costControlEngine';
+import { analyzeIntegratedDecisions } from '@/lib/integratedDecisionEngine';
 // GAP-010: the FIDIC 20.1 notice generator works on the governed Data Date, not on a literal clock.
 import { calendarDaysBetween, isAfterDataDate, isIsoDate, resolveDataDate } from '@/lib/chronologyGuard';
 import { getLanguage, translations, type Language } from '@/lib/i18n';
@@ -401,6 +402,25 @@ ${noticeForm.contractorName}`;
       manualEtc: typeof project.manual_etc_override === 'number' ? project.manual_etc_override : null,
     });
   }, [project, activities, baselineActivities, budgetLines, costTransactions, progressUpdates, costWbs, boqItems, costAllocations, costSnapshots, governedDataDate]);
+  // F7: integrated time-cost decisions (orchestrates the F5 + F6 reports above; no new math).
+  const decisions = useMemo(() => {
+    if (!project || !control || !costStrip) return null;
+    const orderedSched = [...snapshots].sort((a, b) => (a.data_date < b.data_date ? 1 : -1));
+    const orderedCost = [...costSnapshots].sort((a, b) => (a.data_date < b.data_date ? 1 : -1));
+    return analyzeIntegratedDecisions({
+      scheduleReport: control,
+      costReport: costStrip,
+      activities,
+      links,
+      baselines: baselineActivities,
+      progressUpdates,
+      previousScheduleSnapshot: orderedSched.find((x) => x.data_date < governedDataDate) || null,
+      previousCostSnapshot: orderedCost.find((x) => x.data_date < governedDataDate) || null,
+      dataDate: governedDataDate,
+      calendarType: project.calendar_type || '6_days',
+      statusLogic: project.status_logic || 'retained_logic',
+    });
+  }, [project, control, costStrip, activities, links, baselineActivities, progressUpdates, snapshots, costSnapshots, governedDataDate]);
   const controlDelay = control ? control.project.totalDelayWd : null;
   const controlSlipped = control ? control.milestones.filter((m) => m.state === 'slipped').length : 0;
 
@@ -850,6 +870,115 @@ ${noticeForm.contractorName}`;
               <span className={`inline-block mt-1 px-3 py-1 rounded-full text-xs font-bold ${costStrip.confidence.forecast.level === 'High' ? 'bg-emerald-100 text-emerald-800' : costStrip.confidence.forecast.level === 'Medium' ? 'bg-amber-100 text-amber-800' : 'bg-rose-100 text-rose-800'}`}>
                 {costStrip.confidence.forecast.level}
               </span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* F7: Integrated time-cost decision support (summary + top actions + matrix). */}
+      {decisions && (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-4 space-y-4">
+          <div>
+            <h3 className="font-semibold text-slate-800 flex items-center gap-2">
+              <Scale size={18} className="text-slate-500" />
+              {lang === 'ar' ? 'ملخص القرار المتكامل (زمن + تكلفة)' : 'Integrated Decision Summary (Time + Cost)'}
+              <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${decisions.summary.overallConfidence === 'High' ? 'bg-emerald-100 text-emerald-800' : decisions.summary.overallConfidence === 'Medium' ? 'bg-amber-100 text-amber-800' : 'bg-rose-100 text-rose-800'}`}>
+                {decisions.summary.overallConfidence}
+              </span>
+            </h3>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-3 text-center">
+              <div className="p-2.5 bg-slate-50 rounded-xl border border-slate-200">
+                <span className="text-[11px] text-slate-500 font-bold block">{lang === 'ar' ? 'النهاية المتوقعة' : 'Forecast finish'}</span>
+                <span className="text-sm font-black font-mono text-slate-900">{decisions.summary.forecastFinish || 'N/A'}</span>
+                <span className="text-[10px] text-slate-400 block font-mono">
+                  {decisions.summary.delayVsBaselineWd !== null ? `${decisions.summary.delayVsBaselineWd > 0 ? '+' : ''}${decisions.summary.delayVsBaselineWd}d` : 'N/A'}
+                </span>
+              </div>
+              <div className="p-2.5 bg-slate-50 rounded-xl border border-slate-200">
+                <span className="text-[11px] text-slate-500 font-bold block">EAC</span>
+                <span className="text-sm font-black font-mono text-slate-900">{decisions.summary.recommendedEac !== null ? decisions.summary.recommendedEac.toLocaleString() : 'N/A'}</span>
+                <span className="text-[10px] text-slate-400 block font-mono">VAC {decisions.summary.vac !== null ? decisions.summary.vac.toLocaleString() : 'N/A'}</span>
+              </div>
+              <div className="p-2.5 bg-slate-50 rounded-xl border border-slate-200 col-span-2 sm:col-span-1">
+                <span className="text-[11px] text-slate-500 font-bold block">{lang === 'ar' ? 'أعلى مخاطرة' : 'Top risk'}</span>
+                <span className="text-xs font-bold text-slate-900">{decisions.summary.topRisk || '—'}</span>
+              </div>
+              <div className="p-2.5 bg-slate-50 rounded-xl border border-slate-200 col-span-2 sm:col-span-1">
+                <span className="text-[11px] text-slate-500 font-bold block">{lang === 'ar' ? 'القرار المطلوب' : 'Top decision'}</span>
+                <span className="text-xs font-bold text-slate-900">{decisions.summary.topDecision || '—'}</span>
+              </div>
+            </div>
+          </div>
+
+          {decisions.actions.length > 0 && (
+            <div>
+              <h4 className="text-xs font-black text-slate-800 mb-2">{lang === 'ar' ? 'أهم القرارات' : 'Top decisions'}</h4>
+              <ol className="space-y-2">
+                {decisions.actions.map((a) => (
+                  <li key={a.issueId} className="p-3 bg-slate-50 rounded-xl border border-slate-200 text-xs">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="w-5 h-5 rounded-full bg-slate-900 text-amber-400 text-[10px] font-black flex items-center justify-center">{a.rank}</span>
+                      <span className="font-black text-slate-900">{a.title}</span>
+                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${a.confidence === 'High' ? 'bg-emerald-100 text-emerald-800' : a.confidence === 'Medium' ? 'bg-amber-100 text-amber-800' : 'bg-rose-100 text-rose-800'}`}>
+                        {a.confidence}
+                      </span>
+                    </div>
+                    <p className="text-slate-600 mt-1 font-mono text-[11px]">{a.evidence.slice(0, 4).join(' · ')}</p>
+                    {a.rootCause && <p className="text-slate-600 text-[11px]"><span className="font-bold">Cause:</span> {a.rootCause.category} ({a.rootCause.confidence})</p>}
+                    <p className="text-slate-800 mt-0.5"><span className="font-bold">Action:</span> {a.recommendedAction}</p>
+                    <p className="text-slate-600 text-[11px]"><span className="font-bold">Benefit:</span> {a.expectedBenefit ? `−${a.expectedBenefit.daysSaved}d${a.expectedBenefit.costDelta !== null ? `, ${a.expectedBenefit.costDelta.toLocaleString()} SAR` : ''}` : a.expectedBenefitNote}</p>
+                  </li>
+                ))}
+              </ol>
+            </div>
+          )}
+
+          {decisions.warnings.length > 0 && (
+            <div>
+              <h4 className="text-xs font-black text-slate-800 mb-2">{lang === 'ar' ? 'إنذار مبكر' : 'Early warnings'}</h4>
+              <ul className="space-y-1.5">
+                {decisions.warnings.map((w, i) => (
+                  <li key={`${w.code}-${w.activityCode || 'p'}-${i}`} className="p-2.5 bg-amber-50/60 rounded-xl border border-amber-200 text-xs text-slate-700">
+                    <span className="font-mono font-bold">{w.code}</span> — {w.message}
+                    <span className="text-slate-500 font-mono text-[11px] block">{w.evidence.join(' · ')}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          <div>
+            <h4 className="text-xs font-black text-slate-800 mb-2">{lang === 'ar' ? 'مصفوفة الزمن والتكلفة' : 'Time-cost matrix'}</h4>
+            <div className="overflow-x-auto border border-slate-200 rounded-xl max-h-64 overflow-y-auto">
+              <table className="w-full text-xs">
+                <thead className="bg-slate-50 text-slate-700 font-bold border-b sticky top-0">
+                  <tr>
+                    <th className="p-2 text-right">{lang === 'ar' ? 'البند' : 'Item'}</th>
+                    <th className="p-2 text-center">{lang === 'ar' ? 'النوع' : 'Scope'}</th>
+                    <th className="p-2 text-center">{lang === 'ar' ? 'التصنيف' : 'Class'}</th>
+                    <th className="p-2 text-right">{lang === 'ar' ? 'ملاحظات' : 'Notes'}</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {decisions.matrix.map((m) => (
+                    <tr key={`${m.scope}-${m.id}`} className="hover:bg-slate-50">
+                      <td className="p-2 font-bold text-slate-900 font-mono">{m.code} <span className="font-sans font-normal text-slate-500">{m.name.slice(0, 28)}</span></td>
+                      <td className="p-2 text-center text-slate-500">{m.scope}</td>
+                      <td className="p-2 text-center">
+                        <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                          m.class === 'on_track' ? 'bg-emerald-100 text-emerald-800'
+                          : m.class === 'time_cost_risk' ? 'bg-rose-100 text-rose-800'
+                          : m.class === 'data_insufficient' ? 'bg-slate-200 text-slate-600'
+                          : 'bg-amber-100 text-amber-800'
+                        }`}>
+                          {m.class}
+                        </span>
+                      </td>
+                      <td className="p-2 text-slate-500 font-mono text-[11px]">{m.notes.join(' · ')}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </div>
           </div>
         </div>
