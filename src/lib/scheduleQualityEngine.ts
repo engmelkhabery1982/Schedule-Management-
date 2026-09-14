@@ -883,9 +883,16 @@ export async function autoFixDcmaIssues(
   });
 
   for (const r of cpm.results) {
-    // Ensure total float does not exceed 44 days for tightly coupled project
-    const safeTotalFloat = Math.min(Number(r.totalFloat || 0), 20);
-    const safeFreeFloat = Math.min(Number(r.freeFloat || 0), safeTotalFloat);
+    // Persist the CPM engine's own floats verbatim (Final Cleanup, item 2). This used to clamp them:
+    // `Math.min(totalFloat, 20)` — under a comment claiming a 44-day ceiling — rewrote genuine
+    // schedule results (44, 60, 120 days of float) into a fabricated 20-day figure so the repaired
+    // network would look tightly coupled. That is altering CPM output to satisfy an expectation
+    // about the schedule rather than reporting the schedule. High float is a real characteristic of
+    // the network: it is stored exactly as computed, and the DCMA audit is left to flag it. The
+    // `Math.min(freeFloat, totalFloat)` clamp is gone with it — `calculateCpm` already derives free
+    // float bounded by total float, so re-clamping could only distort a correct value.
+    const actualTotalFloat = Number(r.totalFloat || 0);
+    const actualFreeFloat = Number(r.freeFloat || 0);
 
     const actIndex = updatedActivities.findIndex((a) => a.id === r.activityId);
     let finalEarlyStart = r.earlyStart;
@@ -903,8 +910,8 @@ export async function autoFixDcmaIssues(
         early_finish: finalEarlyFinish,
         late_start: r.lateStart,
         late_finish: r.lateFinish,
-        total_float: safeTotalFloat,
-        free_float: safeFreeFloat,
+        total_float: actualTotalFloat,
+        free_float: actualFreeFloat,
         is_critical: r.isCritical,
         activity_drag: r.activityDrag,
       }).eq('id', r.activityId);
@@ -915,8 +922,8 @@ export async function autoFixDcmaIssues(
         early_finish: finalEarlyFinish,
         late_start: r.lateStart,
         late_finish: r.lateFinish,
-        total_float: safeTotalFloat,
-        free_float: safeFreeFloat,
+        total_float: actualTotalFloat,
+        free_float: actualFreeFloat,
         is_critical: r.isCritical,
         activity_drag: r.activityDrag,
       };
@@ -925,7 +932,12 @@ export async function autoFixDcmaIssues(
 
   return {
     fixedCount,
-    message: `تم تنفيذ التصحيح الهندسي بنجاح وتصحيح (${fixedCount}) عنصراً وإعادة حساب شبكة المسار الحرج (CPM) بدقة كاملة (100% PASS).`,
+    // The message states only what this procedure actually did (Final Cleanup, item 2). It used to
+    // close with an unconditional "100% PASS", which asserted a DCMA audit result that this function
+    // never runs: it repairs records and recomputes CPM, nothing more. The 14-Point assessment is
+    // re-run by the audit screen on the returned model, and its real score — including any point
+    // that still fails because of genuinely high float — is what gets reported there.
+    message: `تم تطبيق (${fixedCount}) تصحيحاً على سجلات النموذج، ثم أعيد حساب شبكة المسار الحرج (CPM) وحُفظت نتائجه الفعلية كما هي (التواريخ والهوامش Total/Free Float بلا أي قصّ أو تعديل). لم يُشغَّل تقييم DCMA 14-Point ضمن هذا الإجراء، لذا لا تُعلَن هنا أي نتيجة اجتياز؛ النتيجة الفعلية تظهر في شاشة تدقيق DCMA بعد إعادة الحساب.`,
     updatedActivities,
     updatedLinks,
     updatedAssignments,

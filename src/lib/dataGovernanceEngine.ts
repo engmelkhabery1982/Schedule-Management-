@@ -15,6 +15,53 @@ import type {
 import { runDcma14PointAudit } from '@/lib/scheduleQualityEngine';
 import { resolveDataDate } from '@/lib/chronologyGuard';
 import { getSubcontractPackages, calculateSubcontractorLedger } from '@/lib/subcontractEngine';
+// Final Cleanup (item 4): the EVM pillar consumes the canonical project-control EVM engine instead
+// of carrying its own planned-progress/PV formula. `planningEngine` imports only types and governed
+// constants, so this adds no dependency cycle.
+import { calculateProjectEvmAtDataDate } from '@/lib/planningEngine';
+import type { EvmAcSource, EvmBacSource, EvmRatioStatus, TcpiStatus } from '@/lib/planningEngine';
+
+/**
+ * Bilingual labels for the canonical EVM engine's data-quality metadata, so this audit can say
+ * *where* a number came from — or say that it could not be derived at all. The engine owns the
+ * values; these maps only render them.
+ */
+const BAC_SOURCE_LABEL_AR: Record<EvmBacSource, string> = {
+  contract_value: 'القيمة التعاقدية',
+  budget_lines: 'خطوط ميزانية CBS',
+  boq_items: 'جدول الكميات BOQ',
+  caller_supplied: 'قيمة مُدخلة من المستدعي',
+  unavailable: 'غير متاح — لا مصدر معتمد',
+};
+const BAC_SOURCE_LABEL_EN: Record<EvmBacSource, string> = {
+  contract_value: 'contract value',
+  budget_lines: 'CBS budget lines',
+  boq_items: 'BOQ items',
+  caller_supplied: 'caller-supplied scalar',
+  unavailable: 'unavailable — no authoritative source',
+};
+const AC_SOURCE_LABEL_AR: Record<EvmAcSource, string> = {
+  approved_cost_transactions: 'معاملات التكلفة المعتمدة',
+  budget_line_actuals: 'التكاليف الفعلية المسجلة في خطوط الميزانية',
+  caller_supplied: 'قيمة مُدخلة من المستدعي',
+  unavailable: 'غير متاح — لا دليل تكلفة فعلية',
+};
+const AC_SOURCE_LABEL_EN: Record<EvmAcSource, string> = {
+  approved_cost_transactions: 'approved cost transactions',
+  budget_line_actuals: 'stored budget-line actuals',
+  caller_supplied: 'caller-supplied scalar',
+  unavailable: 'unavailable — no actual-cost evidence',
+};
+const RATIO_STATUS_LABEL_AR: Record<EvmRatioStatus, string> = {
+  valid: 'قيمة مقاسة',
+  empty_no_data: 'لا بيانات',
+  anomalous_zero_denominator: 'مقام صفري — حالة شاذة',
+};
+const TCPI_STATUS_LABEL_AR: Record<TcpiStatus, string> = {
+  valid: 'قيمة مقاسة',
+  undefined_zero_denominator: 'غير معرّف — لا ميزانية متبقية',
+  overrun_budget_exhausted: 'غير قابل للتحقيق — استُنفدت الميزانية',
+};
 
 export interface GovernanceCheckItem {
   id: string;
@@ -64,19 +111,32 @@ export interface GovernanceAuditResult {
     maxVarianceSar: number;
   };
   /**
-   * EVM parity snapshot. Every field except `ac` is null when the project has no budget to derive
-   * earned value from (GAP-041) — no fabricated progress percentage stands in for it any more.
+   * EVM snapshot copied from the canonical engine (`calculateProjectEvmAtDataDate`). A field is null
+   * exactly when that engine could not derive it — no authoritative BAC source, no actual-cost
+   * evidence, or a ratio whose denominator is zero — and `bacSource` / `acSource` state which of
+   * those applies, so a consumer can tell a measured zero from missing data. Nothing in this shape
+   * is recomputed locally by the governance engine (Final Cleanup, item 4).
    */
   evmParity: {
+    dataDate: string;
+    bac: number | null;
+    bacSource: EvmBacSource;
     pv: number | null;
     ev: number | null;
-    ac: number;
+    ac: number | null;
+    acSource: EvmAcSource;
+    sv: number | null;
+    cv: number | null;
+    vac: number | null;
     spi: number | null;
     cpi: number | null;
     eac: number | null;
     tcpi: number | null;
-    /** Canonical earned progress used by this pillar, or null when it is not derivable. */
+    /** Canonical earned progress (EV / BAC), or null when BAC is unavailable. */
     earnedProgressPercent: number | null;
+    /** Canonical planned progress (PV / BAC), or null when BAC is unavailable. */
+    plannedProgressPercent: number | null;
+    /** True only when every index above is a measured value derived from real inputs. */
     isRigorous: boolean;
   };
   summaryAr: string;
@@ -117,7 +177,19 @@ export async function runComprehensiveGovernanceAudit(
   const leads = dcmaAudit.points.find((r) => r.id === 3);
   const hardConstraints = dcmaAudit.points.find((r) => r.id === 5);
   const negativeFloat = dcmaAudit.points.find((r) => r.id === 7);
-  const criticalPath = dcmaAudit.points.find((r) => r.id === 12);
+  // Final Cleanup (item 3): GOV-NET-03 is the critical-path-continuity control, so it now consumes
+  // DCMA Point 11 — the point that actually measures continuity of the driving critical chain. It
+  // used to read Point 12, whose subject is float/drag consistency, which meant a check titled
+  // "Critical Path Continuity" took its evidence (and its pass/fail) from an unrelated control: a
+  // fragmented critical path could be reported as a connected one whenever the float fields happened
+  // to be populated. Point 12 is still consumed — by GOV-NET-02, for float/drag consistency only.
+  // Continuity is never recomputed here: `scheduleQualityEngine` owns that formula (GAP-015) and this
+  // pillar reports its target / actualValue / passRatio as evidence.
+  const criticalPathContinuity = dcmaAudit.points.find((r) => r.id === 11);
+  const floatDragConsistency = dcmaAudit.points.find((r) => r.id === 12);
+  const continuityGapPct = criticalPathContinuity
+    ? Math.round((1 - Math.max(0, Math.min(1, criticalPathContinuity.passRatio))) * 100)
+    : 100;
 
   checks.push({
     id: 'GOV-NET-01',
@@ -143,15 +215,18 @@ export async function runComprehensiveGovernanceAudit(
     pillar: 'network_cpm',
     pillarNameAr: 'سلامة الشبكة والمسار الحرج (CPM Network)',
     pillarNameEn: 'CPM Network & DCMA Structural Integrity',
-    code: 'DCMA-05/06/07',
-    titleAr: 'انضباط القيود الزمنية (Constraints) ومرونة الهوامش (Floats)',
-    titleEn: 'Constraint Discipline & Float Health (<5% Hard Constraints, 0 Negative Float)',
-    descriptionAr: 'التأكد من عدم وجود قيود قسرية تعطل الحساب الديناميكي، وانعدام الهوامش السالبة في خط الأساس.',
-    descriptionEn: 'Ensures no mandatory constraints hijack CPM float dynamics, and 0 negative float exists.',
+    code: 'DCMA-05/07/12',
+    titleAr: 'انضباط القيود الزمنية (Constraints) واتساق الهوامش وكبح المسار الحرج (Float / Drag)',
+    titleEn: 'Constraint Discipline & Float/Drag Consistency (<5% Hard Constraints, 0 Negative Float)',
+    descriptionAr: 'التأكد من عدم وجود قيود قسرية تعطل الحساب الديناميكي، وانعدام الهوامش السالبة في خط الأساس، واكتمال حسابات Total/Free Float وقيم الكبح (Drag) لكل نشاط.',
+    descriptionEn: 'Ensures no mandatory constraints hijack CPM float dynamics, that no negative float exists, and that every activity carries computed Total/Free Float and Drag values (DCMA Point 12).',
     severity: 'high',
-    status: (hardConstraints?.status === 'pass' && negativeFloat?.status === 'pass') ? 'passed' : 'warning',
-    expectedValue: '< 5% قيود قسرية | 0 هامش سالب',
-    actualValue: `${hardConstraints?.actualValue || '0%'} قيود | ${negativeFloat?.actualValue || '0%'} هامش سالب`,
+    status:
+      hardConstraints?.status === 'pass' && negativeFloat?.status === 'pass' && floatDragConsistency?.status === 'pass'
+        ? 'passed'
+        : 'warning',
+    expectedValue: '< 5% قيود قسرية | 0 هامش سالب | هوامش وDrag مكتملة لكل الأنشطة',
+    actualValue: `${hardConstraints?.actualValue || '0%'} قيود | ${negativeFloat?.actualValue || '0%'} هامش سالب | ${floatDragConsistency?.actualValue || 'غير مكتمل'} (Float/Drag)`,
     variance: '0%',
     impactAr: 'تفادي التشوهات الحسابية وتضخيم الهوامش الوهمية في الجدولة التعاقدية.',
     impactEn: 'Prevents artificial float distortion and contractual schedule disputes.',
@@ -162,16 +237,21 @@ export async function runComprehensiveGovernanceAudit(
     pillar: 'network_cpm',
     pillarNameAr: 'سلامة الشبكة والمسار الحرج (CPM Network)',
     pillarNameEn: 'CPM Network & DCMA Structural Integrity',
-    code: 'DCMA-12/14',
-    titleAr: 'استمرارية المسار الحرج ومصداقية مؤشر اكتمال المسار CPI',
-    titleEn: 'Critical Path Continuity & Critical Path Test Integrity',
-    descriptionAr: 'التحقق من أن المسار الحرج يشكل سلسلة متصلة غير منقطعة من تاريخ البدء وحتى تاريخ الإنجاز التعاقدي.',
-    descriptionEn: 'Verifies critical path forms an unbroken chain from project NTP to final contractual milestone.',
+    code: 'DCMA-11',
+    titleAr: 'استمرارية المسار الحرج (Critical Path Continuity — DCMA Point 11)',
+    titleEn: 'Critical Path Continuity (DCMA Point 11)',
+    descriptionAr: 'التحقق من أن المسار الحرج يشكل سلسلة متصلة غير منقطعة عبر علاقات مُحَرِّكة (Driving) من تاريخ البدء وحتى تاريخ الإنجاز التعاقدي — والدليل هو نتيجة النقطة 11 من تدقيق DCMA نفسها دون إعادة حساب محلية.',
+    descriptionEn: 'Verifies the critical path forms an unbroken chain of driving relationships from project start to the final contractual milestone, using DCMA Point 11\'s own result as evidence rather than a locally recomputed formula.',
     severity: 'critical',
-    status: criticalPath?.status === 'pass' ? 'passed' : 'warning',
-    expectedValue: 'مسار حرج متصل ومكتمل (Pass)',
-    actualValue: criticalPath?.status === 'pass' ? 'سلسلة متصلة 100%' : 'تجزؤ في السلسلة',
-    variance: '0 انقطاع',
+    status: criticalPathContinuity?.status === 'pass' ? 'passed' : 'warning',
+    expectedValue: criticalPathContinuity?.target || '100% مسار متصل بعلاقات مُحَرِّكة',
+    actualValue: criticalPathContinuity
+      ? `${criticalPathContinuity.actualValue} — ${criticalPathContinuity.nameAr}`
+      : 'N/A — تعذر تقييم استمرارية المسار الحرج (لا نتائج CPM)',
+    variance:
+      continuityGapPct === 0
+        ? '0 انقطاع'
+        : `${continuityGapPct}% من الأنشطة الحرجة خارج السلسلة المُحَرِّكة`,
     impactAr: 'المسار الحرج هو الأساس القانوني لتسوية النزاعات ومطالبات التمديد الزمني EOT.',
     impactEn: 'Critical path is the primary legal foundation for EOT claims under FIDIC Cl. 8.4.',
   });
@@ -272,52 +352,49 @@ export async function runComprehensiveGovernanceAudit(
   // -------------------------------------------------------------
   // PILLAR 4: EVM & Progress Mathematical Consistency
   // -------------------------------------------------------------
-  const totalActCount = Math.max(1, activities.length);
-  const completedActs = activities.filter((a) => (a.percent_complete || 0) >= 100).length;
-  const inProgressActs = activities.filter((a) => (a.percent_complete || 0) > 0 && (a.percent_complete || 0) < 100).length;
-  
-  // Calculate project progress
-  const plannedProgressRatio = 0.40; // 40.0% planned
-  const actualProgressWeighted = activities.reduce((sum, act) => sum + (Number(act.percent_complete || 0) / 100) * (budgetBac / totalActCount), 0);
-  // GAP-041: earned progress is only derivable when the project carries a budget to weight it. The
-  // hardcoded progress literal this line used to fall back on invented a percentage for every
-  // project with BAC <= 0, and that fabricated figure then flowed into EV, SPI, CPI, EAC, VAC and
-  // TCPI as though it had been measured — while this very pillar reported the result as
-  // mathematically rigorous. Nothing here replaces it with a second formula: when the canonical
-  // earned-progress input is unavailable the metrics are reported as unavailable (null) and the
-  // pillar says so. When a budget exists the arithmetic is byte-for-byte the one that was already
-  // frozen (EV = BAC x earned progress).
-  const earnedProgressAvailable = budgetBac > 0;
-  const earnedProgressPercent: number | null = earnedProgressAvailable
-    ? (actualProgressWeighted / budgetBac) * 100
-    : null;
+  // Final Cleanup (item 4): this pillar consumes the canonical project-control EVM engine instead of
+  // computing its own figures. It used to declare `plannedProgressRatio = 0.40` — a flat "40%
+  // planned complete" applied to every project regardless of its schedule, its budget phasing or the
+  // data date — multiply it by BAC to obtain a PV, derive SPI/CPI/EAC/VAC/TCPI from that PV, and
+  // then report the chain as rigorous with a "0.00 ر.س (مطابقة تامة)" variance. No local progress or
+  // PV formula replaces it: `calculateProjectEvmAtDataDate` phases planned value from the activities'
+  // own CPM windows at the governed Data Date, and it is the single EVM SSOT (GAP-044) that this
+  // module must not duplicate. Where the canonical engine cannot derive a value, the pillar reports
+  // N/A and a warning — never an invented percentage.
+  const canonicalEvm = calculateProjectEvmAtDataDate(
+    project,
+    activities,
+    budgetLines,
+    boqItems,
+    transactions,
+    progressUpdates,
+  );
+  const bacAvailable = canonicalEvm.bacSource !== 'unavailable';
+  const acAvailable = canonicalEvm.acSource !== 'unavailable';
+  const evmFullyMeasured =
+    bacAvailable &&
+    acAvailable &&
+    canonicalEvm.spiStatus === 'valid' &&
+    canonicalEvm.cpiStatus === 'valid' &&
+    canonicalEvm.tcpiStatus === 'valid';
 
-  const theoreticalPv: number | null = earnedProgressAvailable ? budgetBac * plannedProgressRatio : null;
-  const theoreticalEv: number | null = earnedProgressPercent === null ? null : budgetBac * (earnedProgressPercent / 100);
-  
-  const actualCostApproved = transactions
-    .filter((t) => t.status === 'approved')
-    .reduce((sum, t) => sum + Number(t.amount || 0), 0) || budgetLines.reduce((s, l) => s + Number(l.actual_cost || 0), 0);
-
-  // Zero-denominator policies are unchanged for a project that does have a budget; only the
-  // "no earned progress at all" case becomes null instead of a number (GAP-041).
-  const theoreticalSpi: number | null = theoreticalPv === null || theoreticalEv === null
-    ? null
-    : (theoreticalPv > 0 ? theoreticalEv / theoreticalPv : 1);
-  const theoreticalCpi: number | null = theoreticalEv === null
-    ? null
-    : (actualCostApproved > 0 ? theoreticalEv / actualCostApproved : 1);
-  const theoreticalEac: number | null = theoreticalCpi === null
-    ? null
-    : (theoreticalCpi > 0 ? budgetBac / theoreticalCpi : budgetBac);
-  const theoreticalVac: number | null = theoreticalEac === null ? null : budgetBac - theoreticalEac;
-  const theoreticalTcpi: number | null = theoreticalEv === null
-    ? null
-    : ((budgetBac - actualCostApproved) > 0 ? (budgetBac - theoreticalEv) / (budgetBac - actualCostApproved) : 1);
-  const formatIndex = (value: number | null) => (value === null ? 'N/A' : value.toFixed(3));
-  const formatSar = (value: number | null) => (value === null ? 'N/A' : `${Math.round(value).toLocaleString()} ر.س`);
-  const evmUnavailableAr = 'N/A — لا توجد ميزانية معتمدة (BAC = 0) لاشتقاق القيمة المكتسبة';
-  const evmUnavailableEn = 'N/A — no approved budget (BAC = 0), so earned value cannot be derived';
+  const formatSar = (value: number) => `${Math.round(value).toLocaleString()} ر.س`;
+  // A ratio is rendered only when it was actually measured; its data-quality status decides the rest,
+  // so an unavailable denominator can never be presented as a healthy 1.000.
+  const renderRatio = (value: number, status: EvmRatioStatus) =>
+    status === 'valid' ? value.toFixed(3) : `N/A (${RATIO_STATUS_LABEL_AR[status]})`;
+  const renderTcpi = (value: number, status: TcpiStatus) =>
+    status === 'valid' ? value.toFixed(3) : `N/A (${TCPI_STATUS_LABEL_AR[status]})`;
+  const evmUnavailableAr = !bacAvailable
+    ? 'N/A — لا يوجد مصدر معتمد لـ BAC (لا قيمة تعاقدية ولا ميزانية CBS ولا جدول كميات)، لذا يتعذر اشتقاق PV/EV وأي مؤشر أداء'
+    : !acAvailable
+      ? 'N/A — لا يوجد دليل تكلفة فعلية (لا معاملات معتمدة ولا تكاليف فعلية مسجلة)، لذا CPI غير قابل للقياس'
+      : '';
+  const evmUnavailableEn = !bacAvailable
+    ? 'N/A — no authoritative BAC source (no contract value, CBS budget or BOQ), so PV/EV and every index are unavailable'
+    : !acAvailable
+      ? 'N/A — no actual-cost evidence (no approved transactions, no stored budget actuals), so CPI is not measurable'
+      : '';
 
   checks.push({
     id: 'GOV-EVM-01',
@@ -325,19 +402,19 @@ export async function runComprehensiveGovernanceAudit(
     pillarNameAr: 'الدقة الرياضية للقيمة المكتسبة (EVM Mathematics)',
     pillarNameEn: 'Earned Value Mathematical Rigor & Law of Conservation',
     code: 'EVM-01/02/03',
-    titleAr: 'انضباط معادلات EVM الصارمة (EV, PV, AC, SPI, CPI, EAC, TCPI)',
-    titleEn: 'Strict PMI EVM Formula Compliance without Metric Drift',
-    descriptionAr: 'التأكد من أن مؤشرات الأداء (SPI/CPI) وتوقعات الإنجاز (EAC/VAC) تتطابق 100% مع معادلات PMI القياسية دون تقريب شاذ.',
-    descriptionEn: 'Validates performance indices (SPI/CPI) and forecasts (EAC/VAC) strictly obey standard PMI formulas.',
+    titleAr: 'انضباط معادلات EVM المشتقة من المحرك القانوني (EV, PV, AC, SPI, CPI, EAC, TCPI)',
+    titleEn: 'Strict PMI EVM Compliance from the Canonical Engine, with Honest N/A',
+    descriptionAr: 'التحقق من أن مؤشرات الأداء (SPI/CPI) وتوقعات الإنجاز (EAC/VAC/TCPI) مشتقة من محرك EVM القانوني عند تاريخ البيانات المعتمد، وأن كل مدخل غير متاح يُعلن صراحة (N/A) بدل اختلاقه.',
+    descriptionEn: 'Validates that performance indices (SPI/CPI) and forecasts (EAC/VAC/TCPI) come from the canonical EVM engine at the governed Data Date, and that every unavailable input is declared N/A instead of being invented.',
     severity: 'critical',
-    status: earnedProgressAvailable ? 'passed' : 'warning',
-    expectedValue: earnedProgressAvailable
-      ? `SPI: ${formatIndex(theoreticalSpi)} | CPI: ${formatIndex(theoreticalCpi)} | EAC: ${formatSar(theoreticalEac)}`
+    status: evmFullyMeasured ? 'passed' : 'warning',
+    expectedValue: `SPI = EV/PV · CPI = EV/AC · EAC = BAC/CPI · TCPI = (BAC-EV)/(BAC-AC)، مع BAC من مصدر معتمد (${BAC_SOURCE_LABEL_EN[canonicalEvm.bacSource]}) وAC من دليل تكلفة مسجل (${AC_SOURCE_LABEL_EN[canonicalEvm.acSource]})`,
+    actualValue: evmFullyMeasured
+      ? `عند ${canonicalEvm.dataDate}: BAC ${formatSar(canonicalEvm.bac)} (${BAC_SOURCE_LABEL_AR[canonicalEvm.bacSource]}) | PV ${formatSar(canonicalEvm.pv)} | EV ${formatSar(canonicalEvm.ev)} | AC ${formatSar(canonicalEvm.ac)} (${AC_SOURCE_LABEL_AR[canonicalEvm.acSource]}) | SPI ${renderRatio(canonicalEvm.spi, canonicalEvm.spiStatus)} | CPI ${renderRatio(canonicalEvm.cpi, canonicalEvm.cpiStatus)} | EAC ${formatSar(canonicalEvm.eac)} | TCPI ${renderTcpi(canonicalEvm.tcpi, canonicalEvm.tcpiStatus)}`
       : `${evmUnavailableAr} (${evmUnavailableEn})`,
-    actualValue: earnedProgressAvailable
-      ? `SPI: ${formatIndex(theoreticalSpi)} | CPI: ${formatIndex(theoreticalCpi)} | EAC: ${formatSar(theoreticalEac)}`
-      : 'N/A — لا يوجد أي رقم تقدم مُختلق؛ التقدم الفعلي غير قابل للاشتقاق بدون ميزانية',
-    variance: earnedProgressAvailable ? '0.00 ر.س (مطابقة تامة)' : 'N/A (لا قيمة مكتسبة قابلة للمقارنة)',
+    variance: bacAvailable
+      ? `SV = EV - PV = ${formatSar(canonicalEvm.sv)} · CV = EV - AC = ${acAvailable ? formatSar(canonicalEvm.cv) : 'N/A'} · VAC = BAC - EAC = ${acAvailable ? formatSar(canonicalEvm.vac) : 'N/A'}`
+      : 'N/A (لا توجد قيم مالية قابلة للمقارنة)',
     impactAr: 'تقديم تقارير أداء ومؤشرات دقيقة لا تقبل التشكيك أمام مجلس الإدارة والممولين.',
     impactEn: 'Delivers unassailable financial performance reports to Executive Board and stakeholders.',
   });
@@ -393,13 +470,19 @@ export async function runComprehensiveGovernanceAudit(
     code: 'FID-02',
     titleAr: 'المطابقة الثلاثية للفواتير والتوريدات (3-Way Invoice Matching Integrity)',
     titleEn: '3-Way Invoice Matching Parity (PO == GRN Goods Receipt == Vendor Invoice)',
-    descriptionAr: 'التحقق من أن 100% من فواتير الموردين ومقاولي الباطن مطابقة لأوامر الشراء الرسمية ومذكرات استلام البضائع بالموقع.',
-    descriptionEn: 'Verifies 100% of vendor/subcontractor invoices reconcile against Purchase Orders and Site GRNs.',
+    descriptionAr: 'ضابط معرَّف للتحقق من مطابقة فواتير الموردين ومقاولي الباطن لأوامر الشراء الرسمية ومذكرات استلام البضائع بالموقع (GRN). لا يمكن تقييمه حالياً: لا يحتوي النموذج على سجلات أوامر شراء أو استلام مواد أو فواتير موردين، والحقل الوحيد المتصل بالموضوع هو invoice_number النصي على معاملة التكلفة.',
+    descriptionEn: 'A defined control that vendor/subcontractor invoices reconcile against Purchase Orders and site GRNs. It cannot be evaluated yet: the schema holds no purchase-order, goods-receipt (GRN) or vendor-invoice records — the only related field is the free-text `invoice_number` on a cost transaction.',
     severity: 'high',
-    status: 'passed',
-    expectedValue: '100% مطابقة ثلاثية معتمدة',
-    actualValue: '100% مطابقة (0 تعارض)',
-    variance: '0 تعارض مالي',
+    // Final Cleanup (item 5): this control was hardcoded to `status: 'passed'` with the evidence
+    // strings "100% match (0 conflicts)" although nothing was ever compared — there is no PO, GRN or
+    // vendor-invoice data in this schema to compare against. An unevaluated financial control
+    // reported as passing is worse than one reported as unavailable: it tells an auditor the 3-way
+    // match was performed. It is now a warning with explicit N/A wording until real 3-way data
+    // exists. No procurement records are invented here and no procurement subsystem is built.
+    status: 'warning',
+    expectedValue: 'PO ↔ GRN ↔ فاتورة المورد: مطابقة ثلاثية موثقة لكل دفعة (غير متاح للقياس حالياً)',
+    actualValue: 'N/A — لا توجد بيانات أوامر شراء أو استلام مواد (GRN) أو فواتير موردين في النظام، لذا لا يمكن التحقق من هذا الضابط بعد',
+    variance: 'N/A (لم يُقيَّم — لا يوجد دليل للمقارنة)',
     impactAr: 'منع الدفعات المزدوجة وضبط التكاليف الفعلية ومطابقة ضريبة القيمة المضافة ZATCA.',
     impactEn: 'Prevents duplicate payments, enforces ERP financial controls, and ensures ZATCA compliance.',
   });
@@ -452,6 +535,36 @@ export async function runComprehensiveGovernanceAudit(
   else if (overallScore >= 50) ratingGrade = 'C';
   else ratingGrade = 'F';
 
+  // -------------------------------------------------------------
+  // Audit summary — generated from this run's own tallies (Final Cleanup, item 6)
+  // -------------------------------------------------------------
+  // Both summaries used to assert, unconditionally, that every financial, mathematical and CPM
+  // reference was fully reconciled "with zero discrepancies" / "دون أي تعارض في الأرقام": the same
+  // sentence was emitted for a run that had just returned violations, and it was emitted in both
+  // languages, so the overstatement was bilingual and systematic. A governance report may claim only
+  // what its checks produced, and Arabic and English must say the same thing.
+  const listCodes = (items: GovernanceCheckItem[]) => {
+    const codes = items.map((c) => `${c.code} / ${c.id}`);
+    return codes.length <= 5 ? codes.join('، ') : `${codes.slice(0, 5).join('، ')} … (+${codes.length - 5})`;
+  };
+  const violations = checks.filter((c) => c.status === 'violation');
+  const warnings = checks.filter((c) => c.status === 'warning');
+  const repairedNoteAr = repairedCount > 0 ? `، ${repairedCount} مُصلَح` : '';
+  const repairedNoteEn = repairedCount > 0 ? `, ${repairedCount} repaired` : '';
+
+  let summaryAr: string;
+  let summaryEn: string;
+  if (violationCount > 0) {
+    summaryAr = `اكتمل فحص حوكمة البيانات بنتيجة ${overallScore}% وبتقدير (${ratingGrade}) عبر ${totalChecks} ضابطاً: ${passedCount} ناجح${repairedNoteAr}، ${warningCount} تحذير، ${violationCount} مخالفة مفتوحة [${listCodes(violations)}]. لا يمكن اعتبار المرجعيات المالية والرياضية وشبكة CPM متسقة بالكامل ما دامت هناك مخالفات لم تُعالَج.`;
+    summaryEn = `Data governance audit completed with a ${overallScore}% conformance score (Grade ${ratingGrade}) across ${totalChecks} controls: ${passedCount} passed${repairedNoteEn}, ${warningCount} warnings and ${violationCount} open violations [${listCodes(violations)}]. The financial, mathematical and CPM references cannot be reported as fully reconciled while violations remain open.`;
+  } else if (warningCount > 0) {
+    summaryAr = `اكتمل فحص حوكمة البيانات مع تحذيرات: النتيجة ${overallScore}% وبتقدير (${ratingGrade}) عبر ${totalChecks} ضابطاً: ${passedCount} ناجح${repairedNoteAr}، ${warningCount} تحذير، دون مخالفات [${listCodes(warnings)}]. بعض الضوابط ناقصة الأدلة أو غير قابلة للقياس حالياً، لذا لا يُعلَن اكتمال التسوية قبل استيفائها.`;
+    summaryEn = `Data governance audit completed with warnings: ${overallScore}% conformance (Grade ${ratingGrade}) across ${totalChecks} controls: ${passedCount} passed${repairedNoteEn}, ${warningCount} warnings and no violations [${listCodes(warnings)}]. Some controls lack evidence or are not measurable yet, so full reconciliation is not claimed until they are closed.`;
+  } else {
+    summaryAr = `اكتمل فحص حوكمة البيانات بنتيجة ${overallScore}% وبتقدير (${ratingGrade}): ${totalChecks} ضابطاً، ${passedCount} ناجح${repairedNoteAr}، دون مخالفات ودون تحذير. المرجعيات المالية والرياضية وشبكة CPM متسقة وفق الأدلة المسجلة في هذه الجولة.`;
+    summaryEn = `Data governance audit completed with a ${overallScore}% conformance score (Grade ${ratingGrade}): ${totalChecks} controls, ${passedCount} passed${repairedNoteEn}, no violations and no warnings. The financial, mathematical and CPM references reconcile on the evidence recorded in this run.`;
+  }
+
   // Group by Pillar
   const pillarMap = new Map<string, { passed: number; total: number; nameAr: string; nameEn: string }>();
   checks.forEach((c) => {
@@ -491,24 +604,47 @@ export async function runComprehensiveGovernanceAudit(
       maxVarianceSar: Math.max(boqVariance, budgetVariance),
     },
     evmParity: {
-      pv: theoreticalPv,
-      ev: theoreticalEv,
-      ac: actualCostApproved,
-      spi: theoreticalSpi,
-      cpi: theoreticalCpi,
-      eac: theoreticalEac,
-      tcpi: theoreticalTcpi,
-      earnedProgressPercent,
-      isRigorous: earnedProgressAvailable,
+      dataDate: canonicalEvm.dataDate,
+      bac: bacAvailable ? canonicalEvm.bac : null,
+      bacSource: canonicalEvm.bacSource,
+      pv: bacAvailable ? canonicalEvm.pv : null,
+      ev: bacAvailable ? canonicalEvm.ev : null,
+      ac: acAvailable ? canonicalEvm.ac : null,
+      acSource: canonicalEvm.acSource,
+      sv: bacAvailable ? canonicalEvm.sv : null,
+      cv: bacAvailable && acAvailable ? canonicalEvm.cv : null,
+      vac: bacAvailable && acAvailable ? canonicalEvm.vac : null,
+      spi: canonicalEvm.spiStatus === 'valid' ? canonicalEvm.spi : null,
+      cpi: canonicalEvm.cpiStatus === 'valid' ? canonicalEvm.cpi : null,
+      eac: bacAvailable && acAvailable ? canonicalEvm.eac : null,
+      tcpi: canonicalEvm.tcpiStatus === 'valid' ? canonicalEvm.tcpi : null,
+      earnedProgressPercent: bacAvailable ? canonicalEvm.earnedProgressPercent : null,
+      plannedProgressPercent: bacAvailable ? canonicalEvm.plannedProgressPercent : null,
+      isRigorous: evmFullyMeasured,
     },
-    summaryAr: `تم إنجاز فحص الحوكمة الشامل بنجاح بنسبة مطابقة ${overallScore}% وبتقدير معتمد (${ratingGrade}). كافة المرجعيات المالية، الرياضية، وشبكة CPM متسقة بالكامل دون أي تعارض في الأرقام.`,
-    summaryEn: `Comprehensive Enterprise Data Governance Audit completed with a ${overallScore}% conformance score (Grade ${ratingGrade}). All financial, mathematical, and CPM network references are 100% reconciled with zero discrepancies.`,
+    summaryAr,
+    summaryEn,
   };
 }
 
 /**
- * Intelligent 1-Click Data Harmonization Engine
- * Fixes any foreign key issues, aligns rounding discrepancies, and synchronizes persistent state.
+ * 1-Click Data Harmonization Engine (Final Cleanup, item 7).
+ *
+ * Writes to the database only where a deterministic source of truth exists and the transformation is
+ * defensible on its own:
+ *   - orphan `progress_updates` rows, whose parent activity does not exist, are deleted. The parent
+ *     record is the authority and such a row can never become valid, so removing it is a repair.
+ *
+ * Financial reconciliation is REPORT-ONLY. A contract value, a BOQ line and a CBS budget line are
+ * commercial facts, not arithmetic residues: this routine used to invent a target (`contract_value ||
+ * 2345150`) when the project had none and then "balance" the tables by rewriting the LAST BOQ item —
+ * including recomputing its unit price — and the LAST budget line until they matched that fiction.
+ * That fabricated both the target and the evidence, destroyed the audit trail of two real rows, and
+ * made every downstream financial report agree with a number nobody approved. Settling a BOQ/budget
+ * variance against the contract is a commercial decision (variation order, re-measurement, contract
+ * amendment), so the variance is now reported and left for that decision.
+ *
+ * `success` means "the procedure completed without error" — never "the variances were resolved".
  */
 export async function harmonizeAndReconcileAllProjectData(projectId: string): Promise<{ success: boolean; repairedItems: string[] }> {
   const repairedItems: string[] = [];
@@ -524,43 +660,53 @@ export async function harmonizeAndReconcileAllProjectData(projectId: string): Pr
 
     if (!project) return { success: false, repairedItems: ['لم يتم العثور على المشروع المستهدف'] };
 
-    const targetBac = Number(project.contract_value || 2345150); // Master SSOT BAC from Project Contract Value
+    const fmt = (value: number) => `${Math.round(value).toLocaleString()} ر.س`;
+    const boqRows = (boqItems || []) as BoqItem[];
+    const budgetRows = (budgetLines || []) as BudgetLine[];
+    const contractValue = Number(project.contract_value || 0);
 
-    // 2. Harmonize Project Contract Value
-    repairedItems.push(`تم اعتماد القيمة التعاقدية للمشروع (${targetBac.toLocaleString()} ر.س) كمرجع أساسي موحد (SSOT).`);
+    // 2. Financial harmonization requires an authoritative commercial target. With no recorded
+    //    contract value there is nothing to reconcile against, so nothing financial is written and
+    //    the gap is returned as an explicit unresolved item for a human to close.
+    if (!(contractValue > 0)) {
+      repairedItems.push(
+        'بند غير محسوم: لا توجد قيمة تعاقدية مسجلة للمشروع (contract_value) ولا يمكن اعتماد BAC من مصدر موثوق، لذلك أُوقفت المطابقة المالية بالكامل ولم يُجرَ أي تعديل على بنود جدول الكميات أو خطوط الميزانية. الإجراء المطلوب: إدخال القيمة التعاقدية المعتمدة أو تحديد مصدر BAC المعتمد، ثم إعادة الفحص.',
+      );
+    } else {
+      const boqSum = boqRows.reduce((s: number, b: BoqItem) => s + Number(b.total_price || 0), 0);
+      const budgetSum = budgetRows.reduce((s: number, b: BudgetLine) => s + Number(b.planned_cost || 0), 0);
+      const boqVariance = boqSum - contractValue;
+      const budgetVariance = budgetSum - contractValue;
 
-    // 3. Ensure BOQ items match target BAC
-    if (boqItems && boqItems.length > 0) {
-      const currentBoqSum = boqItems.reduce((s: number, b: BoqItem) => s + Number(b.total_price || 0), 0);
-      if (Math.abs(currentBoqSum - targetBac) > 1) {
-        // Find last item to adjust
-        const lastItem = boqItems[boqItems.length - 1];
-        const diff = targetBac - currentBoqSum;
-        const newTotal = Number(lastItem.total_price || 0) + diff;
-        const newUnitPrice = Math.round(newTotal / Number(lastItem.quantity || 1));
-        await supabase.from('boq_items').update({
-          total_price: newTotal,
-          unit_price: newUnitPrice,
-        }).eq('id', lastItem.id);
-        repairedItems.push(`تم ضبط رصيد جدول الكميات (BOQ Item ${lastItem.code}) ليطابق القيمة التعاقدية بدقة 100%.`);
+      repairedItems.push(
+        `القيمة التعاقدية المسجلة (${fmt(contractValue)}) هي المرجع المالي للمطابقة. المطابقة المالية في هذا الإجراء تقريرية فقط: لا يُعدَّل أي بند أو خط ميزانية آلياً.`,
+      );
+
+      if (boqRows.length === 0) {
+        repairedItems.push('بند غير محسوم: لا توجد بنود جدول كميات (BOQ) لهذا المشروع، لذا يتعذر قياس الفرق مقابل القيمة التعاقدية.');
+      } else if (Math.abs(boqVariance) <= 1) {
+        repairedItems.push(`إجمالي جدول الكميات (${fmt(boqSum)}) مطابق للقيمة التعاقدية ضمن ±1 ر.س — لا حاجة إلى أي تعديل.`);
+      } else {
+        repairedItems.push(
+          `فرق مُبلَّغ عنه ولم يُسوَّ آلياً: إجمالي جدول الكميات ${fmt(boqSum)} مقابل القيمة التعاقدية ${fmt(contractValue)} = ${fmt(Math.abs(boqVariance))} ${boqVariance > 0 ? '(الكميات أعلى من العقد)' : '(الكميات أقل من العقد)'}. لم يُعدَّل أي بند BOQ: تسوية هذا الفرق قرار تجاري (أمر تغييري / إعادة قياس / تعديل عقد) ولا يجوز فرضها على آخر بند في الجدول.`,
+        );
+      }
+
+      if (budgetRows.length === 0) {
+        repairedItems.push('بند غير محسوم: لا توجد خطوط ميزانية CBS لهذا المشروع، لذا يتعذر قياس الفرق مقابل القيمة التعاقدية.');
+      } else if (Math.abs(budgetVariance) <= 1) {
+        repairedItems.push(`إجمالي ميزانية CBS (${fmt(budgetSum)}) مطابق للقيمة التعاقدية ضمن ±1 ر.س — لا حاجة إلى أي تعديل.`);
+      } else {
+        repairedItems.push(
+          `فرق مُبلَّغ عنه ولم يُسوَّ آلياً: إجمالي ميزانية CBS ${fmt(budgetSum)} مقابل القيمة التعاقدية ${fmt(contractValue)} = ${fmt(Math.abs(budgetVariance))} ${budgetVariance > 0 ? '(الميزانية أعلى من العقد)' : '(الميزانية أقل من العقد)'}. لم يُعدَّل أي خط ميزانية: موازنة الميزانية مع العقد تتطلب قراراً تجارياً موثقاً ولا تُفرض على آخر خط في الجدول.`,
+        );
       }
     }
 
-    // 4. Harmonize CBS Budget Lines
-    if (budgetLines && budgetLines.length > 0) {
-      const budgetSum = budgetLines.reduce((s: number, b: BudgetLine) => s + Number(b.planned_cost || 0), 0);
-      if (Math.abs(budgetSum - targetBac) > 1) {
-        // Adjust last budget line
-        const lastLine = budgetLines[budgetLines.length - 1];
-        const diff = targetBac - budgetSum;
-        await supabase.from('budget_lines').update({
-          planned_cost: Number(lastLine.planned_cost || 0) + diff,
-        }).eq('id', lastLine.id);
-        repairedItems.push(`تمت موازنة خطوط الميزانية CBS ليتطابق إجمالي الميزانية المعتمدة مع ${targetBac.toLocaleString()} ر.س.`);
-      }
-    }
-
-    // 5. Cleanse any invalid progress records
+    // 3. Cleanse orphan progress records — independent of the financial question above, so it still
+    //    runs when the contract value is missing. The parent activity set is the deterministic
+    //    authority: a progress row pointing at a non-existent activity can never be valid.
+    let orphanRemoved = 0;
     if (activities) {
       const actMap = new Set(activities.map((a: Activity) => a.id));
       const { data: rawProgress } = await supabase.from('progress_updates').select('*').eq('project_id', projectId);
@@ -569,13 +715,19 @@ export async function harmonizeAndReconcileAllProjectData(projectId: string): Pr
         if (invalid.length > 0) {
           for (const inv of invalid) {
             await supabase.from('progress_updates').delete().eq('id', inv.id);
+            orphanRemoved += 1;
           }
-          repairedItems.push(`تم حذف وتطهير ${invalid.length} سجل تقدم غير صالح ومعزول.`);
+          repairedItems.push(`تم حذف وتطهير ${invalid.length} سجل تقدم غير صالح ومعزول (لا يشير إلى نشاط موجود).`);
         }
       }
     }
 
-    repairedItems.push('تم تحديث وحفظ كافة التوازنات بنجاح وتأكيد مصفوفة الحوكمة الشاملة.');
+    // 4. Closing statement — describes what this run actually did, not a blanket success claim.
+    repairedItems.push(
+      orphanRemoved > 0
+        ? `اكتملت العملية: نُفِّذ تعديل آمن واحد (${orphanRemoved} سجل معزول). لم تُجرَ أي كتابة مالية آلية، والفروقات المالية المذكورة أعلاه معروضة للتقرير والقرار التجاري.`
+        : 'اكتملت العملية دون أي كتابة على البيانات: لا توجد إصلاحات آمنة مستحقة، والمطابقة المالية معروضة كفروقات للتقرير فقط.',
+    );
     return { success: true, repairedItems };
   } catch (err: any) {
     console.error('Harmonization error:', err);

@@ -101,6 +101,35 @@ export function generateSmartActivityPlans(
 }
 
 /**
+ * Authoritative source of the reported BAC (Final Cleanup, item 1).
+ *
+ * BAC is a commercial fact, never an estimate produced by the engine: it comes from the contract
+ * value, from the CBS budget lines, or from the BOQ — in that precedence. `'unavailable'` means no
+ * such source exists, in which case `bac` is 0 and consumers must render N/A instead of a figure.
+ * `'caller_supplied'` marks `deriveEvmFromScalars`, where the scalar is handed in by the caller.
+ */
+export type EvmBacSource =
+  | 'contract_value'
+  | 'budget_lines'
+  | 'boq_items'
+  | 'caller_supplied'
+  | 'unavailable';
+
+/**
+ * Authoritative source of the reported AC (Final Cleanup, item 1).
+ *
+ * Actual cost is recorded money only: the approved cost-transaction register, or stored CBS
+ * budget-line actuals. `'unavailable'` means neither holds a value, so `ac` is 0 because there is
+ * **no actual-cost evidence** — which is not the same statement as "the project spent nothing", and
+ * `cpiStatus` plus this field are what let the UI tell the two apart. AC is never derived from EV.
+ */
+export type EvmAcSource =
+  | 'approved_cost_transactions'
+  | 'budget_line_actuals'
+  | 'caller_supplied'
+  | 'unavailable';
+
+/**
  * Canonical result of the project-control EVM engine (SSOT — GAP-044).
  *
  * Every derived index in this shape is produced by `assessEvmRatios`; no other module may
@@ -110,6 +139,10 @@ export function generateSmartActivityPlans(
  */
 export interface ComprehensiveProjectEvm {
   bac: number;
+  /** Where `bac` came from; `'unavailable'` means it is a data gap, not a measured zero. */
+  bacSource: EvmBacSource;
+  /** Where `ac` came from; `'unavailable'` means no actual-cost evidence exists. */
+  acSource: EvmAcSource;
   dataDate: string;
   /**
    * Canonical earned project progress (GAP-045): `EV / BAC * 100` when `BAC > 0`, otherwise 0.
@@ -346,11 +379,25 @@ function finiteOrZero(percent: number | null | undefined): number {
  *   2. the activity's own recorded `percent_complete`, where a recorded 0% stays 0% and a
  *      missing value resolves to 0% — progress is never fabricated from elapsed time or from a
  *      falsy-to-100 fallback.
+ *
+ * No-input policy (Final Cleanup, item 1) — the engine reports what the data says, never what would
+ * make the report look complete:
+ *   - BAC: contract value -> CBS budget lines -> BOQ items. With none of them, `bac` is 0 and
+ *     `bacSource === 'unavailable'` (the former invented `1000000` default is gone).
+ *   - AC: approved cost transactions -> stored CBS budget-line actuals, used verbatim. With neither,
+ *     `ac` is 0 and `acSource === 'unavailable'` (the former `EV * 0.95` estimate and the
+ *     EV-ratio-scaled budget actual are both gone — AC is never derived from EV).
+ *   - dates: the activity's own CPM window, then the project's governed start/end dates, then the
+ *     governed `DEFAULT_DATA_DATE`. The former hardcoded '2026-09-15' / '2027-04-30' window is gone;
+ *     an activity that cannot be placed on a real calendar contributes no planned value and earns
+ *     only its own recorded evidence.
+ * A missing input therefore surfaces as an explicit unavailable state (`bacSource` / `acSource` plus
+ * `spiStatus` / `cpiStatus` / `tcpiStatus`), never as NaN, Infinity, or a plausible-looking number.
  */
 export function calculateProjectEvmAtDataDate(
   // Structural subset of `Project`. The date/value fields accept `null` because `Project`
-  // declares them as `string | null` / nullable numbers; every use below already guards with
-  // `||` fallbacks, so no calculation changes.
+  // declares them as `string | null` / nullable numbers; every use below resolves them explicitly
+  // (governed data date, finite-date checks) instead of substituting an invented default.
   project: {
     contract_value?: number | null;
     start_date?: string | null;
@@ -370,10 +417,31 @@ export function calculateProjectEvmAtDataDate(
   const dataDateStr = overrideDataDate || project.data_date || DEFAULT_DATA_DATE;
   const dataDateMs = new Date(dataDateStr).getTime();
 
-  // 1. Calculate BAC
+  // 1. Calculate BAC — from an authoritative commercial source only (Final Cleanup, item 1)
   const bgtSum = budgetLines.reduce((s, b) => s + Number(b.planned_cost || b.approved_budget || 0), 0);
   const boqSum = boqItems.reduce((s, b) => s + Number(b.total_price || 0), 0);
-  const bac = Number(project.contract_value || bgtSum || boqSum || 1000000);
+  const contractValue = finiteOrZero(project.contract_value);
+  // Precedence is unchanged: contract value -> CBS budget lines -> BOQ items. What is gone is the
+  // `|| 1000000` tail: it invented a seven-figure budget for every project whose commercial data
+  // was missing, and each derived index (PV, EV, SPI, CPI, EAC, VAC, TCPI and both progress
+  // percentages) then looked measured while resting on fiction. BAC is a commercial fact — when no
+  // source holds one it is reported as 0 with `bacSource === 'unavailable'`, which is the explicit
+  // no-data state the UI renders as N/A. `assessEvmRatios` keeps every ratio finite there.
+  let bacSource: EvmBacSource;
+  let bac: number;
+  if (contractValue > 0) {
+    bacSource = 'contract_value';
+    bac = contractValue;
+  } else if (bgtSum > 0) {
+    bacSource = 'budget_lines';
+    bac = bgtSum;
+  } else if (boqSum > 0) {
+    bacSource = 'boq_items';
+    bac = boqSum;
+  } else {
+    bacSource = 'unavailable';
+    bac = 0;
+  }
 
   const totalActs = Math.max(1, activities.length);
 
@@ -398,12 +466,31 @@ export function calculateProjectEvmAtDataDate(
     actCostMap.set(act.id, (actCostMap.get(act.id) || 0) * costScale);
   });
 
+  // Activity window resolution (Final Cleanup, item 1): an activity is time-phased on its own CPM
+  // dates, falling back to the project's governed start/end dates. The literals this used to fall
+  // back on ('2026-09-15' / '2027-04-30') invented a schedule window for undated activities, which
+  // then produced planned and earned value against a calendar nobody approved. With no window of
+  // its own and no project window, the value resolves to NaN and each loop below handles that
+  // explicitly instead of guessing dates.
+  const projectStartMs = project.start_date ? new Date(project.start_date).getTime() : NaN;
+  const projectFinishMs = project.end_date ? new Date(project.end_date).getTime() : NaN;
+  const resolveStartMs = (act: Activity) =>
+    act.early_start ? new Date(act.early_start).getTime() : projectStartMs;
+  const resolveFinishMs = (act: Activity) =>
+    act.early_finish ? new Date(act.early_finish).getTime() : projectFinishMs;
+
   // 2. Compute Planned Value (PV) at dataDate
   let totalPv = 0;
   activities.forEach((act) => {
     const actCost = actCostMap.get(act.id) || (bac / totalActs);
-    const startMs = new Date(act.early_start || project.start_date || '2026-09-15').getTime();
-    const finishMs = new Date(act.early_finish || project.end_date || '2027-04-30').getTime();
+    const startMs = resolveStartMs(act);
+    const finishMs = resolveFinishMs(act);
+
+    if (!Number.isFinite(startMs) || !Number.isFinite(finishMs)) {
+      // Unschedulable: nothing can be planned against an unknown calendar, so the activity
+      // contributes no planned value rather than being placed on fabricated dates.
+      return;
+    }
 
     if (dataDateMs <= startMs) {
       // Not planned to start yet
@@ -433,13 +520,19 @@ export function calculateProjectEvmAtDataDate(
 
   activities.forEach((act) => {
     const actCost = actCostMap.get(act.id) || (bac / totalActs);
-    const startMs = new Date(act.early_start || project.start_date || '2026-09-15').getTime();
+    const startMs = resolveStartMs(act);
 
     let actPct = 0;
     const update = updatesByAct.get(act.id);
     if (update) {
       // An approved progress record is the authoritative earned source for this activity.
       actPct = finiteOrZero(update.percent_complete);
+    } else if (!Number.isFinite(startMs)) {
+      // Undated activity with no approved progress record (Final Cleanup, item 1): the only evidence
+      // of earned work is the activity's own recorded physical percent, so that is what is earned.
+      // With no window there is nothing to time-phase against, and no dates are invented to stand in
+      // for one — the former literals manufactured both a start and a finish here.
+      actPct = finiteOrZero(act.percent_complete);
     } else if (dataDateMs >= startMs) {
       // No approved progress record: fall back to the activity's own recorded physical percent.
       //
@@ -451,8 +544,10 @@ export function calculateProjectEvmAtDataDate(
       //   - recorded null/undefined -> 0% earned (legitimate default; never 100% by accident)
       //   - recorded N%            -> N% earned (unchanged)
       const recordedPct = finiteOrZero(act.percent_complete);
-      const finishMs = new Date(act.early_finish || project.end_date || '2027-04-30').getTime();
-      if (dataDateMs >= finishMs) {
+      const finishMs = resolveFinishMs(act);
+      if (!Number.isFinite(finishMs) || dataDateMs >= finishMs) {
+        // Past the planned finish — or no planned finish to phase against: the recorded percent is
+        // earned in full.
         actPct = recordedPct;
       } else {
         const dur = Math.max(86400000, finishMs - startMs);
@@ -464,22 +559,42 @@ export function calculateProjectEvmAtDataDate(
     totalEv += actCost * (actPct / 100);
   });
 
-  // 4. Compute Actual Cost (AC) at dataDate
+  // 4. Compute Actual Cost (AC) at dataDate — from recorded money only (Final Cleanup, item 1)
   const approvedTxns = costTransactions.filter(
     (t) => t.status === 'approved' && (!t.transaction_date || t.transaction_date <= dataDateStr),
   );
-  let totalAc = approvedTxns.reduce((sum, t) => sum + Number(t.amount || 0), 0);
+  const approvedAc = approvedTxns.reduce((sum, t) => sum + Number(t.amount || 0), 0);
+  const budgetActualAc = budgetLines.reduce((s, b) => s + Number(b.actual_cost || 0), 0);
 
-  if (totalAc === 0) {
-    // If no transactions logged for this project yet, estimate realistically from budget lines and progress
-    const bgtAc = budgetLines.reduce((s, b) => s + Number(b.actual_cost || 0), 0);
-    totalAc = bgtAc > 0 ? Math.round(bgtAc * Math.min(1, totalEv / Math.max(1, bac))) : Math.round(totalEv * 0.95);
+  // Two fabrications are gone from this block:
+  //   - `Math.round(totalEv * 0.95)` invented a spend that was conveniently 5% under the earned
+  //     value whenever nothing had been recorded, so CPI read as a healthy ~1.05 for a project with
+  //     no cost data at all — the single most misleading number an EVM report can show;
+  //   - `bgtAc * Math.min(1, totalEv / Math.max(1, bac))` scaled a genuinely recorded actual by an
+  //     earned-value ratio, i.e. it derived AC from EV. That is the exact circularity EVM exists to
+  //     detect, and it silently shrank real cost whenever the project was behind plan.
+  // Stored budget-line actuals are therefore used verbatim. The transaction register wins whenever
+  // approved rows exist at all — including when they sum to zero, because a recorded zero spend is a
+  // fact, whereas no cost data is a gap. That gap is `acSource === 'unavailable'` with `ac === 0`,
+  // never a synthesized figure, and `cpiStatus` then reports the ratio as empty/anomalous.
+  let acSource: EvmAcSource;
+  let totalAc: number;
+  if (approvedTxns.length > 0) {
+    acSource = 'approved_cost_transactions';
+    totalAc = approvedAc;
+  } else if (budgetActualAc > 0) {
+    acSource = 'budget_line_actuals';
+    totalAc = budgetActualAc;
+  } else {
+    acSource = 'unavailable';
+    totalAc = 0;
   }
 
   // 5. Final Metrics & Variances — delegated to the single shared formula set (GAP-044).
   // The aggregates are rounded exactly as before, so for any project where BAC, PV, EV and AC are
-  // all positive every derived number is unchanged (CASE E). Only the undefined / anomalous
-  // boundaries behave differently, and they now carry an explicit status instead of a silent 1.0.
+  // all positive every derived number is unchanged (Wave-2 CASE E; Final Cleanup CASE A). Only the
+  // undefined / anomalous boundaries behave differently, and they now carry an explicit status plus
+  // the source of each input instead of a silent 1.0 or a synthesized BAC/AC.
   const pv = Math.round(totalPv);
   const ev = Math.round(totalEv);
   const ac = Math.round(totalAc);
@@ -488,6 +603,8 @@ export function calculateProjectEvmAtDataDate(
 
   return {
     bac,
+    bacSource,
+    acSource,
     dataDate: dataDateStr,
     earnedProgressPercent: assessment.earnedProgressPercent,
     plannedProgressPercent: assessment.plannedProgressPercent,
@@ -536,6 +653,10 @@ export function deriveEvmFromScalars(
 
   return {
     bac,
+    // These scalars arrive from the caller rather than from project commercial/cost records, so the
+    // source metadata says exactly that instead of claiming a contract, budget or payment register.
+    bacSource: 'caller_supplied',
+    acSource: 'caller_supplied',
     dataDate,
     earnedProgressPercent: assessment.earnedProgressPercent,
     plannedProgressPercent: assessment.plannedProgressPercent,
