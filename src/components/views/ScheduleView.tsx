@@ -610,6 +610,8 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
       isCritical: boolean;
       isDriving: boolean;
       linkType: string;
+      isResourceLeveling: boolean;
+      resourceKey: string | null;
     }[] = [];
 
     const itemRowIndexMap = new Map<string, number>();
@@ -656,6 +658,8 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
           isCritical: isCrit,
           isDriving,
           linkType: l.link_type || 'FS',
+          isResourceLeveling: (l.origin || null) === 'resource_leveling',
+          resourceKey: l.resource_key || null,
         });
       }
     });
@@ -1641,11 +1645,14 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
                         <marker id="arrow-norm" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
                           <path d="M 0 1 L 10 5 L 0 9 z" fill="#94a3b8" />
                         </marker>
+                        <marker id="arrow-res" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                          <path d="M 0 1 L 10 5 L 0 9 z" fill="#d97706" />
+                        </marker>
                       </defs>
 
                       {dependencyLines.map((line) => {
-                        const strokeColor = line.isCritical ? '#e11d48' : line.isDriving ? '#2563eb' : '#94a3b8';
-                        const markerUrl = line.isCritical ? 'url(#arrow-crit)' : line.isDriving ? 'url(#arrow-driving)' : 'url(#arrow-norm)';
+                        const strokeColor = line.isCritical ? '#e11d48' : line.isResourceLeveling ? '#d97706' : line.isDriving ? '#2563eb' : '#94a3b8';
+                        const markerUrl = line.isCritical ? 'url(#arrow-crit)' : line.isResourceLeveling ? 'url(#arrow-res)' : line.isDriving ? 'url(#arrow-driving)' : 'url(#arrow-norm)';
                         return (
                           <path
                             key={line.id}
@@ -1653,10 +1660,12 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
                             fill="none"
                             stroke={strokeColor}
                             strokeWidth={line.isDriving ? '2.4' : '1.4'}
-                            strokeDasharray={line.isDriving ? undefined : '3,2'}
+                            strokeDasharray={line.isResourceLeveling ? '6,2' : line.isDriving ? undefined : '3,2'}
                             markerEnd={markerUrl}
-                            opacity={line.isDriving ? '0.95' : '0.6'}
-                          />
+                            opacity={line.isDriving || line.isResourceLeveling ? '0.95' : '0.6'}
+                          >
+                            {line.isResourceLeveling && <title>{`تسوية موارد: ${line.resourceKey || ''}`}</title>}
+                          </path>
                         );
                       })}
                     </svg>

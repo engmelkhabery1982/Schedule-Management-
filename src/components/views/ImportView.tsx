@@ -674,6 +674,67 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
                 </div>
               </div>
 
+              {/* F4: leveling policy + pool capacities */}
+              <div className="grid grid-cols-1 gap-3 text-xs">
+                <div>
+                  <span className="block font-medium text-slate-600 mb-1">سياسة الجدولة (الموارد)</span>
+                  <div className="flex flex-wrap gap-2">
+                    {([
+                      { v: 'respect-resources', ar: 'احترام الموارد المتاحة (تسوية تلقائية)' },
+                      { v: 'logic-only', ar: 'المنطق الهندسي فقط (بدون تسوية)' },
+                    ] as const).map((pl) => {
+                      const active = boqOverrides.leveling.policy === pl.v;
+                      return (
+                        <button
+                          key={pl.v}
+                          onClick={() => setBoqOverrides((o) => ({ ...o, leveling: { ...o.leveling, policy: pl.v } }))}
+                          className={`px-3 py-1.5 rounded-full border text-xs font-semibold ${
+                            active ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-slate-600 border-slate-300 hover:border-blue-400'
+                          }`}
+                        >
+                          {pl.ar}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+                {boqOverrides.leveling.policy === 'respect-resources' && boqPlanPreview && 'plan' in boqPlanPreview && boqPlanPreview.plan.leveling.pools.length > 0 && (
+                  <div>
+                    <span className="block font-medium text-slate-600 mb-1">سعات الموارد (عدد الفرق/المعدات المتاحة)</span>
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                      {[...boqPlanPreview.plan.leveling.pools].sort((a, b) => a.poolKey.localeCompare(b.poolKey)).map((pl) => (
+                        <label key={pl.poolKey} className="flex items-center justify-between gap-1 bg-white border border-slate-200 rounded-lg px-2 py-1.5">
+                          <span className="truncate font-mono text-[10px] text-slate-700" title={`${pl.resourceName} — ذروة غير المقيّد: ${pl.peakDemand} (افتراضي: ${pl.capacityProvenance === 'user' ? 'مخصص' : 'تلقائي'})`}>
+                            {pl.poolKey}{pl.capacityProvenance === 'user' ? ' *' : ''}
+                          </span>
+                          <input
+                            type="number"
+                            min={1}
+                            step={1}
+                            value={boqOverrides.leveling.capacities[pl.poolKey] ?? ''}
+                            placeholder={String(pl.capacity)}
+                            onChange={(e) => {
+                              const raw = e.target.value.trim();
+                              setBoqOverrides((o) => {
+                                const caps = { ...o.leveling.capacities };
+                                if (raw === '') delete caps[pl.poolKey];
+                                else {
+                                  const v = Math.floor(Number(raw));
+                                  if (v >= 1) caps[pl.poolKey] = v;
+                                }
+                                return { ...o, leveling: { ...o.leveling, capacities: caps } };
+                              });
+                            }}
+                            className="w-14 px-1 py-0.5 border border-slate-300 rounded text-xs font-mono"
+                          />
+                        </label>
+                      ))}
+                    </div>
+                    <p className="text-[10px] text-slate-400 mt-1">فارغ = سعة افتراضية (أكبر نشاط منفرد). * = مخصصة من المستخدم.</p>
+                  </div>
+                )}
+              </div>
+
               {boqPlanPreview && 'planError' in boqPlanPreview && (
                 <div className="flex items-center gap-2 p-4 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
                   <AlertCircle size={20} />
@@ -705,6 +766,11 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
                     <div className="bg-slate-50 p-3 rounded-lg border border-slate-200">
                       <span className="text-slate-500 block">نهاية الخطة (CPM)</span>
                       <span className="font-bold text-blue-700 text-sm font-mono">{boqPlanPreview.plan.recon.projectFinish || '—'}</span>
+                      {boqPlanPreview.plan.leveling.applied && boqPlanPreview.plan.leveling.resourceDelayDays > 0 && (
+                        <span className="text-amber-700 block text-[10px]">
+                          +{boqPlanPreview.plan.leveling.resourceDelayDays} أيام تسوية (غير المقيّد: {boqPlanPreview.plan.leveling.unconstrained.projectFinish || '—'})
+                        </span>
+                      )}
                     </div>
                   </div>
 
@@ -1019,7 +1085,12 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
                                   <td className="p-2 font-mono font-bold text-blue-700">{l.type}</td>
                                   <td className="p-2 text-slate-700">{to?.code} {to?.name}</td>
                                   <td className="p-2 font-mono">{l.lagDays}</td>
-                                  <td className="p-2 font-mono text-[10px] text-indigo-700">{l.ruleCode}</td>
+                                  <td
+                                    className={`p-2 font-mono text-[10px] ${l.origin === 'resource_leveling' ? 'text-amber-700 font-bold' : 'text-indigo-700'}`}
+                                    title={l.origin === 'resource_leveling' ? `تسوية موارد: ${l.resourceKey || ''}` : l.origin}
+                                  >
+                                    {l.origin === 'resource_leveling' ? '⚖ ' : ''}{l.ruleCode}
+                                  </td>
                                   <td className="p-2 text-[10px] text-slate-400 max-w-52 truncate">{l.rule}</td>
                                   <td className="p-2">
                                     <button
@@ -1159,6 +1230,35 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
 
                   {/* Validation tab */}
                   {boqTab === 'valid' && (
+                    <div className="space-y-3">
+                      {/* F4: target finish + capacity recommendations (review only) */}
+                      <div className="text-xs bg-slate-50 border border-slate-200 rounded-lg p-3 space-y-2">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <label className="font-medium text-slate-600">تاريخ الإنجاز المستهدف (اختياري)</label>
+                          <input
+                            type="date"
+                            value={boqOverrides.leveling.targetFinish || ''}
+                            onChange={(e) => setBoqOverrides((o) => ({ ...o, leveling: { ...o.leveling, targetFinish: e.target.value || null } }))}
+                            className="px-2 py-1.5 border border-slate-300 rounded text-xs font-mono"
+                          />
+                          {boqPlanPreview.plan.leveling.targetVarianceDays !== null && (
+                            <span className={`font-bold ${boqPlanPreview.plan.leveling.targetMet ? 'text-emerald-700' : 'text-red-700'}`}>
+                              {boqPlanPreview.plan.leveling.targetVarianceDays > 0 ? '+' : ''}{boqPlanPreview.plan.leveling.targetVarianceDays} أيام عمل
+                              {boqPlanPreview.plan.leveling.targetMet ? ' (محقق)' : ' (متجاوز)'}
+                            </span>
+                          )}
+                        </div>
+                        {boqPlanPreview.plan.leveling.recommendations.length > 0 && (
+                          <div className="space-y-1">
+                            <p className="font-semibold text-slate-700">توصيات السعة (من إعادة تشغيل فعلية — لا تُطبق تلقائياً):</p>
+                            {boqPlanPreview.plan.leveling.recommendations.map((r) => (
+                              <p key={r.poolKey} className="text-slate-600">
+                                <span className="font-mono font-bold">{r.poolKey}</span>: {r.currentCapacity} ← {r.candidateCapacity} ← {r.newFinish || '—'} (توفير {r.daysSaved} أيام، التكلفة: N/A)
+                              </p>
+                            ))}
+                          </div>
+                        )}
+                      </div>
                     <div className="space-y-2 max-h-96 overflow-y-auto">
                       {boqPlanPreview.plan.findings.length === 0 && (
                         <p className="text-xs text-emerald-700 font-semibold">لا توجد ملاحظات — الخطة جاهزة للاعتماد.</p>
@@ -1179,6 +1279,7 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
                           </div>
                         ))
                       )}
+                    </div>
                     </div>
                   )}
 

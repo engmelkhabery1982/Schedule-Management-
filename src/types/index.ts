@@ -165,6 +165,14 @@ export interface ActivityLink {
    */
   lag_days_exact?: number | null;
   /**
+   * F4: link provenance from the BOQ planning engine (nullable migration columns).
+   * origin: template | sequence | crewflow | milestone | user | resource_leveling.
+   * Null for legacy/XER/manual links. Display-only; CPM ignores these fields.
+   */
+  origin?: string | null;
+  rule_code?: string | null;
+  resource_key?: string | null;
+  /**
    * Optional audit timestamp.
    * Compatibility field: the auto-fix routines in `src/lib/scheduleQualityEngine.ts` stamp
    * newly created links with `created_at`, while the `activity_links` table in

@@ -28,6 +28,20 @@ import {
   type PlanningTemplateKey,
   type TemplateLinkType,
 } from "./planningTemplates";
+import {
+  buildPoolDemands,
+  classifyPools,
+  detectPoolConflicts,
+  levelBoqResources,
+  resolveCapacities,
+  snapshotState,
+  workingDayDelta,
+  type CapacityRecommendation,
+  type LevelAttribution,
+  type LevelingOptions,
+  type PoolConflict,
+  type ResourceLevelingReport,
+} from "./boqResourceLeveling";
 
 // -------------------------------------------------------------------------------------
 // Input
@@ -62,6 +76,8 @@ export interface BoqPlanOverrides {
   sequence: Record<string, number>;
   /** F3: per-BOQ-row quantity distribution "Label=qty; Label=qty" across fronts. */
   distribution: Record<string, string>;
+  /** F4: resource-leveling policy, pool capacities (gangs), target finish, waivers. */
+  leveling: LevelingOptions;
 }
 
 export const EMPTY_BOQ_OVERRIDES: BoqPlanOverrides = {
@@ -77,6 +93,7 @@ export const EMPTY_BOQ_OVERRIDES: BoqPlanOverrides = {
   addLinks: [],
   sequence: {},
   distribution: {},
+  leveling: { policy: "respect-resources", capacities: {}, targetFinish: null, waivedPools: [] },
 };
 
 // -------------------------------------------------------------------------------------
@@ -129,7 +146,9 @@ export interface PlannedLink {
   type: TemplateLinkType;
   lagDays: number;
   rule: string;
-  origin: "template" | "sequence" | "crewflow" | "milestone" | "user";
+  origin: "template" | "sequence" | "crewflow" | "milestone" | "user" | "resource_leveling";
+  /** F4: governing pool for leveling links; null for engineering/user logic. */
+  resourceKey: string | null;
   /** F3: stable rule code (e.g. PIPE_FLOW_EXCV_TO_BEDDING, CREW_CONTINUITY_EXCV). */
   ruleCode: string;
 }
@@ -217,6 +236,7 @@ export interface BoqPlan {
   allocations: PlannedAllocation[];
   findings: PlanFinding[];
   recon: BoqPlanRecon;
+  leveling: ResourceLevelingReport;
   canSave: boolean;
   saveBlockReason: string | null;
   canApproveBaseline: boolean;
@@ -705,7 +725,7 @@ function buildLogic(fronts: Front[], sets: BuiltSets, overrides: BoqPlanOverride
     if (!exists(from) || !exists(to) || from === to) return;
     if (links.some((l) => l.fromActivityId === from && l.toActivityId === to && l.type === type)) return;
     n++;
-    links.push({ stableId: `lnk-${String(n).padStart(4, "0")}`, fromActivityId: from, toActivityId: to, type, lagDays, rule, origin, ruleCode });
+    links.push({ stableId: `lnk-${String(n).padStart(4, "0")}`, fromActivityId: from, toActivityId: to, type, lagDays, rule, origin, ruleCode, resourceKey: null });
   };
 
   // 1. Template edges (endpoints missing when a conditional step had no BOQ item).
@@ -916,7 +936,7 @@ function buildLogic(fronts: Front[], sets: BuiltSets, overrides: BoqPlanOverride
     links.push({
       stableId: `user-link-${i}`, fromActivityId: u.fromActivityId, toActivityId: u.toActivityId,
       type: u.type, lagDays: Math.max(0, Math.round(u.lagDays || 0)),
-      rule: "User-added logic", origin: "user", ruleCode: "USER_LOGIC",
+      rule: "User-added logic", origin: "user", ruleCode: "USER_LOGIC", resourceKey: null,
     });
   });
   return links;
@@ -963,13 +983,13 @@ interface CpmAttachment {
   failed: string | null;
 }
 
-function runCpm(
-  sets: BuiltSets, links: PlannedLink[], profile: BoqPlanProfile
+export function runBoqCpm(
+  activities: PlannedActivity[], links: PlannedLink[], profile: BoqPlanProfile
 ): CpmAttachment {
-  const ids = sets.activities.map((a) => a.stableId);
+  const ids = activities.map((a) => a.stableId);
   const localCycle = findCycleLocal(ids, links);
   if (localCycle) return { projectStart: null, projectFinish: null, cycle: localCycle, failed: null };
-  const cpmActs = sets.activities.map((a) => ({
+  const cpmActs = activities.map((a) => ({
     id: a.stableId,
     project_id: "plan",
     wbs_node_id: null,
@@ -1000,7 +1020,7 @@ function runCpm(
     });
     if (calc.cycle) return { projectStart: null, projectFinish: null, cycle: calc.cycle, failed: null };
     const byId = new Map(calc.results.map((r) => [r.activityId, r]));
-    for (const a of sets.activities) {
+    for (const a of activities) {
       const r = byId.get(a.stableId);
       if (!r) continue;
       a.earlyStart = r.earlyStart;
@@ -1018,6 +1038,12 @@ function runCpm(
   } catch (e) {
     return { projectStart: null, projectFinish: null, cycle: null, failed: (e as Error).message };
   }
+}
+
+function runCpm(
+  sets: BuiltSets, links: PlannedLink[], profile: BoqPlanProfile
+): CpmAttachment {
+  return runBoqCpm(sets.activities, links, profile);
 }
 // -------------------------------------------------------------------------------------
 // Validation: critical findings block Approved Baseline (never the save itself,
@@ -1359,23 +1385,168 @@ export function generateBoqPlan(
     ? runCpm(sets, links, profile)
     : { projectStart: null, projectFinish: null, cycle: null, failed: null };
   const materialBalance = buildMaterialBalance(fronts, rows, overrides);
-  const findings = validatePlan(rows, classifications, fronts, sets, links, usable, review, cpm, overrides, distFlags, materialBalance);
-  const recon = buildRecon(rows, sets, links, wbs, usable, review, cpm, materialBalance);
 
-  const hasCycle = cpm.cycle !== null;
-  const isEmpty = sets.activities.filter((a) => !a.isMilestone).length === 0;
+  // ---- F4: resource-constrained scheduling ----
+  // Unconstrained CPM above is the engineering baseline. When the policy is
+  // "respect-resources", the leveler adds FS-0 resource links (only) and reruns
+  // the SAME canonical CPM; the plan below then carries the feasible schedule
+  // while `leveling.unconstrained` preserves the baseline for comparison.
+  const levelingOpts: LevelingOptions = overrides.leveling || { policy: "logic-only", capacities: {}, targetFinish: null, waivedPools: [] };
+  const frontOrder = new Map(fronts.map((f) => [f.id, f.orderSeq]));
+  const rerun = (acts: PlannedActivity[], lks: PlannedLink[]) => {
+    const att = runBoqCpm(acts, lks, profile);
+    if (att.cycle || att.failed) return null;
+    return { projectFinish: att.projectFinish };
+  };
+  const canLevel = !cpm.cycle && !cpm.failed && sets.activities.some((a) => !a.isMilestone);
+  const { demands, pools } = canLevel
+    ? buildPoolDemands(sets.activities, sets.assignments, sets.resources)
+    : { demands: [], pools: [] as string[] };
+  const resolved = resolveCapacities(demands, pools, levelingOpts.capacities || {});
+  const uncConflicts: PoolConflict[] = canLevel ? detectPoolConflicts(sets.activities, demands, resolved.capacities) : [];
+  const uncSnap = snapshotState(sets.activities, uncConflicts);
+
+  let finalActs = sets.activities;
+  let finalLinks = links;
+  let attributions: LevelAttribution[] = [];
+  let conConflicts: PoolConflict[] = uncConflicts;
+  const infeasible: ResourceLevelingReport["infeasible"] = [];
+  if (canLevel && levelingOpts.policy === "respect-resources") {
+    const out = levelBoqResources({
+      activities: sets.activities, links,
+      assignments: sets.assignments, resources: sets.resources,
+      frontOrder, capacities: levelingOpts.capacities || {},
+      calendarType: profile.calendarType, rerun,
+    });
+    const uncES = new Map(sets.activities.map((a) => [a.stableId, a.earlyStart]));
+    const conById = new Map(out.activities.map((a) => [a.stableId, a]));
+    for (const at of out.attributions) {
+      const shift = workingDayDelta(uncES.get(at.toActivityId) || null, conById.get(at.toActivityId)?.earlyStart || null, profile.calendarType) || 0;
+      at.delayDays = Math.max(0, shift);
+    }
+    finalActs = out.activities;
+    finalLinks = out.links;
+    attributions = out.attributions;
+    conConflicts = out.conflictsAfter;
+    infeasible.push(...out.infeasible);
+  }
+  const conStarts = finalActs.map((a) => a.earlyStart).filter((x): x is string => !!x).sort();
+  const conSnap = snapshotState(finalActs, conConflicts);
+  const finalCpm: CpmAttachment = canLevel
+    ? { projectStart: conStarts[0] || null, projectFinish: conSnap.projectFinish, cycle: null, failed: null }
+    : cpm;
+  const poolStats = classifyPools(pools, sets.resources, uncConflicts, attributions, resolved.capacities, resolved.provenance, finalActs);
+  const resourceDelayDays = Math.max(0, workingDayDelta(uncSnap.projectFinish, conSnap.projectFinish, profile.calendarType) || 0);
+  const criticalChanged = JSON.stringify(uncSnap.criticalStableIds) !== JSON.stringify(conSnap.criticalStableIds);
+
+  const targetRaw = (levelingOpts.targetFinish || "").trim();
+  const targetValid = /^\d{4}-\d{2}-\d{2}$/.test(targetRaw) && !Number.isNaN(new Date(`${targetRaw}T00:00:00Z`).getTime());
+  const targetFinish = targetValid ? targetRaw : null;
+  const feasibleFinish = conSnap.projectFinish;
+  const targetVarianceDays = targetFinish && feasibleFinish
+    ? workingDayDelta(targetFinish, feasibleFinish, profile.calendarType) : null;
+  const targetMet = targetVarianceDays === null ? null : targetVarianceDays <= 0;
+
+  // F4: capacity scenarios from ACTUAL reruns (never estimates), only when an
+  // applied feasible plan misses its target. Never auto-applied. Top 5.
+  let recommendations: CapacityRecommendation[] = [];
+  if (canLevel && levelingOpts.policy === "respect-resources" && targetFinish && feasibleFinish && feasibleFinish > targetFinish) {
+    const afterKeys = new Set(conConflicts.map((c) => c.poolKey));
+    const cands = poolStats.filter((pl) =>
+      pl.peakDemand > pl.capacity && (pl.criticalAffected + pl.nearCriticalAffected > 0 || afterKeys.has(pl.poolKey)));
+    const scored: CapacityRecommendation[] = [];
+    for (const cand of [...cands].sort((a, b) => a.poolKey.localeCompare(b.poolKey))) {
+      const caps2 = { ...(levelingOpts.capacities || {}), [cand.poolKey]: cand.capacity + 1 };
+      const trial = levelBoqResources({
+        activities: sets.activities, links,
+        assignments: sets.assignments, resources: sets.resources,
+        frontOrder, capacities: caps2,
+        calendarType: profile.calendarType, rerun,
+      });
+      const trialSnap = snapshotState(trial.activities, trial.conflictsAfter);
+      const saved = Math.max(0, workingDayDelta(trialSnap.projectFinish, feasibleFinish, profile.calendarType) || 0);
+      scored.push({
+        poolKey: cand.poolKey, currentCapacity: cand.capacity, candidateCapacity: cand.capacity + 1,
+        newFinish: trialSnap.projectFinish, daysSaved: saved,
+        remainingConflicts: trial.conflictsAfter.length,
+        costImpact: "N/A — no authoritative rate", basis: "actual-rerun",
+      });
+    }
+    recommendations = scored
+      .filter((x) => x.daysSaved > 0 || x.remainingConflicts < conConflicts.length)
+      .sort((a, b) => b.daysSaved - a.daysSaved || a.remainingConflicts - b.remainingConflicts || a.poolKey.localeCompare(b.poolKey))
+      .slice(0, 5);
+  }
+
+  const leveling: ResourceLevelingReport = {
+    applied: canLevel && levelingOpts.policy === "respect-resources",
+    policy: levelingOpts.policy,
+    unconstrained: uncSnap,
+    constrained: conSnap,
+    resourceDelayDays, criticalChanged, attributions, pools: poolStats,
+    targetFinish, targetVarianceDays, targetMet, recommendations,
+    infeasible, invalidCapacities: resolved.invalid,
+  };
+
+  const finalSets: BuiltSets = { ...sets, activities: finalActs };
+  const findings = validatePlan(rows, classifications, fronts, finalSets, finalLinks, usable, review, finalCpm, overrides, distFlags, materialBalance);
+
+  // F4 leveling findings (appended after engineering validation, deterministic order).
+  const waived = new Set(levelingOpts.waivedPools || []);
+  for (const ic of resolved.invalid) {
+    findings.push({ severity: "warning", code: "invalid_capacity_override",
+      message: `Resource ${ic.poolKey}: capacity override ${ic.value} ignored (want an integer >= 1) — default used`, refStableId: null });
+  }
+  for (const c of [...conConflicts].sort((a, b) => a.poolKey.localeCompare(b.poolKey))) {
+    if (waived.has(c.poolKey)) {
+      findings.push({ severity: "info", code: "resource_waiver_applied",
+        message: `Resource ${c.poolKey}: remaining over-allocation explicitly waived (peak ${c.peakDemand} vs capacity ${c.capacity})`, refStableId: null });
+    } else {
+      findings.push({ severity: "critical", code: "unresolved_resource_overallocation",
+        message: `Resource ${c.poolKey}: peak demand ${c.peakDemand} exceeds capacity ${c.capacity}${c.peakDay ? ` on ${c.peakDay}` : ""} (${c.activityStableIds.length} activit${c.activityStableIds.length === 1 ? "y" : "ies"}) — increase capacity, accept leveling, or resequence`, refStableId: null });
+    }
+  }
+  const finById = new Map(finalActs.map((a) => [a.stableId, a]));
+  for (const inf of infeasible) {
+    if (inf.aStableId === inf.bStableId) continue; // single-activity deficit: covered by the unresolved critical above
+    const A = finById.get(inf.aStableId);
+    const B = finById.get(inf.bStableId);
+    const overlap = A && B && A.earlyStart && A.earlyFinish && B.earlyStart && B.earlyFinish
+      && A.earlyStart <= B.earlyFinish && B.earlyStart <= A.earlyFinish;
+    if (overlap) {
+      findings.push({ severity: "warning", code: "resource_leveling_infeasible",
+        message: `Resource ${inf.poolKey}: ${A!.code} <-> ${B!.code} cannot be sequenced — ${inf.reason}`, refStableId: null });
+    }
+  }
+  if (leveling.applied && attributions.length > 0) {
+    findings.push({ severity: "info", code: "resource_leveling_applied",
+      message: `Resource leveling added ${attributions.length} constraint link(s); feasible finish +${resourceDelayDays} working day(s) vs unconstrained`, refStableId: null });
+  }
+  if (targetRaw && !targetValid) {
+    findings.push({ severity: "warning", code: "invalid_target_finish",
+      message: `Target finish "${targetRaw}" ignored (want yyyy-mm-dd)`, refStableId: null });
+  }
+  if (targetFinish && targetVarianceDays !== null) {
+    findings.push({ severity: "info", code: "target_variance",
+      message: `Feasible finish ${feasibleFinish} vs target ${targetFinish}: ${targetVarianceDays > 0 ? "+" : ""}${targetVarianceDays} working days${targetMet ? " (target met)" : " (target missed — see capacity recommendations)"}`, refStableId: null });
+  }
+
+  const recon = buildRecon(rows, finalSets, finalLinks, wbs, usable, review, finalCpm, materialBalance);
+
+  const hasCycle = finalCpm.cycle !== null;
+  const isEmpty = finalActs.filter((a) => !a.isMilestone).length === 0;
   const canSave = !hasCycle && !isEmpty;
   const saveBlockReason = hasCycle
-    ? `Logic cycle: ${cpm.cycle!.join(" -> ")}`
+    ? `Logic cycle: ${finalCpm.cycle!.join(" -> ")}`
     : isEmpty ? "Plan is empty: no usable BOQ item produced an activity" : null;
   const canApproveBaseline = canSave && !findings.some((f) => f.severity === "critical");
 
   return {
     profile, classifications, wbs,
-    activities: [...sets.activities].sort((a, b) => a.sortOrder - b.sortOrder),
-    links, budgetLines: sets.budgetLines, resources: sets.resources,
+    activities: [...finalActs].sort((a, b) => a.sortOrder - b.sortOrder),
+    links: finalLinks, budgetLines: sets.budgetLines, resources: sets.resources,
     assignments: sets.assignments, allocations: sets.allocations,
-    findings, recon, canSave, saveBlockReason, canApproveBaseline,
+    findings, recon, canSave, saveBlockReason, canApproveBaseline, leveling,
   };
 }
 
@@ -1384,5 +1555,6 @@ export function emptyBoqOverrides(): BoqPlanOverrides {
     workType: {}, confirmed: {}, excludedFamilies: [], location: {},
     duration: {}, rate: {}, crews: {}, wbs: {}, removeLinks: [], addLinks: [],
     sequence: {}, distribution: {},
+    leveling: { policy: "respect-resources", capacities: {}, targetFinish: null, waivedPools: [] },
   };
 }

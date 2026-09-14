@@ -152,6 +152,10 @@ export function buildBoqPersistPlan(
     successor_id: activityIdByStable[l.toActivityId],
     link_type: l.type,
     lag_days: l.lagDays,
+    // F4: link provenance (nullable; legacy/XER links stay null).
+    origin: l.origin,
+    rule_code: l.ruleCode,
+    resource_key: l.resourceKey,
   }));
 
   const budgetLines = plan.budgetLines.map((b) => ({
