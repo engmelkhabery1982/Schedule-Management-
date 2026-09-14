@@ -1,5 +1,6 @@
 import { useState, useMemo, useEffect } from 'react';
 import { supabase } from '@/lib/supabase';
+import { resolveDataDate } from '@/lib/chronologyGuard';
 import { getLanguage, type Language } from '@/lib/i18n';
 import type { Project, LinearTask, LinearSpatialClash } from '@/types';
 import {
@@ -22,6 +23,9 @@ interface LinearScheduleViewProps {
 
 export default function LinearScheduleView({ project }: LinearScheduleViewProps) {
   const [lang, setLang] = useState<Language>(getLanguage());
+  // Governed Data Date: the only status reference this diagram reads — what lies above the
+  // reference line is history, below it is future. No fixed calendar date is used.
+  const governedDataDate = resolveDataDate(project);
   const [selectedTaskCode, setSelectedTaskCode] = useState<string | null>(null);
   const [filterCriticalOnly, setFilterCriticalOnly] = useState(false);
   const [highlightClashes, setHighlightClashes] = useState(true);
@@ -172,6 +176,11 @@ export default function LinearScheduleView({ project }: LinearScheduleViewProps)
     return padding.top + ratio * plotHeight;
   };
 
+  // The reference line renders only when the governed date falls inside the visible axis.
+  const governedTime = new Date(governedDataDate).getTime();
+  const showGovernedLine = governedTime >= minTime && governedTime <= maxTime;
+  const governedY = dateToPx(governedDataDate);
+
   const filteredTasks = useMemo(() => {
     return linearTasks.filter((task) => {
       if (filterCriticalOnly && !task.isCritical) return false;
@@ -285,6 +294,9 @@ export default function LinearScheduleView({ project }: LinearScheduleViewProps)
           <div className="flex items-center gap-3 text-[11px] font-mono">
             <span className="text-slate-500">X-Axis: Distance (0.00 → 5.00 km)</span>
             <span className="text-slate-500">Y-Axis: Time (Sep 2026 → Mar 2027)</span>
+            <span className="font-bold bg-amber-50 text-amber-900 px-2 py-0.5 rounded border border-amber-300">
+              {lang === 'ar' ? 'خط الحالة:' : 'Data Date:'} {governedDataDate}
+            </span>
           </div>
         </div>
 
@@ -327,6 +339,16 @@ export default function LinearScheduleView({ project }: LinearScheduleViewProps)
                 </g>
               );
             })}
+
+            {/* Governed Data Date reference line (history above, future below) */}
+            {showGovernedLine && (
+              <g key="data-date-line">
+                <line x1={padding.left} y1={governedY} x2={padding.left + plotWidth} y2={governedY} stroke="#d97706" strokeWidth="2" strokeDasharray="8,4" />
+                <text x={padding.left + plotWidth - 6} y={governedY - 6} fontSize="10" fontWeight="bold" fill="#92400e" textAnchor="end" fontFamily="monospace">
+                  {lang === 'ar' ? `خط الحالة ${governedDataDate}` : `Data Date ${governedDataDate}`}
+                </text>
+              </g>
+            )}
 
             {/* Draw Linear Activity Slopes */}
             {filteredTasks.map((task) => {

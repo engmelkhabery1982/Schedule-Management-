@@ -1177,17 +1177,20 @@ export interface CbsCostCenter {
   description: string;
 }
 
+// Cash-flow legs that have no source table in the schema (owner receivables / IPC collection,
+// monthly PV phasing) are `null` = N/A and must be rendered as N/A — never filled with invented
+// demo values. Only cashOutCommittedSar is bound to real records (approved cost_transactions).
 export interface MonthlyCashFlowBucket {
   periodMonth: string; // e.g. "2026-09", "2026-10"
   monthLabel: string;  // e.g. "سبتمبر 2026"
-  plannedValueSar: number;
-  cashInGrossSar: number;       // فواتير المالك
-  cashInNetReceivedSar: number; // المحصل الفعلي بعد الخصومات
-  cashOutCommittedSar: number;  // رواتب + مواد + معدات + باطن
-  netMonthlyCashFlowSar: number;// In - Out
-  cumulativeCashFlowSar: number;// الرصيد التراكمي
-  isDeficit: boolean;
-  fundingGapSar: number;
+  plannedValueSar: number | null;
+  cashInGrossSar: number | null;       // فواتير المالك — N/A: لا يوجد جدول مستخلصات/تحصيل
+  cashInNetReceivedSar: number | null; // المحصل الفعلي بعد الخصومات — N/A
+  cashOutCommittedSar: number;  // رواتب + مواد + معدات + باطن (approved cost_transactions)
+  netMonthlyCashFlowSar: number | null;// In - Out — N/A حتى تتوفر بيانات التحصيل
+  cumulativeCashFlowSar: number | null;// الرصيد التراكمي — N/A
+  isDeficit: boolean | null;    // null = غير محدد (يحتاج التدفق الداخل)
+  fundingGapSar: number | null;
 }
 
 export interface ReserveBurnItem {

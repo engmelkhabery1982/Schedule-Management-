@@ -1,5 +1,6 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
 import { supabase } from '@/lib/supabase';
+import { resolveDataDate } from '@/lib/chronologyGuard';
 import { getLanguage, type Language } from '@/lib/i18n';
 import type { Project, Activity, BimElement } from '@/types';
 import {
@@ -24,15 +25,42 @@ interface Bim4DViewProps {
   project: Project | null;
 }
 
+/** Weekly simulation spine (Sep 2026 -> May 2027). The STARTING position on this spine is the
+ *  governed Data Date (see simIndexForDate) — never a fixed calendar guess. */
+function buildSimulationDates(): string[] {
+  const dates: string[] = [];
+  const start = new Date('2026-09-01');
+  for (let i = 0; i < 38; i++) {
+    const d = new Date(start.getTime() + i * 7 * 86400000);
+    dates.push(d.toISOString().split('T')[0]);
+  }
+  return dates;
+}
+
+/** Latest simulation index on/before the governed date (clamped to the spine ends). */
+function simIndexForDate(dates: string[], dataDate: string): number {
+  let idx = 0;
+  for (let i = 0; i < dates.length; i++) {
+    if (dates[i] <= dataDate) idx = i;
+  }
+  return idx;
+}
+
 export default function Bim4DView({ project }: Bim4DViewProps) {
   const [activities, setActivities] = useState<Activity[]>([]);
   const [loading, setLoading] = useState(true);
   const [lang, setLang] = useState<Language>(getLanguage());
 
+  // Governed Data Date: the simulation opens AT project status — a fixed index (~mid project)
+  // would read element status at an arbitrary calendar point unrelated to this project.
+  const governedDataDate = resolveDataDate(project);
+
   // 4D Timeline Simulation State
   const [isPlaying, setIsPlaying] = useState(false);
   const [playbackSpeed, setPlaybackSpeed] = useState<number>(1);
-  const [currentSimDateIdx, setCurrentSimDateIdx] = useState<number>(12); // ~Mid project
+  const [currentSimDateIdx, setCurrentSimDateIdx] = useState<number>(() =>
+    simIndexForDate(buildSimulationDates(), governedDataDate)
+  );
   const [selectedElementId, setSelectedElementId] = useState<string | null>(null);
 
   // Camera & Display Settings
@@ -67,17 +95,14 @@ export default function Bim4DView({ project }: Bim4DViewProps) {
   }
 
   // Simulation Timeline Dates Array (weekly milestones from Sep 2026 to May 2027)
-  const simulationDates = useMemo(() => {
-    const dates: string[] = [];
-    const start = new Date('2026-09-01');
-    for (let i = 0; i < 38; i++) {
-      const d = new Date(start.getTime() + i * 7 * 86400000);
-      dates.push(d.toISOString().split('T')[0]);
-    }
-    return dates;
-  }, []);
+  const simulationDates = useMemo(() => buildSimulationDates(), []);
 
-  const currentSimDate = simulationDates[currentSimDateIdx] || '2026-11-15';
+  // Re-anchor the simulation to the governed date whenever the project (or its Data Date) changes.
+  useEffect(() => {
+    setCurrentSimDateIdx(simIndexForDate(buildSimulationDates(), governedDataDate));
+  }, [governedDataDate]);
+
+  const currentSimDate = simulationDates[currentSimDateIdx] || governedDataDate;
 
   // Playback timer effect
   useEffect(() => {
@@ -287,9 +312,11 @@ export default function Bim4DView({ project }: Bim4DViewProps) {
     });
   }, [evaluatedBimElements, activeFloorFilter, activeTradeFilter]);
 
+  // The inspector must show the status EVALUATED at the current sim date (which opens at the
+  // governed Data Date), not the fixture's raw static status.
   const selectedElement = useMemo(() => {
-    return bimElements.find((e) => e.id === selectedElementId) || null;
-  }, [bimElements, selectedElementId]);
+    return evaluatedBimElements.find((e) => e.id === selectedElementId) || null;
+  }, [evaluatedBimElements, selectedElementId]);
 
   if (loading) {
     return (
@@ -379,6 +406,10 @@ export default function Bim4DView({ project }: Bim4DViewProps) {
               <span className="flex items-center gap-1.5 bg-amber-500/20 text-amber-300 px-2.5 py-1 rounded-md font-bold border border-amber-500/30">
                 <Calendar size={13} />
                 {lang === 'ar' ? 'تاريخ المحاكاة:' : 'Sim Date:'} {currentSimDate}
+              </span>
+              <span className="flex items-center gap-1.5 bg-sky-500/20 text-sky-300 px-2.5 py-1 rounded-md font-bold border border-sky-500/30">
+                <Clock size={13} />
+                {lang === 'ar' ? 'خط الحالة:' : 'Data Date:'} {governedDataDate}
               </span>
               <span className="text-slate-400 text-[11px]">
                 {lang === 'ar' ? `الأسبوع ${currentSimDateIdx + 1} من ${simulationDates.length}` : `Week ${currentSimDateIdx + 1} of ${simulationDates.length}`}

@@ -292,87 +292,93 @@ export default function BudgetView({ project }: BudgetViewProps) {
   // -------------------------------------------------------------
   // 2. Monthly Cash Flow S-Curve & Peak Working Capital
   // -------------------------------------------------------------
+  // Provenance (Phase B): the Out leg is bound to REAL records — approved `cost_transactions`
+  // grouped by transaction month (the same approval rule as canonical AC). The In leg has NO
+  // source table in the schema — no owner receivables / IPC collection records exist anywhere
+  // in the app — so it and every figure derived from it (net, cumulative, peak working
+  // capital, deficit flags, monthly PV phasing) are `null` = N/A. The previous revision
+  // hardcoded seven demo months of PV/In/Out as if they were project facts; those fabricated
+  // figures are removed and are never shown as actuals.
   const cashFlowTimeline: MonthlyCashFlowBucket[] = useMemo(() => {
-    const months = [
-      { month: '2026-09', label: 'سبتمبر 2026', pv: 350000, inGross: 0, inNet: 0, out: 280000 },
-      { month: '2026-10', label: 'أكتوبر 2026', pv: 520000, inGross: 480000, inNet: 469200, out: 490000 },
-      { month: '2026-11', label: 'نوفمبر 2026', pv: 680000, inGross: 640000, inNet: 625600, out: 580000 },
-      { month: '2026-12', label: 'ديسمبر 2026', pv: 720000, inGross: 660000, inNet: 645150, out: 610000 },
-      { month: '2027-01', label: 'يناير 2027', pv: 650000, inGross: 640000, inNet: 625600, out: 540000 },
-      { month: '2027-02', label: 'فبراير 2027', pv: 580000, inGross: 600000, inNet: 586500, out: 480000 },
-      { month: '2027-03', label: 'مارس 2027', pv: 450000, inGross: 550000, inNet: 537625, out: 390000 },
-    ];
+    const AR_MONTH_NAMES = ['يناير', 'فبراير', 'مارس', 'أبريل', 'مايو', 'يونيو', 'يوليو', 'أغسطس', 'سبتمبر', 'أكتوبر', 'نوفمبر', 'ديسمبر'];
+    const EN_MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    const isDateKey = (v: unknown): v is string => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v);
 
-    let runningCumulative = 0;
-    return months.map((m) => {
-      const netMonthly = m.inNet - m.out;
-      runningCumulative += netMonthly;
-      const isDeficit = runningCumulative < 0;
-      return {
-        periodMonth: m.month,
-        monthLabel: m.label,
-        plannedValueSar: m.pv,
-        cashInGrossSar: m.inGross,
-        cashInNetReceivedSar: m.inNet,
-        cashOutCommittedSar: m.out,
-        netMonthlyCashFlowSar: netMonthly,
-        cumulativeCashFlowSar: runningCumulative,
-        isDeficit,
-        fundingGapSar: isDeficit ? Math.abs(runningCumulative) : 0,
-      };
-    });
-  }, []);
+    const outByMonth = new Map<string, number>();
+    for (const t of transactions) {
+      if (t.status !== 'approved') continue;
+      if (!isDateKey(t.transaction_date)) continue;
+      const amount = Number(t.amount);
+      if (!Number.isFinite(amount) || amount <= 0) continue;
+      const key = t.transaction_date.slice(0, 7);
+      outByMonth.set(key, (outByMonth.get(key) || 0) + amount);
+    }
 
-  // Peak Working Capital Required
-  const peakWorkingCapitalSar = useMemo(() => {
-    let minCumul = 0;
-    cashFlowTimeline.forEach((b) => {
-      if (b.cumulativeCashFlowSar < minCumul) minCumul = b.cumulativeCashFlowSar;
-    });
-    return Math.abs(minCumul);
+    // Contiguous spine covering the scheduled window AND every outflow month, so no approved
+    // outflow can fall outside the table.
+    const extentDates: string[] = [];
+    for (const a of activities) {
+      if (isDateKey(a.early_start)) extentDates.push(a.early_start);
+      if (isDateKey(a.early_finish)) extentDates.push(a.early_finish);
+    }
+    for (const t of transactions) {
+      if (t.status === 'approved' && isDateKey(t.transaction_date)) extentDates.push(t.transaction_date);
+    }
+    if (extentDates.length === 0) return [];
+    extentDates.sort();
+    const startKey = extentDates[0].slice(0, 7);
+    const endKey = extentDates[extentDates.length - 1].slice(0, 7);
+
+    const buckets: MonthlyCashFlowBucket[] = [];
+    let [y, m] = startKey.split('-').map(Number);
+    const [endY, endM] = endKey.split('-').map(Number);
+    for (;;) {
+      const key = `${y}-${String(m).padStart(2, '0')}`;
+      buckets.push({
+        periodMonth: key,
+        monthLabel: lang === 'ar' ? `${AR_MONTH_NAMES[m - 1]} ${y}` : `${EN_MONTH_NAMES[m - 1]} ${y}`,
+        plannedValueSar: null,
+        cashInGrossSar: null,
+        cashInNetReceivedSar: null,
+        cashOutCommittedSar: outByMonth.get(key) || 0,
+        netMonthlyCashFlowSar: null,
+        cumulativeCashFlowSar: null,
+        isDeficit: null,
+        fundingGapSar: null,
+      });
+      if (y === endY && m === endM) break;
+      m += 1;
+      if (m > 12) { m = 1; y += 1; }
+    }
+    return buckets;
+  }, [activities, transactions, lang]);
+
+  // Peak Working Capital Required — N/A: it is the deepest cumulative deficit, and the
+  // cumulative leg needs inflows that do not exist in the schema. Any missing leg forces N/A;
+  // a partial figure is never presented.
+  const peakWorkingCapitalSar: number | null = useMemo(() => {
+    let minCumul: number | null = null;
+    for (const b of cashFlowTimeline) {
+      if (b.cumulativeCashFlowSar == null) return null;
+      if (minCumul == null || b.cumulativeCashFlowSar < minCumul) minCumul = b.cumulativeCashFlowSar;
+    }
+    return minCumul == null ? null : Math.abs(minCumul);
   }, [cashFlowTimeline]);
+
+  // Total Cash-In is real only when at least one bucket carries collection data (none do until
+  // a receivables source exists); otherwise the KPI shows N/A instead of a zero-as-fact.
+  const hasCashInData = cashFlowTimeline.some((b) => b.cashInNetReceivedSar != null);
 
   // -------------------------------------------------------------
   // 3. Contingency & Management Reserves
   // -------------------------------------------------------------
-  const [reserves, setReserves] = useState<ReserveBurnItem[]>([
-    {
-      id: 'RES-01',
-      reserveType: 'contingency',
-      nameAr: 'احتياطي طوارئ مخاطر التوريد والأسعار (Material Inflation)',
-      allocatedAmountSar: 240000, // 5% of BAC
-      spentToDateSar: 75000,
-      remainingAmountSar: 165000,
-      utilizationPercent: 31.25,
-      associatedRiskTitle: 'تقلب أسعار حديد التسليح واستيراد المحابس التخصصية',
-      authorizationNotes: 'معتمد من مدير المشروع لتغطية فرق سعر شحنة الحديد العاجلة.',
-      status: 'healthy',
-    },
-    {
-      id: 'RES-02',
-      reserveType: 'contingency',
-      nameAr: 'احتياطي طوارئ المياه الجوفية وطبقات الحفر (Geotechnical Risk)',
-      allocatedAmountSar: 150000,
-      spentToDateSar: 110000,
-      remainingAmountSar: 40000,
-      utilizationPercent: 73.3,
-      associatedRiskTitle: 'ظهور مياه جوفية غير متوقعة وتدعيم جوانب الحفر الإضافي',
-      authorizationNotes: 'معتمد لتشغيل نظام النزح المائي المستمر (Dewatering System).',
-      status: 'caution',
-    },
-    {
-      id: 'RES-03',
-      reserveType: 'management',
-      nameAr: 'احتياطي الإدارة للتغييرات الكبرى (Management Reserve - MR)',
-      allocatedAmountSar: 250000,
-      spentToDateSar: 45000,
-      remainingAmountSar: 205000,
-      utilizationPercent: 18.0,
-      associatedRiskTitle: 'تعديلات بلدية أو متطلبات أمان مستجدة (Unknown-Unknowns)',
-      authorizationNotes: 'سحب جزئي لتنفيذ تعديل مسار محطة المحولات الكهربائية.',
-      status: 'healthy',
-    },
-  ]);
+  // No reserves table exists in the schema, so there are no reserve balances to show. The
+  // previous revision hardcoded three demo reserves (RES-01..03 with allocated/spent/remaining
+  // figures and approval notes) as if they were project facts; fabricated reserve balances are
+  // forbidden, so the register starts empty and renders N/A until real reserve data exists.
+  // The drawdown recorder below stays dormant (its trigger hides while the register is empty)
+  // and can only ever operate on user-provided entries, never on invented seeds.
+  const [reserves, setReserves] = useState<ReserveBurnItem[]>([]);
 
   const totalReservesAllocated = reserves.reduce((s, r) => s + r.allocatedAmountSar, 0);
   const totalReservesSpent = reserves.reduce((s, r) => s + r.spentToDateSar, 0);
@@ -937,17 +943,17 @@ export default function BudgetView({ project }: BudgetViewProps) {
             <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
               <span className="text-[11px] text-slate-400 block mb-1">أعلى نقطة تمويل مطلوبة (Peak Working Capital)</span>
               <div className="text-xl font-black text-rose-700 font-mono">
-                {peakWorkingCapitalSar.toLocaleString()} SAR
+                {peakWorkingCapitalSar == null ? 'N/A' : `${peakWorkingCapitalSar.toLocaleString()} SAR`}
               </div>
-              <span className="text-[10px] text-slate-500">أقصى عجز سيولة مرحلي يحتاج تسهيل بنكي</span>
+              <span className="text-[10px] text-slate-500">{lang === 'ar' ? 'N/A — يتطلب التدفق الداخل (لا توجد بيانات تحصيل)' : 'N/A — needs cash-in data (no collection records)'}</span>
             </div>
 
             <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
               <span className="text-[11px] text-slate-400 block mb-1">إجمالي التدفقات النقدية الداخلة (Total Cash-In)</span>
               <div className="text-xl font-black text-emerald-700 font-mono">
-                {cashFlowTimeline.reduce((s, b) => s + b.cashInNetReceivedSar, 0).toLocaleString()} SAR
+                {!hasCashInData ? 'N/A' : `${cashFlowTimeline.reduce((s, b) => s + (b.cashInNetReceivedSar || 0), 0).toLocaleString()} SAR`}
               </div>
-              <span className="text-[10px] text-emerald-600 font-semibold">المحصل الفعلي بعد الاستقطاعات</span>
+              <span className="text-[10px] text-emerald-600 font-semibold">{lang === 'ar' ? 'N/A — لا توجد بيانات مستخلصات/تحصيل في النظام' : 'N/A — no receivables data in the system'}</span>
             </div>
 
             <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
@@ -955,7 +961,7 @@ export default function BudgetView({ project }: BudgetViewProps) {
               <div className="text-xl font-black text-slate-900 font-mono">
                 {cashFlowTimeline.reduce((s, b) => s + b.cashOutCommittedSar, 0).toLocaleString()} SAR
               </div>
-              <span className="text-[10px] text-slate-500">مصاريف الموقع والمواد والعمالة والباطن</span>
+              <span className="text-[10px] text-slate-500">{lang === 'ar' ? 'من حركات التكلفة المعتمدة حسب الشهر' : 'From approved cost transactions by month'}</span>
             </div>
           </div>
 
@@ -967,11 +973,13 @@ export default function BudgetView({ project }: BudgetViewProps) {
                   جدول التدفقات النقدية الشهرية ورصد العجز المالي (Monthly Cash Flow Timeline)
                 </h3>
                 <p className="text-xs text-slate-500 mt-0.5">
-                  مقارنة السيولة المحصلة من مستخلصات المالك مقابل التزامات ومصروفات التشغيل بالموقع.
+                  {lang === 'ar'
+                    ? 'التدفق الخارج من حركات التكلفة المعتمدة حسب الشهر. التدفق الداخل N/A — لا توجد بيانات مستخلصات/تحصيل في النظام، لذا الصافي والتراكمي وذروة التمويل وحالة السيولة N/A.'
+                    : 'Cash-out is bound to approved cost transactions by month. Cash-in is N/A — no collection data exists, so net, cumulative, peak funding and liquidity status are N/A.'}
                 </p>
               </div>
               <span className="text-xs font-mono font-bold bg-amber-50 text-amber-900 px-2.5 py-1 rounded border border-amber-200">
-                Payment Lag: 30 Days
+                {lang === 'ar' ? 'التدفق الداخل: N/A — لا توجد بيانات تحصيل' : 'Cash-In: N/A — no collection data'}
               </span>
             </div>
 
@@ -989,24 +997,35 @@ export default function BudgetView({ project }: BudgetViewProps) {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 font-medium">
+                  {cashFlowTimeline.length === 0 && (
+                    <tr>
+                      <td colSpan={7} className="p-6 text-center text-slate-400">
+                        {lang === 'ar' ? 'لا توجد نافذة زمنية أو حركات معتمدة لعرضها (N/A)' : 'No time window or approved transactions to show (N/A)'}
+                      </td>
+                    </tr>
+                  )}
                   {cashFlowTimeline.map((b) => (
                     <tr key={b.periodMonth} className="hover:bg-slate-50 transition-colors">
                       <td className="p-3 font-bold text-slate-900">{b.monthLabel}</td>
-                      <td className="p-3 font-mono text-slate-600">{b.plannedValueSar.toLocaleString()} SAR</td>
+                      <td className="p-3 font-mono text-slate-600">{b.plannedValueSar == null ? 'N/A' : `${b.plannedValueSar.toLocaleString()} SAR`}</td>
                       <td className="p-3 font-mono font-bold text-emerald-800 bg-emerald-50/40">
-                        {b.cashInNetReceivedSar > 0 ? `+${b.cashInNetReceivedSar.toLocaleString()}` : '0'} SAR
+                        {b.cashInNetReceivedSar == null ? 'N/A' : `+${b.cashInNetReceivedSar.toLocaleString()} SAR`}
                       </td>
                       <td className="p-3 font-mono font-bold text-rose-800 bg-rose-50/40">
                         -{b.cashOutCommittedSar.toLocaleString()} SAR
                       </td>
-                      <td className={`p-3 font-mono font-bold ${b.netMonthlyCashFlowSar >= 0 ? 'text-emerald-700' : 'text-rose-700'}`}>
-                        {b.netMonthlyCashFlowSar >= 0 ? `+${b.netMonthlyCashFlowSar.toLocaleString()}` : b.netMonthlyCashFlowSar.toLocaleString()} SAR
+                      <td className={`p-3 font-mono font-bold ${b.netMonthlyCashFlowSar == null ? 'text-slate-400' : b.netMonthlyCashFlowSar >= 0 ? 'text-emerald-700' : 'text-rose-700'}`}>
+                        {b.netMonthlyCashFlowSar == null ? 'N/A' : `${b.netMonthlyCashFlowSar >= 0 ? '+' : ''}${b.netMonthlyCashFlowSar.toLocaleString()} SAR`}
                       </td>
-                      <td className={`p-3 font-mono font-black ${b.cumulativeCashFlowSar >= 0 ? 'text-emerald-700' : 'text-rose-700'}`}>
-                        {b.cumulativeCashFlowSar >= 0 ? `+${b.cumulativeCashFlowSar.toLocaleString()}` : b.cumulativeCashFlowSar.toLocaleString()} SAR
+                      <td className={`p-3 font-mono font-black ${b.cumulativeCashFlowSar == null ? 'text-slate-400' : b.cumulativeCashFlowSar >= 0 ? 'text-emerald-700' : 'text-rose-700'}`}>
+                        {b.cumulativeCashFlowSar == null ? 'N/A' : `${b.cumulativeCashFlowSar >= 0 ? '+' : ''}${b.cumulativeCashFlowSar.toLocaleString()} SAR`}
                       </td>
                       <td className="p-3 text-center">
-                        {b.isDeficit ? (
+                        {b.isDeficit == null ? (
+                          <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-slate-100 text-slate-500">
+                            {lang === 'ar' ? 'غير محدد (N/A)' : 'Unknown (N/A)'}
+                          </span>
+                        ) : b.isDeficit ? (
                           <span className="px-2 py-0.5 rounded-full text-[10px] font-black bg-rose-100 text-rose-800 border border-rose-200">
                             عجز تمويلي ⚠️
                           </span>
@@ -1169,36 +1188,42 @@ export default function BudgetView({ project }: BudgetViewProps) {
             <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
               <span className="text-[11px] text-slate-400 block mb-1">إجمالي المخصص للاحتياطيات</span>
               <div className="text-xl font-black text-slate-900 font-mono">
-                {totalReservesAllocated.toLocaleString()} SAR
+                {reserves.length === 0 ? 'N/A' : `${totalReservesAllocated.toLocaleString()} SAR`}
               </div>
-              <span className="text-[10px] text-slate-500">طوارئ مخاطر + إدارة</span>
+              <span className="text-[10px] text-slate-500">{reserves.length === 0 ? (lang === 'ar' ? 'لا توجد بيانات احتياطي مسجلة' : 'No reserve data recorded') : 'طوارئ مخاطر + إدارة'}</span>
             </div>
 
             <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
               <span className="text-[11px] text-slate-400 block mb-1">المسحوب والمستهلك حتى تاريخه</span>
               <div className="text-xl font-black text-amber-800 font-mono">
-                {totalReservesSpent.toLocaleString()} SAR
+                {reserves.length === 0 ? 'N/A' : `${totalReservesSpent.toLocaleString()} SAR`}
               </div>
-              <span className="text-[10px] text-amber-700 font-semibold">معدل الاستهلاك: {totalReservesUtilization.toFixed(1)}%</span>
+              <span className="text-[10px] text-amber-700 font-semibold">{reserves.length === 0 ? 'N/A' : `معدل الاستهلاك: ${totalReservesUtilization.toFixed(1)}%`}</span>
             </div>
 
             <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
               <span className="text-[11px] text-slate-400 block mb-1">الرصيد المتبقي المتاح</span>
               <div className="text-xl font-black text-emerald-700 font-mono">
-                {totalReservesRemaining.toLocaleString()} SAR
+                {reserves.length === 0 ? 'N/A' : `${totalReservesRemaining.toLocaleString()} SAR`}
               </div>
-              <span className="text-[10px] text-emerald-600 font-semibold">جاهز لمواجهة أي مستجدات</span>
+              <span className="text-[10px] text-emerald-600 font-semibold">{reserves.length === 0 ? (lang === 'ar' ? 'لا توجد بيانات احتياطي مسجلة' : 'No reserve data recorded') : 'جاهز لمواجهة أي مستجدات'}</span>
             </div>
 
             <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex items-center justify-between">
               <div>
                 <span className="text-[11px] text-slate-400 block mb-1">سحب جديد</span>
-                <button
-                  onClick={() => setShowReserveModal(true)}
-                  className="px-3 py-1.5 bg-slate-900 hover:bg-slate-800 text-amber-400 rounded-lg text-xs font-bold transition-all shadow-sm cursor-pointer"
-                >
-                  + طلب سحب من الاحتياطي
-                </button>
+                {/* The recorder can only draw against a user-provided reserve entry; with an
+                    empty register there is nothing to draw from, so the trigger hides. */}
+                {reserves.length > 0 ? (
+                  <button
+                    onClick={() => setShowReserveModal(true)}
+                    className="px-3 py-1.5 bg-slate-900 hover:bg-slate-800 text-amber-400 rounded-lg text-xs font-bold transition-all shadow-sm cursor-pointer"
+                  >
+                    + طلب سحب من الاحتياطي
+                  </button>
+                ) : (
+                  <span className="text-xs text-slate-400">{lang === 'ar' ? 'لا يوجد احتياطي مسجل للسحب منه (N/A)' : 'No recorded reserve to draw from (N/A)'}</span>
+                )}
               </div>
             </div>
           </div>
@@ -1211,7 +1236,9 @@ export default function BudgetView({ project }: BudgetViewProps) {
                   سجل ومراقبة استهلاك مخصصات واحتياطيات المشروع (Reserve Drawdown Register)
                 </h3>
                 <p className="text-xs text-slate-500 mt-0.5">
-                  فصل احتياطي الطوارئ المرتبط بالمخاطر المرصودة عن احتياطي الإدارة للتغييرات الكبرى.
+                  {lang === 'ar'
+                    ? 'لا يوجد جدول احتياطيات في النظام — لا تُعرض أي أرصدة مختلقة. تظهر البيانات هنا فقط عند توفر مصدر حقيقي لها.'
+                    : 'No reserves table exists in the system — no invented balances are shown. Data appears here only when a real source exists.'}
                 </p>
               </div>
             </div>
@@ -1230,6 +1257,13 @@ export default function BudgetView({ project }: BudgetViewProps) {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 font-medium">
+                  {reserves.length === 0 && (
+                    <tr>
+                      <td colSpan={7} className="p-6 text-center text-slate-400">
+                        {lang === 'ar' ? 'لا توجد احتياطيات مسجلة لهذا المشروع (N/A) — لا يُعرض رقم مختلق.' : 'No reserves recorded for this project (N/A) — no invented figure is shown.'}
+                      </td>
+                    </tr>
+                  )}
                   {reserves.map((r) => (
                     <tr key={r.id} className="hover:bg-slate-50 transition-colors">
                       <td className="p-3">

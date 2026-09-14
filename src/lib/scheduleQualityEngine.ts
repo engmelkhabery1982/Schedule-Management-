@@ -697,16 +697,28 @@ export function runDcma14PointAudit(
 }
 
 /**
- * Executes Automated DCMA Correction on Project Activities & Links
+ * Executes Automated DCMA Correction on Project Activities & Links.
+ *
+ * Phase B safety contract: this procedure repairs network records and recomputes CPM, but it
+ * never invents evidence. It creates no fabricated Resource IDs, never rewrites Actual
+ * Start/Finish, never invents completion, and never snaps planned dates onto the Data Date to
+ * hide a delay. Anything that cannot be repaired safely is reported in `skipped` (with a
+ * machine-readable reason) and left untouched instead of being "fixed" with invented values.
  */
+export interface AutoFixSkip {
+  fix: string;
+  reason: 'missing_resource' | 'cannot_fix' | 'not_applicable';
+  detail: string;
+}
 export async function autoFixDcmaIssues(
   projectId: string,
   fixType: 'all' | 'fix_missing_logic' | 'fix_hard_constraints' | 'fix_negative_lags' | 'fix_relationship_types' | 'fix_negative_float' | 'fix_high_float' | 'fix_invalid_dates' | 'fix_resource_loading' | 'fix_bei_execution' | 'fix_milestones',
   activities: Activity[],
   links: ActivityLink[],
   calendarType = '6_days'
-): Promise<{ fixedCount: number; message: string; updatedActivities: Activity[]; updatedLinks: ActivityLink[]; updatedAssignments: ActivityResource[] }> {
+): Promise<{ fixedCount: number; message: string; updatedActivities: Activity[]; updatedLinks: ActivityLink[]; updatedAssignments: ActivityResource[]; skipped: AutoFixSkip[] }> {
   let fixedCount = 0;
+  const skipped: AutoFixSkip[] = [];
   let updatedActivities = activities.map((a) => ({ ...a }));
   let updatedLinks = links.map((l) => ({ ...l }));
   let updatedAssignments: ActivityResource[] = [];
@@ -816,40 +828,30 @@ export async function autoFixDcmaIssues(
     }
   }
 
-  // 5. Fix Invalid Dates & Incomplete Past Dates
+  // 5. Invalid Dates & Overdue Incomplete Work — DETECTION ONLY (no automatic repair).
+  //
+  // A previous revision "repaired" these conditions by rewriting Actual Start/Finish onto the
+  // Data Date, inventing completion (percent_complete = 100 with derived actuals) for overdue
+  // activities at/above 50%, and snapping early_start to the Data Date for the rest. Each of
+  // those either fabricates progress evidence or erases a real delay, so Auto-Fix no longer
+  // touches them: Actuals are recorded evidence and are never overwritten here, and overdue
+  // work is left unresolved for an explicit planning decision (reschedule under the project's
+  // own Retained Logic / Progress Override) instead of being quietly hidden. The DCMA Point
+  // rules that FLAG these conditions are untouched — only the unsafe repair is removed, so
+  // chronology and network logic are preserved exactly.
   if (fixType === 'all' || fixType === 'fix_invalid_dates' || fixType === 'fix_bei_execution') {
-    for (const act of updatedActivities) {
-      let changed = false;
-      // If actual_start or actual_finish is in the future
-      if (act.actual_start && act.actual_start > dataDate) {
-        act.actual_start = dataDate;
-        changed = true;
-      }
-      if (act.actual_finish && act.actual_finish > dataDate) {
-        act.actual_finish = dataDate;
-        changed = true;
-      }
-      // If incomplete activity has early_finish before dataDate, complete or reschedule
-      if (act.percent_complete < 100 && act.early_finish && act.early_finish < dataDate && !act.actual_finish) {
-        if (act.percent_complete >= 50) {
-          act.percent_complete = 100;
-          act.actual_finish = act.early_finish <= dataDate ? act.early_finish : dataDate;
-          if (!act.actual_start) act.actual_start = act.early_start;
-        } else {
-          act.early_start = dataDate;
-        }
-        changed = true;
-      }
-
-      if (changed) {
-        await supabase.from('activities').update({
-          percent_complete: act.percent_complete,
-          actual_start: act.actual_start,
-          actual_finish: act.actual_finish,
-          early_start: act.early_start,
-        }).eq('id', act.id);
-        fixedCount++;
-      }
+    const unfixable = updatedActivities.filter((act) => {
+      if (act.actual_start && act.actual_start > dataDate) return true;
+      if (act.actual_finish && act.actual_finish > dataDate) return true;
+      if (act.percent_complete < 100 && act.early_finish && act.early_finish < dataDate && !act.actual_finish) return true;
+      return false;
+    });
+    if (unfixable.length > 0) {
+      skipped.push({
+        fix: 'fix_invalid_dates',
+        reason: 'cannot_fix',
+        detail: `${unfixable.length} نشاط (تواريخ فعلية بعد خط الحالة / عمل متأخر غير مكتمل) تُرك دون تغيير: الـ Actuals سجل مثبت لا يُعاد كتابته، والتأخير الحقيقي لا يُخفى بتواريخ مختلقة — يلزم قرار تخطيط يدوي.`,
+      });
     }
   }
 
@@ -857,10 +859,21 @@ export async function autoFixDcmaIssues(
   if (fixType === 'all' || fixType === 'fix_resource_loading') {
     const assignedIds = new Set(updatedAssignments.map((a) => a.activity_id));
     const { data: defaultResources } = await supabase.from('resources').select('*').eq('project_id', projectId);
-    const defaultRes = (defaultResources && defaultResources[0]) ? defaultResources[0] : { id: 'res-01' };
+    const unassignedWork = updatedActivities.filter((act) => !act.is_milestone && !assignedIds.has(act.id));
+    // No valid Resource exists: record the gap and skip. A previous revision fabricated a
+    // fallback assignment against a hardcoded 'res-01' ID that may not exist — inventing
+    // resource assignments is forbidden, so nothing is created here.
+    if (unassignedWork.length > 0 && (!defaultResources || defaultResources.length === 0)) {
+      skipped.push({
+        fix: 'fix_resource_loading',
+        reason: 'missing_resource',
+        detail: `${unassignedWork.length} نشاط بلا تخصيص موارد ولا يوجد أي Resource صالح في المشروع — لم يُنشأ أي تخصيص وهمي. عرّف الموارد أولاً ثم أعد التشغيل.`,
+      });
+    }
+    const defaultRes = (defaultResources && defaultResources[0]) ? defaultResources[0] : null;
 
     for (const act of updatedActivities) {
-      if (!act.is_milestone && !assignedIds.has(act.id)) {
+      if (!act.is_milestone && !assignedIds.has(act.id) && defaultRes) {
         const newAssign: ActivityResource = {
           id: `ar-fix-${act.id.slice(0, 8)}`,
           project_id: projectId,
@@ -878,10 +891,15 @@ export async function autoFixDcmaIssues(
     }
   }
 
-  // 7. Recalculate CPM network with the clean updated model
+  // 7. Recalculate CPM network with the clean updated model.
+  // The project's own scheduling convention (Retained Logic vs Progress Override) is honoured,
+  // and CPM results are persisted verbatim: a previous revision snapped any overdue incomplete
+  // activity's early_start/early_finish onto the Data Date, silently erasing real delay. That
+  // snap is removed — planning truth is preserved even when it shows negative float.
   const cpm = calculateCpm(updatedActivities, updatedLinks, {
     calendarType: calendarType as any,
     dataDate: dataDate,
+    statusLogic: (projData?.status_logic as 'retained_logic' | 'progress_override' | undefined) || 'retained_logic',
     calculateDrag: true,
   });
 
@@ -898,16 +916,11 @@ export async function autoFixDcmaIssues(
     const actualFreeFloat = Number(r.freeFloat || 0);
 
     const actIndex = updatedActivities.findIndex((a) => a.id === r.activityId);
-    let finalEarlyStart = r.earlyStart;
-    let finalEarlyFinish = r.earlyFinish;
+    // CPM early dates are persisted exactly as computed — never snapped to the Data Date.
+    const finalEarlyStart = r.earlyStart;
+    const finalEarlyFinish = r.earlyFinish;
 
     if (actIndex >= 0) {
-      const act = updatedActivities[actIndex];
-      if (act.percent_complete < 100 && !act.actual_finish && finalEarlyFinish < dataDate) {
-        finalEarlyStart = dataDate;
-        finalEarlyFinish = dataDate;
-      }
-
       await supabase.from('activities').update({
         early_start: finalEarlyStart,
         early_finish: finalEarlyFinish,
@@ -933,14 +946,21 @@ export async function autoFixDcmaIssues(
     }
   }
 
+  // Items left unrepaired are disclosed, never silently dropped or papered over with invented
+  // values: each skipped entry carries a machine-readable reason (missing_resource / cannot_fix /
+  // not_applicable) plus a human-readable detail, and the headline message names them.
+  const skipNote = skipped.length > 0
+    ? ` وتُرك (${skipped.length}) بند دون إصلاح تلقائي لأسباب موثقة (${skipped.map((x) => `${x.fix}: ${x.reason}`).join('، ')}) — راجع تفاصيل كل بند في نتيجة الإجراء بدل اختراع قيم بديلة.`
+    : '';
   return {
     fixedCount,
+    skipped,
     // The message states only what this procedure actually did (Final Cleanup, item 2). It used to
     // close with an unconditional "100% PASS", which asserted a DCMA audit result that this function
     // never runs: it repairs records and recomputes CPM, nothing more. The 14-Point assessment is
     // re-run by the audit screen on the returned model, and its real score — including any point
     // that still fails because of genuinely high float — is what gets reported there.
-    message: `تم تطبيق (${fixedCount}) تصحيحاً على سجلات النموذج، ثم أعيد حساب شبكة المسار الحرج (CPM) وحُفظت نتائجه الفعلية كما هي (التواريخ والهوامش Total/Free Float بلا أي قصّ أو تعديل). لم يُشغَّل تقييم DCMA 14-Point ضمن هذا الإجراء، لذا لا تُعلَن هنا أي نتيجة اجتياز؛ النتيجة الفعلية تظهر في شاشة تدقيق DCMA بعد إعادة الحساب.`,
+    message: `تم تطبيق (${fixedCount}) تصحيحاً على سجلات النموذج، ثم أعيد حساب شبكة المسار الحرج (CPM) وحُفظت نتائجه الفعلية كما هي (التواريخ والهوامش Total/Free Float بلا أي قصّ أو تعديل). لم يُشغَّل تقييم DCMA 14-Point ضمن هذا الإجراء، لذا لا تُعلَن هنا أي نتيجة اجتياز؛ النتيجة الفعلية تظهر في شاشة تدقيق DCMA بعد إعادة الحساب.${skipNote}`,
     updatedActivities,
     updatedLinks,
     updatedAssignments,
