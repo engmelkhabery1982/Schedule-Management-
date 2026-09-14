@@ -16,6 +16,9 @@ import type {
   ActivityResource,
   Resource,
   ScheduleUpdateSnapshot,
+  WbsNode,
+  ActivityBoqAllocation,
+  CostControlSnapshot,
 } from '@/types';
 import {
   analyzeForecast,
@@ -31,6 +34,7 @@ import { calculateRecoveryPlan } from '@/lib/recoveryEngine';
 import { simulateScenario } from '@/lib/scenarioEngine';
 import { generateSCurveData } from '@/lib/sCurveEngine';
 import { analyzeScheduleControl } from '@/lib/scheduleControlEngine';
+import { analyzeCostControl } from '@/lib/costControlEngine';
 // GAP-010: the FIDIC 20.1 notice generator works on the governed Data Date, not on a literal clock.
 import { calendarDaysBetween, isAfterDataDate, isIsoDate, resolveDataDate } from '@/lib/chronologyGuard';
 import { getLanguage, translations, type Language } from '@/lib/i18n';
@@ -77,6 +81,10 @@ export default function Dashboard({ project, onNavigate }: DashboardProps) {
   // F5: control inputs — the links fetch already existed; snapshots are new.
   const [links, setLinks] = useState<ActivityLink[]>([]);
   const [snapshots, setSnapshots] = useState<ScheduleUpdateSnapshot[]>([]);
+  // F6: cost-strip inputs (packages/schedule linkage stay in BudgetView; the strip is N/A-safe).
+  const [costWbs, setCostWbs] = useState<WbsNode[]>([]);
+  const [costAllocations, setCostAllocations] = useState<ActivityBoqAllocation[]>([]);
+  const [costSnapshots, setCostSnapshots] = useState<CostControlSnapshot[]>([]);
   const [approvedActualCost, setApprovedActualCost] = useState(0);
   const [boqItems, setBoqItems] = useState<BoqItem[]>([]);
   const [loading, setLoading] = useState(true);
@@ -135,7 +143,7 @@ export default function Dashboard({ project, onNavigate }: DashboardProps) {
     setError('');
 
     try {
-      const [actRes, riskRes, issueRes, budgetRes, progRes, costRes, baselineRes, alertsRes, linksRes, assignmentsRes, resourcesRes, boqRes, snapRes] = await Promise.all([
+      const [actRes, riskRes, issueRes, budgetRes, progRes, costRes, baselineRes, alertsRes, linksRes, assignmentsRes, resourcesRes, boqRes, snapRes, cwbsRes, calRes, csnapRes] = await Promise.all([
         supabase.from('activities').select('*, wbs_node:wbs_nodes(*)').eq('project_id', project.id),
         supabase.from('risks').select('*').eq('project_id', project.id),
         supabase.from('issues').select('*').eq('project_id', project.id),
@@ -149,6 +157,9 @@ export default function Dashboard({ project, onNavigate }: DashboardProps) {
         supabase.from('resources').select('*').eq('project_id', project.id),
         supabase.from('boq_items').select('*').eq('project_id', project.id),
         supabase.from('schedule_update_snapshots').select('*').eq('project_id', project.id).order('data_date', { ascending: false }).limit(10),
+        supabase.from('wbs_nodes').select('*').eq('project_id', project.id),
+        supabase.from('activity_boq_allocations').select('*').eq('project_id', project.id),
+        supabase.from('cost_control_snapshots').select('*').eq('project_id', project.id).order('data_date', { ascending: false }).limit(10),
       ]);
 
       const activityData = (actRes.data || []) as Activity[];
@@ -168,6 +179,9 @@ export default function Dashboard({ project, onNavigate }: DashboardProps) {
       setBaselineActivities(baselineData);
       setLinks(((linksRes as { data?: unknown }).data || []) as ActivityLink[]);
       setSnapshots(((snapRes as { data?: unknown }).data || []) as ScheduleUpdateSnapshot[]);
+      setCostWbs((((cwbsRes as { data?: unknown }).data || []) as WbsNode[]));
+      setCostAllocations((((calRes as { data?: unknown }).data || []) as ActivityBoqAllocation[]));
+      setCostSnapshots((((csnapRes as { data?: unknown }).data || []) as CostControlSnapshot[]));
       setAlerts((alertsRes.data || []) as ProjectAlert[]);
     } catch (err: any) {
       console.error('Error loading dashboard:', err);
@@ -368,6 +382,25 @@ ${noticeForm.contractorName}`;
       statusLogic: project.status_logic || 'retained_logic',
     });
   }, [project, activities, links, baselineActivities, progressUpdates, snapshots, governedDataDate]);
+  // F6: cost-control strip (CPI, CV, recommended EAC, VAC, forecast confidence).
+  const costStrip = useMemo(() => {
+    if (!project) return null;
+    return analyzeCostControl({
+      project,
+      activities,
+      baselines: baselineActivities,
+      budgetLines,
+      costTransactions,
+      progressUpdates,
+      wbsNodes: costWbs,
+      boqItems,
+      allocations: costAllocations,
+      previousSnapshots: costSnapshots,
+      dataDate: governedDataDate,
+      calendarType: project.calendar_type || '6_days',
+      manualEtc: typeof project.manual_etc_override === 'number' ? project.manual_etc_override : null,
+    });
+  }, [project, activities, baselineActivities, budgetLines, costTransactions, progressUpdates, costWbs, boqItems, costAllocations, costSnapshots, governedDataDate]);
   const controlDelay = control ? control.project.totalDelayWd : null;
   const controlSlipped = control ? control.milestones.filter((m) => m.state === 'slipped').length : 0;
 
@@ -782,6 +815,45 @@ ${noticeForm.contractorName}`;
           );
         })}
       </div>
+
+      {/* F6: Cost Control strip — five decision numbers, no clutter. */}
+      {costStrip && (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-4">
+          <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 text-center">
+            <div>
+              <span className="text-[11px] text-slate-500 font-bold block">CPI</span>
+              <span className={`text-lg font-black font-mono ${costStrip.project.cpi !== null && costStrip.project.cpi < 0.9 ? 'text-rose-700' : 'text-slate-900'}`}>
+                {costStrip.project.cpi !== null ? costStrip.project.cpi : 'N/A'}
+              </span>
+            </div>
+            <div>
+              <span className="text-[11px] text-slate-500 font-bold block">CV</span>
+              <span className={`text-lg font-black font-mono ${costStrip.project.cv !== null && costStrip.project.cv < 0 ? 'text-rose-700' : 'text-emerald-700'}`}>
+                {costStrip.project.cv !== null ? costStrip.project.cv.toLocaleString() : 'N/A'}
+              </span>
+            </div>
+            <div>
+              <span className="text-[11px] text-slate-500 font-bold block">{lang === 'ar' ? 'EAC الموصى به' : 'Recommended EAC'}</span>
+              <span className="text-lg font-black font-mono text-slate-900">
+                {costStrip.project.eac !== null ? costStrip.project.eac.toLocaleString() : 'N/A'}
+              </span>
+              <span className="text-[10px] text-slate-400 block font-mono">{costStrip.recommended ? costStrip.recommended.method : costStrip.recommendedNote}</span>
+            </div>
+            <div>
+              <span className="text-[11px] text-slate-500 font-bold block">VAC</span>
+              <span className={`text-lg font-black font-mono ${costStrip.project.vac !== null && costStrip.project.vac < 0 ? 'text-rose-700' : 'text-emerald-700'}`}>
+                {costStrip.project.vac !== null ? costStrip.project.vac.toLocaleString() : 'N/A'}
+              </span>
+            </div>
+            <div>
+              <span className="text-[11px] text-slate-500 font-bold block">{lang === 'ar' ? 'ثقة التنبؤ' : 'Forecast confidence'}</span>
+              <span className={`inline-block mt-1 px-3 py-1 rounded-full text-xs font-bold ${costStrip.confidence.forecast.level === 'High' ? 'bg-emerald-100 text-emerald-800' : costStrip.confidence.forecast.level === 'Medium' ? 'bg-amber-100 text-amber-800' : 'bg-rose-100 text-rose-800'}`}>
+                {costStrip.confidence.forecast.level}
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Health & Status Grid */}
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">

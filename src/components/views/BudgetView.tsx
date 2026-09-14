@@ -18,10 +18,18 @@ import type {
   CostTransaction,
   BoqItem,
   Activity,
+  ActivityLink,
+  BaselineActivity,
+  WbsNode,
+  ActivityBoqAllocation,
+  CostControlSnapshot,
   ProgressUpdate,
   MonthlyCashFlowBucket,
   ReserveBurnItem,
 } from '@/types';
+import { analyzeCostControl, buildCostSnapshot, type CostControlReport } from '@/lib/costControlEngine';
+import { analyzeScheduleControl, type ScheduleControlReport } from '@/lib/scheduleControlEngine';
+import { isAfterDataDate, resolveDataDate } from '@/lib/chronologyGuard';
 import {
   Wallet,
   TrendingUp,
@@ -51,7 +59,7 @@ interface BudgetViewProps {
   project: Project | null;
 }
 
-type BudgetTab = 'evm_tcpi' | 'cash_flow' | 'cbs_centers' | 'reserves' | 'transactions_table';
+type BudgetTab = 'evm_tcpi' | 'cash_flow' | 'cbs_centers' | 'reserves' | 'transactions_table' | 'cost_control';
 
 /** Labels of the Earned Schedule status the canonical engine returns (no view-side status logic). */
 const ESM_STATUS_LABELS: Record<EarnedScheduleResult['status'], { ar: string; en: string; className: string }> = {
@@ -77,6 +85,19 @@ export default function BudgetView({ project }: BudgetViewProps) {
   const [boqItems, setBoqItems] = useState<BoqItem[]>([]);
   const [activities, setActivities] = useState<Activity[]>([]);
   const [progressUpdates, setProgressUpdates] = useState<ProgressUpdate[]>([]);
+  // F6: cost-control inputs.
+  const [baselines, setBaselines] = useState<BaselineActivity[]>([]);
+  const [links, setLinks] = useState<ActivityLink[]>([]);
+  const [wbsNodes, setWbsNodes] = useState<WbsNode[]>([]);
+  const [allocations, setAllocations] = useState<ActivityBoqAllocation[]>([]);
+  const [packages, setPackages] = useState<Array<{ status: string; totalSubcontractValueSar: number | null }>>([]);
+  const [costSnapshots, setCostSnapshots] = useState<CostControlSnapshot[]>([]);
+  const [manualEtcInput, setManualEtcInput] = useState('');
+  const [savingSnapshot, setSavingSnapshot] = useState(false);
+  const [savingManual, setSavingManual] = useState(false);
+  const [notice, setNotice] = useState('');
+  const governedDataDate = useMemo(() => resolveDataDate(project), [project]);
+  const [txnDate, setTxnDate] = useState(() => resolveDataDate(project));
   const [lang, setLang] = useState<Language>(getLanguage());
 
   // Cost Transaction Input Form
@@ -109,35 +130,73 @@ export default function BudgetView({ project }: BudgetViewProps) {
       setLang(e.detail?.lang || getLanguage());
     };
     window.addEventListener('app-language-changed', handleLangChange);
-    return () => window.removeEventListener('app-language-changed', handleLangChange);
+    const handleDataDateChange = (e: Event) => {
+      const detail = (e as CustomEvent).detail as { projectId?: string } | undefined;
+      if (project && (!detail?.projectId || detail.projectId === project.id)) loadData();
+    };
+    window.addEventListener('project-data-date-changed', handleDataDateChange);
+    return () => {
+      window.removeEventListener('app-language-changed', handleLangChange);
+      window.removeEventListener('project-data-date-changed', handleDataDateChange);
+    };
+  }, [project]);
+
+  // F6: keep the manual-ETC editor and transaction date anchored when the project changes.
+  useEffect(() => {
+    setManualEtcInput(
+      project?.manual_etc_override !== null && project?.manual_etc_override !== undefined
+        ? String(project.manual_etc_override) : '',
+    );
+    setTxnDate(resolveDataDate(project));
   }, [project]);
 
   async function loadData() {
     if (!project) return;
     setLoading(true);
-    const [{ data }, { data: transactionData }, { data: boqData }, { data: activityData }, { data: progressData }] = await Promise.all([
+    const [{ data }, { data: transactionData }, { data: boqData }, { data: activityData }, { data: progressData }, baseRes, linkRes, wbsRes, allocRes, pkgRes, snapRes] = await Promise.all([
       supabase.from('budget_lines').select('*').eq('project_id', project.id),
       supabase.from('cost_transactions').select('*').eq('project_id', project.id).order('transaction_date', { ascending: false }),
       supabase.from('boq_items').select('*').eq('project_id', project.id).order('sort_order'),
       supabase.from('activities').select('*').eq('project_id', project.id).order('sort_order'),
       supabase.from('progress_updates').select('*').eq('project_id', project.id),
+      supabase.from('baseline_activities').select('*, project_baselines!inner(project_id, is_active, status)').eq('project_baselines.project_id', project.id).eq('project_baselines.is_active', true).eq('project_baselines.status', 'approved'),
+      supabase.from('activity_links').select('*').eq('project_id', project.id),
+      supabase.from('wbs_nodes').select('*').eq('project_id', project.id).order('sort_order'),
+      supabase.from('activity_boq_allocations').select('*').eq('project_id', project.id),
+      // Direct rows only: the cached loader falls back to demo defaults, which F6 must not read as exposure.
+      supabase.from('subcontract_packages').select('status, total_subcontract_value_sar').eq('project_id', project.id),
+      supabase.from('cost_control_snapshots').select('*').eq('project_id', project.id).order('data_date', { ascending: false }).limit(10),
     ]);
     setBudgetLines(data || []);
     setTransactions((transactionData || []) as CostTransaction[]);
     setBoqItems((boqData || []) as BoqItem[]);
     setActivities((activityData || []) as Activity[]);
     setProgressUpdates((progressData || []) as ProgressUpdate[]);
+    setBaselines(((baseRes as { data?: unknown }).data || []) as BaselineActivity[]);
+    setLinks(((linkRes as { data?: unknown }).data || []) as ActivityLink[]);
+    setWbsNodes(((wbsRes as { data?: unknown }).data || []) as WbsNode[]);
+    setAllocations(((allocRes as { data?: unknown }).data || []) as ActivityBoqAllocation[]);
+    setPackages((((pkgRes as { data?: unknown }).data || []) as Array<Record<string, unknown>>).map((r) => ({
+      status: String(r.status || ''),
+      totalSubcontractValueSar: typeof r.total_subcontract_value_sar === 'number' ? (r.total_subcontract_value_sar as number) : null,
+    })));
+    setCostSnapshots(((snapRes as { data?: unknown }).data || []) as CostControlSnapshot[]);
     setLoading(false);
   }
 
   async function addTransaction() {
     if (!project || !transactionForm.description || transactionForm.amount <= 0) return;
+    // F6 §1: a transaction dated after the Data Date is not an actual — blocked at entry.
+    if (isAfterDataDate(txnDate, governedDataDate)) {
+      setNotice(`تعذر التسجيل: تاريخ الحركة (${txnDate}) بعد تاريخ التحديث المعتمد (${governedDataDate}).`);
+      return;
+    }
     const { error } = await supabase.from('cost_transactions').insert({
       project_id: project.id,
       description: transactionForm.description,
       amount: transactionForm.amount,
       cost_type: transactionForm.cost_type,
-      transaction_date: new Date().toISOString().split('T')[0],
+      transaction_date: txnDate,
       source: 'manual',
       status: 'submitted',
       boq_item_id: transactionForm.boq_item_id || null,
@@ -148,7 +207,82 @@ export default function BudgetView({ project }: BudgetViewProps) {
     });
     if (error) return;
     setTransactionForm({ description: '', amount: 0, cost_type: 'direct', boq_item_id: '', activity_id: '', budget_line_id: '', vendor: '', invoice_number: '' });
+    setTxnDate(governedDataDate);
+    setNotice('');
     await loadData();
+  }
+
+  // F6: schedule linkage (read-only F5) + the cost-control report + snapshot/manual persistence.
+  const scheduleReport: ScheduleControlReport | null = useMemo(() => {
+    if (!project) return null;
+    return analyzeScheduleControl({
+      activities,
+      links,
+      baselines,
+      progressUpdates,
+      previousSnapshot: null,
+      dataDate: governedDataDate,
+      calendarType: project.calendar_type || '6_days',
+      statusLogic: project.status_logic || 'retained_logic',
+    });
+  }, [project, activities, links, baselines, progressUpdates, governedDataDate]);
+
+  const manualEtcValue: number | null = manualEtcInput.trim() === '' ? null : Number(manualEtcInput);
+  const costReport: CostControlReport | null = useMemo(() => {
+    if (!project) return null;
+    return analyzeCostControl({
+      project,
+      activities,
+      baselines,
+      budgetLines,
+      costTransactions: transactions,
+      progressUpdates,
+      wbsNodes,
+      boqItems,
+      allocations,
+      subcontractPackages: packages,
+      previousSnapshots: costSnapshots,
+      scheduleReport,
+      dataDate: governedDataDate,
+      calendarType: project.calendar_type || '6_days',
+      manualEtc: manualEtcInput.trim() === '' || !Number.isFinite(Number(manualEtcInput)) ? null : Number(manualEtcInput),
+    });
+  }, [project, activities, baselines, budgetLines, transactions, progressUpdates, wbsNodes, boqItems, allocations, packages, costSnapshots, scheduleReport, governedDataDate, manualEtcInput]);
+
+  async function handleSaveCostSnapshot() {
+    if (!project || !costReport) return;
+    setSavingSnapshot(true);
+    try {
+      const payload = buildCostSnapshot(project.id, costReport);
+      const { error } = await supabase.from('cost_control_snapshots').upsert(payload, { onConflict: 'project_id,data_date' });
+      if (error) throw error;
+      setNotice(`تم حفظ لقطة التكلفة (Data Date ${costReport.dataDate}): EAC الموصى به ${costReport.project.eac !== null ? costReport.project.eac.toLocaleString() : 'N/A'}.`);
+      const snapRes = await supabase.from('cost_control_snapshots').select('*').eq('project_id', project.id).order('data_date', { ascending: false }).limit(10);
+      setCostSnapshots(((snapRes as { data?: unknown }).data || []) as CostControlSnapshot[]);
+    } catch (err: unknown) {
+      setNotice(`تعذر حفظ اللقطة: ${(err as Error).message}`);
+    } finally {
+      setSavingSnapshot(false);
+    }
+  }
+
+  async function handleSaveManualEtc() {
+    if (!project) return;
+    const parsed = manualEtcInput.trim() === '' ? null : Number(manualEtcInput);
+    if (parsed !== null && (!Number.isFinite(parsed) || parsed < 0)) {
+      setNotice('قيمة ETC اليدوية غير صالحة: أدخل رقماً غير سالب أو اترك الحقل فارغاً.');
+      return;
+    }
+    setSavingManual(true);
+    try {
+      const { error } = await supabase.from('projects').update({ manual_etc_override: parsed }).eq('id', project.id);
+      if (error) throw error;
+      setNotice(parsed === null ? 'تم مسح ETC اليدوية: طريقة التقدير اليدوي أصبحت غير منطبقة.' : `تم حفظ ETC اليدوية (${parsed.toLocaleString()} SAR).`);
+    } catch (err: unknown) {
+      setNotice(`تعذر حفظ ETC اليدوية: ${(err as Error).message}`);
+    } finally {
+      setSavingManual(false);
+    }
   }
 
   async function approveTransaction(id: string) {
@@ -495,7 +629,7 @@ export default function BudgetView({ project }: BudgetViewProps) {
       </div>
 
       {/* DEDICATED FULL-WIDTH TAB NAVIGATION BAR */}
-      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2 bg-slate-100 p-1.5 rounded-2xl border border-slate-200 shadow-xs">
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 bg-slate-100 p-1.5 rounded-2xl border border-slate-200 shadow-xs">
         <button
           onClick={() => setActiveTab('evm_tcpi')}
           className={`px-3 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center justify-center gap-2 text-center ${
@@ -555,7 +689,26 @@ export default function BudgetView({ project }: BudgetViewProps) {
           <FileText size={15} className={activeTab === 'transactions_table' ? 'text-amber-400' : 'text-emerald-600'} />
           <span>سجل بنود الميزانية والمصروفات</span>
         </button>
+
+        <button
+          onClick={() => setActiveTab('cost_control')}
+          className={`px-3 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center justify-center gap-2 text-center col-span-2 sm:col-span-1 ${
+            activeTab === 'cost_control'
+              ? 'bg-slate-900 text-amber-400 shadow-sm font-black ring-1 ring-slate-800'
+              : 'bg-white text-slate-700 hover:bg-slate-50 border border-slate-200/60'
+          }`}
+        >
+          <Wallet size={15} className={activeTab === 'cost_control' ? 'text-amber-400' : 'text-amber-700'} />
+          <span>التحكم بالتكلفة (F6)</span>
+        </button>
       </div>
+
+      {notice && (
+        <div className="p-3 bg-blue-50/90 border border-blue-200 text-blue-900 rounded-xl text-xs font-medium flex items-center justify-between shadow-sm">
+          <span>{notice}</span>
+          <button onClick={() => setNotice('')} className="text-blue-500 hover:text-blue-700 font-bold text-sm cursor-pointer">×</button>
+        </div>
+      )}
 
       {/* Summary KPI Ribbon */}
       <div className="grid grid-cols-2 lg:grid-cols-5 gap-3.5">
@@ -1306,6 +1459,371 @@ export default function BudgetView({ project }: BudgetViewProps) {
       {/* -------------------------------------------------------------------------------- */}
       {/* TAB 5: BUDGET LINES & COST TRANSACTIONS TABLE                                    */}
       {/* -------------------------------------------------------------------------------- */}
+      {/* Cost Control Tab — F6: BAC/PV/EV/AC, EAC methods, commitments, trend, anomalies, actions. */}
+      {activeTab === 'cost_control' && costReport && (
+        <div className="space-y-4">
+          <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-sm space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-4 border-b pb-3">
+              <div>
+                <h3 className="text-base font-black text-slate-900 flex items-center gap-2">
+                  <Wallet className="text-amber-600" size={20} />
+                  <span>التحكم بالتكلفة والتنبؤ (Cost Control)</span>
+                  <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-900 border border-amber-200">
+                    Data Date {costReport.dataDate}
+                  </span>
+                </h3>
+                <p className="text-xs text-slate-500 mt-1">
+                  BAC من الموازنة المعتمدة فقط · PV/EAC بلا قيم مخترعة · القسمة على صفر = N/A · الطرق الأربع معلنة والمُوصى به مبرر.
+                </p>
+              </div>
+              <button
+                onClick={() => void handleSaveCostSnapshot()}
+                disabled={savingSnapshot}
+                className="flex items-center gap-1.5 bg-slate-900 hover:bg-slate-800 text-amber-400 px-4 py-2 rounded-xl text-xs font-bold transition-all disabled:opacity-50 cursor-pointer shadow-sm"
+              >
+                <Save size={13} />
+                {savingSnapshot ? 'جاري الحفظ...' : 'حفظ لقطة التكلفة'}
+              </button>
+            </div>
+
+            {/* BAC + PV/EV/AC */}
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+              <div className="p-3 bg-slate-900 rounded-xl border border-slate-800">
+                <span className="text-[11px] text-amber-400 font-bold block">BAC (الميزانية المعتمدة)</span>
+                <div className="text-sm font-black text-white font-mono">{costReport.project.bac !== null ? costReport.project.bac.toLocaleString() : 'N/A'}</div>
+                <span className="text-[10px] text-slate-300 block mt-0.5">المصدر: {costReport.bac.source} · {costReport.bac.confidence}</span>
+              </div>
+              <div className="p-3 bg-slate-50 rounded-xl border border-slate-200">
+                <span className="text-[11px] text-slate-500 font-bold block">PV (المخطط)</span>
+                <div className="text-sm font-black text-slate-900 font-mono">{costReport.project.pv !== null ? costReport.project.pv.toLocaleString() : 'N/A'}</div>
+                <span className="text-[10px] text-slate-400 block mt-0.5">{costReport.pvMethod}</span>
+              </div>
+              <div className="p-3 bg-slate-50 rounded-xl border border-slate-200">
+                <span className="text-[11px] text-slate-500 font-bold block">EV (المكتسب)</span>
+                <div className="text-sm font-black text-slate-900 font-mono">{costReport.project.ev !== null ? costReport.project.ev.toLocaleString() : 'N/A'}</div>
+                <span className="text-[10px] text-slate-400 block mt-0.5">التقدم المسجل × الموازنة</span>
+              </div>
+              <div className="p-3 bg-slate-50 rounded-xl border border-slate-200">
+                <span className="text-[11px] text-slate-500 font-bold block">AC (الفعلي المعتمد)</span>
+                <div className="text-sm font-black text-slate-900 font-mono">{costReport.project.ac.toLocaleString()}</div>
+                <span className="text-[10px] text-slate-400 block mt-0.5">{costReport.project.acCount} حركة · {costReport.project.acSource}</span>
+              </div>
+              <div className="p-3 bg-slate-50 rounded-xl border border-slate-200">
+                <span className="text-[11px] text-slate-500 font-bold block">CV / CPI</span>
+                <div className={`text-sm font-black font-mono ${(costReport.project.cv || 0) < 0 ? 'text-rose-700' : 'text-emerald-700'}`}>
+                  {costReport.project.cv !== null ? costReport.project.cv.toLocaleString() : 'N/A'} / {costReport.project.cpi !== null ? costReport.project.cpi : 'N/A'}
+                </div>
+                <span className="text-[10px] text-slate-400 block mt-0.5">SV {costReport.project.sv !== null ? costReport.project.sv.toLocaleString() : 'N/A'} · SPI {costReport.project.spi !== null ? costReport.project.spi : 'N/A'}</span>
+              </div>
+            </div>
+
+            {/* EAC methods + recommendation */}
+            <div>
+              <h4 className="text-xs font-black text-slate-800 mb-2">طرق التنبؤ EAC (كل طريقة معلنة — لا اختيار صامت)</h4>
+              <div className="overflow-x-auto border border-slate-200 rounded-xl">
+                <table className="w-full text-xs">
+                  <thead className="bg-slate-50 text-slate-700 font-bold border-b">
+                    <tr>
+                      <th className="p-2 text-right">الطريقة</th>
+                      <th className="p-2 text-right">المعادلة</th>
+                      <th className="p-2 text-center">القيمة</th>
+                      <th className="p-2 text-right">متى تنطبق</th>
+                      <th className="p-2 text-center">الثقة</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {costReport.eacMethods.map((m) => (
+                      <tr key={m.key} className={costReport.recommended?.method === m.key ? 'bg-amber-50/60' : 'hover:bg-slate-50'}>
+                        <td className="p-2 font-mono font-bold text-slate-900">{m.key}{costReport.recommended?.method === m.key ? ' ★' : ''}</td>
+                        <td className="p-2 font-mono text-slate-600">{m.formula}</td>
+                        <td className="p-2 text-center font-mono font-bold">{m.value !== null ? m.value.toLocaleString() : 'N/A'}</td>
+                        <td className="p-2 text-slate-600">{m.applicability}</td>
+                        <td className="p-2 text-center">
+                          <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${m.confidence === 'High' ? 'bg-emerald-100 text-emerald-800' : m.confidence === 'Medium' ? 'bg-amber-100 text-amber-800' : 'bg-rose-100 text-rose-800'}`}>
+                            {m.confidence}
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              {costReport.recommended ? (
+                <div className="mt-2 p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs">
+                  <span className="font-black text-slate-900">EAC الموصى به ({costReport.recommended.method}): {costReport.recommended.eac.toLocaleString()} SAR</span>
+                  <span className="text-slate-600"> · ETC {costReport.recommended.etc.toLocaleString()} · VAC {costReport.recommended.vac !== null ? costReport.recommended.vac.toLocaleString() : 'N/A'}</span>
+                  <p className="text-slate-600 mt-1"><span className="font-bold">لماذا:</span> {costReport.recommended.why}</p>
+                </div>
+              ) : (
+                <p className="mt-2 text-xs text-slate-500">N/A — {costReport.recommendedNote}</p>
+              )}
+              {/* Manual ETC editor */}
+              <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+                <label className="font-bold text-slate-700">ETC يدوية (إعادة تقدير المتبقي — فارغ = غير مسجلة):</label>
+                <input
+                  type="number"
+                  min="0"
+                  value={manualEtcInput}
+                  onChange={(e) => setManualEtcInput(e.target.value)}
+                  placeholder="SAR"
+                  className="w-44 px-3 py-1.5 border border-slate-300 rounded-xl text-xs font-mono outline-none focus:ring-2 focus:ring-amber-500 bg-white"
+                />
+                <button
+                  onClick={() => void handleSaveManualEtc()}
+                  disabled={savingManual}
+                  className="px-3 py-1.5 bg-slate-900 text-amber-400 rounded-xl text-xs font-bold disabled:opacity-50 cursor-pointer"
+                >
+                  {savingManual ? 'جاري الحفظ...' : 'حفظ ETC اليدوية'}
+                </button>
+                {manualEtcValue !== null && <span className="text-slate-500 font-mono">الحالية: {manualEtcValue.toLocaleString()} SAR</span>}
+              </div>
+            </div>
+
+            {/* Commitment split */}
+            <div>
+              <h4 className="text-xs font-black text-slate-800 mb-2">الالتزامات (Budget / Committed / Actual / Remaining / Forecast)</h4>
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2 text-xs">
+                <div className="p-2.5 bg-slate-50 rounded-xl border border-slate-200"><span className="text-slate-500 font-bold block">الميزانية</span><span className="font-mono font-black">{costReport.commitment.budget !== null ? costReport.commitment.budget.toLocaleString() : 'N/A'}</span></div>
+                <div className="p-2.5 bg-slate-50 rounded-xl border border-slate-200"><span className="text-slate-500 font-bold block">الملتزم به</span><span className="font-mono font-black">{costReport.commitment.hasCommitmentData ? costReport.commitment.committed.toLocaleString() : 'N/A'}</span></div>
+                <div className="p-2.5 bg-slate-50 rounded-xl border border-slate-200"><span className="text-slate-500 font-bold block">الفعلي</span><span className="font-mono font-black">{costReport.commitment.actual.toLocaleString()}</span></div>
+                <div className="p-2.5 bg-slate-50 rounded-xl border border-slate-200"><span className="text-slate-500 font-bold block">المتبقي الملتزم</span><span className="font-mono font-black">{costReport.commitment.remainingCommitment !== null ? costReport.commitment.remainingCommitment.toLocaleString() : 'N/A'}</span></div>
+                <div className="p-2.5 bg-slate-50 rounded-xl border border-slate-200"><span className="text-slate-500 font-bold block">المتوقع المتبقي ETC</span><span className="font-mono font-black">{costReport.commitment.forecastEtc !== null ? costReport.commitment.forecastEtc.toLocaleString() : 'N/A'}</span></div>
+              </div>
+              <p className="text-[11px] text-slate-400 mt-1">التعاقدات المفتوحة (مرجع غير مجموع): {costReport.commitment.contractedOpen !== null ? costReport.commitment.contractedOpen.toLocaleString() : 'N/A'} — {costReport.commitment.contractedNote}</p>
+            </div>
+
+            {/* WBS rollup */}
+            <div>
+              <h4 className="text-xs font-black text-slate-800 mb-2">التحكم عبر WBS (تجميع شجري بلا ازدواج)</h4>
+              <div className="overflow-x-auto border border-slate-200 rounded-xl max-h-64 overflow-y-auto">
+                <table className="w-full text-xs">
+                  <thead className="bg-slate-50 text-slate-700 font-bold border-b sticky top-0">
+                    <tr>
+                      <th className="p-2 text-right">WBS</th>
+                      <th className="p-2 text-center">BAC</th>
+                      <th className="p-2 text-center">EV</th>
+                      <th className="p-2 text-center">AC</th>
+                      <th className="p-2 text-center">CV</th>
+                      <th className="p-2 text-center">CPI</th>
+                      <th className="p-2 text-center">EAC</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 font-mono">
+                    {[...costReport.wbs, costReport.unassigned].map((w) => (
+                      <tr key={w.id} className="hover:bg-slate-50">
+                        <td className="p-2 font-bold text-slate-900" style={{ paddingRight: `${Math.max(0, w.level) * 12 + 8}px` }}>{w.code} <span className="font-sans font-normal text-slate-500">{w.name}</span></td>
+                        <td className="p-2 text-center">{w.bac.toLocaleString()}</td>
+                        <td className="p-2 text-center">{w.ev !== null ? w.ev.toLocaleString() : 'N/A'}</td>
+                        <td className="p-2 text-center">{w.ac.toLocaleString()}</td>
+                        <td className="p-2 text-center font-bold">{w.cv !== null ? w.cv.toLocaleString() : 'N/A'}</td>
+                        <td className="p-2 text-center">{w.cpi !== null ? w.cpi : 'N/A'}</td>
+                        <td className="p-2 text-center">{w.eac !== null ? w.eac.toLocaleString() : 'N/A'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* Activity overruns */}
+            <div>
+              <h4 className="text-xs font-black text-slate-800 mb-2">تجاوزات الأنشطة (الأعلى |CV|)</h4>
+              {costReport.activities.filter((a) => a.cv !== null && a.cv < 0).length === 0 ? (
+                <p className="text-xs text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-xl p-3">لا تجاوزات على مستوى الأنشطة.</p>
+              ) : (
+                <div className="overflow-x-auto border border-slate-200 rounded-xl">
+                  <table className="w-full text-xs">
+                    <thead className="bg-slate-50 text-slate-700 font-bold border-b">
+                      <tr>
+                        <th className="p-2 text-right">النشاط</th>
+                        <th className="p-2 text-center">BAC</th>
+                        <th className="p-2 text-center">EV</th>
+                        <th className="p-2 text-center">AC</th>
+                        <th className="p-2 text-center">CV</th>
+                        <th className="p-2 text-center">CPI</th>
+                        <th className="p-2 text-center">EAC</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 font-mono">
+                      {costReport.activities.filter((a) => a.cv !== null && (a.cv as number) < 0).sort((a, b) => (a.cv as number) - (b.cv as number)).slice(0, 8).map((a) => (
+                        <tr key={a.id} className="hover:bg-slate-50">
+                          <td className="p-2 font-bold text-slate-900">{a.code} <span className="font-sans font-normal text-slate-500">{a.name.slice(0, 30)}</span></td>
+                          <td className="p-2 text-center">{a.bac.toLocaleString()}</td>
+                          <td className="p-2 text-center">{a.ev !== null ? a.ev.toLocaleString() : 'N/A'}</td>
+                          <td className="p-2 text-center">{a.ac.toLocaleString()}</td>
+                          <td className="p-2 text-center font-bold text-rose-700">{a.cv !== null ? a.cv.toLocaleString() : 'N/A'}</td>
+                          <td className="p-2 text-center">{a.cpi !== null ? a.cpi : 'N/A'}</td>
+                          <td className="p-2 text-center">{a.eac !== null ? a.eac.toLocaleString() : 'N/A'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+
+            {/* Integrity */}
+            <div>
+              <h4 className="text-xs font-black text-slate-800 mb-2">سلامة بيانات التكلفة</h4>
+              {costReport.integrity.length === 0 ? (
+                <p className="text-xs text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-xl p-3">نظيفة — لا ملاحظات.</p>
+              ) : (
+                <div className="overflow-x-auto border border-slate-200 rounded-xl max-h-56 overflow-y-auto">
+                  <table className="w-full text-xs">
+                    <thead className="bg-slate-50 text-slate-700 font-bold border-b sticky top-0">
+                      <tr>
+                        <th className="p-2 text-center">الخطورة</th>
+                        <th className="p-2 text-right">المرجع</th>
+                        <th className="p-2 text-right">الملاحظة</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {costReport.integrity.slice(0, 30).map((f, i) => (
+                        <tr key={i} className="hover:bg-slate-50">
+                          <td className="p-2 text-center">
+                            <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${f.severity === 'error' ? 'bg-rose-100 text-rose-800' : f.severity === 'warning' ? 'bg-amber-100 text-amber-800' : 'bg-blue-100 text-blue-800'}`}>
+                              {f.severity}
+                            </span>
+                          </td>
+                          <td className="p-2 font-mono text-slate-900">{f.refLabel || '—'} <span className="text-slate-400">{f.code}</span></td>
+                          <td className="p-2 text-slate-600">{f.message}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {costReport.integrity.length > 30 && <p className="text-[11px] text-slate-400 p-2">+{costReport.integrity.length - 30} ملاحظات أخرى</p>}
+                </div>
+              )}
+            </div>
+
+            {/* Trend / drift / burn */}
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
+              <div className="p-3 bg-slate-50 rounded-xl border border-slate-200 text-xs">
+                <h4 className="font-black text-slate-800 mb-1.5">الاتجاه (لقطات التكلفة)</h4>
+                {costReport.trend.length <= 1 ? (
+                  <p className="text-slate-400">لقطة واحدة — احفظ لقطات دورية لبناء الاتجاه.</p>
+                ) : (
+                  <ul className="space-y-1 text-slate-600 font-mono">
+                    {costReport.trend.map((t) => (
+                      <li key={t.dataDate + String(t.current)}>{t.dataDate}{t.current ? ' (الحالية)' : ''}: AC {t.ac ?? 'N/A'} · EV {t.ev ?? 'N/A'} · CPI {t.cpi ?? 'N/A'} · EAC {t.eac ?? 'N/A'}</li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+              <div className="p-3 bg-slate-50 rounded-xl border border-slate-200 text-xs">
+                <h4 className="font-black text-slate-800 mb-1.5">الانحراف عن التحديث السابق</h4>
+                {!costReport.drift.hasPrevious ? (
+                  <p className="text-slate-400">N/A — لا يوجد تحديث سابق.</p>
+                ) : (
+                  <ul className="space-y-1 text-slate-600 font-mono">
+                    <li>انحراف EAC: {costReport.drift.eacDrift !== null ? (costReport.drift.eacDrift > 0 ? '+' : '') + costReport.drift.eacDrift.toLocaleString() : 'N/A'}</li>
+                    <li>انحراف ETC: {costReport.drift.etcDrift !== null ? (costReport.drift.etcDrift > 0 ? '+' : '') + costReport.drift.etcDrift.toLocaleString() : 'N/A'}</li>
+                    <li>تغير CPI: {costReport.drift.cpiChange !== null ? costReport.drift.cpiChange : 'N/A'}</li>
+                    <li>الاتجاه: {costReport.drift.direction}</li>
+                  </ul>
+                )}
+              </div>
+              <div className="p-3 bg-slate-50 rounded-xl border border-slate-200 text-xs">
+                <h4 className="font-black text-slate-800 mb-1.5">معدل الحرق</h4>
+                {!costReport.burn.sufficient ? (
+                  <p className="text-slate-400">N/A — {costReport.burn.reason}</p>
+                ) : (
+                  <ul className="space-y-1 text-slate-600 font-mono">
+                    <li>حرق فعلي/يوم: {costReport.burn.acBurnPerDay}</li>
+                    <li>إنتاج مكتسب/يوم: {costReport.burn.evRatePerDay}</li>
+                    <li>كفاءة الاتجاه: {costReport.burn.efficiencyTrend}</li>
+                  </ul>
+                )}
+              </div>
+            </div>
+
+            {/* Anomalies */}
+            <div>
+              <h4 className="text-xs font-black text-slate-800 mb-2">شذوذات التكلفة (بعتبات معلنة)</h4>
+              {costReport.anomalies.length === 0 ? (
+                <p className="text-xs text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-xl p-3">لا شذوذات.</p>
+              ) : (
+                <ul className="space-y-2">
+                  {costReport.anomalies.map((a) => (
+                    <li key={a.code} className="p-3 bg-amber-50/60 rounded-xl border border-amber-200 text-xs">
+                      <span className="font-black text-slate-900 font-mono">{a.code}</span>
+                      <span className="text-slate-600"> — {a.message}</span>
+                      <p className="text-slate-500 mt-0.5 font-mono text-[11px]">العتبة: {a.threshold} · الدليل: {a.evidence.join(' · ')}</p>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+
+            {/* Actions */}
+            <div>
+              <h4 className="text-xs font-black text-slate-800 mb-2">أهم ٥ إجراءات تكلفة</h4>
+              {costReport.actions.length === 0 ? (
+                <p className="text-xs text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-xl p-3">لا إجراءات مطلوبة.</p>
+              ) : (
+                <ol className="space-y-2">
+                  {costReport.actions.map((a) => (
+                    <li key={a.rank} className="p-3 bg-slate-50 rounded-xl border border-slate-200 text-xs">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="w-5 h-5 rounded-full bg-slate-900 text-amber-400 text-[10px] font-black flex items-center justify-center">{a.rank}</span>
+                        <span className="font-black text-slate-900">{a.issue}</span>
+                        <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${a.confidence === 'High' ? 'bg-emerald-100 text-emerald-800' : a.confidence === 'Medium' ? 'bg-amber-100 text-amber-800' : 'bg-rose-100 text-rose-800'}`}>
+                          {a.confidence}
+                        </span>
+                      </div>
+                      <p className="text-slate-600 mt-1"><span className="font-bold">الدليل:</span> {a.evidence.join(' · ')}</p>
+                      <p className="text-slate-600"><span className="font-bold">الأثر المالي:</span> <span className="font-mono">{a.financialImpact.toLocaleString()} SAR</span></p>
+                      {a.scheduleLinkage && <p className="text-slate-600"><span className="font-bold">الارتباط الزمني:</span> {a.scheduleLinkage}</p>}
+                      <p className="text-slate-800"><span className="font-bold">الإجراء:</span> {a.action}</p>
+                    </li>
+                  ))}
+                </ol>
+              )}
+            </div>
+
+            {/* Consistency */}
+            <div>
+              <h4 className="text-xs font-black text-slate-800 mb-2">اتساق الزمن والتكلفة</h4>
+              {costReport.consistencyNote ? (
+                <p className="text-xs text-slate-400">{costReport.consistencyNote}</p>
+              ) : costReport.consistency.length === 0 ? (
+                <p className="text-xs text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-xl p-3">متسق — لا تعارض بين التقدم الزمني والأرقام المالية.</p>
+              ) : (
+                <ul className="space-y-2">
+                  {costReport.consistency.map((f, i) => (
+                    <li key={i} className="p-3 bg-blue-50/60 rounded-xl border border-blue-200 text-xs">
+                      <span className="font-black text-slate-900 font-mono">{f.code}</span>
+                      <span className="text-slate-600"> — {f.message}</span>
+                      <p className="text-slate-500 mt-0.5 font-mono text-[11px]">الدليل: {f.evidence.join(' · ')}</p>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+
+            {/* Confidence */}
+            <div>
+              <h4 className="text-xs font-black text-slate-800 mb-2">الثقة بكل مؤشر</h4>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-2">
+                {(Object.entries(costReport.confidence) as Array<[string, { level: string; notes: string[] }]>).map(([kpi, c]) => (
+                  <div key={kpi} className="p-2.5 bg-slate-50 rounded-xl border border-slate-200 text-xs">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-bold text-slate-700">{kpi}</span>
+                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${c.level === 'High' ? 'bg-emerald-100 text-emerald-800' : c.level === 'Medium' ? 'bg-amber-100 text-amber-800' : 'bg-rose-100 text-rose-800'}`}>
+                        {c.level}
+                      </span>
+                    </div>
+                    <ul className="text-[11px] text-slate-500 mt-1 space-y-0.5">
+                      {c.notes.map((n, i) => (<li key={i}>• {n}</li>))}
+                    </ul>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {activeTab === 'transactions_table' && (
         <div className="space-y-6">
           {/* Add Cost Transaction Form */}
@@ -1367,7 +1885,7 @@ export default function BudgetView({ project }: BudgetViewProps) {
 
               {/* Row 2: CPM Activity Link + Amount + Action Button */}
               <div className="grid grid-cols-1 md:grid-cols-12 gap-3 items-end">
-                <div className="md:col-span-5">
+                <div className="md:col-span-4">
                   <label className="block text-[11px] font-bold text-slate-700 mb-1">تحميل على نشاط CPM في الجدول الزمني:</label>
                   <select
                     value={transactionForm.activity_id}
@@ -1381,8 +1899,19 @@ export default function BudgetView({ project }: BudgetViewProps) {
                   </select>
                 </div>
 
-                <div className="md:col-span-4">
-                  <label className="block text-[11px] font-bold text-slate-700 mb-1">المبلغ المطلوب تسجيله (SAR):</label>
+                <div className="md:col-span-3">
+                  <label className="block text-[11px] font-bold text-slate-700 mb-1">تاريخ الحركة (≤ تاريخ التحديث):</label>
+                  <input
+                    type="date"
+                    value={txnDate}
+                    max={governedDataDate}
+                    onChange={(e) => setTxnDate(e.target.value)}
+                    className="w-full px-3 py-2 border border-slate-300 rounded-xl text-xs font-mono font-bold bg-white outline-none focus:ring-2 focus:ring-amber-500"
+                  />
+                </div>
+
+                <div className="md:col-span-2">
+                  <label className="block text-[11px] font-bold text-slate-700 mb-1">المبلغ (SAR):</label>
                   <input
                     type="number"
                     min="0"

@@ -59,6 +59,8 @@ export interface Project {
   calendar_type?: CalendarType;
   sector?: ProjectSector;
   created_at: string;
+  /** F6: user-supplied remaining-cost re-estimate (SAR); null = not supplied. */
+  manual_etc_override?: number | null;
 }
 
 export interface BoqItem {
@@ -309,6 +311,8 @@ export interface BudgetLine {
   id: string;
   project_id: string;
   wbs_node_id: string | null;
+  /** Direct activity link (migration 20260908004500). Absent on legacy callers. */
+  activity_id?: string | null;
   boq_item_id: string | null;
   description: string | null;
   planned_cost: number;
@@ -416,6 +420,55 @@ export interface ScheduleUpdateSnapshot {
   milestones_slipped: number;
   details: ScheduleSnapshotDetails;
   created_at: string;
+}
+
+/**
+ * F6: one row of `activity_boq_allocations` — the traceable share of a BOQ item's
+ * quantity/cost consumed by an activity. Cost shares (SAR) are the BOQ trace basis;
+ * they explain variances and are never summed into a second total.
+ */
+export interface ActivityBoqAllocation {
+  id: string;
+  project_id: string;
+  activity_id: string;
+  boq_item_id: string;
+  quantity_share: number | null;
+  cost_share: number;
+  allocation_basis: string;
+}
+
+/**
+ * F6: one deterministic cost-control row per (project, data_date).
+ * Aggregates are columns; the EAC method ledger and per-activity cost evidence are
+ * the versioned `details` blob. Missing inputs persist as null, never as defaults.
+ */
+export interface CostControlSnapshot {
+  id: string;
+  project_id: string;
+  data_date: string;
+  bac: number | null;
+  pv: number | null;
+  ev: number | null;
+  ac: number | null;
+  cpi: number | null;
+  spi: number | null;
+  etc: number | null;
+  eac: number | null;
+  vac: number | null;
+  committed: number | null;
+  forecast_confidence: string | null;
+  recommended_method: string | null;
+  details: CostSnapshotDetails;
+  created_at: string;
+}
+
+/** F6: versioned cost evidence inside a cost-control snapshot. */
+export interface CostSnapshotDetails {
+  version: 1;
+  methods: Array<{ key: string; value: number | null; confidence: string; reason: string }>;
+  recommended: { method: string; why: string; confidence: string } | null;
+  activities: Record<string, { ev: number; ac: number; pct: number }>;
+  counts: { activities: number; wbsNodes: number; integrityErrors: number; anomalies: number };
 }
 
 /** F5: versioned per-activity evidence inside a schedule update snapshot. */
