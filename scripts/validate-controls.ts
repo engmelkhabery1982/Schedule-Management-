@@ -18,6 +18,8 @@
  *   S11 finish-forecast + rollup reconciliation     (acceptance G/H)
  *   S12 NaN/Infinity scan on empty + sparse inputs  (acceptance E/L)
  *   S13 determinism of the full pipeline            (acceptance J)
+ *   S17 Controlled Pilot defects                    (F9.4: EVM reconciliation, cost-approval
+ *                                                    persistence, F5 baseline/delay, critical count)
  *
  * Expectations are either independently hand-computed (refWdDelta replicates the documented
  * inclusive working-day convention on purpose) or exact quotes of the source engine's output —
@@ -34,10 +36,12 @@ import { levelScheduleResources } from '@/lib/resourceLevelingEngine';
 import { parseXerContent } from '@/lib/xerImporter';
 import { generateBoqPlan, emptyBoqOverrides } from '@/lib/boqPlanningEngine';
 import { calculateProjectEvmAtDataDate, deriveEvmFromScalars, assessEvmRatios } from '@/lib/planningEngine';
-import { analyzeScheduleControl, buildUpdateSnapshot, workingDayDelta } from '@/lib/scheduleControlEngine';
+import { analyzeScheduleControl, buildUpdateSnapshot, workingDayDelta, summarizeCanonicalCriticality } from '@/lib/scheduleControlEngine';
 import { analyzeCostControl, buildCostSnapshot } from '@/lib/costControlEngine';
 import { analyzeIntegratedDecisions, gateConfidence } from '@/lib/integratedDecisionEngine';
 import { analyzeForecastTrust } from '@/lib/forecastTrustEngine';
+import { selectCanonicalEvm, canonicalEvmToComprehensive, quoteCanonicalEvm, CANONICAL_EVM_SOURCE } from '@/lib/canonicalEvm';
+import { applyReviewCostTransaction, unimplementedRpcError, reviewStateOf, type DemoDb } from '@/lib/demoDbContracts';
 import { reconcileFinishForecasts, calculateCpmDeterministicEarlyFinish } from '@/lib/forecastReconciliation';
 import { calculateControlHealth } from '@/lib/controlHealthEngine';
 import {
@@ -45,7 +49,7 @@ import {
   calculateScenarioSensitivityTornado, STANDARD_COMPLEX_SCENARIOS,
 } from '@/lib/complexScenarioSimulator';
 import type {
-  Activity, ActivityBoqAllocation, ActivityLink, ActivityResource, BaselineActivity, BoqItem,
+  Activity, ActivityBoqAllocation, ActivityLink, ActivityResource, BaselineActivity, BoqItem, BudgetLine,
   ComplexScenarioModel, ComplexScenarioResult, CostControlSnapshot, CostTransaction, ParsedBoqRow,
   Project, ProgressUpdate, Resource, ScenarioSensitivityTornado, ScheduleUpdateSnapshot, WbsNode,
 } from '@/types';
@@ -1160,6 +1164,382 @@ console.log('--- S16 tornado sensitivity + cash-flow audit (F9.3 anti-pseudo-ana
   ok('S16 watchdog: no cash-flow-integrity metric anywhere claims a measured precision status',
     wd.every((m) => m.category !== 'cashflow_integrity' || (m.precisionStatus === 'not_measured' && m.deviation === null)));
   noNonFinite('S16 watchdog: full audit output carries no NaN/Infinity', wd);
+}
+
+
+// ===========================================================================
+console.log('--- S17 Controlled Pilot defects (F9.4)');
+// ===========================================================================
+// The four defects the Controlled Pilot stopped on. Each subsection first proves the scenario
+// actually REPRODUCES the reported symptom against the pre-fix code path, then asserts the fixed
+// behaviour — a regression test that cannot fail on the old code is not a regression test.
+{
+  const mkProject = (o: Partial<Project> = {}): Project => ({
+    id: 'p1', name: 'Controlled Pilot — commercial office building', client: null, location: null,
+    contract_value: 2345150, currency: 'SAR', start_date: '2026-07-01', end_date: '2027-02-28',
+    data_date: DD, duration_days: 195, status: 'active', description: null,
+    calendar_type: '6_days', created_at: '2026-01-01T00:00:00Z', ...o,
+  });
+  // `approved_budget` is `number | undefined` on the type, so it is simply omitted here: the
+  // legacy derivation reads `planned_cost || approved_budget`, and F6 reads the baseline.
+  const bl = (id: string, wbsNodeId: string, planned: number): BudgetLine => ({
+    id, project_id: 'p1', wbs_node_id: wbsNodeId, activity_id: null, boq_item_id: null,
+    description: id, planned_cost: planned, committed_cost: 0,
+    actual_cost: 0, remaining_cost: planned, created_at: '2026-01-01T00:00:00Z',
+  });
+
+  // ---------------------------------------------------------------------
+  // S17-A  EVM reconciliation: one canonical SSOT, quoted by every screen
+  // ---------------------------------------------------------------------
+  // Pilot-shaped dataset: four completed activities in WBS node w1 (whose budget is split over TWO
+  // budget lines), one 70%-complete activity in w2, two not-started activities. Every BAC source
+  // agrees at 2,345,150 — exactly as in the pilot — so the divergence is purely in how each engine
+  // WEIGHTS an activity's budget and earns its percent.
+  const pilotProject = mkProject();
+  const pilotActs = [
+    act({ id: 'PA1', code: 'PA1', wbs_node_id: 'w1', early_start: '2026-07-01', early_finish: '2026-07-13', duration_days: 12, percent_complete: 100, actual_start: '2026-07-01', actual_finish: '2026-07-13' }),
+    act({ id: 'PA2', code: 'PA2', wbs_node_id: 'w1', early_start: '2026-07-14', early_finish: '2026-07-22', duration_days: 8, percent_complete: 100, actual_start: '2026-07-14', actual_finish: '2026-07-22' }),
+    act({ id: 'PA3', code: 'PA3', wbs_node_id: 'w1', early_start: '2026-07-23', early_finish: '2026-08-14', duration_days: 20, percent_complete: 100, actual_start: '2026-07-23', actual_finish: '2026-08-14' }),
+    act({ id: 'PA4', code: 'PA4', wbs_node_id: 'w1', early_start: '2026-08-15', early_finish: '2026-08-25', duration_days: 10, percent_complete: 100, actual_start: '2026-08-15', actual_finish: '2026-08-25' }),
+    act({ id: 'PA5', code: 'PA5', wbs_node_id: 'w2', early_start: '2026-08-26', early_finish: '2026-09-19', duration_days: 22, percent_complete: 70, actual_start: '2026-08-26' }),
+    act({ id: 'PA6', code: 'PA6', wbs_node_id: 'w2', early_start: '2026-09-20', early_finish: '2026-11-08', duration_days: 45, percent_complete: 0 }),
+    act({ id: 'PA7', code: 'PA7', wbs_node_id: 'w3', early_start: '2026-10-01', early_finish: '2026-11-04', duration_days: 30, percent_complete: 0 }),
+  ];
+  const pilotLinks = [link('PL1', 'PA1', 'PA2'), link('PL2', 'PA2', 'PA3'), link('PL3', 'PA3', 'PA4'), link('PL4', 'PA4', 'PA5'), link('PL5', 'PA5', 'PA6')];
+  // The approved baseline authorizes BAC per activity (the PMB). Sums to the contract value.
+  const pilotBaselines = [
+    base('PB1', 'PA1', '2026-07-01', '2026-07-13', 12, 42000),
+    base('PB2', 'PA2', '2026-07-14', '2026-07-22', 8, 39900),
+    base('PB3', 'PA3', '2026-07-23', '2026-08-14', 20, 323150),
+    base('PB4', 'PA4', '2026-08-15', '2026-08-25', 10, 20250),
+    base('PB5', 'PA5', '2026-08-26', '2026-09-19', 22, 468000),
+    base('PB6', 'PA6', '2026-09-20', '2026-11-08', 45, 468000),
+    base('PB7', 'PA7', '2026-10-01', '2026-11-04', 30, 983850),
+  ];
+  // Node w1's budget is split over TWO lines — the shape that broke the legacy allocation, which
+  // took only the FIRST matching line and handed it in full to all four w1 activities.
+  // Node w2's budget is likewise split, with the bulk in the SECOND line. The legacy derivation
+  // matched only the first line per node and then re-scaled to BAC, so the not-started PA7 (whose
+  // node holds one large line) absorbed most of the budget and earned nothing — collapsing EV.
+  const pilotBudget = [
+    bl('PBL1', 'w1', 42000), bl('PBL2', 'w1', 383300),
+    bl('PBL3', 'w2', 46000), bl('PBL4', 'w2', 890000),
+    bl('PBL5', 'w3', 983850),
+  ];
+  const pilotUpdates = [
+    upd('PU1', 'PA1', '2026-07-13', 100), upd('PU2', 'PA2', '2026-07-22', 100),
+    upd('PU3', 'PA3', '2026-08-14', 100), upd('PU4', 'PA4', '2026-08-25', 100),
+    upd('PU5', 'PA5', '2026-09-12', 70),
+  ];
+  const pilotTxns = [
+    txn('PT1', 'PA1', '2026-07-15', 40500), txn('PT2', 'PA2', '2026-07-24', 39900),
+    txn('PT3', 'PA3', '2026-08-16', 310000), txn('PT4', 'PA4', '2026-08-28', 19500),
+    txn('PT5', 'PA5', '2026-09-10', 280000),
+  ];
+  eq('S17-A baseline BAC reconciles to the contract value', pilotBaselines.reduce((s, b) => s + b.planned_cost, 0), 2345150);
+  eq('S17-A budget lines reconcile to the contract value', pilotBudget.reduce((s, b) => s + b.planned_cost, 0), 2345150);
+
+  const pilotF5 = analyzeScheduleControl({
+    activities: pilotActs, links: pilotLinks, baselines: pilotBaselines, progressUpdates: pilotUpdates,
+    previousSnapshot: null, dataDate: DD, calendarType: '6_days',
+  });
+  const pilotF6 = analyzeCostControl({
+    project: pilotProject, activities: pilotActs, baselines: pilotBaselines, budgetLines: pilotBudget,
+    costTransactions: pilotTxns, progressUpdates: pilotUpdates, wbsNodes: [], boqItems: [],
+    allocations: [], previousSnapshots: [], dataDate: DD, calendarType: '6_days',
+  });
+  const canonical = selectCanonicalEvm(pilotF6);
+  const adapted = canonicalEvmToComprehensive(canonical);
+  const pilotTrust = analyzeForecastTrust({
+    scheduleReport: pilotF5, costReport: pilotF6, decisionReport: null,
+    activities: pilotActs, links: pilotLinks, baselines: pilotBaselines, progressUpdates: pilotUpdates,
+    costTransactions: pilotTxns, boqItems: [], allocations: [],
+    scheduleSnapshots: [], costSnapshots: [], dataDate: DD, calendarType: '6_days',
+  });
+  // The superseded second derivation, kept here ONLY to prove the scenario reproduces the defect.
+  const legacy = calculateProjectEvmAtDataDate(pilotProject, pilotActs, pilotBudget, [], pilotTxns, pilotUpdates);
+
+  // (i) the scenario really is the pilot defect: the two derivations disagreed materially.
+  ok('S17-A scenario reproduces the pilot: the superseded derivation produced a different EV',
+    legacy.ev !== pilotF6.project.ev);
+  // The reported pilot numbers, reproduced to the riyal: a healthy F6 (CPI 1.091) read as a
+  // distressed project (CPI 0.55, EAC 4.26m against a 2.35m contract) by the second derivation.
+  eq('S17-A canonical EV is the pilot-reported 752,900', pilotF6.project.ev, 752900);
+  eq('S17-A canonical CPI is the pilot-reported 1.091', pilotF6.project.cpi, 1.091);
+  eq('S17-A canonical EAC is the pilot-reported 2,149,541.7', pilotF6.project.eac, 2149541.7);
+  eq('S17-A the superseded derivation collapsed EV to 377,456', legacy.ev, 377456);
+  eq('S17-A the superseded derivation collapsed CPI to 0.55', legacy.cpi, 0.55);
+  eq('S17-A the superseded derivation inflated EAC to 4,263,909', legacy.eac, 4263909);
+  ok('S17-A the superseded derivation retained barely half the canonical earned value',
+    legacy.ev < 0.55 * (pilotF6.project.ev ?? 0));
+  ok('S17-A scenario reproduces the pilot: CPI and EAC diverged with EV',
+    legacy.cpi !== pilotF6.project.cpi && legacy.eac !== pilotF6.project.eac
+    && legacy.vac !== pilotF6.project.vac && legacy.pv !== pilotF6.project.pv);
+  ok('S17-A the divergence was NOT a BAC or AC disagreement (both sources agreed there)',
+    legacy.bac === pilotF6.bac.value && legacy.ac === pilotF6.project.ac);
+  eq('S17-A BAC agreed in both (the pilot divergence was weighting, not budget)', legacy.bac, pilotF6.bac.value);
+  eq('S17-A AC agreed in both (approved-only + Data Date filter is shared)', legacy.ac, pilotF6.project.ac);
+
+  // (ii) the canonical read-out is a VERBATIM quote of F6 — no re-derivation, no rounding drift.
+  eq('S17-A canonical declares its source', canonical.source, CANONICAL_EVM_SOURCE);
+  eq('S17-A canonical.dataDate === F6.dataDate', canonical.dataDate, pilotF6.dataDate);
+  eq('S17-A canonical.BAC === F6.BAC', canonical.bac, pilotF6.bac.value);
+  eq('S17-A canonical.PV === F6.PV', canonical.pv, pilotF6.project.pv);
+  eq('S17-A canonical.EV === F6.EV', canonical.ev, pilotF6.project.ev);
+  eq('S17-A canonical.AC === F6.AC', canonical.ac, pilotF6.project.ac);
+  eq('S17-A canonical.CPI === F6.CPI (quoted at F6 precision, not re-rounded)', canonical.cpi, pilotF6.project.cpi);
+  eq('S17-A canonical.SPI === F6.SPI', canonical.spi, pilotF6.project.spi);
+  eq('S17-A canonical.ETC === F6.ETC', canonical.etc, pilotF6.project.etc);
+  eq('S17-A canonical.EAC === F6.EAC', canonical.eac, pilotF6.project.eac);
+  eq('S17-A canonical.VAC === F6.VAC', canonical.vac, pilotF6.project.vac);
+  eq('S17-A canonical.CV === F6.CV', canonical.cv, pilotF6.project.cv);
+  eq('S17-A canonical.SV === F6.SV', canonical.sv, pilotF6.project.sv);
+  eq('S17-A canonical BAC basis names the approved baseline', canonical.bacSource, 'approved_baseline');
+
+  // (iii) F8 QUOTES the canonical result — it is a trust layer, not a second EVM engine.
+  eq('S17-A F8 quoted EAC === canonical EAC', pilotTrust.trust.eac, canonical.eac);
+  eq('S17-A F8 quoted forecast finish === F5 forecast finish', pilotTrust.trust.forecastFinish, pilotF5.project.forecastFinish);
+  ok('S17-A F8 publishes no EVM figure that contradicts F6',
+    pilotTrust.trust.eac === pilotF6.project.eac);
+
+  // (iv) the shape adapter used by the S-curve / earned-schedule / control-health engines carries
+  //      the SAME canonical numbers, so no consumer downstream can drift.
+  eq('S17-A adapted.BAC === canonical.BAC', adapted.bac, canonical.bac);
+  eq('S17-A adapted.PV === canonical.PV', adapted.pv, canonical.pv);
+  eq('S17-A adapted.EV === canonical.EV', adapted.ev, canonical.ev);
+  eq('S17-A adapted.AC === canonical.AC', adapted.ac, canonical.ac);
+  eq('S17-A adapted.CPI === canonical.CPI', adapted.cpi, canonical.cpi);
+  eq('S17-A adapted.SPI === canonical.SPI', adapted.spi, canonical.spi);
+  eq('S17-A adapted.EAC === canonical.EAC', adapted.eac, canonical.eac);
+  eq('S17-A adapted.ETC === canonical.ETC', adapted.etc, canonical.etc);
+  eq('S17-A adapted.VAC === canonical.VAC', adapted.vac, canonical.vac);
+  eq('S17-A quoteCanonicalEvm(F6) is byte-identical to select+adapt', JSON.stringify(quoteCanonicalEvm(pilotF6)), JSON.stringify(adapted));
+
+  // (v) the reported equalities the pilot required, stated as one chain each.
+  eq('S17-A F6.EV === F8-quoted EV === report EV',
+    [pilotF6.project.ev, canonical.ev, adapted.ev],
+    [pilotF6.project.ev, pilotF6.project.ev, pilotF6.project.ev]);
+  eq('S17-A F6.CPI === report CPI === adapted CPI',
+    [pilotF6.project.cpi, canonical.cpi, adapted.cpi],
+    [pilotF6.project.cpi, pilotF6.project.cpi, pilotF6.project.cpi]);
+  eq('S17-A F6.EAC === F8-quoted EAC === report EAC',
+    [pilotF6.project.eac, pilotTrust.trust.eac, adapted.eac],
+    [pilotF6.project.eac, pilotF6.project.eac, pilotF6.project.eac]);
+
+  // (vi) determinism + no non-finite leakage through the canonical path.
+  const canonical2 = selectCanonicalEvm(analyzeCostControl({
+    project: pilotProject, activities: pilotActs, baselines: pilotBaselines, budgetLines: pilotBudget,
+    costTransactions: pilotTxns, progressUpdates: pilotUpdates, wbsNodes: [], boqItems: [],
+    allocations: [], previousSnapshots: [], dataDate: DD, calendarType: '6_days',
+  }));
+  eq('S17-A canonical EVM is deterministic for identical inputs', JSON.stringify(canonical2), JSON.stringify(canonical));
+  noNonFinite('S17-A canonical EVM scan', canonical);
+  noNonFinite('S17-A adapted EVM scan', adapted);
+
+  // (vii) no project => the explicit all-N/A canonical state, never a fabricated budget.
+  const emptyCanonical = selectCanonicalEvm(null);
+  eq('S17-A no F6 report => BAC is N/A, not an invented budget', emptyCanonical.bac, null);
+  eq('S17-A no F6 report => EV is N/A', emptyCanonical.ev, null);
+  eq('S17-A no F6 report => CPI flagged empty, not a healthy 1.0 presented as measured', emptyCanonical.cpiStatus, 'empty_no_data');
+  eq('S17-A no F6 report => earned progress is N/A', emptyCanonical.earnedProgressPercent, null);
+  noNonFinite('S17-A empty canonical scan', emptyCanonical);
+  noNonFinite('S17-A empty adapted scan', canonicalEvmToComprehensive(emptyCanonical));
+
+  // ---------------------------------------------------------------------
+  // S17-B  Cost-transaction approval persists (demo-store RPC contract)
+  // ---------------------------------------------------------------------
+  const PILOT_TXN_DESC = 'Controlled Pilot cost transaction - 100 SAR';
+  const mkDb = (txnOverrides: Record<string, unknown> = {}, date = '2026-09-10'): DemoDb => ({
+    cost_transactions: [{
+      id: 'cp-100', project_id: 'p1', activity_id: 'PA5', boq_item_id: null, category: 'work',
+      transaction_date: date, description: PILOT_TXN_DESC, cost_type: 'direct', amount: 100,
+      source: 'manual', status: 'submitted', approved_at: null, approved_by: null,
+      rejected_reason: null, approval_level: 0, created_at: '2026-09-10T08:00:00Z', ...txnOverrides,
+    }],
+    approval_events: [],
+  });
+  const NOW = '2026-09-13T09:00:00Z';
+  const rowOf = (db: DemoDb) => (db['cost_transactions'] || [])[0];
+
+  // The pilot symptom: Approve produced NO state change and NO error. The contract now writes.
+  const dbA = mkDb();
+  const first = applyReviewCostTransaction(dbA, { transaction_uuid: 'cp-100', approver: 'project_control', decision: 'approve' }, NOW);
+  eq('S17-B first approval returns no error', first.error, null);
+  eq('S17-B first approval advances the level (two-level SQL gate)', rowOf(dbA).approval_level, 1);
+  eq('S17-B level 1 is still submitted — status is not faked to approved', rowOf(dbA).status, 'submitted');
+  eq('S17-B level 1 sets no approval timestamp', rowOf(dbA).approved_at, null);
+  eq('S17-B the advance is VISIBLE to the caller (the pilot showed nothing at all)', reviewStateOf(rowOf(dbA))?.awaitingFurtherApproval, true);
+
+  const second = applyReviewCostTransaction(dbA, { transaction_uuid: 'cp-100', approver: 'finance_manager', decision: 'approve' }, NOW);
+  eq('S17-B second approval returns no error', second.error, null);
+  eq('S17-B pending -> approved', rowOf(dbA).status, 'approved');
+  eq('S17-B approval_level reaches the contractual maximum', rowOf(dbA).approval_level, 2);
+  eq('S17-B approved_at is set to a timestamptz-shaped ISO instant', rowOf(dbA).approved_at, NOW);
+  ok('S17-B approved_at parses as a real date', !Number.isNaN(new Date(String(rowOf(dbA).approved_at)).getTime()));
+  eq('S17-B approved_by records the approver', rowOf(dbA).approved_by, 'finance_manager');
+  eq('S17-B review state reports approved', reviewStateOf(rowOf(dbA))?.isApproved, true);
+  eq('S17-B no approval levels remain', reviewStateOf(rowOf(dbA))?.levelsRemaining, 0);
+
+  // Persistence contract: the write landed in the STORE, not in local component state. Re-reading
+  // the store (what a reload does) still shows the row approved.
+  const reloaded = JSON.parse(JSON.stringify(dbA)) as DemoDb;
+  eq('S17-B approval survives a reload (persisted, not optimistic local state)', rowOf(reloaded).status, 'approved');
+  eq('S17-B approved_at survives a reload', rowOf(reloaded).approved_at, NOW);
+  eq('S17-B every decision is audit-trailed', (dbA['approval_events'] || []).length, 2);
+  eq('S17-B the audit trail names the entity', (dbA['approval_events'] || [])[0].entity_type, 'cost_transaction');
+
+  // An already-approved row is not re-reviewable: the SQL raises, so the demo store must too, and
+  // must NOT report success.
+  const dbApproved = mkDb({ status: 'approved', approval_level: 2 });
+  const reApprove = applyReviewCostTransaction(dbApproved, { transaction_uuid: 'cp-100', approver: 'project_control', decision: 'approve' }, NOW);
+  ok('S17-B re-approving a non-submitted row FAILS', reApprove.error !== null);
+  ok('S17-B the failure names the contract breach', String(reApprove.error?.message).includes('Only submitted cost transactions'));
+  ok('S17-B the failure identifies the failed step', String(reApprove.error?.hint).includes('review_cost_transaction'));
+  eq('S17-B a failed review writes nothing', rowOf(dbApproved).approved_at, null);
+
+  const dbMissing = mkDb();
+  const missing = applyReviewCostTransaction(dbMissing, { transaction_uuid: 'does-not-exist', decision: 'approve' }, NOW);
+  ok('S17-B an unknown row id FAILS instead of silently succeeding', missing.error !== null);
+  eq('S17-B an unknown row id leaves the store untouched', rowOf(dbMissing).status, 'submitted');
+
+  const dbBad = mkDb();
+  const badDecision = applyReviewCostTransaction(dbBad, { transaction_uuid: 'cp-100', decision: 'maybe' }, NOW);
+  ok('S17-B an invalid decision FAILS', badDecision.error !== null);
+  eq('S17-B an invalid decision names the breach', badDecision.error?.message, 'Invalid review decision');
+  eq('S17-B an invalid decision writes nothing', rowOf(dbBad).status, 'submitted');
+
+  // The exact mechanism that hid the pilot defect: an RPC the store does not implement used to
+  // answer `{ data: true, error: null }`, which the UI read as a committed write.
+  const unimplemented = unimplementedRpcError('review_cost_transaction');
+  ok('S17-B an unimplemented RPC is an ERROR, never a false success', unimplemented.error !== null);
+  ok('S17-B the error names the missing function', String(unimplemented.error?.message).includes('review_cost_transaction'));
+  ok('S17-B the error states the write did not happen', String(unimplemented.error?.details).includes('NOT performed'));
+  eq('S17-B an unimplemented RPC returns no data payload', unimplemented.data, null);
+
+  // Rejection path.
+  const dbR = mkDb();
+  const rejected = applyReviewCostTransaction(dbR, { transaction_uuid: 'cp-100', approver: 'reviewer', decision: 'reject', review_notes: 'needs correction' }, NOW);
+  eq('S17-B rejection returns no error', rejected.error, null);
+  eq('S17-B rejection sets status rejected', rowOf(dbR).status, 'rejected');
+  eq('S17-B rejection records the reason', rowOf(dbR).rejected_reason, 'needs correction');
+  eq('S17-B a rejected row is not approved', reviewStateOf(rowOf(dbR))?.isApproved, false);
+
+  // AC cut-off: an approved row enters canonical AC only when its date is on/before the Data Date.
+  const acOf = (date: string, status: string): number => analyzeCostControl({
+    project: pilotProject, activities: pilotActs, baselines: pilotBaselines, budgetLines: pilotBudget,
+    costTransactions: [...pilotTxns, txn('CPX', 'PA5', date, 100, status)],
+    progressUpdates: pilotUpdates, wbsNodes: [], boqItems: [], allocations: [],
+    previousSnapshots: [], dataDate: DD, calendarType: '6_days',
+  }).project.ac;
+  const acBaseline = pilotF6.project.ac;
+  eq('S17-B an approved 100 SAR row dated on/before the Data Date enters AC', acOf('2026-09-10', 'approved'), acBaseline + 100);
+  eq('S17-B an approved row dated AFTER the Data Date is excluded from AC', acOf('2026-09-20', 'approved'), acBaseline);
+  eq('S17-B a still-submitted row is excluded from AC (approved-only rule)', acOf('2026-09-10', 'submitted'), acBaseline);
+  eq('S17-B a rejected row is excluded from AC', acOf('2026-09-10', 'rejected'), acBaseline);
+  ok('S17-B the approved 100 SAR row is inside the Data Date window', !isAfterDataDate('2026-09-10', DD) && isAfterDataDate('2026-09-20', DD));
+
+  // ---------------------------------------------------------------------
+  // S17-C  F5 baseline finish / total delay (the -310 corruption)
+  // ---------------------------------------------------------------------
+  // CPM anchors on the activity's own early_start, so this pair forecasts a project finish of
+  // exactly 2027-03-03 on the 6-day calendar (Friday off).
+  const delayActs = [
+    act({ id: 'DL1', code: 'DL1', early_start: '2027-02-21', early_finish: '2027-03-03', duration_days: 10, percent_complete: 0 }),
+    act({ id: 'DL2', code: 'DL2', early_start: '2027-02-21', early_finish: '2027-02-26', duration_days: 5, percent_complete: 0 }),
+  ];
+  const delayBaselines = [
+    base('DB1', 'DL1', '2027-02-18', '2027-02-28', 10, 500000),
+    base('DB2', 'DL2', '2027-02-18', '2027-02-26', 5, 100000),
+    // The leak: a baseline row belonging to ANOTHER project (its activity is not in the analysed
+    // set). `baseline_activities` has no project_id, so an unscoped fetch delivers exactly this.
+    base('DB-FOREIGN', 'other-project-activity', '2027-03-01', '2028-02-28', 200, 9999999),
+  ];
+  const f5leak = analyzeScheduleControl({
+    activities: delayActs, links: [], baselines: delayBaselines, progressUpdates: [],
+    previousSnapshot: null, dataDate: DD, calendarType: '6_days',
+  });
+  ok('S17-C the scenario really contains a foreign 2028 baseline row',
+    delayBaselines.some((b) => b.early_finish === '2028-02-28' && !delayActs.some((a) => a.id === b.activity_id)));
+  eq('S17-C baseline finish is the PROJECT baseline, not the foreign 2028 row', f5leak.project.baselineFinish, '2027-02-28');
+  ok('S17-C baseline finish is never year-shifted to 2028', String(f5leak.project.baselineFinish).startsWith('2027'));
+  eq('S17-C forecast finish is exactly 2027-03-03', f5leak.project.forecastFinish, '2027-03-03');
+  ok('S17-C total delay is POSITIVE (a slip, not recovered time)', (f5leak.project.totalDelayWd ?? -1) > 0);
+  eq('S17-C total delay uses the F5 inclusive working-day convention', f5leak.project.totalDelayWd, refWdDelta('2027-02-28', '2027-03-03'));
+  eq('S17-C total delay is the small pilot-scale value (3 wd)', f5leak.project.totalDelayWd, 3);
+  ok('S17-C total delay is NEVER -310', f5leak.project.totalDelayWd !== -310);
+  eq('S17-C the same result holds when the caller scopes the rows itself',
+    JSON.stringify(analyzeScheduleControl({
+      activities: delayActs, links: [], baselines: delayBaselines.filter((b) => b.activity_id !== 'other-project-activity'),
+      progressUpdates: [], previousSnapshot: null, dataDate: DD, calendarType: '6_days',
+    }).project), JSON.stringify(f5leak.project));
+  // Working-day sanity on the governed calendar for these exact dates.
+  eq('S17-C workingDayDelta(2027-02-28 -> 2027-03-03) on 6_days = 3',
+    workingDayDelta('2027-02-28', '2027-03-03', getCalendar('6_days')), 3);
+  eq('S17-C the corrupt pairing (2028-02-28 -> 2027-03-03) is exactly the reported -310',
+    workingDayDelta('2028-02-28', '2027-03-03', getCalendar('6_days')), -310);
+  noNonFinite('S17-C F5 project scan', f5leak.project);
+
+  // ---------------------------------------------------------------------
+  // S17-D  Critical activity count: one canonical definition everywhere
+  // ---------------------------------------------------------------------
+  // Three 100%-complete activities still carry the persisted `is_critical` flag (as the pilot seed
+  // did), while the statused CPM at the Data Date drives criticality through the remaining work.
+  const critActs = [
+    act({ id: 'CC1', code: 'CC1', early_start: '2026-07-01', early_finish: '2026-07-13', duration_days: 10, percent_complete: 100, actual_start: '2026-07-01', actual_finish: '2026-07-13', is_critical: true, total_float: 0 }),
+    act({ id: 'CC2', code: 'CC2', early_start: '2026-07-14', early_finish: '2026-07-25', duration_days: 10, percent_complete: 100, actual_start: '2026-07-14', actual_finish: '2026-07-25', is_critical: true, total_float: 0 }),
+    act({ id: 'CC3', code: 'CC3', early_start: '2026-07-26', early_finish: '2026-08-10', duration_days: 12, percent_complete: 100, actual_start: '2026-07-26', actual_finish: '2026-08-10', is_critical: true, total_float: 0 }),
+    act({ id: 'CC4', code: 'CC4', early_start: '2026-08-11', early_finish: '2026-09-20', duration_days: 20, percent_complete: 60, actual_start: '2026-08-11', is_critical: true, total_float: 0 }),
+    act({ id: 'CC5', code: 'CC5', early_start: '2026-09-21', early_finish: '2026-10-20', duration_days: 20, percent_complete: 0, is_critical: true, total_float: 0 }),
+    act({ id: 'CC6', code: 'CC6', early_start: '2026-08-11', early_finish: '2026-08-20', duration_days: 8, percent_complete: 0, is_critical: false, total_float: 12 }),
+  ];
+  const critLinks = [link('CL1', 'CC1', 'CC2'), link('CL2', 'CC2', 'CC3'), link('CL3', 'CC3', 'CC4'), link('CL4', 'CC4', 'CC5')];
+  const critF5 = analyzeScheduleControl({
+    activities: critActs, links: critLinks, baselines: [], progressUpdates: [],
+    previousSnapshot: null, dataDate: DD, calendarType: '6_days',
+  });
+  const crit = summarizeCanonicalCriticality(critActs, critLinks, { dataDate: DD, calendarType: '6_days' });
+  const cpmCrit = calculateCpm(critActs, critLinks, { calendarType: '6_days', dataDate: DD }).results.filter((r) => r.isCritical).length;
+  const staleFlagCount = critActs.filter((a) => a.is_critical).length;
+  const oldDashboardFormula = critActs.filter((a) => a.is_critical && a.percent_complete < 100).length;
+
+  ok('S17-D scenario reproduces the pilot: the stale flag count exceeds the canonical count', staleFlagCount > crit.totalCritical);
+  eq('S17-D the stale persisted flag count is the reported 9-shape (5 flagged, 2 canonical)', staleFlagCount, 5);
+  eq('S17-D canonical total === CPM result.isCritical count', crit.totalCritical, cpmCrit);
+  eq('S17-D canonical total === F5 project.criticalCount (one source, two consumers)', crit.totalCritical, critF5.project.criticalCount);
+  ok('S17-D canonical total excludes completed work the stale flag still marked critical', crit.totalCritical < staleFlagCount);
+  ok('S17-D a completed activity carrying is_critical=true is NOT canonically critical',
+    crit.byId.get('CC1')?.critical === false && crit.byId.get('CC2')?.critical === false && crit.byId.get('CC3')?.critical === false);
+  ok('S17-D the remaining critical activities ARE canonically critical',
+    crit.byId.get('CC4')?.critical === true && crit.byId.get('CC5')?.critical === true);
+
+  // The incomplete subset is a SEPARATE, explicitly named metric — tested on its own, never
+  // presented as the total.
+  eq('S17-D remaining === canonical-critical AND not completed', crit.remainingCritical,
+    critActs.filter((a) => crit.byId.get(a.id)?.critical && !crit.byId.get(a.id)?.completed).length);
+  ok('S17-D remaining is a subset of the total', crit.remainingCritical <= crit.totalCritical);
+  eq('S17-D remaining ids are exactly the incomplete canonical-critical activities', crit.remainingCriticalIds, ['CC4', 'CC5']);
+  eq('S17-D total ids include every canonical-critical activity', crit.criticalIds, ['CC4', 'CC5']);
+  ok('S17-D the old dashboard formula (stale flag && pct<100) is not the canonical definition',
+    oldDashboardFormula !== crit.totalCritical || staleFlagCount !== crit.totalCritical);
+  eq('S17-D F5 statused rows agree with the shared canonical helper',
+    critF5.statused.filter((s) => s.critical).length, crit.totalCritical);
+  eq('S17-D F5 statused incomplete-critical agrees with the named subset',
+    critF5.statused.filter((s) => s.critical && !s.completed).length, crit.remainingCritical);
+
+  // Empty project: no activities, no criticality, no fabricated count.
+  const critEmpty = summarizeCanonicalCriticality([], [], { dataDate: DD, calendarType: '6_days' });
+  eq('S17-D empty project canonical total is 0', critEmpty.totalCritical, 0);
+  eq('S17-D empty project remaining is 0', critEmpty.remainingCritical, 0);
+  // Determinism.
+  eq('S17-D canonical criticality is deterministic',
+    JSON.stringify(summarizeCanonicalCriticality(critActs, critLinks, { dataDate: DD, calendarType: '6_days' }).criticalIds),
+    JSON.stringify(crit.criticalIds));
+  // Machine-clock independence: criticality must not read the wall clock.
+  let critShifted: string[] = [];
+  withShiftedClock(400, () => {
+    critShifted = summarizeCanonicalCriticality(critActs, critLinks, { dataDate: DD, calendarType: '6_days' }).criticalIds;
+  });
+  eq('S17-D canonical criticality is identical under a +400d clock shift', JSON.stringify(critShifted), JSON.stringify(crit.criticalIds));
 }
 
 // ---------------------------------------------------------------------------

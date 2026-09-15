@@ -14,11 +14,12 @@ import type {
 import { runDcma14PointAudit } from '@/lib/scheduleQualityEngine';
 import { generateSCurveData, type SCurveData } from '@/lib/sCurveEngine';
 import { calculateEarnedSchedule } from '@/lib/earnedScheduleEngine';
-import {
-  calculateProjectEvmAtDataDate,
-  deriveEvmFromScalars,
-  type ComprehensiveProjectEvm,
-} from '@/lib/planningEngine';
+import { type ComprehensiveProjectEvm } from '@/lib/planningEngine';
+// F9.4 (Controlled Pilot defects 1 & 4): this report QUOTES the canonical engines instead of
+// running its own derivations. F6 is canonical for cost, F5/canonical CPM for criticality.
+import { analyzeCostControl, type CostControlReport } from '@/lib/costControlEngine';
+import { summarizeCanonicalCriticality } from '@/lib/scheduleControlEngine';
+import { canonicalEvmToComprehensive, selectCanonicalEvm, type CanonicalEvm } from '@/lib/canonicalEvm';
 import { reconcileFinishForecasts } from '@/lib/forecastReconciliation';
 import { DEFAULT_DATA_DATE } from '@/lib/projectControlsConstants';
 import SCurveChart from '@/components/views/SCurveChart';
@@ -108,32 +109,69 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
   // Typed as the canonical `ComprehensiveProjectEvm` (it always was one at runtime): the former
   // narrow annotation hid `earnedProgressPercent`, the ratio statuses and `dataDate` from this
   // report, so the progress and data-quality semantics could not be shown (GAP-039 / GAP-036).
-  const evmMetrics: ComprehensiveProjectEvm = useMemo(() => {
-    // Null safety (no project selected yet): return the canonical all-zero empty state instead of
-    // dereferencing `project!`. Same pattern as Dashboard — no fabricated Project, no conditional
-    // hook, and the ratios come back flagged 'empty_no_data' rather than as fake performance.
-    if (!project) return deriveEvmFromScalars(0, 0, 0, 0);
-    return calculateProjectEvmAtDataDate(
+  // F9.4 (Controlled Pilot defect 1) — the canonical F6 cost-control report for this project.
+  //
+  // This report used to compute its financial block with `calculateProjectEvmAtDataDate`, a second
+  // EVM derivation that weights each activity by the FIRST budget line matching its WBS node (that
+  // one line's cost handed in full to every activity in the node) and then time-prorates the
+  // recorded percent. F6 weights by the approved baseline's `planned_cost` and earns the recorded
+  // percent. On the pilot project, at the same governed Data Date, that yielded EV 276,918 /
+  // CPI 0.400 / EAC 5,862,875 here against F6's EV 755,708 / CPI 1.095 / EAC 2,141,689.5 — the
+  // material disagreement the pilot was stopped for.
+  //
+  // The inputs are the same governed rows Dashboard and BudgetView feed F6, including the persisted
+  // manual-ETC override, so the recommended EAC method resolves identically on every screen.
+  // `wbsNodes`/`allocations` are not loaded by this report and are passed empty: they drive F6's WBS
+  // roll-up and BOQ trace, not the project-level EVM facts quoted below.
+  const costReport: CostControlReport | null = useMemo(() => {
+    if (!project) return null;
+    return analyzeCostControl({
       project,
       activities,
-      // GAP-036 correction: this parameter is the CBS budget-line input of the EVM engine.
-      // It previously received `baselineActivities` (baseline activity snapshots, which carry
-      // no project_id/wbs_node_id/approved_budget/actual_cost), which is not a legitimate
-      // budget-line relationship. `budgetLines` is already loaded by this view from the
-      // `budget_lines` table (see loadData), so the correct source is passed instead.
-      // No EVM formula, fallback, or ordering is changed.
+      baselines: baselineActivities,
       budgetLines,
-      boqItems,
-      transactions,
+      costTransactions: transactions,
       progressUpdates,
-      // GAP-007: no view-level Data Date override. The canonical engine already resolves
-      // `project.data_date || DEFAULT_DATA_DATE`; the local '2026-11-15' literal that used to be
-      // passed here pre-empted the governed constant and made this report disagree with every
-      // other consumer whenever a project has no stored data date.
-    );
-  }, [project, activities, budgetLines, boqItems, transactions, progressUpdates]);
+      wbsNodes: [],
+      boqItems,
+      allocations: [],
+      dataDate: dcmaDataDate,
+      calendarType: project.calendar_type || '6_days',
+      manualEtc: typeof project.manual_etc_override === 'number' ? project.manual_etc_override : null,
+    });
+  }, [project, activities, baselineActivities, budgetLines, transactions, progressUpdates, boqItems, dcmaDataDate]);
 
-  const totalBac = evmMetrics.bac;
+  // The canonical EVM facts: a verbatim quote of F6 (nulls preserved, so "not measurable" stays N/A
+  // instead of becoming a plausible 0). F8 quotes the same `f6.project.*` block, so this report, the
+  // dashboard's F8 panel and F6 itself cannot disagree.
+  const canonical: CanonicalEvm = useMemo(() => selectCanonicalEvm(costReport), [costReport]);
+
+  // Shape adapter for the engines below that require the non-nullable `ComprehensiveProjectEvm`
+  // (S-curve, earned schedule). It carries the SAME canonical numbers — no second derivation.
+  const evmMetrics: ComprehensiveProjectEvm = useMemo(
+    () => canonicalEvmToComprehensive(canonical),
+    [canonical],
+  );
+
+  // F9.4 (Controlled Pilot defect 4) — canonical criticality from the statused CPM.
+  //
+  // The critical-path table below used to read the persisted `activities.is_critical` column, a
+  // cached flag from an earlier CPM run. In the pilot it marked three 100%-complete activities as
+  // critical, so this report listed 9 critical activities while F5 and the dashboard reported 6 from
+  // the canonical statused CPM. Both counts below come from that one canonical source: the total
+  // (every critical activity) and the explicitly separate remaining/incomplete subset.
+  const criticality = useMemo(
+    () => summarizeCanonicalCriticality(activities, links, {
+      dataDate: dcmaDataDate,
+      calendarType: project?.calendar_type || '6_days',
+      statusLogic: project?.status_logic || 'retained_logic',
+    }),
+    [activities, links, dcmaDataDate, project?.calendar_type, project?.status_logic],
+  );
+  const criticalActivitiesList = useMemo(
+    () => activities.filter((a) => criticality.byId.get(a.id)?.critical),
+    [activities, criticality],
+  );
 
   const sCurveData: SCurveData = useMemo(() => {
     return generateSCurveData(
@@ -249,7 +287,7 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
               المالك / العميل: <span className="font-semibold text-slate-800">{project?.client || 'شركة الأفق'}</span> | الموقع: <span className="font-semibold text-slate-800">{project?.location || 'الرياض'}</span>
             </p>
             <p className="text-xs text-slate-600">
-              قيمة العقد: <span className="font-bold text-slate-900">{totalBac.toLocaleString()} {project?.currency || 'ر.س'}</span> | البداية: <span className="font-mono">{project?.start_date}</span> | النهاية المعتمدة: <span className="font-mono">{project?.end_date}</span>
+              قيمة العقد: <span className="font-bold text-slate-900">{(project?.contract_value ?? 0).toLocaleString()} {project?.currency || 'ر.س'}</span> | البداية: <span className="font-mono">{project?.start_date}</span> | النهاية المعتمدة: <span className="font-mono">{project?.end_date}</span>
             </p>
           </div>
 
@@ -333,24 +371,26 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
           <div className="grid grid-cols-2 sm:grid-cols-5 gap-2.5">
             <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg">
               <span className="text-[10px] text-slate-500 font-semibold block">الإنجاز المكتسب للمشروع (EV / BAC)</span>
-              <span className="text-lg font-black text-amber-700 font-mono">{evmMetrics.earnedProgressPercent}%</span>
-              <span className="text-[9px] text-slate-400 block">المخطط (PV / BAC): {evmMetrics.plannedProgressPercent}%</span>
+              <span className="text-lg font-black text-amber-700 font-mono">{canonical.earnedProgressPercent !== null ? `${canonical.earnedProgressPercent}%` : 'غير متاح (N/A)'}</span>
+              <span className="text-[9px] text-slate-400 block">المخطط (PV / BAC): {canonical.plannedProgressPercent !== null ? `${canonical.plannedProgressPercent}%` : 'غير متاح (N/A)'}</span>
             </div>
             <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg">
-              <span className="text-[10px] text-slate-500 font-semibold block">ميزانية العقد BAC</span>
-              <span className="text-lg font-black text-slate-800 font-mono">{evmMetrics.bac.toLocaleString()}</span>
+              <span className="text-[10px] text-slate-500 font-semibold block">الاعتماد المستحق BAC</span>
+              <span className="text-lg font-black text-slate-800 font-mono">{canonical.bac !== null ? canonical.bac.toLocaleString() : 'غير متاح (N/A)'}</span>
+              {/* BAC is a commercial fact with a named basis; the canonical quote carries it. */}
+              <span className="text-[9px] text-slate-400 block">{canonical.bacSource === 'unavailable' ? 'لا يوجد مصدر معتمد' : `المصدر: ${canonical.bacSource}`}</span>
             </div>
             <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg">
               <span className="text-[10px] text-slate-500 font-semibold block">القيمة المخططة PV</span>
-              <span className="text-lg font-black text-slate-800 font-mono">{evmMetrics.pv.toLocaleString()}</span>
+              <span className="text-lg font-black text-slate-800 font-mono">{canonical.pv !== null ? canonical.pv.toLocaleString() : 'غير متاح (N/A)'}</span>
             </div>
             <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg">
               <span className="text-[10px] text-slate-500 font-semibold block">القيمة المكتسبة EV</span>
-              <span className="text-lg font-black text-emerald-700 font-mono">{evmMetrics.ev.toLocaleString()}</span>
+              <span className="text-lg font-black text-emerald-700 font-mono">{canonical.ev !== null ? canonical.ev.toLocaleString() : 'غير متاح (N/A)'}</span>
             </div>
             <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg">
               <span className="text-[10px] text-slate-500 font-semibold block">التكلفة الفعلية AC</span>
-              <span className="text-lg font-black text-slate-800 font-mono">{evmMetrics.ac.toLocaleString()}</span>
+              <span className="text-lg font-black text-slate-800 font-mono">{canonical.ac !== null ? canonical.ac.toLocaleString() : 'غير متاح (N/A)'}</span>
             </div>
           </div>
 
@@ -358,7 +398,7 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
             <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg">
               <span className="text-[10px] text-slate-500 font-semibold block">كفاءة التكلفة CPI</span>
               <span className={`text-lg font-black font-mono ${evmMetrics.cpiStatus === 'valid' ? (evmMetrics.cpi >= 1 ? 'text-emerald-700' : 'text-rose-700') : 'text-slate-500'}`}>
-                {evmMetrics.cpiStatus === 'valid' ? evmMetrics.cpi.toFixed(3) : 'غير مقاس (N/A)'}
+                {canonical.cpiStatus === 'valid' && canonical.cpi !== null ? canonical.cpi.toFixed(3) : 'غير مقاس (N/A)'}
               </span>
               {evmMetrics.cpiStatus !== 'valid' && (
                 <span className="text-[9px] text-rose-600 block">
@@ -369,7 +409,7 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
             <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg">
               <span className="text-[10px] text-slate-500 font-semibold block">كفاءة الجدول SPI</span>
               <span className={`text-lg font-black font-mono ${evmMetrics.spiStatus === 'valid' ? (evmMetrics.spi >= 1 ? 'text-emerald-700' : 'text-rose-700') : 'text-slate-500'}`}>
-                {evmMetrics.spiStatus === 'valid' ? evmMetrics.spi.toFixed(3) : 'غير مقاس (N/A)'}
+                {canonical.spiStatus === 'valid' && canonical.spi !== null ? canonical.spi.toFixed(3) : 'غير مقاس (N/A)'}
               </span>
               {evmMetrics.spiStatus !== 'valid' && (
                 <span className="text-[9px] text-rose-600 block">
@@ -379,16 +419,18 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
             </div>
             <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg">
               <span className="text-[10px] text-slate-500 font-semibold block">التقدير عند الإنجاز EAC</span>
-              <span className="text-lg font-black text-amber-700 font-mono">{evmMetrics.eac.toLocaleString()}</span>
+              <span className="text-lg font-black text-amber-700 font-mono">{canonical.eac !== null ? canonical.eac.toLocaleString() : 'غير متاح (N/A)'}</span>
+              {/* Name the EAC method being quoted, so the forecast basis is explicit. */}
+              <span className="text-[9px] text-slate-400 block">{canonical.eacMethod ? `طريقة: ${canonical.eacMethod}` : 'لا توجد طريقة منطبقة'}</span>
             </div>
             <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg">
               <span className="text-[10px] text-slate-500 font-semibold block">التكلفة المتبقية ETC</span>
-              <span className="text-lg font-black text-slate-800 font-mono">{evmMetrics.etc.toLocaleString()}</span>
+              <span className="text-lg font-black text-slate-800 font-mono">{canonical.etc !== null ? canonical.etc.toLocaleString() : 'غير متاح (N/A)'}</span>
             </div>
             <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg">
               <span className="text-[10px] text-slate-500 font-semibold block">الانحراف عند الإنجاز VAC</span>
-              <span className={`text-lg font-black font-mono ${evmMetrics.vac >= 0 ? 'text-emerald-700' : 'text-rose-700'}`}>
-                {evmMetrics.vac >= 0 ? '+' : ''}{evmMetrics.vac.toLocaleString()}
+              <span className={`text-lg font-black font-mono ${canonical.vac !== null && canonical.vac >= 0 ? 'text-emerald-700' : 'text-rose-700'}`}>
+                {canonical.vac !== null ? `${canonical.vac >= 0 ? '+' : ''}${canonical.vac.toLocaleString()}` : 'غير متاح (N/A)'}
               </span>
             </div>
           </div>
@@ -438,8 +480,14 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
         <div className="space-y-2">
           <h3 className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
             <Zap size={15} className="text-rose-600" />
-            أنشطة المسار الحرج (Critical Path Activities - Zero Float)
+            أنشطة المسار الحرج (Critical Path Activities — canonical CPM @ Data Date {criticality.dataDate})
           </h3>
+          {/* F9.4 (defect 4): the total and the incomplete subset are named separately, because they
+              are different metrics. The headline count is the canonical total. */}
+          <p className="text-[10px] text-slate-500">
+            إجمالي الأنشطة الحرجة: <span className="font-black text-slate-800 font-mono">{criticality.totalCritical}</span>
+            {' · '}الحرجة غير المكتملة (Remaining): <span className="font-black text-slate-800 font-mono">{criticality.remainingCritical}</span>
+          </p>
           <div className="overflow-x-auto border border-slate-200 rounded-xl">
             <table className="w-full text-xs">
               <thead className="bg-slate-100 text-slate-700 font-bold">
@@ -454,7 +502,7 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {activities.filter((a) => a.is_critical).map((act) => (
+                {criticalActivitiesList.map((act) => (
                   <tr key={act.id} className="hover:bg-slate-50">
                     <td className="p-2 font-mono font-bold text-rose-700">{act.code}</td>
                     <td className="p-2 font-semibold text-slate-800">{act.name}</td>

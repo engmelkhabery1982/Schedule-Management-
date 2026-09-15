@@ -20,12 +20,11 @@ import type {
   ActivityBoqAllocation,
   CostControlSnapshot,
 } from '@/types';
-import {
-  analyzeForecast,
-  calculateActivityCompletionAverage,
-  calculateProjectEvmAtDataDate,
-  deriveEvmFromScalars,
-} from '@/lib/planningEngine';
+import { analyzeForecast, calculateActivityCompletionAverage } from '@/lib/planningEngine';
+// F9.4 (defect 1): the dashboard QUOTES the canonical EVM from its own F6 report instead of running
+// a second, competing EVM derivation. F6 is canonical for the cost-control layer; F8 (below) already
+// quotes F6, so all three surfaces now read one source.
+import { quoteCanonicalEvm } from '@/lib/canonicalEvm';
 import { generateScheduleAlerts } from '@/lib/alertEngine';
 import { generateResourceConflictAlerts } from '@/lib/resourceConflictEngine';
 import { calculateBaselineVariances, calculatePerformanceTrend, generateTrendAlerts } from '@/lib/trendEngine';
@@ -303,8 +302,59 @@ ${noticeForm.contractorName}`;
   const highRisks = risks.filter((r) => r.severity >= 15).length;
   const openIssues = issues.filter((i) => i.status === 'open').length;
 
-  const criticalActivities = activities.filter((a) => a.is_critical && a.percent_complete < 100).length;
-  const nearCriticalActivities = activities.filter((a) => Number(a.total_float || 0) > 0 && Number(a.total_float || 0) <= 5 && a.percent_complete < 100).length;
+  // F5: schedule-control summary (forecast vs baseline) derived from the canonical statused CPM.
+  const control = useMemo(() => {
+    if (!project) return null;
+    const ordered = [...snapshots].sort((a, b) => (a.data_date < b.data_date ? 1 : -1));
+    return analyzeScheduleControl({
+      activities,
+      links,
+      baselines: baselineActivities,
+      progressUpdates,
+      previousSnapshot: ordered.find((x) => x.data_date < governedDataDate) || null,
+      dataDate: governedDataDate,
+      calendarType: project.calendar_type || '6_days',
+      statusLogic: project.status_logic || 'retained_logic',
+    });
+  }, [project, activities, links, baselineActivities, progressUpdates, snapshots, governedDataDate]);
+  // F6: cost-control strip (CPI, CV, recommended EAC, VAC, forecast confidence).
+  const costStrip = useMemo(() => {
+    if (!project) return null;
+    return analyzeCostControl({
+      project,
+      activities,
+      baselines: baselineActivities,
+      budgetLines,
+      costTransactions,
+      progressUpdates,
+      wbsNodes: costWbs,
+      boqItems,
+      allocations: costAllocations,
+      previousSnapshots: costSnapshots,
+      dataDate: governedDataDate,
+      calendarType: project.calendar_type || '6_days',
+      manualEtc: typeof project.manual_etc_override === 'number' ? project.manual_etc_override : null,
+    });
+  }, [project, activities, baselineActivities, budgetLines, costTransactions, progressUpdates, costWbs, boqItems, costAllocations, costSnapshots, governedDataDate]);
+
+  // F9.4 (Controlled Pilot defect 4) — canonical criticality, quoted from F5.
+  //
+  // These two counts used to be read off the PERSISTED `activities.is_critical` / `total_float`
+  // columns, which are a cached snapshot of some earlier CPM run (or, in seed data, hand-authored).
+  // The pilot showed the same project reporting 9 critical activities where the canonical statused
+  // CPM said 6: three 100%-complete activities were still flagged critical in the column, and
+  // finished work does not drive the remaining critical path. The old `criticalActivities` also
+  // carried an extra `percent_complete < 100` filter, so it was really an INCOMPLETE subset wearing
+  // the "Critical Activities" label — it agreed with the canonical total only by coincidence.
+  //
+  // F5 is canonical for the schedule-control layer, so both figures are now quoted from its report:
+  // `project.criticalCount` for the total, and the explicitly separate remaining/incomplete subset
+  // derived from the same statused rows. Same label, same source, same number everywhere.
+  const criticalActivities = control ? control.project.criticalCount : 0;
+  const remainingCriticalActivities = control
+    ? control.statused.filter((s) => s.critical && !s.completed).length
+    : 0;
+  const nearCriticalActivities = control ? control.project.nearCriticalCount : 0;
 
   const startDate = useMemo(() => {
     return activities.length > 0
@@ -320,27 +370,20 @@ ${noticeForm.contractorName}`;
 
   const recentUpdates = useMemo(() => progressUpdates.slice(0, 5), [progressUpdates]);
 
-  // Empty state (no project selected): the scoped low-level helper `deriveEvmFromScalars`
-  // delegates to the same canonical primitives as the engine, so no second EVM formula set is
-  // involved and nothing is fabricated (BAC 0 -> all-zero metrics, ratios flagged
-  // 'empty_no_data'). Both branches now return the canonical `ComprehensiveProjectEvm`, so the
-  // transitional Wave-1 union cast is gone and the progress fields are defined numbers (0)
-  // instead of undefined/NaN.
-  const evm = useMemo(() => {
-    if (!project) return deriveEvmFromScalars(0, 0.40, 0.40, 0);
-    return calculateProjectEvmAtDataDate(
-      project,
-      activities,
-      budgetLines,
-      boqItems,
-      costTransactions,
-      progressUpdates,
-      // GAP-007: the view-level '2026-11-15' override is removed. The canonical engine resolves
-      // `project.data_date || DEFAULT_DATA_DATE` itself, and this dashboard now feeds that resolved
-      // data date straight into the S-Curve, so a local literal here would silently move the
-      // actual/forecast cutoff away from the governed Data Date.
-    );
-  }, [project, activities, budgetLines, boqItems, costTransactions, progressUpdates, project?.data_date]);
+  // F9.4 (Controlled Pilot defect 1) — canonical EVM, quoted from the F6 cost-control report above.
+  //
+  // The Controlled Pilot read two different answers for the same project at the same governed Data
+  // Date: F6 showed EV 755,708 / CPI 1.095 / EAC 2,141,689.5 while this dashboard's EVM block and
+  // the Executive Report showed EV 276,918 / CPI 0.400 / EAC 5,862,875. The dashboard was running
+  // `calculateProjectEvmAtDataDate` beside its own F6 report — a second derivation that weights each
+  // activity by the FIRST budget line matching its WBS node (shared in full by every activity in the
+  // node) and time-prorates the recorded percent, while F6 weights by the approved baseline's
+  // `planned_cost`. F8 already quotes F6, so the dashboard was the odd one out.
+  //
+  // `quoteCanonicalEvm` copies F6's published BAC/PV/EV/AC/CPI/SPI/ETC/EAC/VAC verbatim and derives
+  // nothing of its own. With no project selected `costStrip` is null and the result is the explicit
+  // all-N/A canonical state — no fabricated budget, ratios flagged 'empty_no_data'.
+  const evm = useMemo(() => quoteCanonicalEvm(costStrip), [costStrip]);
 
   // GAP-039: the primary project progress metric on this dashboard is the canonical earned
   // progress (EV / BAC) from the shared engine. The deprecated `actualProgressPercent` alias it used
@@ -416,40 +459,6 @@ ${noticeForm.contractorName}`;
     );
   }, [activities, baselineActivities, progressUpdates, costTransactions, evm, project, startDate, endDate, budgetLines, boqItems]);
 
-  // F5: schedule-control summary (forecast vs baseline) derived from the canonical statused CPM.
-  const control = useMemo(() => {
-    if (!project) return null;
-    const ordered = [...snapshots].sort((a, b) => (a.data_date < b.data_date ? 1 : -1));
-    return analyzeScheduleControl({
-      activities,
-      links,
-      baselines: baselineActivities,
-      progressUpdates,
-      previousSnapshot: ordered.find((x) => x.data_date < governedDataDate) || null,
-      dataDate: governedDataDate,
-      calendarType: project.calendar_type || '6_days',
-      statusLogic: project.status_logic || 'retained_logic',
-    });
-  }, [project, activities, links, baselineActivities, progressUpdates, snapshots, governedDataDate]);
-  // F6: cost-control strip (CPI, CV, recommended EAC, VAC, forecast confidence).
-  const costStrip = useMemo(() => {
-    if (!project) return null;
-    return analyzeCostControl({
-      project,
-      activities,
-      baselines: baselineActivities,
-      budgetLines,
-      costTransactions,
-      progressUpdates,
-      wbsNodes: costWbs,
-      boqItems,
-      allocations: costAllocations,
-      previousSnapshots: costSnapshots,
-      dataDate: governedDataDate,
-      calendarType: project.calendar_type || '6_days',
-      manualEtc: typeof project.manual_etc_override === 'number' ? project.manual_etc_override : null,
-    });
-  }, [project, activities, baselineActivities, budgetLines, costTransactions, progressUpdates, costWbs, boqItems, costAllocations, costSnapshots, governedDataDate]);
   // F7: integrated time-cost decisions (orchestrates the F5 + F6 reports above; no new math).
   const decisions = useMemo(() => {
     if (!project || !control || !costStrip) return null;
@@ -544,12 +553,19 @@ ${noticeForm.contractorName}`;
       progress: budgetUtilization,
     },
     {
+      // F9.4 (defect 4): the headline number is the canonical TOTAL critical count (F5's
+      // `project.criticalCount`, from the statused CPM at the governed Data Date). The incomplete
+      // subset is still useful, so it is shown beside it under its own explicit name instead of
+      // being passed off as the total — which is what the old `is_critical && percent_complete < 100`
+      // filter did.
       label: t.critical_activities,
       value: `${criticalActivities}`,
       icon: Zap,
       bg: 'bg-red-50',
       text: 'text-red-600',
-      subtext: lang === 'ar' ? 'على المسار الحرج' : 'On Critical Path',
+      subtext: lang === 'ar'
+        ? `على المسار الحرج · الحرجة غير المكتملة ${remainingCriticalActivities}`
+        : `On Critical Path · ${remainingCriticalActivities} remaining incomplete`,
     },
     {
       label: lang === 'ar' ? 'تأخير النهاية المتوقعة' : 'Forecast delay',

@@ -11,6 +11,7 @@ import type {
   SubcontractPackage,
   BudgetLine,
   CostTransaction,
+  BaselineActivity,
 } from '@/types';
 import { calculateEarnedSchedule } from '@/lib/earnedScheduleEngine';
 // GAP-026: physical commodity progress is derived in `src/lib` (one unit per row, evidence-based
@@ -22,11 +23,11 @@ import {
 } from '@/lib/commodityProgressEngine';
 // GAP-010: one governed Data Date resolution and one definition of "may this record count as actual".
 import { isAfterDataDate, latestDate, resolveDataDate } from '@/lib/chronologyGuard';
-import {
-  calculateActivityCompletionAverage,
-  calculateProjectEvmAtDataDate,
-  deriveEvmFromScalars,
-} from '@/lib/planningEngine';
+import { calculateActivityCompletionAverage } from '@/lib/planningEngine';
+// F9.4 (Controlled Pilot defect 1): the project-control totals below are a QUOTE of the canonical F6
+// cost-control report, not a second EVM derivation.
+import { analyzeCostControl, type CostControlReport } from '@/lib/costControlEngine';
+import { quoteCanonicalEvm } from '@/lib/canonicalEvm';
 import { reconcileFinishForecasts } from '@/lib/forecastReconciliation';
 import {
   getSubcontractPackages,
@@ -215,6 +216,10 @@ export default function ProgressView({ project }: ProgressViewProps) {
   // of its numbers saw an equal share of contract value and a synthetic AC instead of real data.
   const [budgetLines, setBudgetLines] = useState<BudgetLine[]>([]);
   const [costTransactions, setCostTransactions] = useState<CostTransaction[]>([]);
+  // F9.4 (defect 1): the canonical EVM needs the approved baseline that authorizes BAC, so this view
+  // now loads the project's ACTIVE APPROVED baseline rows — scoped through `project_baselines`, the
+  // same join BudgetView and Dashboard use, because `baseline_activities` carries no `project_id`.
+  const [baselines, setBaselines] = useState<BaselineActivity[]>([]);
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState('');
   const [saving, setSaving] = useState(false);
@@ -302,7 +307,7 @@ export default function ProgressView({ project }: ProgressViewProps) {
   async function loadData() {
     if (!project) return;
     setLoading(true);
-    const [actRes, updRes, inspectionRes, boqRes, linksRes, budgetRes, costRes] = await Promise.all([
+    const [actRes, updRes, inspectionRes, boqRes, linksRes, budgetRes, costRes, baselineRes] = await Promise.all([
       supabase.from('activities').select('*').eq('project_id', project.id).order('sort_order', { ascending: true }),
       supabase.from('progress_updates').select('*').eq('project_id', project.id).order('update_date', { ascending: false }),
       supabase.from('inspection_requests').select('*').eq('project_id', project.id).order('inspection_date', { ascending: false }),
@@ -311,6 +316,7 @@ export default function ProgressView({ project }: ProgressViewProps) {
       // Project-scoped, same tables BudgetView/Dashboard feed the canonical EVM with (GAP-008).
       supabase.from('budget_lines').select('*').eq('project_id', project.id),
       supabase.from('cost_transactions').select('*').eq('project_id', project.id).order('transaction_date', { ascending: false }),
+      supabase.from('baseline_activities').select('*, project_baselines!inner(project_id, is_active, status)').eq('project_baselines.project_id', project.id).eq('project_baselines.is_active', true).eq('project_baselines.status', 'approved'),
     ]);
     
     const actList = (actRes.data || []) as Activity[];
@@ -327,6 +333,7 @@ export default function ProgressView({ project }: ProgressViewProps) {
     setBoqItems((boqRes.data || []) as BoqItem[]);
     setBudgetLines((budgetRes.data || []) as BudgetLine[]);
     setCostTransactions((costRes.data || []) as CostTransaction[]);
+    setBaselines(((baselineRes as { data?: unknown }).data || []) as BaselineActivity[]);
 
     // Subcontract packages are loaded from `subcontract_packages` / `subcontract_items`. The first
     // load for a project performs a one-time import of the legacy localStorage store (or of the
@@ -472,17 +479,25 @@ export default function ProgressView({ project }: ProgressViewProps) {
   // sources (activities, budget_lines, boq_items, cost_transactions, progress_updates).
   // Null safety: with no project selected the canonical low-level helper produces an all-zero empty
   // state — no Project object is fabricated and no hook becomes conditional.
-  const evm = useMemo(() => {
-    if (!project) return deriveEvmFromScalars(0, 0, 0, 0);
-    return calculateProjectEvmAtDataDate(
+  const costReport: CostControlReport | null = useMemo(() => {
+    if (!project) return null;
+    return analyzeCostControl({
       project,
       activities,
+      baselines,
       budgetLines,
-      boqItems,
       costTransactions,
-      updates,
-    );
-  }, [project, activities, budgetLines, boqItems, costTransactions, updates]);
+      progressUpdates: updates,
+      wbsNodes: [],
+      boqItems,
+      allocations: [],
+      dataDate: governedDataDate,
+      calendarType: project.calendar_type || '6_days',
+      manualEtc: typeof project.manual_etc_override === 'number' ? project.manual_etc_override : null,
+    });
+  }, [project, activities, baselines, budgetLines, costTransactions, updates, boqItems, governedDataDate]);
+
+  const evm = useMemo(() => quoteCanonicalEvm(costReport), [costReport]);
 
   // Earned Schedule — consumes the canonical EVM above (GAP-007) and the same real sources, so the
   // engine does not recompute it and this view computes nothing twice (GAP-008).

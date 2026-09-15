@@ -2,6 +2,9 @@ import { useState, useEffect, useMemo } from 'react';
 import { supabase } from '@/lib/supabase';
 import type { Project, Activity, ActivityLink, BaselineActivity, ActivityResource, DcmaAuditResult } from '@/types';
 import { runDcma14PointAudit, autoFixDcmaIssues } from '@/lib/scheduleQualityEngine';
+// F9.4 (Controlled Pilot defect 4): the float profile's critical bucket must use the same canonical
+// criticality as F5, the dashboard and the Executive Report — not the cached `is_critical` column.
+import { summarizeCanonicalCriticality } from '@/lib/scheduleControlEngine';
 // GAP-010: one governed Data Date for the audit and for the label that reports it.
 import { resolveDataDate } from '@/lib/chronologyGuard';
 import { getLanguage, translations, type Language } from '@/lib/i18n';
@@ -67,6 +70,36 @@ export default function DcmaAuditView({ project }: DcmaAuditViewProps) {
   // can no longer decide which activities are late, and the displayed Data Date is the very date the
   // audit used instead of a second, unrelated literal.
   const dcmaDataDate = resolveDataDate(project);
+
+  // F9.4 (defect 4) — canonical criticality + float profile, one source for all three buckets.
+  //
+  // The critical bucket used to count the persisted `activities.is_critical` column while the other
+  // two buckets counted the persisted `total_float`, so the profile mixed a cached criticality flag
+  // with cached float and disagreed with the canonical statused CPM (9 vs 6 in the pilot, where three
+  // 100%-complete activities were still flagged critical). All three buckets now come from the same
+  // canonical CPM run, so they partition the same activity set on the same evidence.
+  const criticality = useMemo(
+    () => summarizeCanonicalCriticality(activities, links, {
+      dataDate: dcmaDataDate,
+      calendarType: project?.calendar_type || '6_days',
+      statusLogic: project?.status_logic || 'retained_logic',
+    }),
+    [activities, links, dcmaDataDate, project?.calendar_type, project?.status_logic],
+  );
+  const floatProfile = useMemo(() => {
+    let critical = 0;
+    let near = 0;
+    let loose = 0;
+    for (const a of activities) {
+      const c = criticality.byId.get(a.id);
+      if (!c) continue;
+      if (c.critical) critical += 1;
+      else if (c.totalFloat <= 14) near += 1;
+      else loose += 1;
+    }
+    return { critical, near, loose };
+  }, [activities, criticality]);
+
   const audit: DcmaAuditResult = useMemo(() => {
     return runDcma14PointAudit(
       activities,
@@ -279,15 +312,15 @@ export default function DcmaAuditView({ project }: DcmaAuditViewProps) {
             <div className="grid grid-cols-3 gap-1 text-center font-mono text-[10px]">
               <div className="bg-rose-50 border border-rose-200 p-1 rounded">
                 <span className="text-rose-700 font-bold block">حرج (0d)</span>
-                <span className="font-black text-rose-950">{activities.filter((a) => a.is_critical).length}</span>
+                <span className="font-black text-rose-950">{floatProfile.critical}</span>
               </div>
               <div className="bg-amber-50 border border-amber-200 p-1 rounded">
                 <span className="text-amber-700 font-bold block">1-14d</span>
-                <span className="font-black text-amber-950">{activities.filter((a) => !a.is_critical && (a.total_float || 0) <= 14).length}</span>
+                <span className="font-black text-amber-950">{floatProfile.near}</span>
               </div>
               <div className="bg-emerald-50 border border-emerald-200 p-1 rounded">
                 <span className="text-emerald-700 font-bold block">&gt; 14d</span>
-                <span className="font-black text-emerald-950">{activities.filter((a) => (a.total_float || 0) > 14).length}</span>
+                <span className="font-black text-emerald-950">{floatProfile.loose}</span>
               </div>
             </div>
           </div>

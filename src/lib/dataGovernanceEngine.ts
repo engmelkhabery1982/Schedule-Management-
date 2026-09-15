@@ -28,6 +28,7 @@ import type { EvmAcSource, EvmBacSource, EvmRatioStatus, TcpiStatus } from '@/li
  */
 const BAC_SOURCE_LABEL_AR: Record<EvmBacSource, string> = {
   contract_value: 'القيمة التعاقدية',
+  approved_baseline: 'خط الأساس المعتمد (PMB)',
   budget_lines: 'خطوط ميزانية CBS',
   boq_items: 'جدول الكميات BOQ',
   caller_supplied: 'قيمة مُدخلة من المستدعي',
@@ -35,6 +36,7 @@ const BAC_SOURCE_LABEL_AR: Record<EvmBacSource, string> = {
 };
 const BAC_SOURCE_LABEL_EN: Record<EvmBacSource, string> = {
   contract_value: 'contract value',
+  approved_baseline: 'approved baseline (PMB)',
   budget_lines: 'CBS budget lines',
   boq_items: 'BOQ items',
   caller_supplied: 'caller-supplied scalar',

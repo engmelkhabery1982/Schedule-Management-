@@ -1,7 +1,9 @@
 import { useState, useEffect, useMemo } from 'react';
 import { supabase } from '@/lib/supabase';
 import { getLanguage, type Language } from '@/lib/i18n';
-import { calculateProjectEvmAtDataDate, deriveEvmFromScalars } from '@/lib/planningEngine';
+import { quoteCanonicalEvm } from '@/lib/canonicalEvm';
+import { reviewStateOf } from '@/lib/demoDbContracts';
+import { assertDbWriteOk } from '@/lib/supabaseErrors';
 import { calculateEarnedSchedule, type EarnedScheduleResult } from '@/lib/earnedScheduleEngine';
 import {
   aggregateCbsCostCenters,
@@ -285,35 +287,83 @@ export default function BudgetView({ project }: BudgetViewProps) {
     }
   }
 
+  /**
+   * F9.4 (Controlled Pilot defect 2) — approve a submitted cost transaction.
+   *
+   * The pilot's "Controlled Pilot cost transaction — 100 SAR" stayed Pending after Approve with no
+   * message at all. The handler was already gating on the returned `{ error }`; the failure was
+   * underneath it. In demo mode `supabase.rpc` is served by the local store, whose `mockRpc`
+   * implemented only `approve_progress_update` and answered EVERY other function name with
+   * `{ data: true, error: null }` without writing anything. An unimplemented write therefore
+   * reported success: no error to gate on, no state change, and `loadData()` re-read the row that
+   * had never been touched. The contract now lives in `src/lib/demoDbContracts.ts`, mirroring the
+   * `review_cost_transaction` SQL function, and an unimplemented RPC is an explicit error.
+   *
+   * Two further points this handler now honours:
+   *   - the SQL procedure is a TWO-LEVEL gate (`approval_level` 0 -> 1 keeps status `submitted`;
+   *     1 -> 2 sets `approved`, `approved_at`, `approved_by`). A legitimate level advance used to be
+   *     invisible because only the status badge was rendered, so the notice names the outcome;
+   *   - success is confirmed by reading the row BACK, so the message reports persisted state rather
+   *     than an assumption. No optimistic local state is written anywhere.
+   */
   async function approveTransaction(id: string) {
     const transaction = transactions.find((item) => item.id === id);
-    const { error } = await supabase.rpc('review_cost_transaction', {
-      transaction_uuid: id,
-      approver: (transaction?.approval_level || 0) === 0 ? 'project_control' : 'finance_manager',
-      decision: 'approve',
-    });
-    // F9 (items 5 & 11): a failed approval RPC must be announced — silently doing nothing left the
-    // user believing the transaction was approved (it feeds the approved-only AC filter).
-    if (error) {
-      setNotice(`تعذر اعتماد المعاملة: ${error.message}`);
+    try {
+      assertDbWriteOk(
+        await supabase.rpc('review_cost_transaction', {
+          transaction_uuid: id,
+          approver: (transaction?.approval_level || 0) === 0 ? 'project_control' : 'finance_manager',
+          decision: 'approve',
+        }),
+        lang === 'ar' ? 'اعتماد حركة التكلفة (review_cost_transaction)' : 'approve cost transaction (review_cost_transaction)',
+      );
+    } catch (err: unknown) {
+      // Failure: no success message, no local state change, and enough context to identify the
+      // failed database step.
+      setNotice(lang === 'ar'
+        ? `تعذر اعتماد المعاملة: ${(err as Error).message}`
+        : `Approval failed: ${(err as Error).message}`);
       return;
     }
     await loadData();
+    // Read the committed row back so the notice states what is actually persisted.
+    const { data: row } = await supabase.from('cost_transactions').select('*').eq('id', id).maybeSingle();
+    const state = reviewStateOf((row as { status?: unknown; approval_level?: unknown } | null) || null);
+    if (!state) {
+      setNotice(lang === 'ar'
+        ? 'تم تنفيذ الاعتماد ولكن تعذرت قراءة الحركة للتأكد من الحالة.'
+        : 'Approval executed, but the transaction could not be read back to confirm its state.');
+      return;
+    }
+    setNotice(state.isApproved
+      ? (lang === 'ar'
+        ? `تم اعتماد الحركة (${transaction?.description ?? id}) — الحالة: معتمدة، وسيُحتسب مبلغها ضمن التكلفة الفعلية (AC) إذا كان تاريخها في حدود تاريخ التحديث المعتمد.`
+        : `Transaction approved (${transaction?.description ?? id}) — status: approved. Its amount enters AC when its date is on or before the governed Data Date.`)
+      : (lang === 'ar'
+        ? `تم تسجيل الاعتماد الأول للحالة (${transaction?.description ?? id}) — المستوى ${state.approvalLevel}/2، ما زالت بانتظار اعتماد المستوى التالي.`
+        : `First-level approval recorded (${transaction?.description ?? id}) — level ${state.approvalLevel}/2; still awaiting the next approval level.`));
   }
 
   async function rejectTransaction(id: string) {
-    const { error } = await supabase.rpc('review_cost_transaction', {
-      transaction_uuid: id,
-      approver: 'reviewer',
-      decision: 'reject',
-      review_notes: 'مرفوض للمراجعة والتصحيح',
-    });
-    // F9 (item 5): same gating for rejection.
-    if (error) {
-      setNotice(`تعذر رفض المعاملة: ${error.message}`);
+    try {
+      assertDbWriteOk(
+        await supabase.rpc('review_cost_transaction', {
+          transaction_uuid: id,
+          approver: 'reviewer',
+          decision: 'reject',
+          review_notes: 'مرفوض للمراجعة والتصحيح',
+        }),
+        lang === 'ar' ? 'رفض حركة التكلفة (review_cost_transaction)' : 'reject cost transaction (review_cost_transaction)',
+      );
+    } catch (err: unknown) {
+      // F9 (item 5) + F9.4 (defect 2): same gating for rejection — a failed write is announced.
+      setNotice(lang === 'ar'
+        ? `تعذر رفض المعاملة: ${(err as Error).message}`
+        : `Rejection failed: ${(err as Error).message}`);
       return;
     }
     await loadData();
+    setNotice(lang === 'ar' ? 'تم رفض الحركة.' : 'Transaction rejected.');
   }
 
   async function saveActual(id: string) {
@@ -338,27 +388,19 @@ export default function BudgetView({ project }: BudgetViewProps) {
     await loadData();
   }
 
-  // Unified EVM metrics from single source of truth engine
-  const evm = useMemo(() => {
-    // Null safety (no project selected yet): the canonical all-zero empty state instead of
-    // dereferencing `project!`, which threw on the first render before a project was loaded.
-    // Same pattern as Dashboard / ExecutiveReportView — no fabricated Project, no conditional hook.
-    if (!project) return deriveEvmFromScalars(0, 0, 0, 0);
-    return calculateProjectEvmAtDataDate(
-      project,
-      activities,
-      budgetLines,
-      boqItems,
-      transactions,
-      progressUpdates,
-      // No view-level Data Date override: the local '2026-09-13' literal duplicated the governed
-      // DEFAULT_DATA_DATE and would silently diverge from Dashboard / ProgressView /
-      // ExecutiveReportView if that constant ever moved. The engine resolves
-      // `project.data_date || DEFAULT_DATA_DATE` itself.
-    );
-    // `project` alone covers the resolved Data Date; the previous `project?.data_date` entry was an
-    // unnecessary dependency once the local literal override was dropped.
-  }, [project, activities, budgetLines, boqItems, transactions, progressUpdates]);
+  // Canonical EVM — QUOTED from this view's own F6 cost-control report (F9.4, Controlled Pilot
+  // defect 1). This screen is the F6 cost-control workstation, and it used to render a second,
+  // independently derived EVM block beside the F6 panel: `calculateProjectEvmAtDataDate` allocates
+  // each activity's budget from the FIRST budget line matching its WBS node (shared in full by every
+  // activity in that node) and time-prorates the recorded percent, whereas F6 allocates from the
+  // approved baseline's `planned_cost`. On the pilot project that produced EV 275,358 / CPI 0.40 /
+  // EAC 5,862,875 here against F6's EV 752,900 / CPI 1.091 / EAC 2,149,542 on the same approved data
+  // at the same Data Date — two answers on one screen.
+  //
+  // F6 is canonical for the cost-control layer, so every BAC/PV/EV/AC/CPI/SPI/ETC/EAC/VAC figure
+  // this view shows is now a verbatim quote of `costReport`. No formula is re-implemented here and
+  // no value is copied between widgets: both read the same report object.
+  const evm = useMemo(() => quoteCanonicalEvm(costReport), [costReport]);
 
   // Earned Schedule (ESM) — the SAME canonical engine ProgressView and the Executive Report use, so
   // this card cannot present a competing forecast (GAP-008: one engine, many consumers). It consumes
@@ -2007,6 +2049,20 @@ export default function BudgetView({ project }: BudgetViewProps) {
                           }`}>
                             {t.status === 'approved' ? 'معتمد' : t.status === 'rejected' ? 'مرفوض' : 'بانتظار الاعتماد'}
                           </span>
+                          {/* F9.4 (defect 2): `review_cost_transaction` is a two-level gate, so an
+                              approval that advances the level without changing the status used to be
+                              indistinguishable from nothing happening. The level is part of the
+                              persisted row — showing it makes every committed press visible. */}
+                          {t.status === 'submitted' && (
+                            <span className="block text-[9px] text-slate-500 font-mono mt-0.5">
+                              مستوى الاعتماد {(reviewStateOf(t)?.approvalLevel ?? 0)}/2
+                            </span>
+                          )}
+                          {t.status === 'approved' && t.approved_at && (
+                            <span className="block text-[9px] text-slate-500 font-mono mt-0.5">
+                              {String(t.approved_at).slice(0, 10)}
+                            </span>
+                          )}
                         </td>
                         <td className="p-3 text-center">
                           {t.status === 'submitted' && (

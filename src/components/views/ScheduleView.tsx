@@ -215,7 +215,15 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
     const [actRes, wbsRes, baselineRes, linkRes, resourceRes, assignmentRes, calRes, snapRes, progRes] = await Promise.all([
       supabase.from('activities').select('*, wbs_node:wbs_nodes(*)').eq('project_id', project.id).order('sort_order', { ascending: true }),
       supabase.from('wbs_nodes').select('*').eq('project_id', project.id).order('sort_order', { ascending: true }),
-      supabase.from('baseline_activities').select('*'),
+      // F9.4 (Controlled Pilot defect 3): scope baseline rows to THIS project's ACTIVE APPROVED
+      // baseline. `baseline_activities` has no `project_id` column — it hangs off `project_baselines`
+      // — so the previous unfiltered `select('*')` loaded every project's baseline snapshots (39 rows
+      // across 4 projects in the pilot dataset) and handed them to F5, which derives the project
+      // baseline finish as the latest `early_finish` in the set. The pilot therefore reported a
+      // baseline finish of 2028-02-28 (the hospital project's) for an office project whose approved
+      // baseline finishes 2027-02-28, and a total delay of -310 working days against a 2027-03-03
+      // forecast. This is the same join BudgetView and Dashboard already use.
+      supabase.from('baseline_activities').select('*, project_baselines!inner(project_id, is_active, status)').eq('project_baselines.project_id', project.id).eq('project_baselines.is_active', true).eq('project_baselines.status', 'approved'),
       supabase.from('activity_links').select('*').eq('project_id', project.id),
       supabase.from('resources').select('*').eq('project_id', project.id).order('name'),
       supabase.from('activity_resources').select('*, resource:resources(*)').eq('project_id', project.id),

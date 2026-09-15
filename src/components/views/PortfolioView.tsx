@@ -2,7 +2,10 @@ import { useState, useMemo, useEffect } from 'react';
 import { supabase } from '@/lib/supabase';
 import { getLanguage, type Language } from '@/lib/i18n';
 import type { Project, ViewName, ProjectSector, Activity, BudgetLine, BoqItem, CostTransaction, ProgressUpdate, Risk, ActivityLink, BaselineActivity } from '@/types';
-import { calculateProjectEvmAtDataDate } from '@/lib/planningEngine';
+// F9.4 (Controlled Pilot defect 1): every project's EVM here is a QUOTE of the canonical F6
+// cost-control report, the same source the project screens and the Executive Report read.
+import { analyzeCostControl } from '@/lib/costControlEngine';
+import { selectCanonicalEvm } from '@/lib/canonicalEvm';
 // Case N: the portfolio DCMA figure is the canonical 14-point audit result, not a constant.
 import { runDcma14PointAudit } from '@/lib/scheduleQualityEngine';
 import { DEFAULT_DATA_DATE } from '@/lib/projectControlsConstants';
@@ -135,27 +138,34 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
       const pActivityIds = new Set(pActs.map((a) => a.id));
       const pBaselines = allBaselines.filter((b) => pActivityIds.has(b.activity_id));
 
-      const evm = calculateProjectEvmAtDataDate(
-        p,
-        pActs,
-        pBgts,
-        pBoqs,
-        pTxns,
-        pPrgs,
-        // GAP-039 cross-screen consistency: the view-level '2026-11-15' override is dropped so the
-        // canonical engine resolves `project.data_date || DEFAULT_DATA_DATE` itself. With the
-        // override a project whose data_date is null was evaluated at a different Data Date here
-        // than on Dashboard / ProgressView / BudgetView / ExecutiveReportView, so the "same" earned
-        // progress KPI could legitimately differ between screens.
-      );
+      // Canonical EVM at each project's OWN governed Data Date (`project.data_date` or the governed
+      // constant) — quoted from F6, never re-derived here, so the portfolio roll-up cannot disagree
+      // with the project's own Dashboard / BudgetView / Executive Report.
+      const canonical = selectCanonicalEvm(analyzeCostControl({
+        project: p,
+        activities: pActs,
+        baselines: pBaselines,
+        budgetLines: pBgts,
+        costTransactions: pTxns,
+        progressUpdates: pPrgs,
+        wbsNodes: [],
+        boqItems: pBoqs,
+        allocations: [],
+        dataDate: p.data_date || DEFAULT_DATA_DATE,
+        calendarType: p.calendar_type || '6_days',
+        manualEtc: typeof p.manual_etc_override === 'number' ? p.manual_etc_override : null,
+      }));
 
-      const contractVal = evm.bac;
-      const progress = evm.earnedProgressPercent;
-      const pv = evm.pv;
-      const ev = evm.ev;
-      const ac = evm.ac;
-      const spi = evm.spi;
-      const cpi = evm.cpi;
+      // Contract value is a commercial fact and a DIFFERENT figure from the authorized budget basis
+      // (BAC). It used to be read from `evm.bac` under a "contract value" label, which conflated the
+      // two; the card now shows the contract's own value and the EVM fields are the canonical ones.
+      const contractVal = Number(p.contract_value) || 0;
+      const progress = canonical.earnedProgressPercent ?? 0;
+      const pv = canonical.pv ?? 0;
+      const ev = canonical.ev ?? 0;
+      const ac = canonical.ac;
+      const spi = canonical.spi ?? 0;
+      const cpi = canonical.cpi ?? 0;
       // Case N (GAP-010 wave): the portfolio used to show a fabricated schedule-quality score
       // (100 / 90 chosen by "does the project have activities") and fabricated EOT days
       // (14 / 0 chosen by contract duration). The score now comes from the canonical DCMA 14-point
@@ -354,7 +364,7 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
           </div>
           <div>
             <div className="text-xl font-black text-emerald-700">{(totalPortfolioValue / 1000000).toFixed(1)}M SAR</div>
-            <span className="text-[11px] text-slate-500 font-semibold">{lang === 'ar' ? 'إجمالي قيمة العقود (BAC)' : 'Portfolio Value'}</span>
+            <span className="text-[11px] text-slate-500 font-semibold">{lang === 'ar' ? 'إجمالي قيمة العقود' : 'Portfolio Contract Value'}</span>
           </div>
         </div>
 

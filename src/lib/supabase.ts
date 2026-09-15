@@ -1,5 +1,6 @@
 import { createClient as createSupabaseClient } from '@supabase/supabase-js';
 import { getInitialSeedData } from './mockSeed';
+import { applyReviewCostTransaction, unimplementedRpcError } from './demoDbContracts';
 
 const envUrl = import.meta.env?.VITE_SUPABASE_URL;
 const envAnonKey = import.meta.env?.VITE_SUPABASE_ANON_KEY;
@@ -302,8 +303,23 @@ const mockRpc = async (fnName: string, params: any) => {
       }
       saveDb(db);
     }
+    return { data: true, error: null };
   }
-  return { data: true, error: null };
+  // F9.4 (Controlled Pilot defect 2): the cost-transaction review procedure is now implemented
+  // against the demo store, mirroring `review_cost_transaction` from
+  // 20260908004500_governed_reviews_and_resources.sql statement for statement. Previously this
+  // function name fell through to the unconditional `{ data: true, error: null }` below, so pressing
+  // Approve reported success while writing nothing — the row stayed Pending and no error surfaced.
+  if (fnName === 'review_cost_transaction') {
+    const result = applyReviewCostTransaction(db, params, new Date().toISOString());
+    // Persist only a write that actually happened; a rejected contract must not touch the store.
+    if (!result.error) saveDb(db);
+    return result;
+  }
+  // An RPC this store does not implement is a FAILURE, not a success. Returning `{ data: true }`
+  // here is what made the approval defect invisible: the caller gates on `error`, so a false success
+  // is indistinguishable from a committed write. The message names the function that is missing.
+  return unimplementedRpcError(fnName);
 };
 
 export const supabase: any = hasValidSupabaseEnv

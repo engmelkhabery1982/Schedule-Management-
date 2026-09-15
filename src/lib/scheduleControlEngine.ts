@@ -691,8 +691,25 @@ export function analyzeScheduleControl(input: ScheduleControlInput): ScheduleCon
   });
   const varById = new Map(variances.map((v) => [v.id, v]));
 
+  // Project baseline finish = the latest baseline early_finish OF THE PROJECT BEING ANALYSED.
+  //
+  // F9.4 (Controlled Pilot defect 3): `baseline_activities` carries no `project_id` — it hangs off
+  // `project_baselines` — so a caller that fetches the table unscoped hands this engine every
+  // project's baseline rows at once. The previous unguarded `max(b.early_finish)` then reported
+  // ANOTHER project's finish as this project's baseline: the pilot read 2028-02-28 (the hospital
+  // project's finish) for an office project whose approved baseline finishes 2027-02-28, and
+  // `totalDelayWd` against a 2027-03-03 forecast came out at -310 working days — a schedule-control
+  // nonsense value that looked like a recovered year of float.
+  //
+  // Scoping to the analysed activity set is the only sound definition available to this engine: it
+  // receives no project id, and a baseline row that describes an activity it was not given cannot
+  // belong to the project under control. This is defence in depth, not a substitute for callers
+  // fetching the right rows — every caller must still scope the query to the project's active
+  // approved baseline. Correctly-scoped callers are unaffected: their rows all match, so the
+  // maximum is identical.
   let baselineFinish: string | null = null;
   for (const b of baselines) {
+    if (!actById.has(b.activity_id)) continue; // foreign-project / foreign-baseline row
     if (isIsoDate(b.early_finish) && (baselineFinish === null || b.early_finish > baselineFinish)) {
       baselineFinish = b.early_finish;
     }
@@ -1146,6 +1163,117 @@ export function analyzeScheduleControl(input: ScheduleControlInput): ScheduleCon
     },
     variances, migration, nearCritical: nearCriticalList, milestones,
     attribution, lookahead, accuracy, actions: top5, confidence,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// §8b — canonical criticality (F9.4, Controlled Pilot defect 4)
+// ---------------------------------------------------------------------------
+
+/**
+ * Canonical criticality of one activity, as determined by the statused CPM at the governed Data
+ * Date — never by the persisted `activities.is_critical` column.
+ */
+export interface CanonicalActivityCriticality {
+  critical: boolean;
+  totalFloat: number;
+  /** `percent_complete >= 100` or an `actual_finish` is recorded — the same rule F5 uses. */
+  completed: boolean;
+}
+
+/**
+ * The single definition of "how many critical activities does this project have".
+ *
+ * WHY THIS EXISTS
+ * ---------------
+ * The Controlled Pilot showed the same project reporting 9 critical activities on one screen and 6
+ * on another. Two criticality sources were live:
+ *
+ *   - the persisted `activities.is_critical` column — a CACHED flag written by the last CPM
+ *     recalculation (or, in seed data, authored by hand). It still marked three 100%-complete
+ *     activities as critical, which the statused CPM at the governed Data Date no longer does,
+ *     because finished work does not drive the remaining critical path;
+ *   - the canonical statused CPM (`calculateCpm(...).isCritical`), which F5 quotes as
+ *     `project.criticalCount`.
+ *
+ * The Executive Report's critical-activity table and the DCMA float profile read the cached flag
+ * (9); the F5 panel read the canonical CPM (6); and the Dashboard read the cached flag WITH an
+ * extra `percent_complete < 100` filter, which landed on 6 by coincidence while being labelled
+ * "Critical Activities" — an incomplete-subset metric wearing the total metric's name.
+ *
+ * THE RULE
+ * --------
+ * `totalCritical` is the count behind any label that says "Critical Activities". It is derived from
+ * the canonical statused CPM only, and it is identical to `ScheduleControlReport.project
+ * .criticalCount` for the same inputs (S17 asserts the equality rather than trusting it).
+ *
+ * `remainingCritical` is an explicitly SEPARATE metric — canonical-critical activities that are not
+ * yet complete. A screen that wants it must label it as remaining/incomplete critical work and must
+ * not present it under the total metric's name.
+ */
+export interface CanonicalCriticality {
+  dataDate: string;
+  /** Canonical total: every activity the statused CPM flags critical, completed or not. */
+  totalCritical: number;
+  /** Explicit subset: canonical-critical AND not completed. Never labelled "Critical Activities". */
+  remainingCritical: number;
+  criticalIds: string[];
+  remainingCriticalIds: string[];
+  /** Per-activity canonical criticality, so a consumer never falls back to the stored flag. */
+  byId: Map<string, CanonicalActivityCriticality>;
+}
+
+/**
+ * Derive canonical criticality from the same statused CPM F5 runs.
+ *
+ * Pure and clock-free: the Data Date is supplied, never inferred from the machine. Options mirror
+ * `ScheduleControlInput` so a caller already running F5 gets byte-identical criticality, and a
+ * caller that does not run F5 (report and audit screens) still gets the canonical answer instead of
+ * reading a stale column.
+ */
+export function summarizeCanonicalCriticality(
+  activities: Activity[],
+  links: ActivityLink[],
+  options: {
+    dataDate: string;
+    calendarType?: CalendarType;
+    statusLogic?: 'retained_logic' | 'progress_override';
+  },
+): CanonicalCriticality {
+  const { dataDate, calendarType = '6_days', statusLogic = 'retained_logic' } = options;
+  const byId = new Map<string, CanonicalActivityCriticality>();
+
+  if (activities.length === 0) {
+    return { dataDate, totalCritical: 0, remainingCritical: 0, criticalIds: [], remainingCriticalIds: [], byId };
+  }
+
+  const cpm = calculateCpm(activities, links, { calendarType, dataDate, statusLogic });
+  const resultById = new Map(cpm.results.map((r) => [r.activityId, r]));
+
+  for (const a of activities) {
+    const r = resultById.get(a.id);
+    const pct = Number(a.percent_complete) || 0;
+    byId.set(a.id, {
+      // Same source and same fallback as F5's `statused` rows: canonical CPM criticality, and
+      // `false` when the CPM produced no result for the activity.
+      critical: r ? r.isCritical : false,
+      totalFloat: r ? r.totalFloat : 0,
+      completed: pct >= 100 || !!a.actual_finish,
+    });
+  }
+
+  const criticalIds = activities.filter((a) => byId.get(a.id)?.critical).map((a) => a.id);
+  const remainingCriticalIds = activities
+    .filter((a) => byId.get(a.id)?.critical && !byId.get(a.id)?.completed)
+    .map((a) => a.id);
+
+  return {
+    dataDate,
+    totalCritical: criticalIds.length,
+    remainingCritical: remainingCriticalIds.length,
+    criticalIds,
+    remainingCriticalIds,
+    byId,
   };
 }
 

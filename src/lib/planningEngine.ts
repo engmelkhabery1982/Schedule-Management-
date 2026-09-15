@@ -107,11 +107,17 @@ export function generateSmartActivityPlans(
  * value, from the CBS budget lines, or from the BOQ — in that precedence. `'unavailable'` means no
  * such source exists, in which case `bac` is 0 and consumers must render N/A instead of a figure.
  * `'caller_supplied'` marks `deriveEvmFromScalars`, where the scalar is handed in by the caller.
+ *
+ * `'approved_baseline'` (F9.4) is produced only by the canonical EVM read-out in
+ * `src/lib/canonicalEvm.ts`, which quotes F6: the cost-control layer authorizes BAC from the
+ * approved baseline's `planned_cost` (the PMB) ahead of any other source. This engine's own
+ * precedence below is unchanged and never returns it.
  */
 export type EvmBacSource =
   | 'contract_value'
   | 'budget_lines'
   | 'boq_items'
+  | 'approved_baseline'
   | 'caller_supplied'
   | 'unavailable';
 
