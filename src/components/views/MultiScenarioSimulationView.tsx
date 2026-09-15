@@ -572,7 +572,17 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
                         </td>
 
                         <td className="p-3 text-center font-mono font-bold text-rose-700 text-[11px]">
-                          {s.peakCashDeficitSar === null ? NA : `-${s.peakCashDeficitSar.toLocaleString()} ر.س`}
+                          {s.peakCashDeficitSar === null ? (
+                            // F9.2: no authoritative cash-flow basis ⇒ N/A, never a fabricated SAR deficit.
+                            <span
+                              className="text-slate-400 font-sans cursor-help"
+                              title={isRtl ? (s.peakCashDeficitReasonAr ?? undefined) : (s.peakCashDeficitReasonEn ?? undefined)}
+                            >
+                              {NA}
+                            </span>
+                          ) : (
+                            `-${s.peakCashDeficitSar.toLocaleString()} ر.س`
+                          )}
                         </td>
 
                         <td className="p-3 text-center font-mono text-[10px] text-slate-600">
@@ -945,8 +955,20 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
 
                   <div className="bg-slate-800/80 p-3 rounded-xl border border-slate-700">
                     <p className="text-[10px] text-slate-400 uppercase font-bold">{isRtl ? 'عجز السيولة الأقصى' : 'Peak Cash Squeeze'}</p>
-                    <p className="text-base font-black text-rose-400 font-mono mt-1">{customScenarioResult.peakCashDeficitSar === null ? NA : `-${customScenarioResult.peakCashDeficitSar.toLocaleString()} ر.س`}</p>
-                    <span className="text-[10px] text-slate-400 font-mono">Working Capital Gap</span>
+                    <p
+                      className="text-base font-black text-rose-400 font-mono mt-1"
+                      title={customScenarioResult.peakCashDeficitSar === null
+                        ? (isRtl ? (customScenarioResult.peakCashDeficitReasonAr ?? undefined) : (customScenarioResult.peakCashDeficitReasonEn ?? undefined))
+                        : undefined}
+                    >
+                      {customScenarioResult.peakCashDeficitSar === null ? NA : `-${customScenarioResult.peakCashDeficitSar.toLocaleString()} ر.س`}
+                    </p>
+                    {/* F9.2: no authoritative cash-flow basis ⇒ N/A with an explicit reason, never a fabricated deficit. */}
+                    <span className="text-[10px] text-slate-400 font-sans">
+                      {customScenarioResult.peakCashDeficitSar === null
+                        ? (isRtl ? 'غير متاح — لا أساس تدفق نقدي/مدفوعات موثوق' : 'N/A — no authoritative cash-flow/payment basis')
+                        : (isRtl ? 'فجوة رأس المال العامل' : 'Working Capital Gap')}
+                    </span>
                   </div>
                 </div>
               </div>

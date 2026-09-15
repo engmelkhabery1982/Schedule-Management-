@@ -26,7 +26,7 @@
 import { DEFAULT_DATA_DATE, governedDefaultToday } from '@/lib/projectControlsConstants';
 import { resolveDataDate, isIsoDate, isAfterDataDate, isOnOrBeforeDataDate, calendarDaysBetween, classifyByDate, latestDate, earliestDate } from '@/lib/chronologyGuard';
 import { calculateCpm } from '@/lib/cpmEngine';
-import { getCalendar, countWorkingDays } from '@/lib/calendarEngine';
+import { getCalendar, countWorkingDays, addWorkingDays } from '@/lib/calendarEngine';
 import { calculateBaselineVariances } from '@/lib/trendEngine';
 import { generateScheduleAlerts } from '@/lib/alertEngine';
 import { calculateRecoveryPlan } from '@/lib/recoveryEngine';
@@ -46,8 +46,8 @@ import {
 } from '@/lib/complexScenarioSimulator';
 import type {
   Activity, ActivityBoqAllocation, ActivityLink, ActivityResource, BaselineActivity, BoqItem,
-  ComplexScenarioResult, CostControlSnapshot, CostTransaction, ParsedBoqRow, Project,
-  ProgressUpdate, Resource, ScheduleUpdateSnapshot, WbsNode,
+  ComplexScenarioModel, ComplexScenarioResult, CostControlSnapshot, CostTransaction, ParsedBoqRow,
+  Project, ProgressUpdate, Resource, ScheduleUpdateSnapshot, WbsNode,
 } from '@/types';
 
 // ---------------------------------------------------------------------------
@@ -992,6 +992,86 @@ console.log('--- S14 complex-scenario schedule basis (F9.1 anti-fabrication)');
       r.probabilisticEnvelope.p90DurationDays, r.probabilisticEnvelope.p80CostSar],
   });
   eq('S14 determinism: identical seed ⇒ identical scenario figures', keyFigures(okRes2), keyFigures(okRes));
+}
+
+// ===========================================================================
+console.log('--- S15 complex-scenario anti-fabrication (F9.2: duration floor + cash deficit)');
+// ===========================================================================
+{
+  const mkProject = (o: Partial<Project> = {}): Project => ({
+    id: 'p1', name: 'F9.2 Test Project', client: null, location: null, contract_value: 3000000,
+    currency: 'SAR', start_date: null, end_date: null, data_date: DD, duration_days: null,
+    status: 'active', description: null, calendar_type: '6_days', created_at: '2026-01-01T00:00:00Z',
+    ...o,
+  });
+  const neutral = STANDARD_COMPLEX_SCENARIOS[0]; // SCN-01-BASELINE ⇒ netDurationVarianceDays === 0
+  const cal = getCalendar('6_days');
+  const start = '2026-07-01';
+  const runOpts = { seed: 7, iterations: 50, risks: [] };
+
+  // --- Finding 1: no fabricated 90-day minimum duration ---------------------
+  // A real 30-day project under the neutral scenario must stay 30 days (the old floor forced 90).
+  const r30 = simulateComplexProjectScenario(mkProject({ start_date: start, duration_days: 30 }), [], [], [], neutral, null, runOpts);
+  eq('S15 duration: real 30-day project + neutral scenario stays 30 (not floored to 90)', r30.totalDurationDays, 30);
+  ok('S15 duration: is NOT the fabricated 90-day floor', r30.totalDurationDays !== 90);
+
+  // Finish date follows the corrected 30-day duration (mirrors the engine's own addWorkingDays call).
+  eq('S15 finish: follows the corrected 30-day duration', r30.finishDate, addWorkingDays(start, 30, cal));
+  ok('S15 finish: is not the 90-day-fabricated finish', r30.finishDate !== addWorkingDays(start, 90, cal));
+
+  // SPI follows the corrected duration: neutral ⇒ schedule factor 30/30 = 1.0 ⇒ SPI == canonical SPI.
+  // Under the old 90-day floor the factor was 30/90 = 0.333 and SPI would have collapsed.
+  ok('S15 SPI: neutral 30-day scenario leaves SPI at the canonical value (factor 1.0, not 0.33)',
+    r30.spi !== null && Math.abs(r30.spi - r30.baselineSpi) < 0.01);
+
+  // Cost follows the corrected duration: overhead prolongation factor is total/base = 30/30 = 1.0.
+  // A 90-day project under the same neutral scenario also has factor 90/90 = 1.0, so the two cost
+  // outcomes must be EQUAL. Under the old floor the 30-day project's factor was 90/30 = 3.0 and its
+  // overhead (hence cost outcome) would have been inflated above the 90-day project's.
+  const r90 = simulateComplexProjectScenario(mkProject({ start_date: start, duration_days: 90 }), [], [], [], neutral, null, runOpts);
+  eq('S15 duration: real 90-day project + neutral stays 90', r90.totalDurationDays, 90);
+  ok('S15 cost: 30-day and 90-day neutral cost outcomes are equal (prolongation factor 1.0 both; old floor tripled the 30-day overhead)',
+    r30.simulatedCostOutcomeSar !== null && r30.simulatedCostOutcomeSar === r90.simulatedCostOutcomeSar);
+
+  // Lower bound: an aggressive-crashing scenario on a tiny project clamps to the valid minimum (>= 1
+  // working day), never to 90 and never non-positive.
+  const crashScenario: ComplexScenarioModel = {
+    ...neutral, id: 'SCN-TEST-CRASH',
+    parameters: { ...neutral.parameters, crashingOvertimeFactor: 2.0, criticalDelayDays: 0, variationOrderDays: 0 },
+  };
+  const r5crash = simulateComplexProjectScenario(mkProject({ start_date: start, duration_days: 5 }), [], [], [], crashScenario, null, runOpts);
+  ok('S15 duration: aggressive crashing clamps to the valid minimum (>= 1), never 90 and never non-positive',
+    r5crash.totalDurationDays !== null && r5crash.totalDurationDays >= 1 && r5crash.totalDurationDays < 90);
+
+  // --- Finding 2: no fabricated Peak Cash Deficit SAR -----------------------
+  // The old code added 250000 (inflation > 10) or 80000 (else) to a monthly burn rate. Prove that no
+  // scenario — including each branch, WITH a real schedule basis — publishes any SAR cash deficit now.
+  const supplyChain = STANDARD_COMPLEX_SCENARIOS[1]; // materialInflationPercent 22 (> 10 ⇒ old +250000)
+  const bigProj = () => mkProject({ start_date: start, duration_days: 200, contract_value: 5000000 });
+  const cashHigh = simulateComplexProjectScenario(bigProj(), FULL.activities, FULL.links, [], supplyChain, null, runOpts);
+  ok('S15 cash: high-inflation scenario has a real schedule basis (so the old code WOULD have published a deficit)',
+    cashHigh.scheduleBasisAvailable && cashHigh.simulatedCostOutcomeSar !== null);
+  eq('S15 cash: high-inflation scenario publishes NO cash deficit (was the +250000 branch)', cashHigh.peakCashDeficitSar, null);
+  ok('S15 cash: high-inflation deficit is not the fabricated 250000', cashHigh.peakCashDeficitSar !== 250000);
+
+  const cashLow = simulateComplexProjectScenario(bigProj(), FULL.activities, FULL.links, [], neutral, null, runOpts);
+  eq('S15 cash: low-inflation scenario publishes NO cash deficit (was the +80000 branch)', cashLow.peakCashDeficitSar, null);
+  ok('S15 cash: low-inflation deficit is not the fabricated 80000', cashLow.peakCashDeficitSar !== 80000);
+
+  ok('S15 cash: bilingual N/A reason present on an available-basis scenario',
+    cashHigh.peakCashDeficitReasonAr !== null && cashHigh.peakCashDeficitReasonEn !== null);
+
+  // The unavailable-basis path is also N/A with a reason (nothing fabricated either way).
+  const cashNa = simulateComplexProjectScenario(mkProject(), [], [], [], supplyChain, null, runOpts);
+  eq('S15 cash: unavailable schedule basis also N/A', cashNa.peakCashDeficitSar, null);
+  ok('S15 cash: unavailable basis carries the N/A reason', cashNa.peakCashDeficitReasonEn !== null);
+
+  noNonFinite('S15 duration: 30-day result carries no NaN/Infinity', r30);
+  noNonFinite('S15 cash: high-inflation result carries no NaN/Infinity', cashHigh);
+
+  // The watchdog must not divide by the null cash deficit nor emit a fabricated deviation.
+  const cashWatch = runPrecisionWatchdogAudit(bigProj(), FULL.activities, [], [cashHigh]);
+  noNonFinite('S15 watchdog over a scenario with a null cash deficit', cashWatch);
 }
 
 // ---------------------------------------------------------------------------

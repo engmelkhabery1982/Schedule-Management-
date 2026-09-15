@@ -51,6 +51,28 @@ export const SCENARIO_COST_NATURE_SPLIT_BASIS_POINTS = {
   overheads: 800,
 } as const;
 
+/**
+ * F9.2: the ONLY floor applied to a simulated project duration. It is the mathematically valid
+ * minimum (a project spans at least one working day) required so the finish-date offset, the
+ * overhead prolongation factor and the index scaling stay well-defined. The former
+ * `Math.max(90, ...)` fabricated a 90-day minimum project: a real 30-day project under a neutral
+ * scenario was silently inflated to 90 days (and its overhead cost tripled with it). The simulated
+ * duration is now `baseDurationDays + netDurationVarianceDays`, clamped only to this bound.
+ */
+export const MIN_SIMULATED_DURATION_DAYS = 1;
+
+/**
+ * F9.2: this scenario simulator is given NO authoritative cash-flow/payment basis — no payment
+ * schedule, client billing curve, retention deductions or cash-flow model is passed in; it models
+ * only the scenario's COST outcome. A SAR cash deficit is a cash-flow fact, so it is never
+ * fabricated here (the former formula added hardcoded 250000 / 80000 SAR to a monthly burn rate).
+ * These reasons accompany the always-null `peakCashDeficitSar` so the UI can state why it is N/A.
+ */
+export const PEAK_CASH_DEFICIT_UNAVAILABLE_REASON_EN =
+  'No authoritative cash-flow/payment basis (payment schedule, client billing, retention or cash-flow curve) is available to the scenario simulator, so no cash-deficit amount is fabricated; reported as N/A.';
+export const PEAK_CASH_DEFICIT_UNAVAILABLE_REASON_AR =
+  'لا يتوفر لمحاكي السيناريوهات أساس تدفق نقدي/مدفوعات موثوق (جدول دفعات، فواتير المالك، المحتجزات أو منحنى التدفق النقدي)، لذا لا يتم اختلاق أي قيمة عجز نقدي؛ تُعرض كـ N/A.';
+
 export const STANDARD_COMPLEX_SCENARIOS: ComplexScenarioModel[] = [
   {
     id: 'SCN-01-BASELINE',
@@ -338,8 +360,11 @@ export function simulateComplexProjectScenario(
   const crashingCompressionDays = p.crashingOvertimeFactor > 1.0 ? Math.round((p.crashingOvertimeFactor - 1.0) * 45) : 0;
   
   const netDurationVarianceDays = Math.round((rawAddedDays / effectiveProductivity) - crashingCompressionDays);
+  // F9.2: no arbitrary minimum. The simulated duration is the authoritative base plus the scenario
+  // delta, clamped only to the mathematically valid lower bound (>= 1 working day). The former
+  // `Math.max(90, ...)` fabricated a 90-day floor (a real 30-day project became 90 days).
   const totalSimulatedDurationDays =
-    baseDurationDays !== null ? Math.max(90, baseDurationDays + netDurationVarianceDays) : null;
+    baseDurationDays !== null ? Math.max(MIN_SIMULATED_DURATION_DAYS, baseDurationDays + netDurationVarianceDays) : null;
   const simulatedFinishDate =
     startDate !== null && totalSimulatedDurationDays !== null
       ? addWorkingDays(startDate, totalSimulatedDurationDays, calendar)
@@ -413,14 +438,16 @@ export function simulateComplexProjectScenario(
   const eacPessimistic = forecast ? forecast.pessimistic.eac : null;
   const eacBottomUp = forecast ? forecast.bottomUp.eac : null;
 
-  // 3. Peak Cash Deficit Calculation (Working capital strain)
-  // Monthly billing delays + material cost surges. The burn rate spreads the cost outcome over the
-  // simulated duration, so it is N/A when either is unavailable.
-  const cashInflowLagMonths = p.cashInflowDelayDays / 30;
-  const peakCashDeficitSar =
-    simulatedCostOutcomeSar !== null && totalSimulatedDurationDays !== null && totalSimulatedDurationDays > 0
-      ? Math.round((simulatedCostOutcomeSar / (totalSimulatedDurationDays / 30)) * (1.5 + cashInflowLagMonths) + (p.materialInflationPercent > 10 ? 250000 : 80000))
-      : null;
+  // 3. Peak Cash Deficit (working-capital strain) — F9.2 anti-fabrication.
+  // A SAR cash deficit is a cash-flow/payment fact. This simulator is given NO authoritative
+  // cash-flow basis (no payment schedule, client billing curve, retention deductions or cash-flow
+  // model is passed in) — it models only the scenario's COST outcome. The former formula fabricated
+  // a deficit from a monthly burn rate plus hardcoded 250000 / 80000 SAR constants. We never invent
+  // a cash figure: without an authoritative basis the field is N/A with an explicit reason. A real
+  // cash-flow/payment model, if ever wired in, is the only thing that may populate it.
+  const peakCashDeficitSar: number | null = null;
+  const peakCashDeficitReasonAr: string | null = PEAK_CASH_DEFICIT_UNAVAILABLE_REASON_AR;
+  const peakCashDeficitReasonEn: string | null = PEAK_CASH_DEFICIT_UNAVAILABLE_REASON_EN;
 
   // 4. Probabilistic percentile envelope (GAP-029) -- sampled, never a static multiplier.
   //
@@ -641,6 +668,8 @@ export function simulateComplexProjectScenario(
     spi,
     cpi,
     peakCashDeficitSar,
+    peakCashDeficitReasonAr,
+    peakCashDeficitReasonEn,
     p80FinishDate,
     p80CostSar,
     probabilisticEnvelope,

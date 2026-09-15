@@ -992,7 +992,12 @@ export interface ComplexScenarioResult {
    * Null when the schedule basis is unavailable (F9.1) — the factors need a real duration. */
   spi: number | null;
   cpi: number | null;
+  /** Null (N/A) whenever no authoritative cash-flow/payment basis exists — never a fabricated
+   * SAR deficit (F9.2 removed the hardcoded 250000/80000 constants). */
   peakCashDeficitSar: number | null;
+  /** Bilingual reason the cash deficit is N/A; null only if a real figure was ever derived. */
+  peakCashDeficitReasonAr: string | null;
+  peakCashDeficitReasonEn: string | null;
   /**
    * P80 finish date read from the SIMULATED duration distribution (GAP-029) -- never the former
    * `deterministic duration x 1.08`. When no valid simulation exists it falls back to the
