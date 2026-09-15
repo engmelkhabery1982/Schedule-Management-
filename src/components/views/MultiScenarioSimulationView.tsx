@@ -175,6 +175,8 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
   const num = (v: number | null, suffix = '') => (v === null ? NA : `${v.toLocaleString()}${suffix}`);
   const idx = (v: number | null) => (v === null ? NA : v.toFixed(2));
   const dateOr = (v: string | null) => v ?? NA;
+  /** Honest signed formatting for measured deltas — '+' only when the value really is positive. */
+  const fmtSigned = (v: number) => `${v > 0 ? '+' : ''}${v.toLocaleString()}`;
 
   // Compute Standard Scenarios Results
   const scenarioResults: ComplexScenarioResult[] = useMemo(() => {
@@ -208,12 +210,19 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
     return runPrecisionWatchdogAudit(activeProject, activities, budgetLines, allResults);
   }, [activeProject, activities, budgetLines, scenarioResults, customScenarioResult]);
 
-  // Compute Tornado Data
-  const tornadoData = useMemo(() => {
-    if (scenarioResults.length === 0) return [];
-    const baseResult = scenarioResults[0];
-    return calculateScenarioSensitivityTornado(baseResult, scenarioResults);
-  }, [scenarioResults]);
+  // Compute Tornado Data — F9.3: real one-at-a-time scenario reruns centred on the same contractual
+  // baseline scenario scenarioResults[0] uses, or an explicit unavailable envelope. Never hardcoded bars.
+  const tornado = useMemo(() => {
+    if (!activeProject) return null;
+    return calculateScenarioSensitivityTornado(
+      activeProject, activities, links, budgetLines, STANDARD_COMPLEX_SCENARIOS[0], canonicalEvm, { risks },
+    );
+  }, [activeProject, activities, links, budgetLines, canonicalEvm, risks]);
+
+  // F9.3: the watchdog header verdict is DERIVED from the actual audit output — never a fixed
+  // "100% parity" badge. A not-measured audit is counted and announced, not dressed as success.
+  const watchdogDriftCount = watchdogMetrics.filter((m) => m.precisionStatus === 'drift_detected').length;
+  const watchdogNotMeasuredCount = watchdogMetrics.filter((m) => m.precisionStatus === 'not_measured').length;
 
   const selectedScenarioDetail = useMemo(() => {
     if (selectedScenarioId === 'SCN-CUSTOM-USER') return customScenarioResult;
@@ -989,17 +998,29 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
                 </h3>
                 <p className="text-xs text-slate-500 mt-0.5">
                   {isRtl
-                    ? 'تدقيق حاسوبي صارم لانحفاظ قوانين الهوامش الزمنية، ومعادلات EVM، وميزان التدفقات النقدية بدون أي تسامح مع الأخطاء.'
-                    : 'Mathematical conservation audits verifying float equations, EVM law, and cash-flow parity with zero error tolerance.'}
+                    ? 'تدقيق حاسوبي لانحفاظ قوانين الهوامش الزمنية ومعادلات EVM؛ وأي تدقيق بلا بيانات موثوقة يُعلن صراحةً كغير مقاس (N/A) ولا يُعرض كتطابق ناجح.'
+                    : 'Mathematical conservation audits for float equations and EVM law; any audit without an authoritative data basis is explicitly reported as not measured (N/A), never as a successful parity.'}
                 </p>
               </div>
 
-              <div className="flex items-center gap-2 bg-emerald-50 border border-emerald-200 px-3 py-1.5 rounded-xl">
-                <CheckCircle2 size={16} className="text-emerald-600" />
-                <span className="text-xs font-black text-emerald-800">
-                  {isRtl ? '100% تطابق رياضي (0.00 ر.س فارق)' : '100% Mathematical Parity'}
-                </span>
-              </div>
+              {/* F9.3: derived from the actual audit output — not a fixed "100% parity" claim. */}
+              {watchdogDriftCount > 0 ? (
+                <div className="flex items-center gap-2 bg-rose-50 border border-rose-200 px-3 py-1.5 rounded-xl">
+                  <AlertTriangle size={16} className="text-rose-600" />
+                  <span className="text-xs font-black text-rose-800">
+                    {isRtl ? `${watchdogDriftCount} انحراف دقة مرصود` : `${watchdogDriftCount} precision drift(s) detected`}
+                  </span>
+                </div>
+              ) : (
+                <div className="flex items-center gap-2 bg-emerald-50 border border-emerald-200 px-3 py-1.5 rounded-xl">
+                  <CheckCircle2 size={16} className="text-emerald-600" />
+                  <span className="text-xs font-black text-emerald-800">
+                    {isRtl
+                      ? `كل المقاييس المقاسة ضمن التسامح${watchdogNotMeasuredCount ? ` · ${watchdogNotMeasuredCount} غير مقاس (N/A)` : ''}`
+                      : `All measured checks within tolerance${watchdogNotMeasuredCount ? ` · ${watchdogNotMeasuredCount} not measured (N/A)` : ''}`}
+                  </span>
+                </div>
+              )}
             </div>
 
             <div className="divide-y divide-slate-100">
@@ -1007,7 +1028,16 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
                 <div key={item.id} className="py-4 space-y-2">
                   <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                     <div className="flex items-center gap-2">
-                      <span className="inline-block w-2.5 h-2.5 rounded-full bg-emerald-500" />
+                      {/* F9.3: the dot follows the metric's real status, not a fixed green. */}
+                      <span
+                        className={`inline-block w-2.5 h-2.5 rounded-full ${
+                          item.precisionStatus === 'drift_detected'
+                            ? 'bg-rose-500'
+                            : item.precisionStatus === 'not_measured'
+                              ? 'bg-slate-400'
+                              : 'bg-emerald-500'
+                        }`}
+                      />
                       <p className="font-bold text-slate-900 text-xs">{isRtl ? item.labelAr : item.labelEn}</p>
                       <span className="text-[10px] font-mono text-slate-400 bg-slate-100 px-2 py-0.5 rounded">
                         {item.id}
@@ -1015,8 +1045,21 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
                     </div>
 
                     <div className="flex items-center gap-2">
-                      <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-emerald-100 text-emerald-800">
-                        {item.precisionStatus.toUpperCase()} (0 Drift)
+                      {/* F9.3: the chip shows the REAL deviation (or N/A) — never a hardcoded "(0 Drift)". */}
+                      <span
+                        className={`px-2 py-0.5 rounded text-[10px] font-mono font-bold ${
+                          item.precisionStatus === 'drift_detected'
+                            ? 'bg-rose-100 text-rose-800'
+                            : item.precisionStatus === 'not_measured'
+                              ? 'bg-slate-100 text-slate-500'
+                              : item.precisionStatus === 'exact'
+                                ? 'bg-emerald-100 text-emerald-800'
+                                : 'bg-amber-100 text-amber-800'
+                        }`}
+                      >
+                        {item.precisionStatus === 'not_measured'
+                          ? (isRtl ? 'غير مقاس (N/A)' : 'NOT MEASURED (N/A)')
+                          : `${item.precisionStatus.toUpperCase()} · ${isRtl ? 'انحراف' : 'drift'} ${item.deviation === null ? 'N/A' : item.deviation.toLocaleString()}`}
                       </span>
                     </div>
                   </div>
@@ -1049,48 +1092,74 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
             <h3 className="text-base font-black text-slate-900 mb-1">
               {isRtl ? 'مخطط تورنادو لتحليل الحساسية ومرونة المتغيرات (Tornado Sensitivity Analysis)' : 'Parameter Sensitivity & Volatility Tornado Diagram'}
             </h3>
+            {/* F9.3: a calculated analysis says what it was calculated from; an unavailable one says why. */}
             <p className="text-xs text-slate-500 mb-6">
-              {isRtl
-                ? 'ترتيب المتغيرات الأكثر تأثيراً على الجدول الزمني وتكاليف المشروع لاستهداف تدابير التحكم الهندسي بدقة.'
-                : 'Ranked sensitivity impact of key project variables on duration and financial budget.'}
+              {tornado?.available
+                ? (isRtl
+                    ? `مرتبة حسب التأثير المقاس: كل شريط محسوب من إعادة تشغيل فعلية للسيناريو بمتغير واحد في كل مرة حول السيناريو الأساسي (${tornado.baseScenarioId}) — فروق مقاسة من بيانات المشروع وليست ثوابت معلبة.`
+                    : `Ranked by measured impact: every bar is calculated from real one-at-a-time scenario reruns around the base scenario (${tornado.baseScenarioId}) — measured deltas from project data, never canned constants.`)
+                : (isRtl
+                    ? 'ترتيب المتغيرات الأكثر تأثيراً على الجدول الزمني وتكاليف المشروع لاستهداف تدابير التحكم الهندسي بدقة.'
+                    : 'Ranked sensitivity impact of key project variables on duration and financial budget.')}
             </p>
 
-            <div className="space-y-4">
-              {tornadoData.map((item, idx) => (
-                <div key={idx} className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
-                  <div className="flex justify-between items-center text-xs font-bold">
-                    <span className="text-slate-900">{isRtl ? item.parameterNameAr : item.parameterNameEn}</span>
-                    <span className="text-slate-600 font-mono text-[11px]">
-                      {isRtl ? `تأثير التكلفة: ${item.lowCostSar.toLocaleString()} إلى +${item.highCostSar.toLocaleString()} ر.س` : `Cost Spread: ${item.lowCostSar.toLocaleString()} to +${item.highCostSar.toLocaleString()} SAR`}
-                    </span>
-                  </div>
-
-                  {/* Tornado visual bar */}
-                  <div className="grid grid-cols-2 gap-1 items-center h-5">
-                    {/* Left side: compression / reduction */}
-                    <div className="flex justify-end bg-slate-200 h-3 rounded-l-md overflow-hidden">
-                      <div
-                        className="bg-emerald-500 h-3"
-                        style={{ width: `${Math.min(100, Math.abs(item.lowDurationDays) * 2)}%` }}
-                      />
-                    </div>
-                    {/* Right side: delay expansion */}
-                    <div className="flex justify-start bg-slate-200 h-3 rounded-r-md overflow-hidden">
-                      <div
-                        className="bg-rose-500 h-3"
-                        style={{ width: `${Math.min(100, item.highDurationDays * 1.5)}%` }}
-                      />
-                    </div>
-                  </div>
-
-                  <div className="flex justify-between text-[10px] text-slate-500 font-mono">
-                    <span className="text-emerald-700 font-bold">{item.lowDurationDays} يوم</span>
-                    <span>خط الأساس (Baseline 0)</span>
-                    <span className="text-rose-700 font-bold">+{item.highDurationDays} يوم</span>
-                  </div>
+            {!tornado || !tornado.available ? (
+              <div className="flex items-start gap-2.5 bg-amber-50 border border-amber-300 text-amber-900 rounded-xl p-4 text-xs">
+                <AlertTriangle size={16} className="mt-0.5 shrink-0 text-amber-600" />
+                <div>
+                  <p className="font-bold">
+                    {isRtl ? 'تحليل الحساسية غير متاح (N/A) — لا تُنشر قيم معلبة' : 'Sensitivity analysis unavailable (N/A) — no canned values are published'}
+                  </p>
+                  <p className="mt-1 break-words">
+                    {tornado
+                      ? (isRtl ? tornado.reasonAr : tornado.reasonEn)
+                      : (isRtl ? 'لا يوجد مشروع نشط لتحليله.' : 'No active project to analyze.')}
+                  </p>
                 </div>
-              ))}
-            </div>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                {tornado.bars.map((item) => (
+                  <div key={item.parameterKey} className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+                    <div className="flex justify-between items-center text-xs font-bold">
+                      <span className="text-slate-900">{isRtl ? item.parameterNameAr : item.parameterNameEn}</span>
+                      <span className="text-slate-600 font-mono text-[11px]">
+                        {isRtl
+                          ? `تأثير التكلفة: ${fmtSigned(item.lowCostSar)} إلى ${fmtSigned(item.highCostSar)} ر.س`
+                          : `Cost Spread: ${fmtSigned(item.lowCostSar)} to ${fmtSigned(item.highCostSar)} SAR`}
+                      </span>
+                    </div>
+
+                    {/* Tornado visual bar: left = low-end probe, right = high-end probe; colour follows
+                        the SIGN of the measured delta (rose = longer, emerald = shorter). */}
+                    <div className="grid grid-cols-2 gap-1 items-center h-5">
+                      <div className="flex justify-end bg-slate-200 h-3 rounded-l-md overflow-hidden">
+                        <div
+                          className={`h-3 ${item.lowDurationDays > 0 ? 'bg-rose-500' : 'bg-emerald-500'}`}
+                          style={{ width: `${Math.min(100, Math.abs(item.lowDurationDays) * 2)}%` }}
+                        />
+                      </div>
+                      <div className="flex justify-start bg-slate-200 h-3 rounded-r-md overflow-hidden">
+                        <div
+                          className={`h-3 ${item.highDurationDays > 0 ? 'bg-rose-500' : 'bg-emerald-500'}`}
+                          style={{ width: `${Math.min(100, Math.abs(item.highDurationDays) * 1.5)}%` }}
+                        />
+                      </div>
+                    </div>
+
+                    <div className="flex justify-between text-[10px] text-slate-500 font-mono">
+                      <span className={item.lowDurationDays > 0 ? 'text-rose-700 font-bold' : 'text-emerald-700 font-bold'}>
+                        {fmtSigned(item.lowDurationDays)} {isRtl ? 'يوم' : 'd'}
+                      </span>
+                      <span>{isRtl ? `الأساس (${tornado.baseScenarioId})` : `base (${tornado.baseScenarioId})`}</span>
+                      <span className={item.highDurationDays > 0 ? 'text-rose-700 font-bold' : 'text-emerald-700 font-bold'}>
+                        {fmtSigned(item.highDurationDays)} {isRtl ? 'يوم' : 'd'}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         </div>
       )}

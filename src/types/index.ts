@@ -1025,6 +1025,42 @@ export interface ComplexScenarioResult {
   scheduleBasisReasonEn: string | null;
 }
 
+/**
+ * F9.3: one bar of the scenario sensitivity tornado. Every figure is a DELTA measured from an
+ * actual one-at-a-time scenario rerun (a single parameter swung across its declared probe range,
+ * the deterministic outcome minus the base scenario's). None of these values is a hardcoded
+ * constant: the former implementation published fixed impacts (-25/+55 days, -85k/+420k SAR, ...)
+ * for every project as though they were measured analysis.
+ */
+export interface ScenarioTornadoBar {
+  /** The scenario parameter this bar swings. */
+  parameterKey: keyof ComplexScenarioModel['parameters'];
+  parameterNameAr: string;
+  parameterNameEn: string;
+  /** Signed duration delta (days) of the low-end swing rerun vs the base scenario. */
+  lowDurationDays: number;
+  /** Signed duration delta (days) of the high-end swing rerun vs the base scenario. */
+  highDurationDays: number;
+  /** Signed cost-outcome delta (SAR) of the low-end swing rerun vs the base scenario. */
+  lowCostSar: number;
+  /** Signed cost-outcome delta (SAR) of the high-end swing rerun vs the base scenario. */
+  highCostSar: number;
+}
+
+/**
+ * F9.3: the sensitivity-tornado envelope. `available: false` with empty bars means no defensible
+ * sensitivity could be calculated from the real schedule/cost basis; the bilingual reason says why.
+ * An unavailable analysis is never presented as a measured one.
+ */
+export interface ScenarioSensitivityTornado {
+  available: boolean;
+  /** The scenario the one-at-a-time reruns were centred on; null when nothing ran. */
+  baseScenarioId: string | null;
+  reasonAr: string | null;
+  reasonEn: string | null;
+  bars: ScenarioTornadoBar[];
+}
+
 export interface PrecisionWatchdogMetric {
   id: string;
   category: 'cpm_float' | 'evm_conservation' | 'ssot_cost' | 'cashflow_integrity' | 'statistical_bounds';
@@ -1033,8 +1069,12 @@ export interface PrecisionWatchdogMetric {
   formula: string;
   calculatedValue: string;
   expectedValue: string;
-  deviation: number;
-  precisionStatus: 'exact' | 'acceptable' | 'drift_detected';
+  /** The measured discrepancy. `null` (F9.3) when the audit had no authoritative data to read —
+   * a metric that measured nothing must never publish a fabricated `0`. */
+  deviation: number | null;
+  /** `not_measured` (F9.3): no authoritative basis existed, so no precision is claimed at all —
+   * an unavailable audit is never dressed as a successful one. */
+  precisionStatus: 'exact' | 'acceptable' | 'drift_detected' | 'not_measured';
   notesAr: string;
   notesEn: string;
 }

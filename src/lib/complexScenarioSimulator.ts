@@ -10,6 +10,8 @@ import type {
   ComplexScenarioResult,
   PrecisionWatchdogMetric,
   ScenarioProbabilisticEnvelope,
+  ScenarioSensitivityTornado,
+  ScenarioTornadoBar,
 } from '@/types';
 import { addWorkingDays, countWorkingDays, getCalendar } from '@/lib/calendarEngine';
 import { earliestDate, isIsoDate } from '@/lib/chronologyGuard';
@@ -72,6 +74,67 @@ export const PEAK_CASH_DEFICIT_UNAVAILABLE_REASON_EN =
   'No authoritative cash-flow/payment basis (payment schedule, client billing, retention or cash-flow curve) is available to the scenario simulator, so no cash-deficit amount is fabricated; reported as N/A.';
 export const PEAK_CASH_DEFICIT_UNAVAILABLE_REASON_AR =
   'لا يتوفر لمحاكي السيناريوهات أساس تدفق نقدي/مدفوعات موثوق (جدول دفعات، فواتير المالك، المحتجزات أو منحنى التدفق النقدي)، لذا لا يتم اختلاق أي قيمة عجز نقدي؛ تُعرض كـ N/A.';
+
+/**
+ * F9.3: the declared one-at-a-time probe ranges the sensitivity tornado swings. These are
+ * assumptions about WHICH ranges to probe (the same ranges the chart has always advertised) —
+ * they are NOT results. Every published impact is calculated from real scenario reruns against
+ * the current schedule/cost basis; the former implementation published hardcoded impacts
+ * (-25/+55 days, -85k/+420k SAR, ...) for every project as though they were measured.
+ */
+export interface TornadoSwingDefinition {
+  parameterKey: keyof ComplexScenarioModel['parameters'];
+  nameAr: string;
+  nameEn: string;
+  lowValue: number;
+  highValue: number;
+}
+export const TORNADO_PARAMETER_SWINGS: readonly TornadoSwingDefinition[] = [
+  {
+    parameterKey: 'productivityFactor',
+    nameAr: 'إنتاجية العمالة والأطقم (Labor Productivity)',
+    nameEn: 'Labor & Crew Productivity (0.6x - 1.25x)',
+    lowValue: 0.6,
+    highValue: 1.25,
+  },
+  {
+    parameterKey: 'materialInflationPercent',
+    nameAr: 'تضخم أسعار المواد الدائمة (Material Inflation)',
+    nameEn: 'Permanent Materials Inflation (0% - 25%)',
+    lowValue: 0,
+    highValue: 25,
+  },
+  {
+    parameterKey: 'cashInflowDelayDays',
+    nameAr: 'تأخر مستخلصات المالك والسيولة (Cash Delay)',
+    nameEn: 'Client Cash Inflow Delay (0 - 60 Days)',
+    lowValue: 0,
+    highValue: 60,
+  },
+  {
+    parameterKey: 'subcontractorCapacityFactor',
+    nameAr: 'تعثر مقاولي الباطن (Subcontractor Output)',
+    nameEn: 'Subcontractor Capacity Factor (0.4x - 1.2x)',
+    lowValue: 0.4,
+    highValue: 1.2,
+  },
+  {
+    parameterKey: 'variationOrderValueSar',
+    nameAr: 'أوامر التغيير وتوسيع النطاق (Variation Orders)',
+    nameEn: 'Client Scope Variations (+0 to +450k SAR)',
+    lowValue: 0,
+    highValue: 450000,
+  },
+];
+
+/** The tornado consumes ONLY the deterministic scenario outputs (duration days, cost outcome), so
+ * its reruns sample the envelope minimally; the probabilistic envelope is never read from them. */
+export const TORNADO_RERUN_ITERATIONS = 1;
+
+export const TORNADO_UNAVAILABLE_REASON_EN =
+  'Sensitivity analysis unavailable: the scenario schedule/cost basis could not be resolved, so no parameter swing can be rerun against real data. No sensitivity figure is fabricated.';
+export const TORNADO_UNAVAILABLE_REASON_AR =
+  'تحليل الحساسية غير متاح: تعذر استخراج أساس الجدول/التكلفة للسيناريو، لذا لا يمكن إعادة تشغيل أي متغير على بيانات حقيقية. لا يتم اختلاق أي قيم حساسية.';
 
 export const STANDARD_COMPLEX_SCENARIOS: ComplexScenarioModel[] = [
   {
@@ -757,19 +820,23 @@ export function runPrecisionWatchdogAudit(
     });
   });
 
-  // 3. Cash Flow Deficit Parity
+  // 3. Cash Flow Deficit Parity — F9.3: this audit formerly claimed 'exact' parity with deviation 0
+  //    "against the client billing schedule" without reading a single cash-flow record. No
+  //    authoritative cash-flow/payment basis is wired into the scenario pipeline (peakCashDeficitSar
+  //    is N/A — see F9.2), so there is nothing to reconcile and no precision to claim: the metric is
+  //    published as not-measured with an explicit reason, never as a fabricated successful status.
   metrics.push({
     id: 'WATCH-CASH-01',
     category: 'cashflow_integrity',
     labelAr: 'تطابق ميزان السيولة ورأس المال العامل (Cash Flow Balance)',
     labelEn: 'Cash Flow Conservation & Liquidity Parity',
     formula: 'Peak Cash Deficit = Cumulative Outflows - Cumulative Inflows',
-    calculatedValue: 'متسق مع منحنى التدفقات الشهرية',
-    expectedValue: '0.00 ر.س فارق محاسبي',
-    deviation: 0,
-    precisionStatus: 'exact',
-    notesAr: 'تمت مطابقة متطلبات السيولة الشهرية مع جدول دفعات المالك واستقطاعات الضمان وحسن التنفيذ.',
-    notesEn: 'Monthly working capital requirements strictly reconcile against client billing schedule.',
+    calculatedValue: 'N/A — لا توجد بيانات تدفق نقدي أو مدفوعات موثوقة تمت قراءتها',
+    expectedValue: 'N/A — no authoritative cash-flow/payment basis is wired into this audit',
+    deviation: null,
+    precisionStatus: 'not_measured',
+    notesAr: 'لا يدّعي هذا المقياس أي تطابق: لم يُزوَّد التدقيق بجدول دفعات المالك أو منحنى التدفقات النقدية أو بيانات المحتجزات، فلا يوجد ما تتم مطابقته. عجز السيولة في السيناريوهات معروض N/A ولا تُختلق أي قيمة نقدية.',
+    notesEn: 'This metric claims no parity: no client payment schedule, cash-flow curve or retention data is provided to the audit, so there is nothing to reconcile. The scenario cash deficit is reported N/A and no cash figure is fabricated.',
   });
 
   // 4. Statistical Bounds Ordering -- MEASURED from the sampled envelopes (GAP-029 / GAP-031).
@@ -819,52 +886,86 @@ export function runPrecisionWatchdogAudit(
 }
 
 /**
- * Compute Multi-Scenario Sensitivity Tornado Analysis
+ * Compute Multi-Scenario Sensitivity Tornado Analysis (F9.3).
+ *
+ * The former implementation returned five hardcoded bars (-25/+55 days, -85k/+420k SAR, ...) for
+ * EVERY project and scenario, dressed as measured analysis. This implementation calculates the
+ * sensitivity deterministically instead: each declared parameter is swung one-at-a-time across its
+ * declared probe range (`TORNADO_PARAMETER_SWINGS`), the scenario is RERUN against the real
+ * schedule/cost basis, and the published figure is the rerun's deterministic outcome minus the base
+ * scenario's. A parameter that genuinely does not move an outcome in this model yields a true 0 —
+ * a measured zero, never a constant.
+ *
+ * When the basis cannot support reruns (no schedule basis ⇒ no duration/cost outcome), the analysis
+ * is published as unavailable with an explicit bilingual reason and zero bars — never fabricated.
  */
 export function calculateScenarioSensitivityTornado(
-  baseResult: ComplexScenarioResult,
-  scenarios: ComplexScenarioResult[],
-): { parameterNameAr: string; parameterNameEn: string; lowDurationDays: number; highDurationDays: number; lowCostSar: number; highCostSar: number }[] {
-  return [
-    {
-      parameterNameAr: 'إنتاجية العمالة والأطقم (Labor Productivity)',
-      parameterNameEn: 'Labor & Crew Productivity (0.6x - 1.25x)',
-      lowDurationDays: -25,
-      highDurationDays: +55,
-      lowCostSar: -85000,
-      highCostSar: +420000,
-    },
-    {
-      parameterNameAr: 'تضخم أسعار المواد الدائمة (Material Inflation)',
-      parameterNameEn: 'Permanent Materials Inflation (0% - 25%)',
-      lowDurationDays: 0,
-      highDurationDays: +15,
-      lowCostSar: 0,
-      highCostSar: +515000,
-    },
-    {
-      parameterNameAr: 'تأخر مستخلصات المالك والسيولة (Cash Delay)',
-      parameterNameEn: 'Client Cash Inflow Delay (0 - 60 Days)',
-      lowDurationDays: 0,
-      highDurationDays: +40,
-      lowCostSar: 0,
-      highCostSar: +180000,
-    },
-    {
-      parameterNameAr: 'تعثر مقاولي الباطن (Subcontractor Output)',
-      parameterNameEn: 'Subcontractor Capacity Factor (0.4x - 1.2x)',
-      lowDurationDays: -15,
-      highDurationDays: +40,
-      lowCostSar: -40000,
-      highCostSar: +260000,
-    },
-    {
-      parameterNameAr: 'أوامر التغيير وتوسيع النطاق (Variation Orders)',
-      parameterNameEn: 'Client Scope Variations (+0 to +450k SAR)',
-      lowDurationDays: 0,
-      highDurationDays: +45,
-      lowCostSar: 0,
-      highCostSar: +450000,
-    },
-  ];
+  project: Project,
+  activities: Activity[],
+  links: ActivityLink[],
+  budgetLines: BudgetLine[],
+  baseScenario: ComplexScenarioModel,
+  canonicalEvm?: ScenarioEvmBaseline | null,
+  options?: ScenarioSimulationOptions | null,
+): ScenarioSensitivityTornado {
+  // The tornado reads ONLY deterministic outputs (totalDurationDays, simulatedCostOutcomeSar), so
+  // the reruns sample the probabilistic envelope minimally (declared constant, never hidden).
+  const rerunOptions: ScenarioSimulationOptions = {
+    risks: options?.risks ?? null,
+    iterations: TORNADO_RERUN_ITERATIONS,
+    seed: options?.seed ?? null,
+  };
+  const unavailable = (base: ComplexScenarioResult | null): ScenarioSensitivityTornado => ({
+    available: false,
+    baseScenarioId: baseScenario.id,
+    reasonAr: base?.scheduleBasisReasonAr ?? TORNADO_UNAVAILABLE_REASON_AR,
+    reasonEn: base?.scheduleBasisReasonEn ?? TORNADO_UNAVAILABLE_REASON_EN,
+    bars: [],
+  });
+
+  const base = simulateComplexProjectScenario(project, activities, links, budgetLines, baseScenario, canonicalEvm, rerunOptions);
+  if (!base.scheduleBasisAvailable || base.totalDurationDays === null || base.simulatedCostOutcomeSar === null) {
+    return unavailable(base);
+  }
+  const baseDurationDays = base.totalDurationDays;
+  const baseCostSar = base.simulatedCostOutcomeSar;
+
+  const bars: ScenarioTornadoBar[] = [];
+  for (const swing of TORNADO_PARAMETER_SWINGS) {
+    const rerun = (value: number): ComplexScenarioResult => {
+      const parameters = { ...baseScenario.parameters };
+      parameters[swing.parameterKey] = value;
+      return simulateComplexProjectScenario(
+        project, activities, links, budgetLines, { ...baseScenario, parameters }, canonicalEvm, rerunOptions,
+      );
+    };
+    const lowRes = rerun(swing.lowValue);
+    const highRes = rerun(swing.highValue);
+    // Defensive: the basis is shared by every rerun, so these can only be null if the base was
+    // null (handled above). If a rerun ever lost the basis, the analysis is unavailable — no bar
+    // is published from partial data.
+    if (
+      lowRes.totalDurationDays === null || lowRes.simulatedCostOutcomeSar === null
+      || highRes.totalDurationDays === null || highRes.simulatedCostOutcomeSar === null
+    ) {
+      return unavailable(base);
+    }
+    bars.push({
+      parameterKey: swing.parameterKey,
+      parameterNameAr: swing.nameAr,
+      parameterNameEn: swing.nameEn,
+      lowDurationDays: lowRes.totalDurationDays - baseDurationDays,
+      highDurationDays: highRes.totalDurationDays - baseDurationDays,
+      lowCostSar: Math.round(lowRes.simulatedCostOutcomeSar - baseCostSar),
+      highCostSar: Math.round(highRes.simulatedCostOutcomeSar - baseCostSar),
+    });
+  }
+
+  // Classic tornado ordering: widest duration swing first, then widest cost swing. This ranks the
+  // MEASURED spreads; nothing about the order encodes an assumption.
+  const durationSpread = (b: ScenarioTornadoBar) => Math.abs(b.lowDurationDays) + Math.abs(b.highDurationDays);
+  const costSpread = (b: ScenarioTornadoBar) => Math.abs(b.lowCostSar) + Math.abs(b.highCostSar);
+  bars.sort((a, b) => (durationSpread(b) - durationSpread(a)) || (costSpread(b) - costSpread(a)));
+
+  return { available: true, baseScenarioId: baseScenario.id, reasonAr: null, reasonEn: null, bars };
 }

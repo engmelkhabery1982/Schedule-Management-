@@ -42,12 +42,12 @@ import { reconcileFinishForecasts, calculateCpmDeterministicEarlyFinish } from '
 import { calculateControlHealth } from '@/lib/controlHealthEngine';
 import {
   simulateComplexProjectScenario, resolveScenarioScheduleBasis, runPrecisionWatchdogAudit,
-  STANDARD_COMPLEX_SCENARIOS,
+  calculateScenarioSensitivityTornado, STANDARD_COMPLEX_SCENARIOS,
 } from '@/lib/complexScenarioSimulator';
 import type {
   Activity, ActivityBoqAllocation, ActivityLink, ActivityResource, BaselineActivity, BoqItem,
   ComplexScenarioModel, ComplexScenarioResult, CostControlSnapshot, CostTransaction, ParsedBoqRow,
-  Project, ProgressUpdate, Resource, ScheduleUpdateSnapshot, WbsNode,
+  Project, ProgressUpdate, Resource, ScenarioSensitivityTornado, ScheduleUpdateSnapshot, WbsNode,
 } from '@/types';
 
 // ---------------------------------------------------------------------------
@@ -1072,6 +1072,94 @@ console.log('--- S15 complex-scenario anti-fabrication (F9.2: duration floor + c
   // The watchdog must not divide by the null cash deficit nor emit a fabricated deviation.
   const cashWatch = runPrecisionWatchdogAudit(bigProj(), FULL.activities, [], [cashHigh]);
   noNonFinite('S15 watchdog over a scenario with a null cash deficit', cashWatch);
+}
+
+// ===========================================================================
+console.log('--- S16 tornado sensitivity + cash-flow audit (F9.3 anti-pseudo-analysis)');
+// ===========================================================================
+{
+  const mkProject = (o: Partial<Project> = {}): Project => ({
+    id: 'p1', name: 'F9.3 Test Project', client: null, location: null, contract_value: 3000000,
+    currency: 'SAR', start_date: '2026-07-01', end_date: null, data_date: DD, duration_days: 200,
+    status: 'active', description: null, calendar_type: '6_days', created_at: '2026-01-01T00:00:00Z',
+    ...o,
+  });
+  const supplyChain = STANDARD_COMPLEX_SCENARIOS[1]; // carries real delay/VO days and 22% inflation
+  const baselineScn = STANDARD_COMPLEX_SCENARIOS[0]; // neutral: zero delay/VO days
+  const barOf = (t: ScenarioSensitivityTornado, key: string) => t.bars.find((b) => b.parameterKey === key) ?? null;
+
+  // --- Finding 1a: without a schedule/cost basis the analysis is unavailable, never canned ---
+  const tNa = calculateScenarioSensitivityTornado(mkProject({ start_date: null, duration_days: null }), [], [], [], supplyChain, null, { seed: 7 });
+  eq('S16 tornado: no schedule basis ⇒ unavailable', tNa.available, false);
+  eq('S16 tornado: unavailable analysis publishes zero bars (never the five canned ones)', tNa.bars.length, 0);
+  ok('S16 tornado: unavailable analysis carries a bilingual reason', tNa.reasonAr !== null && tNa.reasonEn !== null);
+  eq('S16 tornado: the base scenario is still identified', tNa.baseScenarioId, supplyChain.id);
+
+  // --- Finding 1b: with a real basis every bar is calculated from one-at-a-time reruns ---
+  const projSmall = mkProject({ contract_value: 3000000 });
+  const tSmall = calculateScenarioSensitivityTornado(projSmall, [], [], [], supplyChain, null, { seed: 7 });
+  eq('S16 tornado: available with a real basis', tSmall.available, true);
+  eq('S16 tornado: one bar per declared parameter swing', tSmall.bars.length, 5);
+  ok('S16 tornado: an available analysis needs no reason', tSmall.reasonAr === null && tSmall.reasonEn === null);
+  noNonFinite('S16 tornado: bars carry no NaN/Infinity', tSmall);
+  eq('S16 tornado: ranked by measured duration spread (productivity widest on a delay-carrying base)',
+    tSmall.bars[0].parameterKey, 'productivityFactor');
+
+  // The old implementation returned identical constants for EVERY input. Two materially different
+  // projects (BAC 50M vs 3M) must NOT receive the same sensitivity result: cost bars scale with BAC.
+  const projBig = mkProject({ contract_value: 50000000 });
+  const tBig = calculateScenarioSensitivityTornado(projBig, [], [], [], supplyChain, null, { seed: 7 });
+  const inflSmall = barOf(tSmall, 'materialInflationPercent');
+  const inflBig = barOf(tBig, 'materialInflationPercent');
+  ok('S16 tornado: both runs produced the material-inflation bar', inflSmall !== null && inflBig !== null);
+  ok('S16 tornado: materially different projects do NOT receive the same sensitivity result',
+    inflSmall !== null && inflBig !== null && inflSmall.highCostSar !== inflBig.highCostSar);
+  ok('S16 tornado: cost impact scales with the real BAC (bigger project ⇒ bigger SAR swing)',
+    inflSmall !== null && inflBig !== null && inflBig.highCostSar > inflSmall.highCostSar);
+  ok('S16 tornado: no bar reproduces the old hardcoded productivity constants (-25/+55 d, -85k/+420k SAR)',
+    !tSmall.bars.some((b) => b.lowDurationDays === -25 && b.highDurationDays === 55 && b.lowCostSar === -85000 && b.highCostSar === 420000));
+
+  // Mathematical-justification spot checks against the model's real structure.
+  const prod = barOf(tSmall, 'productivityFactor');
+  ok('S16 tornado: productivity swing moves duration in opposite directions (base carries real delay days)',
+    prod !== null && prod.lowDurationDays > 0 && prod.highDurationDays < 0);
+  const cash = barOf(tSmall, 'cashInflowDelayDays');
+  ok('S16 tornado: cash-delay bar is a MEASURED zero (parameter absent from the duration/cost model), not the old +40 d / +180k SAR',
+    cash !== null && cash.lowDurationDays === 0 && cash.highDurationDays === 0 && cash.lowCostSar === 0 && cash.highCostSar === 0);
+  ok('S16 tornado: material inflation moves cost only, never duration',
+    inflSmall !== null && inflSmall.lowDurationDays === 0 && inflSmall.highDurationDays === 0 && inflSmall.highCostSar > 0);
+
+  // Equal results across different inputs occur ONLY where mathematically justified: the neutral
+  // baseline has no delay days to scale, so its productivity duration sensitivity is a true zero.
+  const tBaseline = calculateScenarioSensitivityTornado(projSmall, [], [], [], baselineScn, null, { seed: 7 });
+  const prodBase = barOf(tBaseline, 'productivityFactor');
+  ok('S16 tornado: baseline productivity duration sensitivity is a justified zero (no delay days to scale)',
+    prodBase !== null && prodBase.lowDurationDays === 0 && prodBase.highDurationDays === 0);
+  ok('S16 tornado: baseline vs supply-chain analyses differ (different inputs ⇒ different results)',
+    JSON.stringify(tBaseline.bars) !== JSON.stringify(tSmall.bars));
+
+  // Determinism: identical inputs ⇒ byte-identical analysis.
+  const tSmall2 = calculateScenarioSensitivityTornado(projSmall, [], [], [], supplyChain, null, { seed: 7 });
+  eq('S16 tornado: deterministic for identical inputs', JSON.stringify(tSmall2), JSON.stringify(tSmall));
+
+  // --- Finding 2: WATCH-CASH-01 never claims exact / deviation 0 without cash-flow data ---
+  const okRes = simulateComplexProjectScenario(projSmall, [], [], [], supplyChain, null, { seed: 7, iterations: 20, risks: [] });
+  const wd = runPrecisionWatchdogAudit(projSmall, [], [], [okRes]);
+  const cashMetric = wd.find((m) => m.id === 'WATCH-CASH-01');
+  ok('S16 watchdog: WATCH-CASH-01 is published', cashMetric !== undefined);
+  eq('S16 watchdog: cash audit is not_measured (no authoritative cash-flow basis exists)', cashMetric?.precisionStatus, 'not_measured');
+  eq('S16 watchdog: cash audit deviation is null — never a fabricated 0', cashMetric?.deviation, null);
+  ok('S16 watchdog: cash audit does not claim exact parity', cashMetric?.precisionStatus !== 'exact');
+  ok('S16 watchdog: cash audit announces N/A in its published values',
+    (cashMetric?.calculatedValue ?? '').includes('N/A') && (cashMetric?.expectedValue ?? '').includes('N/A'));
+  // Even an empty audit cannot coax a successful cash-flow status out of it.
+  const wdEmpty = runPrecisionWatchdogAudit(mkProject({ start_date: null, duration_days: null }), [], [], []);
+  const cashEmpty = wdEmpty.find((m) => m.id === 'WATCH-CASH-01');
+  eq('S16 watchdog: empty inputs also yield not_measured (never exact/deviation 0)', cashEmpty?.precisionStatus, 'not_measured');
+  eq('S16 watchdog: empty inputs cash deviation is null', cashEmpty?.deviation, null);
+  ok('S16 watchdog: no cash-flow-integrity metric anywhere claims a measured precision status',
+    wd.every((m) => m.category !== 'cashflow_integrity' || (m.precisionStatus === 'not_measured' && m.deviation === null)));
+  noNonFinite('S16 watchdog: full audit output carries no NaN/Infinity', wd);
 }
 
 // ---------------------------------------------------------------------------
