@@ -13,6 +13,7 @@ import type {
   ActivityResource,
   ActivityLink,
   Risk,
+  BaselineActivity,
 } from '@/types';
 import {
   runComprehensiveGovernanceAudit,
@@ -190,6 +191,7 @@ export default function DataGovernanceView({ project }: DataGovernanceViewProps)
         { data: res },
         { data: actRes },
         { data: rsks },
+        { data: bsls },
       ] = await Promise.all([
         supabase.from('activities').select('*').eq('project_id', project.id).order('sort_order'),
         supabase.from('activity_links').select('*').eq('project_id', project.id),
@@ -201,6 +203,18 @@ export default function DataGovernanceView({ project }: DataGovernanceViewProps)
         supabase.from('resources').select('*').eq('project_id', project.id),
         supabase.from('activity_resources').select('*').eq('project_id', project.id),
         supabase.from('risks').select('*').eq('project_id', project.id),
+        // F9.5 (defect 1): the governance EVM pillar now QUOTES canonical F6, and F6's
+        // first-precedence BAC basis is the approved baseline. Load it with the same governed query
+        // every other F6 consumer uses — scoped through `project_baselines` (the parent that carries
+        // `project_id`, since `baseline_activities` does not) to the revision that is both ACTIVE and
+        // APPROVED. Appended LAST so no existing slot is transposed. Without these rows the pillar
+        // would fall back to unfrozen budget lines and could not equal the Dashboard or the
+        // Executive Report.
+        supabase.from('baseline_activities')
+          .select('*, project_baselines!inner(project_id, is_active, status)')
+          .eq('project_baselines.project_id', project.id)
+          .eq('project_baselines.is_active', true)
+          .eq('project_baselines.status', 'approved'),
       ]);
 
       const actData = (acts || []) as Activity[];
@@ -213,6 +227,7 @@ export default function DataGovernanceView({ project }: DataGovernanceViewProps)
       const resData = (res || []) as Resource[];
       const actResData = (actRes || []) as ActivityResource[];
       const rskData = (rsks || []) as Risk[];
+      const bslData = (bsls || []) as BaselineActivity[];
 
       setActivities(actData);
       setLinks(lnkData);
@@ -237,6 +252,7 @@ export default function DataGovernanceView({ project }: DataGovernanceViewProps)
         resData,
         actResData,
         rskData,
+        bslData,
       );
       setAuditResult(audit);
     } catch (err) {

@@ -19,7 +19,7 @@ import type {
   ScheduleUpdateSnapshot,
 } from '@/types';
 import { calculateCpm, type LinkDrivingResult } from '@/lib/cpmEngine';
-import { analyzeScheduleControl, buildUpdateSnapshot, type ScheduleControlReport } from '@/lib/scheduleControlEngine';
+import { analyzeScheduleControl, buildUpdateSnapshot, type ScheduleControlReport, type StatusedActivity } from '@/lib/scheduleControlEngine';
 import { addWorkingDays, subtractWorkingDays, getCalendar, countWorkingDays, resolveActivityExecutionCalendar } from '@/lib/calendarEngine';
 import { DEFAULT_DATA_DATE } from '@/lib/projectControlsConstants';
 import {
@@ -89,6 +89,30 @@ const AVAILABLE_COLUMNS: ColumnOption[] = [
   { key: 'critical', labelAr: 'حرج', labelEn: 'Critical', defaultVisible: true },
   { key: 'actions', labelAr: 'إجراءات', labelEn: 'Actions', defaultVisible: true },
 ];
+
+/**
+ * F9.5 (Pilot Closure defect 2) — the ONE definition of "critical NOW" for every CPM-screen surface.
+ *
+ * The CPM toolbar published `Critical Path (9)` while canonical F5, the Dashboard and the Executive
+ * Report all published 6 for the same project at the same governed Data Date. The count came from
+ * `activities.filter((a) => a.is_critical).length` — the PERSISTED column, not the canonical result.
+ *
+ * That column is written by `recalculatePersistedSchedule`, which does run a correctly statused CPM
+ * at the governed Data Date with the project's own calendar and status logic. So the flag is not
+ * conceptually wrong — it is a CACHE of the last manual recalculation, and it is only as fresh as
+ * that press. Record progress afterwards (three activities reach 100%) and the canonical statused CPM
+ * immediately drops them off the critical path, while their persisted `is_critical = true` stays
+ * until somebody recalculates. Nine flagged rows, six currently critical: the same stale-flag
+ * mechanism as F9.4 defect 4, on the one screen F9.4 did not migrate.
+ *
+ * Canonical first, persisted only as the fallback when F5 has produced no statused row for the
+ * activity (no project loaded yet, or the activity is absent from the CPM result) — identical to the
+ * precedence this file already used for the lookahead table, so the screen now speaks with one voice.
+ */
+function isCurrentlyCritical(act: Activity, stById: Map<string, StatusedActivity>): boolean {
+  const statused = stById.get(act.id);
+  return statused ? statused.critical : !!act.is_critical;
+}
 
 export default function ScheduleView({ project }: ScheduleViewProps) {
   const [activities, setActivities] = useState<Activity[]>([]);
@@ -450,18 +474,34 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
   // describes the calendar that actually scheduled the activity.
   const calendarsById = useMemo(() => new Map(calendars.map((c) => [c.id, c])), [calendars]);
 
+  // F9.5: the critical/longest-path filters now select exactly the activities the toolbar count
+  // claims, so pressing the button can never show nine rows under a label that says six.
   const filteredActivities = useMemo(() => {
     return activities.filter((a) => {
-      if (filterCriticalOnly && !a.is_critical) return false;
+      const statused = stById.get(a.id);
+      const currentlyCritical = statused ? statused.critical : !!a.is_critical;
+      if (filterCriticalOnly && !currentlyCritical) return false;
       if (filterMilestonesOnly && !a.is_milestone) return false;
-      if (filterLongestPathOnly && !a.is_critical) return false;
+      if (filterLongestPathOnly && !currentlyCritical) return false;
       if (searchQuery) {
         const q = searchQuery.toLowerCase();
         return a.name.toLowerCase().includes(q) || a.code.toLowerCase().includes(q);
       }
       return true;
     });
-  }, [activities, filterCriticalOnly, filterMilestonesOnly, filterLongestPathOnly, searchQuery]);
+  }, [activities, stById, filterCriticalOnly, filterMilestonesOnly, filterLongestPathOnly, searchQuery]);
+
+  // F9.5: the current critical count (canonical statused CPM at the governed Data Date) and, kept
+  // strictly separate, the raw persisted-flag count. The second is a diagnostic about cache staleness
+  // and is never shown under the "Critical Path" label.
+  const currentCriticalCount = useMemo(
+    () => activities.filter((a) => isCurrentlyCritical(a, stById)).length,
+    [activities, stById],
+  );
+  const persistedCriticalFlagCount = useMemo(
+    () => activities.filter((a) => a.is_critical).length,
+    [activities],
+  );
 
   // Hierarchical WBS + Activities Structure with Rollup Calculations
   const hierarchicalItems = useMemo(() => {
@@ -1294,7 +1334,9 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
             <div className="overflow-x-auto p-4 bg-slate-50/70 rounded-xl border border-slate-200 min-h-[450px]">
               <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-6 min-w-[900px]">
                 {activities.map((act) => {
-                  const isCrit = act.is_critical;
+                  // F9.5: the network diagram highlights currently-critical activities, so a
+                  // completed activity can no longer be drawn as driving the remaining work.
+                  const isCrit = isCurrentlyCritical(act, stById);
                   return (
                     <div
                       key={act.id}
@@ -1746,12 +1788,15 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
 
             <button
               onClick={() => setFilterCriticalOnly(!filterCriticalOnly)}
+              title={lang === 'ar'
+                ? `الأنشطة الحرجة الحالية وفق CPM المُحدَّث عند تاريخ البيانات ${currentDataDate} = ${currentCriticalCount}. العلم المحفوظ is_critical (يشمل المكتملة، ويُحدَّث عند إعادة الحساب فقط) = ${persistedCriticalFlagCount} — قيمة تشخيصية secondary، ليست العدد الحالي.`
+                : `Current critical activities per the statused CPM at Data Date ${currentDataDate} = ${currentCriticalCount}. Persisted is_critical flag (includes completed work; refreshed only on recalculation) = ${persistedCriticalFlagCount} — a secondary diagnostic, not the current count.`}
               className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-bold transition-all cursor-pointer ${
                 filterCriticalOnly ? 'bg-rose-50 text-rose-700 border-rose-300' : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-100'
               }`}
             >
               <Zap size={13} className={filterCriticalOnly ? 'text-rose-600' : 'text-slate-400'} />
-              {t.filter_critical} ({activities.filter((a) => a.is_critical).length})
+              {t.filter_critical} ({currentCriticalCount})
             </button>
 
             <button
@@ -1907,7 +1952,7 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
                     >
                       <div className="truncate pr-1">
                         <span className="font-mono text-slate-400 text-[10px] ml-1">{act.code}</span>
-                        <span className={`font-semibold ${act.is_critical ? 'text-rose-700' : 'text-slate-800'}`}>
+                        <span className={`font-semibold ${isCurrentlyCritical(act, stById) ? 'text-rose-700' : 'text-slate-800'}`}>
                           {act.name}
                         </span>
                       </div>
@@ -1921,7 +1966,7 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
                             {act.constraint_type}
                           </span>
                         )}
-                        {act.is_critical && <span title={t.critical}><Zap size={13} className="text-rose-500" /></span>}
+                        {isCurrentlyCritical(act, stById) && <span title={t.critical}><Zap size={13} className="text-rose-500" /></span>}
                         {act.is_milestone && <span title={t.filter_milestones}><Flag size={13} className="text-amber-500" /></span>}
                       </div>
                     </div>
@@ -2117,7 +2162,7 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
                           <div
                             onMouseDown={(e) => handleMouseDownBar(e, act, 'move')}
                             className={`absolute h-6 rounded-lg shadow-sm flex items-center px-2 text-[10px] text-white font-bold overflow-visible z-20 cursor-grab active:cursor-grabbing group/bar transition-all ${
-                              act.is_critical
+                              isCurrentlyCritical(act, stById)
                                 ? 'bg-gradient-to-r from-rose-600 to-red-500 shadow-rose-500/20'
                                 : 'bg-gradient-to-r from-slate-900 to-slate-800 shadow-slate-900/20'
                             } ${isBeingDragged ? 'ring-2 ring-amber-400 scale-[1.02] opacity-90' : ''}`}
@@ -2356,7 +2401,7 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
                                 </div>
                               </div>
                             ) : (
-                              <span className={act.is_critical ? 'font-bold text-rose-700' : 'font-medium'}>{act.name}</span>
+                              <span className={isCurrentlyCritical(act, stById) ? 'font-bold text-rose-700' : 'font-medium'}>{act.name}</span>
                             )}
                           </td>
                         )}
@@ -2450,7 +2495,7 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
 
                         {visibleColumns.activity_drag && (
                           <td className="p-3 font-mono text-slate-600 font-bold">
-                            {act.is_critical ? `${act.activity_drag || act.duration_days} ${lang === 'ar' ? 'يوم' : 'd'}` : `0 ${lang === 'ar' ? 'يوم' : 'd'}`}
+                            {isCurrentlyCritical(act, stById) ? `${act.activity_drag || act.duration_days} ${lang === 'ar' ? 'يوم' : 'd'}` : `0 ${lang === 'ar' ? 'يوم' : 'd'}`}
                           </td>
                         )}
 
@@ -2470,7 +2515,7 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
 
                         {visibleColumns.critical && (
                           <td className="p-3 text-center">
-                            {act.is_critical ? <Zap size={16} className="text-rose-500 mx-auto" /> : <span className="text-slate-300">-</span>}
+                            {isCurrentlyCritical(act, stById) ? <Zap size={16} className="text-rose-500 mx-auto" /> : <span className="text-slate-300">-</span>}
                           </td>
                         )}
 

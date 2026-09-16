@@ -44,11 +44,16 @@ import { levelScheduleResources } from '@/lib/resourceLevelingEngine';
 import { parseXerContent } from '@/lib/xerImporter';
 import { generateBoqPlan, emptyBoqOverrides } from '@/lib/boqPlanningEngine';
 import { calculateProjectEvmAtDataDate, deriveEvmFromScalars, assessEvmRatios } from '@/lib/planningEngine';
-import { analyzeScheduleControl, buildUpdateSnapshot, workingDayDelta, summarizeCanonicalCriticality } from '@/lib/scheduleControlEngine';
+import { analyzeScheduleControl, buildUpdateSnapshot, workingDayDelta, summarizeCanonicalCriticality, type StatusedActivity } from '@/lib/scheduleControlEngine';
 import { analyzeCostControl, buildCostSnapshot } from '@/lib/costControlEngine';
 import { analyzeIntegratedDecisions, gateConfidence } from '@/lib/integratedDecisionEngine';
 import { analyzeForecastTrust } from '@/lib/forecastTrustEngine';
 import { selectCanonicalEvm, canonicalEvmToComprehensive, quoteCanonicalEvm, CANONICAL_EVM_SOURCE } from '@/lib/canonicalEvm';
+// S18 (F9.5 Pilot Closure): the governance EVM pillar is a PURE module precisely so this harness can
+// drive the same function that renders the visible `EVM-01/02/03` row. `dataGovernanceEngine` itself
+// cannot be imported here — it pulls in `@/lib/supabase`.
+import { buildGovernanceEvmCheck, formatGovernedSar, CANONICAL_EVM_ROW_MARKER, DIAGNOSTIC_ROW_MARKER } from '@/lib/governanceEvmPillar';
+import { getInitialSeedData } from '@/lib/mockSeed';
 import { applyReviewCostTransaction, unimplementedRpcError, reviewStateOf, selectGovernedBaselineActivities, type DemoDb } from '@/lib/demoDbContracts';
 import { reconcileFinishForecasts, calculateCpmDeterministicEarlyFinish } from '@/lib/forecastReconciliation';
 import { calculateControlHealth } from '@/lib/controlHealthEngine';
@@ -1761,6 +1766,492 @@ console.log('--- S17 Controlled Pilot defects (F9.4)');
     selectCanonicalEvm(reversed(allRows)).ev, 950000);
   noNonFinite('S17-F governed canonical EVM scan', govCanonical);
   noNonFinite('S17-F governed F6 project scan', govF6.project);
+}
+
+
+// ===========================================================================
+console.log('--- S18 Pilot Closure (F9.5)');
+// ===========================================================================
+// The two defects that survived the F9.4 Controlled Pilot re-run. As in S17, each subsection first
+// reproduces the reported symptom against the pre-fix code path, then asserts the fixed behaviour.
+//
+// Both surfaces live in files the harness cannot import (they pull in `@/lib/supabase`, whose real
+// Supabase client cannot be bundled for node ESM). So each defect is pinned twice over:
+//   - BEHAVIOURALLY, against the pure module the production code delegates to
+//     (`governanceEvmPillar.buildGovernanceEvmCheck` for the visible EVM row; the canonical
+//     criticality selector F5 and ScheduleView both read for the CPM count); and
+//   - STRUCTURALLY, against the shipped source of the engine/view, so the delegation itself cannot
+//     be quietly undone.
+{
+  // ---------------------------------------------------------------------
+  // Fixtures
+  // ---------------------------------------------------------------------
+  const mkProject = (o: Partial<Project> = {}): Project => ({
+    id: 'p1', name: 'Pilot Closure — commercial office building', client: null, location: null,
+    contract_value: 2345150, currency: 'SAR', start_date: '2026-07-01', end_date: '2027-02-28',
+    data_date: DD, duration_days: 195, status: 'active', description: null,
+    calendar_type: '6_days', created_at: '2026-01-01T00:00:00Z', ...o,
+  });
+  const bl = (id: string, wbsNodeId: string, planned: number): BudgetLine => ({
+    id, project_id: 'p1', wbs_node_id: wbsNodeId, activity_id: null, boq_item_id: null,
+    description: id, planned_cost: planned, committed_cost: 0,
+    actual_cost: 0, remaining_cost: planned, created_at: '2026-01-01T00:00:00Z',
+  });
+
+  // The pilot-shaped cost dataset: a WBS node whose budget is split over TWO lines, a second split
+  // node, and one node holding a single large line whose activity has not started. That is the shape
+  // the superseded derivation mis-weights, and it reproduces the reported divergence.
+  const pcProject = mkProject();
+  const pcActs = [
+    act({ id: 'PC1', code: 'PC1', wbs_node_id: 'w1', early_start: '2026-07-01', early_finish: '2026-07-13', duration_days: 12, percent_complete: 100, actual_start: '2026-07-01', actual_finish: '2026-07-13' }),
+    act({ id: 'PC2', code: 'PC2', wbs_node_id: 'w1', early_start: '2026-07-14', early_finish: '2026-07-22', duration_days: 8, percent_complete: 100, actual_start: '2026-07-14', actual_finish: '2026-07-22' }),
+    act({ id: 'PC3', code: 'PC3', wbs_node_id: 'w1', early_start: '2026-07-23', early_finish: '2026-08-14', duration_days: 20, percent_complete: 100, actual_start: '2026-07-23', actual_finish: '2026-08-14' }),
+    act({ id: 'PC4', code: 'PC4', wbs_node_id: 'w1', early_start: '2026-08-15', early_finish: '2026-08-25', duration_days: 10, percent_complete: 100, actual_start: '2026-08-15', actual_finish: '2026-08-25' }),
+    act({ id: 'PC5', code: 'PC5', wbs_node_id: 'w2', early_start: '2026-08-26', early_finish: '2026-09-19', duration_days: 22, percent_complete: 70, actual_start: '2026-08-26' }),
+    act({ id: 'PC6', code: 'PC6', wbs_node_id: 'w2', early_start: '2026-09-20', early_finish: '2026-11-08', duration_days: 45, percent_complete: 0 }),
+    act({ id: 'PC7', code: 'PC7', wbs_node_id: 'w3', early_start: '2026-10-01', early_finish: '2026-11-04', duration_days: 30, percent_complete: 0 }),
+  ];
+  const pcBaselines = [
+    base('PCB1', 'PC1', '2026-07-01', '2026-07-13', 12, 42000),
+    base('PCB2', 'PC2', '2026-07-14', '2026-07-22', 8, 39900),
+    base('PCB3', 'PC3', '2026-07-23', '2026-08-14', 20, 323150),
+    base('PCB4', 'PC4', '2026-08-15', '2026-08-25', 10, 20250),
+    base('PCB5', 'PC5', '2026-08-26', '2026-09-19', 22, 468000),
+    base('PCB6', 'PC6', '2026-09-20', '2026-11-08', 45, 468000),
+    base('PCB7', 'PC7', '2026-10-01', '2026-11-04', 30, 983850),
+  ];
+  const pcBudget = [
+    bl('PCL1', 'w1', 42000), bl('PCL2', 'w1', 383300),
+    bl('PCL3', 'w2', 46000), bl('PCL4', 'w2', 890000),
+    bl('PCL5', 'w3', 983850),
+  ];
+  const pcUpdates = [
+    upd('PCU1', 'PC1', '2026-07-13', 100), upd('PCU2', 'PC2', '2026-07-22', 100),
+    upd('PCU3', 'PC3', '2026-08-14', 100), upd('PCU4', 'PC4', '2026-08-25', 100),
+    upd('PCU5', 'PC5', '2026-09-12', 70),
+  ];
+  const pcTxns = [
+    txn('PCT1', 'PC1', '2026-07-15', 40500), txn('PCT2', 'PC2', '2026-07-24', 39900),
+    txn('PCT3', 'PC3', '2026-08-16', 310000), txn('PCT4', 'PC4', '2026-08-28', 19500),
+    txn('PCT5', 'PC5', '2026-09-10', 280000),
+  ];
+
+  const pcF6 = analyzeCostControl({
+    project: pcProject, activities: pcActs, baselines: pcBaselines, budgetLines: pcBudget,
+    costTransactions: pcTxns, progressUpdates: pcUpdates, wbsNodes: [], boqItems: [],
+    allocations: [], previousSnapshots: [], dataDate: DD, calendarType: '6_days',
+  });
+  const pcCanonical = selectCanonicalEvm(pcF6);
+  // The superseded derivation, used ONLY as the labelled diagnostic the pillar now renders.
+  const pcDiagnostic = calculateProjectEvmAtDataDate(pcProject, pcActs, pcBudget, [], pcTxns, pcUpdates);
+
+  const pcRow = buildGovernanceEvmCheck({
+    canonical: pcCanonical,
+    diagnostic: pcDiagnostic,
+    diagnosticLabel: 'planningEngine.calculateProjectEvmAtDataDate',
+  });
+
+  /**
+   * Reads a published figure back off a rendered row.
+   *
+   * `(^|[^A-Z])` is load-bearing: without it a search for `AC` matches inside `BAC`, and `CPI`
+   * matches inside `TCPI`. Grouping commas are stripped first so the value parses exactly, which is
+   * why the pillar renders at F6's own precision instead of rounding to whole riyals.
+   */
+  const visibleValue = (row: string, label: string): number | null => {
+    for (const raw of row.split('|')) {
+      const m = raw.replace(/,/g, '').match(new RegExp(`(^|[^A-Z])${label} (-?\\d+(?:\\.\\d+)?)`));
+      if (m) return Number(m[2]);
+    }
+    return null;
+  };
+  /**
+   * Reads a published EVM IDENTITY back off the variance line, which renders as
+   * `SV = EV - PV = <value>` rather than `SV <value>`. `[^=]*` stops at the first `=` so each
+   * identity yields its own result, and the canonical identities precede any diagnostic segment.
+   */
+  const identityValue = (row: string, label: string): number | null => {
+    const m = row.replace(/,/g, '').match(new RegExp(`(^|[^A-Z])${label} = [^=]*= (-?\\d+(?:\\.\\d+)?)`));
+    return m ? Number(m[2]) : null;
+  };
+
+  // ---------------------------------------------------------------------
+  // S18-A  The visible EVM surface quotes canonical F6 current values
+  // ---------------------------------------------------------------------
+  // This is the row the pilot saw: `code: 'EVM-01/02/03'`, id `GOV-EVM-01`.
+  eq('S18-A the row under test is the one the pilot reported', pcRow.code, 'EVM-01/02/03');
+  eq('S18-A the row id is GOV-EVM-01', pcRow.id, 'GOV-EVM-01');
+  eq('S18-A the row belongs to the EVM-mathematics pillar', pcRow.pillar, 'evm_math');
+  ok('S18-A the visible row identifies itself as canonical F6', pcRow.actualValue.includes(CANONICAL_EVM_ROW_MARKER));
+
+  // The scenario really is the pilot defect: the two derivations disagreed materially.
+  ok('S18-A scenario reproduces the pilot: the diagnostic derivation disagrees with canonical F6',
+    pcDiagnostic.ev !== pcCanonical.ev && pcDiagnostic.pv !== pcCanonical.pv
+    && pcDiagnostic.cpi !== pcCanonical.cpi && pcDiagnostic.eac !== pcCanonical.eac);
+  eq('S18-A both derivations still agree on BAC (the divergence is weighting, not budget)',
+    pcDiagnostic.bac, pcCanonical.bac);
+  eq('S18-A both derivations still agree on AC (approved-only + Data Date filter is shared)',
+    pcDiagnostic.ac, pcCanonical.ac);
+
+  // The requirement, literally: every visible canonical label must equal canonical F6.
+  eq('S18-A visible BAC === canonical F6 BAC', visibleValue(pcRow.actualValue, 'BAC'), pcCanonical.bac);
+  eq('S18-A visible PV === canonical F6 PV', visibleValue(pcRow.actualValue, 'PV'), pcCanonical.pv);
+  eq('S18-A visible EV === canonical F6 EV', visibleValue(pcRow.actualValue, 'EV'), pcCanonical.ev);
+  eq('S18-A visible AC === canonical F6 AC', visibleValue(pcRow.actualValue, 'AC'), pcCanonical.ac);
+  eq('S18-A visible SPI === canonical F6 SPI', visibleValue(pcRow.actualValue, 'SPI'), pcCanonical.spi);
+  eq('S18-A visible CPI === canonical F6 CPI', visibleValue(pcRow.actualValue, 'CPI'), pcCanonical.cpi);
+  eq('S18-A visible ETC === canonical F6 ETC', visibleValue(pcRow.actualValue, 'ETC'), pcCanonical.etc);
+  eq('S18-A visible EAC === canonical F6 EAC', visibleValue(pcRow.actualValue, 'EAC'), pcCanonical.eac);
+  eq('S18-A visible VAC === canonical F6 VAC', visibleValue(pcRow.actualValue, 'VAC'), pcCanonical.vac);
+  eq('S18-A visible TCPI is measured', visibleValue(pcRow.actualValue, 'TCPI'), Number(pcCanonical.tcpi.toFixed(3)));
+
+  // And canonical F6 is F6 verbatim, so the chain visible === canonical === F6 closes.
+  eq('S18-A visible PV === F6 project PV', visibleValue(pcRow.actualValue, 'PV'), pcF6.project.pv);
+  eq('S18-A visible EV === F6 project EV', visibleValue(pcRow.actualValue, 'EV'), pcF6.project.ev);
+  eq('S18-A visible CPI === F6 project CPI', visibleValue(pcRow.actualValue, 'CPI'), pcF6.project.cpi);
+  eq('S18-A visible SPI === F6 project SPI', visibleValue(pcRow.actualValue, 'SPI'), pcF6.project.spi);
+  eq('S18-A visible EAC === F6 project EAC', visibleValue(pcRow.actualValue, 'EAC'), pcF6.project.eac);
+  eq('S18-A visible VAC === F6 project VAC', visibleValue(pcRow.actualValue, 'VAC'), pcF6.project.vac);
+  eq('S18-A visible ETC === F6 project ETC', visibleValue(pcRow.actualValue, 'ETC'), pcF6.project.etc);
+  eq('S18-A visible BAC === F6 BAC basis', visibleValue(pcRow.actualValue, 'BAC'), pcF6.bac.value);
+
+  // The visible row must NOT be showing the superseded numbers under canonical labels.
+  ok('S18-A visible EV is not the superseded EV', visibleValue(pcRow.actualValue, 'EV') !== pcDiagnostic.ev);
+  ok('S18-A visible PV is not the superseded PV', visibleValue(pcRow.actualValue, 'PV') !== pcDiagnostic.pv);
+  ok('S18-A visible CPI is not the superseded CPI', visibleValue(pcRow.actualValue, 'CPI') !== pcDiagnostic.cpi);
+  ok('S18-A visible EAC is not the superseded EAC', visibleValue(pcRow.actualValue, 'EAC') !== pcDiagnostic.eac);
+
+  // The canonical identities still hold on the published variance line.
+  eq('S18-A published SV === canonical SV', identityValue(pcRow.variance, 'SV'), pcCanonical.sv);
+  eq('S18-A published CV === canonical CV', identityValue(pcRow.variance, 'CV'), pcCanonical.cv);
+  eq('S18-A published VAC === canonical VAC', identityValue(pcRow.variance, 'VAC'), pcCanonical.vac);
+  eq('S18-A the row reports the governed Data Date', pcRow.actualValue.includes(pcCanonical.dataDate), true);
+  eq('S18-A a fully measured project passes the pillar', pcRow.status, 'passed');
+
+  // End-to-end against the REAL pilot seed, so the closure is proved on shipped data and not only on
+  // a synthetic fixture. This reproduces the exact figures the pilot recorded.
+  const seed = getInitialSeedData() as Record<string, unknown[]>;
+  const seedProjects = (seed['projects'] || []) as unknown as Project[];
+  const seedP1 = seedProjects.find((p) => p.id === 'proj-seed-001');
+  ok('S18-A the pilot seed project is present', seedP1 !== undefined);
+  if (seedP1) {
+    const sActs = ((seed['activities'] || []) as unknown as Activity[]).filter((a) => a.project_id === seedP1.id);
+    const sBgts = ((seed['budget_lines'] || []) as unknown as BudgetLine[]).filter((b) => b.project_id === seedP1.id);
+    const sTxns = ((seed['cost_transactions'] || []) as unknown as CostTransaction[]).filter((c) => c.project_id === seedP1.id);
+    const sPrgs = ((seed['progress_updates'] || []) as unknown as ProgressUpdate[]).filter((u) => u.project_id === seedP1.id);
+    const sBoqs = ((seed['boq_items'] || []) as unknown as BoqItem[]).filter((b) => b.project_id === seedP1.id);
+    const sActIds = new Set(sActs.map((a) => a.id));
+    const sBsls = ((seed['baseline_activities'] || []) as unknown as BaselineActivity[]).filter((b) => sActIds.has(b.activity_id));
+    const sDd = seedP1.data_date || DD;
+    const sF6 = analyzeCostControl({
+      project: seedP1, activities: sActs, baselines: sBsls, budgetLines: sBgts, costTransactions: sTxns,
+      progressUpdates: sPrgs, wbsNodes: [], boqItems: sBoqs, allocations: [], dataDate: sDd,
+      calendarType: seedP1.calendar_type,
+    });
+    const sCanonical = selectCanonicalEvm(sF6);
+    const sDiagnostic = calculateProjectEvmAtDataDate(seedP1, sActs, sBgts, sBoqs, sTxns, sPrgs);
+    const sRow = buildGovernanceEvmCheck({ canonical: sCanonical, diagnostic: sDiagnostic });
+
+    // The pilot's canonical column, reproduced on the shipped seed.
+    eq('S18-A seed canonical BAC is the pilot-reported 2,345,150', sCanonical.bac, 2345150);
+    eq('S18-A seed canonical PV is the pilot-reported 781,871.43', sCanonical.pv, 781871.43);
+    eq('S18-A seed canonical AC is 689,900', sCanonical.ac, 689900);
+    // The pilot's divergent column, reproduced exactly — this is what the EVM-01/02/03 row showed.
+    eq('S18-A the superseded derivation reproduces the pilot PV 288,359', sDiagnostic.pv, 288359);
+    eq('S18-A the superseded derivation reproduces the pilot CPI 0.400', sDiagnostic.cpi, 0.4);
+    eq('S18-A the superseded derivation reproduces the pilot EAC 5,862,875', sDiagnostic.eac, 5862875);
+    eq('S18-A the superseded derivation reproduces the pilot VAC -3,517,725', sDiagnostic.vac, -3517725);
+    // And the visible row now quotes the canonical side of that disagreement.
+    eq('S18-A seed visible EV === seed canonical F6 EV', visibleValue(sRow.actualValue, 'EV'), sCanonical.ev);
+    eq('S18-A seed visible PV === seed canonical F6 PV', visibleValue(sRow.actualValue, 'PV'), sCanonical.pv);
+    eq('S18-A seed visible PV is the pilot canonical 781,871.43, not 288,359',
+      visibleValue(sRow.actualValue, 'PV'), 781871.43);
+    eq('S18-A seed visible CPI === seed canonical F6 CPI', visibleValue(sRow.actualValue, 'CPI'), sCanonical.cpi);
+    eq('S18-A seed visible EAC === seed canonical F6 EAC', visibleValue(sRow.actualValue, 'EAC'), sCanonical.eac);
+    eq('S18-A seed visible VAC === seed canonical F6 VAC', visibleValue(sRow.actualValue, 'VAC'), sCanonical.vac);
+    ok('S18-A seed visible EV is not the superseded EV', visibleValue(sRow.actualValue, 'EV') !== sDiagnostic.ev);
+    ok('S18-A the seed row keeps the divergent figures only as a labelled diagnostic',
+      sRow.variance.includes(DIAGNOSTIC_ROW_MARKER) && !sRow.actualValue.includes(DIAGNOSTIC_ROW_MARKER));
+  }
+
+  // Honesty under no data: the pillar must announce N/A, never a plausible-looking zero.
+  const emptyRow = buildGovernanceEvmCheck({ canonical: selectCanonicalEvm(null) });
+  ok('S18-A an empty project publishes no monetary figure', visibleValue(emptyRow.actualValue, 'BAC') === null);
+  ok('S18-A an empty project announces unavailable BAC', emptyRow.actualValue.includes('N/A'));
+  eq('S18-A an empty project is a warning, not a pass', emptyRow.status, 'warning');
+  eq('S18-A an empty project still identifies its source marker', emptyRow.actualValue.includes(CANONICAL_EVM_ROW_MARKER), true);
+  noNonFinite('S18-A empty canonical scan', selectCanonicalEvm(null));
+
+  // Determinism.
+  eq('S18-A the rendered row is deterministic',
+    JSON.stringify(buildGovernanceEvmCheck({
+      canonical: pcCanonical,
+      diagnostic: pcDiagnostic,
+      diagnosticLabel: 'planningEngine.calculateProjectEvmAtDataDate',
+    })),
+    JSON.stringify(pcRow));
+
+  // ---------------------------------------------------------------------
+  // S18-B  A diagnostic comparison cannot masquerade as current canonical EVM
+  // ---------------------------------------------------------------------
+  ok('S18-B the diagnostic segment is present when the derivations disagree',
+    pcRow.variance.includes(DIAGNOSTIC_ROW_MARKER));
+  ok('S18-B the diagnostic segment is confined to `variance`',
+    !pcRow.actualValue.includes(DIAGNOSTIC_ROW_MARKER));
+  ok('S18-B the diagnostic segment says in terms that it is NOT the current value',
+    pcRow.variance.includes('NOT the current value') && pcRow.variance.includes('ليست القيمة الحالية'));
+  ok('S18-B the diagnostic segment names the derivation it came from',
+    pcRow.variance.includes('planningEngine.calculateProjectEvmAtDataDate'));
+  // The superseded figures may appear in the diagnostic segment, but never in the current-value row.
+  ok('S18-B the superseded EV is absent from the current-value row',
+    !pcRow.actualValue.includes(formatGovernedSar(pcDiagnostic.ev).replace(' ر.س', '')));
+  ok('S18-B the superseded EAC is absent from the current-value row',
+    !pcRow.actualValue.includes(formatGovernedSar(pcDiagnostic.eac).replace(' ر.س', '')));
+  eq('S18-B the current-value row still parses to canonical EV', visibleValue(pcRow.actualValue, 'EV'), pcCanonical.ev);
+  // The diagnostic figures ARE readable in the comparison segment, so the finding stays auditable.
+  ok('S18-B the diagnostic EV is readable in the comparison segment',
+    visibleValue(pcRow.variance.slice(pcRow.variance.indexOf(DIAGNOSTIC_ROW_MARKER)), 'EV') === pcDiagnostic.ev);
+  ok('S18-B the diagnostic EAC is readable in the comparison segment',
+    visibleValue(pcRow.variance.slice(pcRow.variance.indexOf(DIAGNOSTIC_ROW_MARKER)), 'EAC') === pcDiagnostic.eac);
+  // When the two agree there is nothing to reconcile, so no second set of numbers is published.
+  const agreeingRow = buildGovernanceEvmCheck({ canonical: pcCanonical, diagnostic: null });
+  ok('S18-B no diagnostic segment is rendered when none was supplied',
+    !agreeingRow.variance.includes(DIAGNOSTIC_ROW_MARKER));
+  // Constructing an AGREEING diagnostic needs non-nullable scalars, while canonical facts are
+  // `number | null` by contract (N/A rather than a fabricated zero). So the fixture narrows first and
+  // asserts the precondition, instead of papering over the nullability with `!` or a `?? 0` default.
+  const agreeingDiagnostic = pcCanonical.bac !== null && pcCanonical.pv !== null && pcCanonical.ev !== null
+    && pcCanonical.cpi !== null && pcCanonical.spi !== null && pcCanonical.eac !== null && pcCanonical.vac !== null
+    ? {
+      ...pcDiagnostic, bac: pcCanonical.bac, pv: pcCanonical.pv, ev: pcCanonical.ev, ac: pcCanonical.ac,
+      cpi: pcCanonical.cpi, spi: pcCanonical.spi, eac: pcCanonical.eac, vac: pcCanonical.vac,
+    }
+    : null;
+  ok('S18-B the fixture is fully measured, so an agreeing diagnostic exists to test with',
+    agreeingDiagnostic !== null);
+  const sameNumbers = buildGovernanceEvmCheck({ canonical: pcCanonical, diagnostic: agreeingDiagnostic });
+  ok('S18-B a diagnostic that AGREES produces no comparison segment (nothing to reconcile)',
+    !sameNumbers.variance.includes(DIAGNOSTIC_ROW_MARKER));
+  eq('S18-B an agreeing diagnostic leaves the current-value row identical',
+    sameNumbers.actualValue, agreeingRow.actualValue);
+  eq('S18-B omitting the diagnostic leaves the current-value row identical',
+    agreeingRow.actualValue, pcRow.actualValue);
+
+  // Structural: the delegation itself, pinned against the shipped engine source.
+  const dgRoot = (() => {
+    const cwd = process.cwd();
+    if (existsSync(resolvePath(cwd, 'package.json'))) return cwd;
+    let dir = dirname(fileURLToPath(import.meta.url));
+    for (let i = 0; i < 8; i += 1) {
+      if (existsSync(resolvePath(dir, 'package.json'))) return dir;
+      dir = dirname(dir);
+    }
+    return cwd;
+  })();
+  const dgSrc = readFileSync(resolvePath(dgRoot, 'src/lib/dataGovernanceEngine.ts'), 'utf8');
+  ok('S18-B the governance engine delegates the EVM row to the pure pillar',
+    dgSrc.includes('buildGovernanceEvmCheck({'));
+  ok('S18-B the governance engine derives canonical EVM from F6',
+    dgSrc.includes('selectCanonicalEvm(costReport)') && dgSrc.includes('analyzeCostControl({'));
+  ok('S18-B the superseded derivation is bound to a DIAGNOSTIC name, not to `canonicalEvm`',
+    /const diagnosticEvm = calculateProjectEvmAtDataDate\(/.test(dgSrc)
+    && !/const canonicalEvm = calculateProjectEvmAtDataDate\(/.test(dgSrc));
+  ok('S18-B the diagnostic is passed only through the `diagnostic:` slot',
+    /diagnostic: diagnosticEvm/.test(dgSrc));
+  ok('S18-B evmParity is populated from the canonical quote',
+    /evmParity: \{[\s\S]*?dataDate: canonicalEvm\.dataDate/.test(dgSrc));
+  ok('S18-B evmParity never reads the diagnostic derivation',
+    !/evmParity: \{[\s\S]*?diagnosticEvm\./.test(dgSrc));
+  // Match a real import STATEMENT: the pillar's own docblock names `@/lib/supabase` in prose while
+  // explaining why this module exists, so a substring test would fail on the explanation itself.
+  ok('S18-B the pillar module imports no supabase client',
+    !/import[^;\n]*from\s+'@\/lib\/supabase'/.test(
+      readFileSync(resolvePath(dgRoot, 'src/lib/governanceEvmPillar.ts'), 'utf8')));
+  const dgvSrc = readFileSync(resolvePath(dgRoot, 'src/components/views/DataGovernanceView.tsx'), 'utf8');
+  ok('S18-B the governance view supplies the governed baseline evidence F6 needs',
+    dgvSrc.includes("from('baseline_activities')") && dgvSrc.includes('project_baselines!inner')
+    && dgvSrc.includes(".eq('project_baselines.is_active', true)")
+    && dgvSrc.includes(".eq('project_baselines.status', 'approved')"));
+  ok('S18-B the governance view passes those baselines into the audit', /bslData,\s*\);/.test(dgvSrc));
+
+  // ---------------------------------------------------------------------
+  // S18-C  The CPM current critical count uses the canonical statused definition
+  // ---------------------------------------------------------------------
+  // Nine activities carry the persisted `is_critical` flag; three of them finished before the
+  // governed Data Date. This reproduces the pilot exactly: CPM screen 9, F5 6, near-critical 0,
+  // Dashboard/Executive Report total 6 and remaining 6.
+  const cpActs = [
+    act({ id: 'CP1', code: 'CP1', early_start: '2026-07-01', duration_days: 10, percent_complete: 100, actual_start: '2026-07-01', actual_finish: '2026-07-14', is_critical: true }),
+    act({ id: 'CP2', code: 'CP2', duration_days: 10, percent_complete: 100, actual_start: '2026-07-15', actual_finish: '2026-07-28', is_critical: true }),
+    act({ id: 'CP3', code: 'CP3', duration_days: 10, percent_complete: 100, actual_start: '2026-07-29', actual_finish: '2026-08-11', is_critical: true }),
+    act({ id: 'CP4', code: 'CP4', duration_days: 10, percent_complete: 60, actual_start: '2026-08-12', is_critical: true }),
+    act({ id: 'CP5', code: 'CP5', duration_days: 10, is_critical: true }),
+    act({ id: 'CP6', code: 'CP6', duration_days: 10, is_critical: true }),
+    act({ id: 'CP7', code: 'CP7', duration_days: 10, is_critical: true }),
+    act({ id: 'CP8', code: 'CP8', duration_days: 10, is_critical: true }),
+    act({ id: 'CP9', code: 'CP9', duration_days: 10, is_critical: true }),
+  ];
+  const cpLinks = ['CP1|CP2', 'CP2|CP3', 'CP3|CP4', 'CP4|CP5', 'CP5|CP6', 'CP6|CP7', 'CP7|CP8', 'CP8|CP9']
+    .map((pair, i) => link(`CPL${i + 1}`, pair.split('|')[0], pair.split('|')[1]));
+  const cpCanon = summarizeCanonicalCriticality(cpActs, cpLinks, { dataDate: DD, calendarType: '6_days' });
+  const cpF5 = analyzeScheduleControl({
+    activities: cpActs, links: cpLinks, baselines: [], progressUpdates: [],
+    previousSnapshot: null, dataDate: DD, calendarType: '6_days',
+  });
+  const cpPersistedFlags = cpActs.filter((a) => a.is_critical).length;
+
+  eq('S18-C nine activities carry the persisted critical flag', cpPersistedFlags, 9);
+  eq('S18-C three of them are complete by the governed Data Date', cpF5.statused.filter((s) => s.completed).length, 3);
+  eq('S18-C canonical statused critical total is 6', cpCanon.totalCritical, 6);
+  eq('S18-C canonical remaining critical is 6', cpCanon.remainingCritical, 6);
+  eq('S18-C F5 project.criticalCount is 6', cpF5.project.criticalCount, 6);
+  eq('S18-C F5 near-critical count is 0 (as the pilot reported)', cpF5.project.nearCriticalCount, 0);
+  eq('S18-C the canonical selector and F5 agree (one definition, two consumers)',
+    cpCanon.totalCritical, cpF5.project.criticalCount);
+  eq('S18-C F5 statused rows agree with the canonical selector',
+    cpF5.statused.filter((s) => s.critical).length, cpCanon.totalCritical);
+  eq('S18-C the canonical critical ids are the six incomplete activities',
+    cpCanon.criticalIds, ['CP4', 'CP5', 'CP6', 'CP7', 'CP8', 'CP9']);
+  ok('S18-C the persisted-flag count still overstates the current count (the reported defect)',
+    cpPersistedFlags > cpCanon.totalCritical);
+  eq('S18-C the overstatement is exactly the three completed activities',
+    cpPersistedFlags - cpCanon.totalCritical, 3);
+
+  // Structural: the CPM screen must publish the canonical count under the "Critical Path" label.
+  const svSrc = readFileSync(resolvePath(dgRoot, 'src/components/views/ScheduleView.tsx'), 'utf8');
+  const svToolbar = svSrc.slice(svSrc.indexOf('{t.filter_critical} ('));
+  ok('S18-C the Critical Path label publishes the canonical current count',
+    svToolbar.startsWith('{t.filter_critical} ({currentCriticalCount})'));
+  ok('S18-C the Critical Path label no longer counts the persisted flag',
+    !/\{t\.filter_critical\} \(\{activities\.filter\(\(a\) => a\.is_critical\)\.length\}\)/.test(svSrc));
+  ok('S18-C the current count is derived from F5 statused rows',
+    /const currentCriticalCount = useMemo\(\s*\(\) => activities\.filter\(\(a\) => isCurrentlyCritical\(a, stById\)\)\.length/.test(svSrc));
+  ok('S18-C one shared predicate defines "critical now" for the screen',
+    /function isCurrentlyCritical\(act: Activity, stById: Map<string, StatusedActivity>\): boolean \{\s*const statused = stById\.get\(act\.id\);\s*return statused \? statused\.critical : !!act\.is_critical;/.test(svSrc));
+  ok('S18-C the critical filter selects exactly what the count claims',
+    /const currentlyCritical = statused \? statused\.critical : !!a\.is_critical;\s*\n\s*if \(filterCriticalOnly && !currentlyCritical\) return false;/.test(svSrc)
+    && /if \(filterLongestPathOnly && !currentlyCritical\) return false;/.test(svSrc));
+  // The raw count survives only as a separately named secondary diagnostic, in a tooltip.
+  ok('S18-C the persisted-flag count is retained as a separately named secondary metric',
+    /const persistedCriticalFlagCount = useMemo\(/.test(svSrc));
+  ok('S18-C the secondary metric is labelled a diagnostic and never shown as the count',
+    /a secondary diagnostic, not the current count/.test(svSrc)
+    && !/\{t\.filter_critical\} \(\{persistedCriticalFlagCount\}\)/.test(svSrc));
+  // Every other criticality surface on the screen reads the same predicate.
+  const svRawRenderSites = (svSrc.match(/act\.is_critical/g) || []).length;
+  ok('S18-C no render site still highlights off the raw persisted flag',
+    !/className=\{`font-semibold \$\{act\.is_critical/.test(svSrc)
+    && !/\{act\.is_critical && <span title=\{t\.critical\}>/.test(svSrc)
+    && !/const isCrit = act\.is_critical;/.test(svSrc));
+  ok('S18-C the remaining raw-flag reads are the predicate fallback, the edit form and the secondary metric',
+    svRawRenderSites <= 4);
+
+  // ---------------------------------------------------------------------
+  // S18-D  Completed persisted flags cannot inflate the current count
+  // ---------------------------------------------------------------------
+  ok('S18-D a completed activity carrying is_critical=true is NOT currently critical',
+    cpCanon.byId.get('CP1')?.critical === false
+    && cpCanon.byId.get('CP2')?.critical === false
+    && cpCanon.byId.get('CP3')?.critical === false);
+  ok('S18-D those same activities are recorded as completed',
+    cpCanon.byId.get('CP1')?.completed === true
+    && cpCanon.byId.get('CP2')?.completed === true
+    && cpCanon.byId.get('CP3')?.completed === true);
+  ok('S18-D no completed activity appears in the canonical critical id list',
+    cpCanon.criticalIds.every((id) => cpCanon.byId.get(id)?.completed === false));
+  ok('S18-D no completed activity appears in the remaining-critical id list',
+    cpCanon.remainingCriticalIds.every((id) => cpCanon.byId.get(id)?.completed === false));
+  // Stamping more completed activities with the stale flag cannot move the canonical number.
+  const moreStaleFlags = cpActs.map((a) => (a.percent_complete >= 100 ? { ...a, is_critical: true } : a));
+  eq('S18-D re-stamping completed activities with the flag does not change the canonical count',
+    summarizeCanonicalCriticality(moreStaleFlags, cpLinks, { dataDate: DD, calendarType: '6_days' }).totalCritical,
+    cpCanon.totalCritical);
+  const allFlagged = cpActs.map((a) => ({ ...a, is_critical: true }));
+  eq('S18-D flagging EVERY activity critical still yields the canonical 6',
+    summarizeCanonicalCriticality(allFlagged, cpLinks, { dataDate: DD, calendarType: '6_days' }).totalCritical, 6);
+  const noneFlagged = cpActs.map((a) => ({ ...a, is_critical: false }));
+  eq('S18-D clearing every flag still yields the canonical 6 (the flag is not an input)',
+    summarizeCanonicalCriticality(noneFlagged, cpLinks, { dataDate: DD, calendarType: '6_days' }).totalCritical, 6);
+  // Order and clock independence.
+  eq('S18-D the canonical count is independent of activity order',
+    summarizeCanonicalCriticality([...cpActs].reverse(), cpLinks, { dataDate: DD, calendarType: '6_days' }).totalCritical,
+    cpCanon.totalCritical);
+  let cpShifted = -1;
+  withShiftedClock(400, () => {
+    cpShifted = summarizeCanonicalCriticality(cpActs, cpLinks, { dataDate: DD, calendarType: '6_days' }).totalCritical;
+  });
+  eq('S18-D the canonical count is identical under a +400d clock shift', cpShifted, cpCanon.totalCritical);
+  eq('S18-D the canonical count is deterministic',
+    JSON.stringify(summarizeCanonicalCriticality(cpActs, cpLinks, { dataDate: DD, calendarType: '6_days' })),
+    JSON.stringify(cpCanon));
+  // The predicate the screen uses: canonical where F5 has a statused row, persisted flag only as the
+  // fallback when there is none. Mirrors `isCurrentlyCritical` in ScheduleView.
+  const stById = new Map<string, StatusedActivity>(cpF5.statused.map((s) => [s.id, s]));
+  const predicateCount = cpActs.filter((a) => {
+    const statused = stById.get(a.id);
+    return statused ? statused.critical : !!a.is_critical;
+  }).length;
+  eq('S18-D the screen predicate yields the canonical 6', predicateCount, 6);
+  const emptyStatused = new Map<string, { critical: boolean; completed: boolean }>();
+  eq('S18-D with no F5 rows yet the predicate falls back to the persisted flag (9), never to zero',
+    cpActs.filter((a) => {
+      const statused = emptyStatused.get(a.id);
+      return statused ? statused.critical : !!a.is_critical;
+    }).length, 9);
+
+  // ---------------------------------------------------------------------
+  // S18-E  F9.4 closure guards (re-asserted; nothing here was redesigned)
+  // ---------------------------------------------------------------------
+  // Cost approval: pending -> level 1 -> approved, persists across a store re-read, and the 100 SAR
+  // enters AC only inside the Data Date.
+  const closureDb: DemoDb = {
+    cost_transactions: [{
+      id: 'cl-100', project_id: 'p1', activity_id: 'PC5', boq_item_id: null, category: 'work',
+      transaction_date: '2026-09-10', description: 'Pilot closure cost transaction - 100 SAR',
+      cost_type: 'direct', amount: 100, source: 'manual', status: 'submitted', approved_at: null,
+      approved_by: null, rejected_reason: null, approval_level: 0, created_at: '2026-09-10T08:00:00Z',
+    }],
+    approval_events: [],
+  };
+  const closureRow = () => (closureDb['cost_transactions'] || [])[0];
+  const NOW = '2026-09-13T09:00:00Z';
+  applyReviewCostTransaction(closureDb, { transaction_uuid: 'cl-100', approver: 'project_control', decision: 'approve' }, NOW);
+  eq('S18-E first approval advances to level 1 and stays submitted', closureRow().status, 'submitted');
+  eq('S18-E first approval level', closureRow().approval_level, 1);
+  applyReviewCostTransaction(closureDb, { transaction_uuid: 'cl-100', approver: 'finance_manager', decision: 'approve' }, NOW);
+  eq('S18-E second approval reaches approved', closureRow().status, 'approved');
+  eq('S18-E approval timestamp is written', closureRow().approved_at, NOW);
+  eq('S18-E approval survives a store re-read (reload)',
+    (JSON.parse(JSON.stringify(closureDb)) as DemoDb)['cost_transactions'][0].status, 'approved');
+  const acWith = (date: string, status: string): number => analyzeCostControl({
+    project: pcProject, activities: pcActs, baselines: pcBaselines, budgetLines: pcBudget,
+    costTransactions: [...pcTxns, txn('CLX', 'PC5', date, 100, status)],
+    progressUpdates: pcUpdates, wbsNodes: [], boqItems: [], allocations: [],
+    previousSnapshots: [], dataDate: DD, calendarType: '6_days',
+  }).project.ac;
+  eq('S18-E an approved 100 SAR dated on/before the Data Date enters AC', acWith('2026-09-10', 'approved'), pcF6.project.ac + 100);
+  eq('S18-E an approved 100 SAR dated after the Data Date does not', acWith('2026-09-20', 'approved'), pcF6.project.ac);
+  eq('S18-E a still-submitted 100 SAR does not', acWith('2026-09-10', 'submitted'), pcF6.project.ac);
+
+  // F5 baseline/delay: no 2028 leakage, no -310, a small positive delay.
+  const clActs = [
+    act({ id: 'CL1', code: 'CL1', early_start: '2027-02-21', early_finish: '2027-03-03', duration_days: 10, percent_complete: 0 }),
+    act({ id: 'CL2', code: 'CL2', early_start: '2027-02-21', early_finish: '2027-02-26', duration_days: 5, percent_complete: 0 }),
+  ];
+  const clBaselines = [
+    base('CLB1', 'CL1', '2027-02-18', '2027-02-28', 10, 500000),
+    base('CLB2', 'CL2', '2027-02-18', '2027-02-26', 5, 100000),
+    base('CLB-FOREIGN', 'other-project-activity', '2027-03-01', '2028-02-28', 200, 9999999),
+  ];
+  const clF5 = analyzeScheduleControl({
+    activities: clActs, links: [], baselines: clBaselines, progressUpdates: [],
+    previousSnapshot: null, dataDate: DD, calendarType: '6_days',
+  });
+  eq('S18-E baseline finish is still 2027-02-28 (no 2028 leakage)', clF5.project.baselineFinish, '2027-02-28');
+  ok('S18-E total delay is still positive', (clF5.project.totalDelayWd ?? -1) > 0);
+  ok('S18-E total delay is still never -310', clF5.project.totalDelayWd !== -310);
+  eq('S18-E total delay still equals the working-day convention',
+    clF5.project.totalDelayWd, refWdDelta(String(clF5.project.baselineFinish), String(clF5.project.forecastFinish)));
 }
 
 // ---------------------------------------------------------------------------

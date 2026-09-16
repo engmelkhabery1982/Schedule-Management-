@@ -11,59 +11,24 @@ import type {
   ActivityResource,
   ActivityLink,
   Risk,
+  BaselineActivity,
 } from '@/types';
 import { runDcma14PointAudit } from '@/lib/scheduleQualityEngine';
 import { resolveDataDate } from '@/lib/chronologyGuard';
 import { getSubcontractPackages, calculateSubcontractorLedger } from '@/lib/subcontractEngine';
-// Final Cleanup (item 4): the EVM pillar consumes the canonical project-control EVM engine instead
-// of carrying its own planned-progress/PV formula. `planningEngine` imports only types and governed
-// constants, so this adds no dependency cycle.
+// F9.5 (Pilot Closure defect 1): the EVM pillar QUOTES canonical F6. `analyzeCostControl` +
+// `selectCanonicalEvm` are the cost-control SSOT established in F9.4; neither imports `supabase`, so
+// this adds no dependency cycle. `calculateProjectEvmAtDataDate` is retained ONLY as an explicitly
+// labelled diagnostic comparison — it is no longer a source of user-facing EVM values anywhere here.
+import { analyzeCostControl } from '@/lib/costControlEngine';
+import { selectCanonicalEvm } from '@/lib/canonicalEvm';
+import { buildGovernanceEvmCheck } from '@/lib/governanceEvmPillar';
 import { calculateProjectEvmAtDataDate } from '@/lib/planningEngine';
-import type { EvmAcSource, EvmBacSource, EvmRatioStatus, TcpiStatus } from '@/lib/planningEngine';
+import type { EvmAcSource, EvmBacSource } from '@/lib/planningEngine';
 
-/**
- * Bilingual labels for the canonical EVM engine's data-quality metadata, so this audit can say
- * *where* a number came from — or say that it could not be derived at all. The engine owns the
- * values; these maps only render them.
- */
-const BAC_SOURCE_LABEL_AR: Record<EvmBacSource, string> = {
-  contract_value: 'القيمة التعاقدية',
-  approved_baseline: 'خط الأساس المعتمد (PMB)',
-  budget_lines: 'خطوط ميزانية CBS',
-  boq_items: 'جدول الكميات BOQ',
-  caller_supplied: 'قيمة مُدخلة من المستدعي',
-  unavailable: 'غير متاح — لا مصدر معتمد',
-};
-const BAC_SOURCE_LABEL_EN: Record<EvmBacSource, string> = {
-  contract_value: 'contract value',
-  approved_baseline: 'approved baseline (PMB)',
-  budget_lines: 'CBS budget lines',
-  boq_items: 'BOQ items',
-  caller_supplied: 'caller-supplied scalar',
-  unavailable: 'unavailable — no authoritative source',
-};
-const AC_SOURCE_LABEL_AR: Record<EvmAcSource, string> = {
-  approved_cost_transactions: 'معاملات التكلفة المعتمدة',
-  budget_line_actuals: 'التكاليف الفعلية المسجلة في خطوط الميزانية',
-  caller_supplied: 'قيمة مُدخلة من المستدعي',
-  unavailable: 'غير متاح — لا دليل تكلفة فعلية',
-};
-const AC_SOURCE_LABEL_EN: Record<EvmAcSource, string> = {
-  approved_cost_transactions: 'approved cost transactions',
-  budget_line_actuals: 'stored budget-line actuals',
-  caller_supplied: 'caller-supplied scalar',
-  unavailable: 'unavailable — no actual-cost evidence',
-};
-const RATIO_STATUS_LABEL_AR: Record<EvmRatioStatus, string> = {
-  valid: 'قيمة مقاسة',
-  empty_no_data: 'لا بيانات',
-  anomalous_zero_denominator: 'مقام صفري — حالة شاذة',
-};
-const TCPI_STATUS_LABEL_AR: Record<TcpiStatus, string> = {
-  valid: 'قيمة مقاسة',
-  undefined_zero_denominator: 'غير معرّف — لا ميزانية متبقية',
-  overrun_budget_exhausted: 'غير قابل للتحقيق — استُنفدت الميزانية',
-};
+// The bilingual EVM data-quality label maps this pillar used to own moved to `governanceEvmPillar`
+// with the row-building logic they render, so the pure module the harness can import is the single
+// definition of how a canonical EVM fact is labelled.
 
 export interface GovernanceCheckItem {
   id: string;
@@ -132,6 +97,8 @@ export interface GovernanceAuditResult {
     vac: number | null;
     spi: number | null;
     cpi: number | null;
+    /** F9.5: estimate to complete, quoted from canonical F6 (the label set the pilot reconciled). */
+    etc: number | null;
     eac: number | null;
     tcpi: number | null;
     /** Canonical earned progress (EV / BAC), or null when BAC is unavailable. */
@@ -160,6 +127,14 @@ export async function runComprehensiveGovernanceAudit(
   resources: Resource[],
   activityResources: ActivityResource[],
   risks: Risk[],
+  // F9.5: the project's ACTIVE APPROVED baseline rows, fetched by the caller with the same governed
+  // `project_baselines!inner` query BudgetView / Dashboard / ProgressView / ScheduleView /
+  // ExecutiveReportView use. F6's first-precedence BAC basis is the approved baseline, so without
+  // these rows the canonical EVM this pillar quotes would fall back to unfrozen budget lines and
+  // could not equal what the Dashboard and the Executive Report show. Optional and last so the
+  // existing positional call keeps compiling; an omitted value degrades to F6's documented
+  // budget-line/contract BAC precedence rather than to an invented budget.
+  baselines: BaselineActivity[] = [],
 ): Promise<GovernanceAuditResult> {
   const checks: GovernanceCheckItem[] = [];
 
@@ -354,16 +329,47 @@ export async function runComprehensiveGovernanceAudit(
   // -------------------------------------------------------------
   // PILLAR 4: EVM & Progress Mathematical Consistency
   // -------------------------------------------------------------
-  // Final Cleanup (item 4): this pillar consumes the canonical project-control EVM engine instead of
-  // computing its own figures. It used to declare `plannedProgressRatio = 0.40` — a flat "40%
-  // planned complete" applied to every project regardless of its schedule, its budget phasing or the
-  // data date — multiply it by BAC to obtain a PV, derive SPI/CPI/EAC/VAC/TCPI from that PV, and
-  // then report the chain as rigorous with a "0.00 ر.س (مطابقة تامة)" variance. No local progress or
-  // PV formula replaces it: `calculateProjectEvmAtDataDate` phases planned value from the activities'
-  // own CPM windows at the governed Data Date, and it is the single EVM SSOT (GAP-044) that this
-  // module must not duplicate. Where the canonical engine cannot derive a value, the pillar reports
-  // N/A and a warning — never an invented percentage.
-  const canonicalEvm = calculateProjectEvmAtDataDate(
+  // F9.5 (Pilot Closure defect 1) — ROOT CAUSE OF THE VISIBLE `EVM-01/02/03` DIVERGENCE.
+  //
+  // This pillar published EVM under the canonical labels BAC/PV/EV/AC/SPI/CPI/EAC/TCPI/VAC from
+  // `calculateProjectEvmAtDataDate` — the secondary derivation F9.4 retired as a DISPLAY source but
+  // could not delete (S6 locks its contract-value-first BAC precedence and other callers use it).
+  // That is where the pilot's visible rows got EV 276,918 / PV 288,359 / CPI 0.400 / EAC 5,862,875 /
+  // VAC -3,517,725 while F6, the Dashboard's canonical strip and the Executive Report all showed
+  // EV 755,708 / PV 781,871.43 / CPI 1.095 / EAC 2,141,689.5 / VAC +203,460.5 for the SAME project at
+  // the SAME governed Data Date. It was never a BAC or AC disagreement — both derivations agree on
+  // 2,345,150 and 690,000. They diverge on how each activity's budget is WEIGHTED and EARNED: the
+  // secondary derivation matches an activity to the FIRST budget line of its WBS node, hands that
+  // line in full to every activity in the node, re-scales to BAC and time-prorates planned value,
+  // whereas F6 earns `activityBac x percent_complete` against the approved baseline.
+  //
+  // `forecastTrustEngine` was NOT the source: F8's `analyzeForecastTrust()` already receives the F6
+  // cost strip and quotes it. The rows were this governance pillar's.
+  //
+  // The pillar now QUOTES canonical F6 (`analyzeCostControl` -> `selectCanonicalEvm`) and keeps the
+  // secondary derivation only as an explicitly labelled DIAGNOSTIC comparison, so the divergence that
+  // fooled the pilot becomes a visible reconciliation finding instead of two equally authoritative
+  // sets of "EVM" numbers. Row construction lives in `governanceEvmPillar` — a pure module with no
+  // `supabase` import, because THIS file cannot be bundled into the node-ESM regression harness and
+  // the pillar was therefore untestable. S18 drives that same function.
+  const governedDataDate = resolveDataDate(project);
+  const costReport = analyzeCostControl({
+    project,
+    activities,
+    baselines,
+    budgetLines,
+    costTransactions: transactions,
+    progressUpdates,
+    wbsNodes: [],
+    boqItems,
+    allocations: [],
+    dataDate: governedDataDate,
+    calendarType: project.calendar_type,
+  });
+  const canonicalEvm = selectCanonicalEvm(costReport);
+  // DIAGNOSTIC ONLY. Its output must never be presented as a current value under a canonical label;
+  // `buildGovernanceEvmCheck` renders it in a separately marked comparison segment of `variance`.
+  const diagnosticEvm = calculateProjectEvmAtDataDate(
     project,
     activities,
     budgetLines,
@@ -371,6 +377,7 @@ export async function runComprehensiveGovernanceAudit(
     transactions,
     progressUpdates,
   );
+
   const bacAvailable = canonicalEvm.bacSource !== 'unavailable';
   const acAvailable = canonicalEvm.acSource !== 'unavailable';
   const evmFullyMeasured =
@@ -380,46 +387,11 @@ export async function runComprehensiveGovernanceAudit(
     canonicalEvm.cpiStatus === 'valid' &&
     canonicalEvm.tcpiStatus === 'valid';
 
-  const formatSar = (value: number) => `${Math.round(value).toLocaleString()} ر.س`;
-  // A ratio is rendered only when it was actually measured; its data-quality status decides the rest,
-  // so an unavailable denominator can never be presented as a healthy 1.000.
-  const renderRatio = (value: number, status: EvmRatioStatus) =>
-    status === 'valid' ? value.toFixed(3) : `N/A (${RATIO_STATUS_LABEL_AR[status]})`;
-  const renderTcpi = (value: number, status: TcpiStatus) =>
-    status === 'valid' ? value.toFixed(3) : `N/A (${TCPI_STATUS_LABEL_AR[status]})`;
-  const evmUnavailableAr = !bacAvailable
-    ? 'N/A — لا يوجد مصدر معتمد لـ BAC (لا قيمة تعاقدية ولا ميزانية CBS ولا جدول كميات)، لذا يتعذر اشتقاق PV/EV وأي مؤشر أداء'
-    : !acAvailable
-      ? 'N/A — لا يوجد دليل تكلفة فعلية (لا معاملات معتمدة ولا تكاليف فعلية مسجلة)، لذا CPI غير قابل للقياس'
-      : '';
-  const evmUnavailableEn = !bacAvailable
-    ? 'N/A — no authoritative BAC source (no contract value, CBS budget or BOQ), so PV/EV and every index are unavailable'
-    : !acAvailable
-      ? 'N/A — no actual-cost evidence (no approved transactions, no stored budget actuals), so CPI is not measurable'
-      : '';
-
-  checks.push({
-    id: 'GOV-EVM-01',
-    pillar: 'evm_math',
-    pillarNameAr: 'الدقة الرياضية للقيمة المكتسبة (EVM Mathematics)',
-    pillarNameEn: 'Earned Value Mathematical Rigor & Law of Conservation',
-    code: 'EVM-01/02/03',
-    titleAr: 'انضباط معادلات EVM المشتقة من المحرك القانوني (EV, PV, AC, SPI, CPI, EAC, TCPI)',
-    titleEn: 'Strict PMI EVM Compliance from the Canonical Engine, with Honest N/A',
-    descriptionAr: 'التحقق من أن مؤشرات الأداء (SPI/CPI) وتوقعات الإنجاز (EAC/VAC/TCPI) مشتقة من محرك EVM القانوني عند تاريخ البيانات المعتمد، وأن كل مدخل غير متاح يُعلن صراحة (N/A) بدل اختلاقه.',
-    descriptionEn: 'Validates that performance indices (SPI/CPI) and forecasts (EAC/VAC/TCPI) come from the canonical EVM engine at the governed Data Date, and that every unavailable input is declared N/A instead of being invented.',
-    severity: 'critical',
-    status: evmFullyMeasured ? 'passed' : 'warning',
-    expectedValue: `SPI = EV/PV · CPI = EV/AC · EAC = BAC/CPI · TCPI = (BAC-EV)/(BAC-AC)، مع BAC من مصدر معتمد (${BAC_SOURCE_LABEL_EN[canonicalEvm.bacSource]}) وAC من دليل تكلفة مسجل (${AC_SOURCE_LABEL_EN[canonicalEvm.acSource]})`,
-    actualValue: evmFullyMeasured
-      ? `عند ${canonicalEvm.dataDate}: BAC ${formatSar(canonicalEvm.bac)} (${BAC_SOURCE_LABEL_AR[canonicalEvm.bacSource]}) | PV ${formatSar(canonicalEvm.pv)} | EV ${formatSar(canonicalEvm.ev)} | AC ${formatSar(canonicalEvm.ac)} (${AC_SOURCE_LABEL_AR[canonicalEvm.acSource]}) | SPI ${renderRatio(canonicalEvm.spi, canonicalEvm.spiStatus)} | CPI ${renderRatio(canonicalEvm.cpi, canonicalEvm.cpiStatus)} | EAC ${formatSar(canonicalEvm.eac)} | TCPI ${renderTcpi(canonicalEvm.tcpi, canonicalEvm.tcpiStatus)}`
-      : `${evmUnavailableAr} (${evmUnavailableEn})`,
-    variance: bacAvailable
-      ? `SV = EV - PV = ${formatSar(canonicalEvm.sv)} · CV = EV - AC = ${acAvailable ? formatSar(canonicalEvm.cv) : 'N/A'} · VAC = BAC - EAC = ${acAvailable ? formatSar(canonicalEvm.vac) : 'N/A'}`
-      : 'N/A (لا توجد قيم مالية قابلة للمقارنة)',
-    impactAr: 'تقديم تقارير أداء ومؤشرات دقيقة لا تقبل التشكيك أمام مجلس الإدارة والممولين.',
-    impactEn: 'Delivers unassailable financial performance reports to Executive Board and stakeholders.',
-  });
+  checks.push(buildGovernanceEvmCheck({
+    canonical: canonicalEvm,
+    diagnostic: diagnosticEvm,
+    diagnosticLabel: 'planningEngine.calculateProjectEvmAtDataDate',
+  }));
 
   // -------------------------------------------------------------
   // PILLAR 5: Commercial, Subcontractor & FIDIC Controls Parity
@@ -606,22 +578,27 @@ export async function runComprehensiveGovernanceAudit(
       maxVarianceSar: Math.max(boqVariance, budgetVariance),
     },
     evmParity: {
+      // F9.5: quoted from canonical F6, field for field. `CanonicalEvm` already publishes `null`
+      // where F6 could not measure a fact, so the old `bacAvailable ? ... : null` guards are
+      // redundant here — keeping them would only risk masking a real null with a second opinion.
+      // The ratio guards stay: a ratio whose status is not `valid` is rendered as not-measured.
       dataDate: canonicalEvm.dataDate,
-      bac: bacAvailable ? canonicalEvm.bac : null,
+      bac: canonicalEvm.bac,
       bacSource: canonicalEvm.bacSource,
-      pv: bacAvailable ? canonicalEvm.pv : null,
-      ev: bacAvailable ? canonicalEvm.ev : null,
+      pv: canonicalEvm.pv,
+      ev: canonicalEvm.ev,
       ac: acAvailable ? canonicalEvm.ac : null,
       acSource: canonicalEvm.acSource,
-      sv: bacAvailable ? canonicalEvm.sv : null,
-      cv: bacAvailable && acAvailable ? canonicalEvm.cv : null,
-      vac: bacAvailable && acAvailable ? canonicalEvm.vac : null,
+      sv: canonicalEvm.sv,
+      cv: canonicalEvm.cv,
+      vac: canonicalEvm.vac,
       spi: canonicalEvm.spiStatus === 'valid' ? canonicalEvm.spi : null,
       cpi: canonicalEvm.cpiStatus === 'valid' ? canonicalEvm.cpi : null,
-      eac: bacAvailable && acAvailable ? canonicalEvm.eac : null,
+      etc: canonicalEvm.etc,
+      eac: canonicalEvm.eac,
       tcpi: canonicalEvm.tcpiStatus === 'valid' ? canonicalEvm.tcpi : null,
-      earnedProgressPercent: bacAvailable ? canonicalEvm.earnedProgressPercent : null,
-      plannedProgressPercent: bacAvailable ? canonicalEvm.plannedProgressPercent : null,
+      earnedProgressPercent: canonicalEvm.earnedProgressPercent,
+      plannedProgressPercent: canonicalEvm.plannedProgressPercent,
       isRigorous: evmFullyMeasured,
     },
     summaryAr,
