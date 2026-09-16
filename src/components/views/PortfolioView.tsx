@@ -83,16 +83,33 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
   async function loadPortfolio() {
     setLoading(true);
     try {
+      // REVIEW FINDING 1 (HIGH): slots 8 and 9 of this `Promise.all` were transposed — `prgData`
+      // received `baseline_activities` while `baselineData` received `progress_updates`. So
+      // `setAllProgress` was handed baseline rows and `setAllBaselines` progress rows, corrupting
+      // every consumer below: `analyzeCostControl` (hence the canonical EVM this roll-up quotes) and
+      // the per-project DCMA audit.
+      //
+      // It was silent for two reasons. (a) `baseline_activities` carries no `project_id`, so
+      // `allProgress.filter(pr => pr.project_id === p.id)` matched nothing and earned value quietly
+      // fell back to each activity's own recorded percent; (b) `progress_updates` DOES carry
+      // `activity_id`, so `allBaselines.filter(b => pActivityIds.has(b.activity_id))` matched and fed
+      // progress rows into F6's baseline BAC basis, where `planned_cost` is undefined. The
+      // `as BaselineActivity[]` cast on the setter suppressed the only diagnostic that could have
+      // caught it, so both casts are now gone and the demo store's `any` payload is not re-asserted.
+      //
+      // Each slot below is commented with the table it binds, and S17-E pins the table->slot mapping
+      // against this source file, so transposing either list now fails the gate instead of silently
+      // corrupting portfolio EVM.
       const [
-        { data: projData },
-        { data: actData },
-        { data: bgtData },
-        { data: cstData },
-        { data: rskData },
-        { data: lnkData },
-        { data: boqData },
-        { data: prgData },
-        { data: baselineData },
+        { data: projData },        // <- projects
+        { data: actData },         // <- activities
+        { data: bgtData },         // <- budget_lines
+        { data: cstData },         // <- cost_transactions
+        { data: rskData },         // <- risks
+        { data: lnkData },         // <- activity_links
+        { data: boqData },         // <- boq_items
+        { data: baselineData },    // <- baseline_activities
+        { data: prgData },         // <- progress_updates
       ] = await Promise.all([
         supabase.from('projects').select('*').order('created_at', { ascending: false }),
         supabase.from('activities').select('*'),
@@ -101,9 +118,20 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
         supabase.from('risks').select('*'),
         supabase.from('activity_links').select('*'),
         supabase.from('boq_items').select('*'),
-        // Baseline rows are loaded so the DCMA audit of each project sees the same evidence the
-        // project screen sees; without them the baseline-variance points would be silently skipped.
-        supabase.from('baseline_activities').select('*'),
+        // Baseline rows are loaded so the DCMA audit and the canonical EVM of each project see the
+        // same evidence the project's own screen sees; without them the baseline-variance points
+        // would be silently skipped and F6 would fall back to unfrozen budget lines for BAC.
+        //
+        // REVIEW FINDING 2 (extended): restricted to the ACTIVE APPROVED revision, exactly as
+        // BudgetView / Dashboard / ProgressView / ScheduleView / ExecutiveReportView do. This is a
+        // portfolio roll-up, so it cannot scope by a single `project_id`; it scopes by revision
+        // governance instead and then partitions per project by activity id below. Without this a
+        // superseded revision's rows would double F6's BAC (which sums every row it is handed) and
+        // its `baselineByAct` map would let whichever revision sorts last decide per-activity EV/PV.
+        supabase.from('baseline_activities')
+          .select('*, project_baselines!inner(project_id, is_active, status)')
+          .eq('project_baselines.is_active', true)
+          .eq('project_baselines.status', 'approved'),
         supabase.from('progress_updates').select('*'),
       ]);
 
@@ -115,7 +143,7 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
       setAllLinks(lnkData || []);
       setAllBoqs(boqData || []);
       setAllProgress(prgData || []);
-      setAllBaselines((baselineData || []) as BaselineActivity[]);
+      setAllBaselines(baselineData || []);
     } catch (err) {
       console.error('Error loading portfolio:', err);
     } finally {

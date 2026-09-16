@@ -254,3 +254,72 @@ export function reviewStateOf(
     levelsRemaining: isApproved ? 0 : Math.max(0, 2 - level),
   };
 }
+
+/* -------------------------------------------------------------------------
+ * REVIEW FINDING 2 (F9.4) — governed baseline evidence.
+ *
+ * `baseline_activities` has NO `project_id` column: it hangs off `project_baselines`, the revision
+ * header that carries `project_id`, `is_active` and `status`. Filtering baseline rows client-side by
+ * `activity_id` alone therefore proves only that a row belongs to one of this project's activities —
+ * it says nothing about WHICH REVISION it belongs to. Every superseded revision of the same activity
+ * passes that filter.
+ *
+ * That matters because F6 treats the rows it is handed as the authorized budget: `analyzeCostControl`
+ * sets BAC = sum(`planned_cost`) over ALL of them, and builds `baselineByAct` as a Map keyed by
+ * `activity_id`, so when two revisions cover one activity the LAST row in array order silently wins
+ * and decides that activity's BAC — and therefore its EV (`activityBac x percent_complete`) and its
+ * PV window (baseline `early_start` / `early_finish`). A stale revision reaching F6 changes BAC, PV
+ * and EV without any error being raised anywhere.
+ *
+ * This function is the single, headlessly testable definition of the evidence set every governed
+ * screen must read — the exact semantics of the PostgREST query
+ *   baseline_activities
+ *     -> project_baselines!inner(project_id, is_active, status)
+ *     -> project_id = <this project>, is_active = true, status = 'approved'
+ * used by BudgetView, Dashboard, ProgressView, ScheduleView and ExecutiveReportView. `!inner` is
+ * load-bearing: a row whose `baseline_id` does not resolve to a revision header is EXCLUDED, never
+ * waved through (the demo store's dot-notation `eq` used to fail open on exactly those rows).
+ *
+ * Pass `projectId: null` for a cross-project roll-up (PortfolioView), which cannot scope to one
+ * project but must still see only active approved revisions.
+ * ----------------------------------------------------------------------- */
+
+/** A `baseline_activities` row as the demo store holds it. */
+export interface DemoBaselineActivityRow extends Record<string, unknown> {
+  id?: unknown;
+  baseline_id?: unknown;
+  activity_id?: unknown;
+  planned_cost?: unknown;
+}
+
+/** A `project_baselines` revision header as the demo store holds it. */
+export interface DemoProjectBaselineRow extends Record<string, unknown> {
+  id?: unknown;
+  project_id?: unknown;
+  is_active?: unknown;
+  status?: unknown;
+}
+
+/**
+ * The governed baseline evidence set for one project (or, with `projectId === null`, for every
+ * project) — active approved revisions only, orphaned rows excluded.
+ *
+ * Deterministic: rows are returned in store order, unreordered, so a caller's "last row wins"
+ * behaviour cannot be perturbed by this function.
+ */
+export function selectGovernedBaselineActivities(
+  db: DemoDb,
+  projectId: string | null,
+): DemoBaselineActivityRow[] {
+  const revisions = (db['project_baselines'] || []) as DemoProjectBaselineRow[];
+  const rows = (db['baseline_activities'] || []) as DemoBaselineActivityRow[];
+  return rows.filter((row) => {
+    const parent = revisions.find((rev) => rev.id === row.baseline_id);
+    // `!inner`: no resolvable revision header means the row is not governed evidence at all.
+    if (!parent) return false;
+    if (parent.is_active !== true) return false;
+    if (String(parent.status) !== 'approved') return false;
+    if (projectId !== null && String(parent.project_id) !== projectId) return false;
+    return true;
+  });
+}

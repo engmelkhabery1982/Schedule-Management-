@@ -61,7 +61,24 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
     const [actRes, linkRes, baselineRes, bgtRes, cstRes, prgRes, boqRes, rskRes] = await Promise.all([
       supabase.from('activities').select('*').eq('project_id', project.id).order('sort_order'),
       supabase.from('activity_links').select('*').eq('project_id', project.id),
-      supabase.from('baseline_activities').select('*'),
+      // REVIEW FINDING 2 (HIGH): this was an unscoped `select('*')` filtered only client-side by
+      // `activity_id`. That stops CROSS-PROJECT rows but not cross-REVISION rows: every historical
+      // baseline revision of THIS project's activities still arrived, and F6 sums `planned_cost` over
+      // every row it is handed (so a second revision inflates BAC) while its `baselineByAct` map lets
+      // whichever revision sorts last silently decide per-activity BAC — and therefore EV and PV.
+      // Those rows reached `analyzeCostControl` (canonical EVM), the DCMA audit and the baseline
+      // S-Curve, breaking the F9.4 requirement that F6 / Dashboard / BudgetView / Executive Report
+      // all rest on the SAME governed baseline evidence.
+      //
+      // Now the identical governed query BudgetView / Dashboard / ProgressView / ScheduleView use:
+      // scope through `project_baselines` (the parent that carries `project_id`) to the revision that
+      // is both ACTIVE and APPROVED. The engine-side foreign-row guard stays as defence in depth, and
+      // the client-side activity-id filter below is kept for the same reason.
+      supabase.from('baseline_activities')
+        .select('*, project_baselines!inner(project_id, is_active, status)')
+        .eq('project_baselines.project_id', project.id)
+        .eq('project_baselines.is_active', true)
+        .eq('project_baselines.status', 'approved'),
       supabase.from('budget_lines').select('*').eq('project_id', project.id),
       supabase.from('cost_transactions').select('*').eq('project_id', project.id),
       supabase.from('progress_updates').select('*').eq('project_id', project.id),
@@ -70,10 +87,11 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
     ]);
     setActivities(actRes.data || []);
     setLinks((linkRes.data || []) as ActivityLink[]);
-    // Cross-project leak: `baseline_activities` has no `project_id` column (it hangs off
-    // `baselines`), so the unfiltered fetch above pulled every project's baseline snapshots into
-    // this report's DCMA audit and baseline S-Curve. Scope them to the activities of the project
-    // being reported — client-side, no query or migration change.
+    // Defence in depth (kept deliberately). The query above is now the authoritative governance
+    // filter — it restricts to THIS project's ACTIVE APPROVED baseline revision. This client-side
+    // pass additionally drops any row whose `activity_id` is not an activity of the reported project,
+    // so a malformed or orphaned join result still cannot reach the DCMA audit, the baseline S-Curve
+    // or the canonical EVM. It is a filter, never a correction: it cannot widen the evidence set.
     const projectActivityIds = new Set(((actRes.data || []) as Activity[]).map((a) => a.id));
     setBaselineActivities(
       ((baselineRes.data || []) as BaselineActivity[]).filter((b) => projectActivityIds.has(b.activity_id)),

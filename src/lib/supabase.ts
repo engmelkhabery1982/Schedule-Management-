@@ -89,7 +89,16 @@ class MockQueryBuilder<T = any> implements PromiseLike<{ data: any; error: any }
         if (direct && typeof direct === 'object') {
           return direct[parts[1]] === value;
         }
-        return true;
+        // REVIEW FINDING 2 (defence in depth): this returned `true`, i.e. a row whose joined parent is
+        // absent or null PASSED the filter. That is the opposite of PostgREST `!inner` semantics,
+        // where a row with no matching parent is excluded — so it failed OPEN on exactly the rows the
+        // governed baseline query exists to keep out: a `baseline_activities` row whose `baseline_id`
+        // no longer resolves (deleted or never-existing `project_baselines` revision) sailed through
+        // `.eq('project_baselines.project_id', …)` and into F6's BAC basis. Now it fails CLOSED,
+        // matching the real database. Every dot-notation `eq` in the app is a governed
+        // `project_baselines!inner` baseline query, so this narrows only those, and every seeded
+        // baseline row resolves to a real revision — no legitimate row is dropped.
+        return false;
       }
       return item[column] === value;
     });

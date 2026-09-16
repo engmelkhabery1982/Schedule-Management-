@@ -25,6 +25,14 @@
  * inclusive working-day convention on purpose) or exact quotes of the source engine's output —
  * a downstream engine that re-derives a number instead of quoting it fails the equality checks.
  */
+// S17-E reads the VIEW SOURCE FILES as text. The harness cannot import them: a view pulls in
+// `@/lib/supabase`, whose real Supabase client cannot be bundled for node ESM (`Dynamic require of
+// "stream" is not supported`). So the table->slot and governed-query contracts are asserted against
+// the shipped source instead — which is also the stronger check, because it tests the code the user
+// actually runs rather than a copy of it.
+import { readFileSync, existsSync } from 'node:fs';
+import { dirname, resolve as resolvePath } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { DEFAULT_DATA_DATE, governedDefaultToday } from '@/lib/projectControlsConstants';
 import { resolveDataDate, isIsoDate, isAfterDataDate, isOnOrBeforeDataDate, calendarDaysBetween, classifyByDate, latestDate, earliestDate } from '@/lib/chronologyGuard';
 import { calculateCpm } from '@/lib/cpmEngine';
@@ -41,7 +49,7 @@ import { analyzeCostControl, buildCostSnapshot } from '@/lib/costControlEngine';
 import { analyzeIntegratedDecisions, gateConfidence } from '@/lib/integratedDecisionEngine';
 import { analyzeForecastTrust } from '@/lib/forecastTrustEngine';
 import { selectCanonicalEvm, canonicalEvmToComprehensive, quoteCanonicalEvm, CANONICAL_EVM_SOURCE } from '@/lib/canonicalEvm';
-import { applyReviewCostTransaction, unimplementedRpcError, reviewStateOf, type DemoDb } from '@/lib/demoDbContracts';
+import { applyReviewCostTransaction, unimplementedRpcError, reviewStateOf, selectGovernedBaselineActivities, type DemoDb } from '@/lib/demoDbContracts';
 import { reconcileFinishForecasts, calculateCpmDeterministicEarlyFinish } from '@/lib/forecastReconciliation';
 import { calculateControlHealth } from '@/lib/controlHealthEngine';
 import {
@@ -1540,6 +1548,219 @@ console.log('--- S17 Controlled Pilot defects (F9.4)');
     critShifted = summarizeCanonicalCriticality(critActs, critLinks, { dataDate: DD, calendarType: '6_days' }).criticalIds;
   });
   eq('S17-D canonical criticality is identical under a +400d clock shift', JSON.stringify(critShifted), JSON.stringify(crit.criticalIds));
+
+  // ---------------------------------------------------------------------
+  // S17-E  Independent review finding 1 & 2 — source-level contracts
+  // ---------------------------------------------------------------------
+  // Both findings were invisible to the type system: the demo store's query result is `any`, so a
+  // transposed `Promise.all` slot and an ungoverned `baseline_activities` fetch both typecheck, build
+  // and lint cleanly while silently corrupting canonical EVM. These checks read the shipped view
+  // source as text and pin the contracts that the compiler cannot.
+  const repoRoot = (() => {
+    const cwd = process.cwd();
+    if (existsSync(resolvePath(cwd, 'package.json'))) return cwd;
+    // The bundle lands in node_modules/.cache, so walk up from this module to the package root.
+    let dir = dirname(fileURLToPath(import.meta.url));
+    for (let i = 0; i < 8; i += 1) {
+      if (existsSync(resolvePath(dir, 'package.json'))) return dir;
+      dir = dirname(dir);
+    }
+    return cwd;
+  })();
+  const readSrc = (rel: string): string => readFileSync(resolvePath(repoRoot, rel), 'utf8');
+
+  /** The full query expression for one table: from `supabase.from('<t>')` to the next `.from(`. */
+  const queryFor = (src: string, table: string): string | null => {
+    const head = `supabase.from('${table}')`;
+    const start = src.indexOf(head);
+    if (start < 0) return null;
+    const next = src.indexOf('supabase.from(', start + head.length);
+    return src.slice(start, next < 0 ? src.length : next);
+  };
+  /** The governed baseline query: scoped through the revision header to ACTIVE + APPROVED. */
+  const isRevisionGoverned = (q: string): boolean =>
+    q.includes('project_baselines!inner')
+    && q.includes(".eq('project_baselines.is_active', true)")
+    && q.includes(".eq('project_baselines.status', 'approved')");
+  const isProjectScoped = (q: string): boolean =>
+    q.includes(".eq('project_baselines.project_id', project.id)");
+
+  // --- Finding 1: PortfolioView table -> destructured slot binding. ---
+  const pfSrc = readSrc('src/components/views/PortfolioView.tsx');
+  const pfBody = pfSrc.slice(pfSrc.indexOf('async function loadPortfolio()'));
+  const pfDestructure = pfBody.slice(pfBody.indexOf('const ['), pfBody.indexOf('= await Promise.all(['));
+  const pfSlots = Array.from(pfDestructure.matchAll(/\{\s*data:\s*(\w+)\s*\}/g)).map((m) => m[1]);
+  const pfArray = pfBody.slice(pfBody.indexOf('= await Promise.all(['));
+  const pfTables = Array.from(
+    pfArray.slice(0, pfArray.indexOf(']);')).matchAll(/supabase\.from\('([^']+)'\)/g),
+  ).map((m) => m[1]);
+  const PF_EXPECTED: [string, string][] = [
+    ['projects', 'projData'], ['activities', 'actData'], ['budget_lines', 'bgtData'],
+    ['cost_transactions', 'cstData'], ['risks', 'rskData'], ['activity_links', 'lnkData'],
+    ['boq_items', 'boqData'], ['baseline_activities', 'baselineData'], ['progress_updates', 'prgData'],
+  ];
+  eq('S17-E PortfolioView loads every expected table', pfTables, PF_EXPECTED.map((e) => e[0]));
+  eq('S17-E PortfolioView destructures every expected slot', pfSlots, PF_EXPECTED.map((e) => e[1]));
+  eq('S17-E PortfolioView query count === slot count (no unbound result)', pfTables.length, pfSlots.length);
+  // The check that FAILS if slots 8 and 9 are transposed again: pair them positionally, by index.
+  eq('S17-E PortfolioView binds each table to its own slot, positionally',
+    pfTables.map((t, i) => `${t}->${pfSlots[i]}`), PF_EXPECTED.map(([t, v]) => `${t}->${v}`));
+  eq('S17-E baseline_activities is NOT bound to prgData (the reported swap)',
+    pfSlots[pfTables.indexOf('baseline_activities')], 'baselineData');
+  eq('S17-E progress_updates is NOT bound to baselineData (the reported swap)',
+    pfSlots[pfTables.indexOf('progress_updates')], 'prgData');
+  // Each setter must receive the slot whose name matches the table it came from.
+  ok('S17-E setAllProgress receives prgData', /setAllProgress\(\s*prgData/.test(pfBody));
+  ok('S17-E setAllBaselines receives baselineData', /setAllBaselines\(\s*baselineData/.test(pfBody));
+  ok('S17-E setAllProgress does NOT receive baselineData', !/setAllProgress\(\s*baselineData/.test(pfBody));
+  ok('S17-E setAllBaselines does NOT receive prgData', !/setAllBaselines\(\s*prgData/.test(pfBody));
+  // The `as BaselineActivity[]` cast on the setter is what suppressed the only available diagnostic.
+  ok('S17-E the masking cast on setAllBaselines is gone',
+    !/setAllBaselines\([^)]*as BaselineActivity\[\]/.test(pfBody));
+
+  // --- Finding 2: every screen that feeds F6 must use the governed baseline query. ---
+  const GOVERNED_VIEWS = [
+    'src/components/views/BudgetView.tsx',
+    'src/components/views/Dashboard.tsx',
+    'src/components/views/ProgressView.tsx',
+    'src/components/views/ScheduleView.tsx',
+    'src/components/views/ExecutiveReportView.tsx',
+  ];
+  for (const rel of GOVERNED_VIEWS) {
+    const name = rel.split('/').pop();
+    const src = readSrc(rel);
+    const q = queryFor(src, 'baseline_activities');
+    ok(`S17-E ${name} fetches baseline_activities`, q !== null);
+    ok(`S17-E ${name} uses the governed revision query`, q !== null && isRevisionGoverned(q));
+    ok(`S17-E ${name} scopes to the current project's revision`, q !== null && isProjectScoped(q));
+    // Client-side activity-id filtering alone is not governance: it proves a row belongs to one of
+    // this project's activities, never which REVISION it belongs to.
+    ok(`S17-E ${name} does not rely on a bare unscoped select('*')`,
+      q !== null && !/select\('\*'\)\s*[;,)]/.test(q));
+  }
+  // The Executive Report specifically — the file finding 2 named.
+  const erSrc = readSrc('src/components/views/ExecutiveReportView.tsx');
+  const erQ = queryFor(erSrc, 'baseline_activities') ?? '';
+  ok('S17-E ExecutiveReportView joins through project_baselines', erQ.includes('project_baselines!inner'));
+  ok('S17-E ExecutiveReportView selects the governance columns it filters on',
+    erQ.includes('project_baselines!inner(project_id, is_active, status)'));
+  ok('S17-E ExecutiveReportView keeps the client-side activity-id filter as defence in depth',
+    /projectActivityIds\.has\(b\.activity_id\)/.test(erSrc));
+  // PortfolioView is a cross-project roll-up: it cannot scope to one project_id, but it must still
+  // see only ACTIVE APPROVED revisions, or a superseded revision doubles F6's BAC in the roll-up.
+  const pfQ = queryFor(pfSrc, 'baseline_activities') ?? '';
+  ok('S17-E PortfolioView restricts baseline rows to active approved revisions', isRevisionGoverned(pfQ));
+
+  // The demo store's dot-notation `eq` must fail CLOSED, matching PostgREST `!inner`: a row whose
+  // joined parent is absent is excluded, not waved through.
+  const supSrc = readSrc('src/lib/supabase.ts');
+  const eqBody = supSrc.slice(supSrc.indexOf('  eq(column: string, value: any) {'));
+  const eqDotBranch = eqBody.slice(0, eqBody.indexOf('return item[column] === value;'));
+  ok('S17-E the demo store resolves a dot-notation parent before comparing',
+    eqDotBranch.includes("column.includes('.')") && eqDotBranch.includes('typeof direct ==='));
+  ok('S17-E an unresolvable join parent FAILS CLOSED (was `return true` — fail-open)',
+    /return false;/.test(eqDotBranch) && !/return true;/.test(eqDotBranch));
+
+  // ---------------------------------------------------------------------
+  // S17-F  Independent review finding 2 — governed baseline evidence (behaviour)
+  // ---------------------------------------------------------------------
+  // Two revisions of the same project baseline over the same activities, plus a draft revision, a
+  // foreign project's revision and an orphaned row. This is the shape the client-side activity-id
+  // filter cannot distinguish: every row below carries an `activity_id` belonging to this project.
+  const govActs = [
+    act({ id: 'GA1', code: 'GA1', early_start: '2026-07-01', early_finish: '2026-07-31', duration_days: 20, percent_complete: 100, actual_start: '2026-07-01', actual_finish: '2026-07-31' }),
+    act({ id: 'GA2', code: 'GA2', early_start: '2026-08-01', early_finish: '2026-09-30', duration_days: 30, percent_complete: 50, actual_start: '2026-08-01' }),
+  ];
+  const rev = (id: string, baselineId: string, actId: string, cost: number, es: string, ef: string, dur: number): BaselineActivity => ({
+    ...base(id, actId, es, ef, dur, cost), baseline_id: baselineId,
+  });
+  const govDb: DemoDb = {
+    project_baselines: [
+      { id: 'REV0', project_id: 'p1', is_active: false, status: 'approved' }, // superseded revision
+      { id: 'REV1', project_id: 'p1', is_active: true, status: 'approved' },  // THE governed revision
+      { id: 'REVD', project_id: 'p1', is_active: true, status: 'draft' },     // active but not approved
+      { id: 'REVX', project_id: 'p2', is_active: true, status: 'approved' },  // another project
+    ],
+    baseline_activities: [
+      rev('B0a', 'REV0', 'GA1', 900000, '2026-06-01', '2026-06-30', 20),
+      rev('B0b', 'REV0', 'GA2', 100000, '2026-07-01', '2026-07-15', 10),
+      rev('B1a', 'REV1', 'GA1', 500000, '2026-07-01', '2026-07-31', 20),
+      rev('B1b', 'REV1', 'GA2', 500000, '2026-08-01', '2026-09-30', 30),
+      rev('BDa', 'REVD', 'GA1', 777, '2026-07-01', '2026-07-31', 20),
+      rev('BXa', 'REVX', 'GA1', 999999, '2026-07-01', '2026-07-31', 20),
+      rev('BORPH', 'NO-SUCH-REVISION', 'GA1', 123456, '2026-07-01', '2026-07-31', 20),
+    ] as unknown as Record<string, unknown>[],
+  };
+  const allRows = (govDb['baseline_activities'] || []) as unknown as BaselineActivity[];
+  const governed = selectGovernedBaselineActivities(govDb, 'p1') as unknown as BaselineActivity[];
+
+  // The scenario really is the finding: activity-id filtering alone admits every row.
+  const govActivityIds = new Set(govActs.map((a) => a.id));
+  eq('S17-F client-side activity-id filtering admits ALL rows (it is not revision governance)',
+    allRows.filter((b) => govActivityIds.has(b.activity_id)).length, allRows.length);
+  eq('S17-F the store holds 7 baseline rows over 2 activities', allRows.length, 7);
+  eq('S17-F governance selects exactly the active approved revision of THIS project',
+    governed.map((b) => b.id), ['B1a', 'B1b']);
+  ok('S17-F a superseded (inactive) revision is excluded', !governed.some((b) => b.baseline_id === 'REV0'));
+  ok('S17-F an active-but-draft revision is excluded', !governed.some((b) => b.baseline_id === 'REVD'));
+  ok('S17-F another project\'s approved revision is excluded', !governed.some((b) => b.baseline_id === 'REVX'));
+  ok('S17-F an orphaned row with no resolvable revision is excluded (!inner fails closed)',
+    !governed.some((b) => b.baseline_id === 'NO-SUCH-REVISION'));
+  eq('S17-F governance yields exactly one row per activity (no last-wins ambiguity)',
+    new Set(governed.map((b) => b.activity_id)).size, governed.length);
+  eq('S17-F a cross-project roll-up sees every active approved revision, and nothing else',
+    selectGovernedBaselineActivities(govDb, null).map((b) => b.id), ['B1a', 'B1b', 'BXa']);
+  eq('S17-F governance is deterministic',
+    JSON.stringify(selectGovernedBaselineActivities(govDb, 'p1')), JSON.stringify(governed));
+
+  // The consequence: what a stale revision does to canonical EVM once it reaches F6.
+  // A real approved cost inside the Data Date window, so AC > 0 and CPI/EAC are MEASURED rather
+  // than N/A — without it both sides report null indices and "they differ" would be vacuous.
+  const govTxns = [txn('GT1', 'GA1', '2026-08-15', 400000)];
+  const f6With = (baselines: BaselineActivity[]) => analyzeCostControl({
+    project: mkProject({ contract_value: 1000000 }), activities: govActs, baselines,
+    budgetLines: [], costTransactions: govTxns, progressUpdates: [], wbsNodes: [], boqItems: [],
+    allocations: [], previousSnapshots: [], dataDate: DD, calendarType: '6_days',
+  });
+  const govF6 = f6With(governed);
+  const ungF6 = f6With(allRows);
+  const govCanonical = selectCanonicalEvm(govF6);
+  const ungCanonical = selectCanonicalEvm(ungF6);
+
+  eq('S17-F governed BAC is the active approved revision only', govF6.bac.value, 1000000);
+  eq('S17-F governed BAC names the baseline as its source', govF6.bac.source, 'baseline');
+  eq('S17-F governed EV = 100% of 500k + 50% of 500k', govF6.project.ev, 750000);
+  ok('S17-F an ungoverned fetch INFLATES BAC (F6 sums every row it is handed)',
+    (ungF6.bac.value ?? 0) > (govF6.bac.value ?? 0));
+  eq('S17-F the inflation is exactly the sum of the non-governed rows', ungF6.bac.value, 3124232);
+  ok('S17-F a stale revision therefore changes canonical EV too', ungCanonical.ev !== govCanonical.ev);
+  ok('S17-F a stale revision therefore changes canonical PV too', ungCanonical.pv !== govCanonical.pv);
+  eq('S17-F governed AC is the approved cost inside the Data Date', govF6.project.ac, 400000);
+  ok('S17-F the governed indices are measured, not N/A',
+    govCanonical.cpi !== null && govCanonical.eac !== null);
+  ok('S17-F a stale revision therefore changes canonical CPI', ungCanonical.cpi !== govCanonical.cpi);
+  ok('S17-F a stale revision therefore changes canonical EAC', ungCanonical.eac !== govCanonical.eac);
+  ok('S17-F a stale revision therefore changes canonical VAC', ungCanonical.vac !== govCanonical.vac);
+  eq('S17-F canonical EVM quotes the governed F6 verbatim', govCanonical.bac, govF6.bac.value);
+  eq('S17-F canonical EV quotes the governed F6 verbatim', govCanonical.ev, govF6.project.ev);
+
+  // The sharpest form of the hazard: F6's `baselineByAct` is a Map keyed by activity_id, so with two
+  // revisions per activity the LAST row in array order decides that activity's BAC — and therefore
+  // its EV and PV window. Governing the evidence makes canonical EVM order-INDEPENDENT.
+  const reversed = (rows: BaselineActivity[]) => f6With([...rows].reverse());
+  eq('S17-F governed canonical EV is independent of row order',
+    selectCanonicalEvm(reversed(governed)).ev, govCanonical.ev);
+  eq('S17-F governed canonical BAC is independent of row order',
+    selectCanonicalEvm(reversed(governed)).bac, govCanonical.bac);
+  eq('S17-F governed canonical PV is independent of row order',
+    selectCanonicalEvm(reversed(governed)).pv, govCanonical.pv);
+  ok('S17-F UNGOVERNED canonical EV depends on row order (the last-wins hazard)',
+    selectCanonicalEvm(reversed(allRows)).ev !== ungCanonical.ev);
+  eq('S17-F ungoverned EV follows whichever revision sorts last', ungCanonical.ev, 373456);
+  eq('S17-F reversing the ungoverned rows flips EV to the other revision',
+    selectCanonicalEvm(reversed(allRows)).ev, 950000);
+  noNonFinite('S17-F governed canonical EVM scan', govCanonical);
+  noNonFinite('S17-F governed F6 project scan', govF6.project);
 }
 
 // ---------------------------------------------------------------------------
