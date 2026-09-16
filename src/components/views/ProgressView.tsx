@@ -510,8 +510,12 @@ export default function ProgressView({ project }: ProgressViewProps) {
       boqItems,
       costTransactions,
       progressUpdates: updates,
+      // F9.6: share ONE canonical PV curve with the Dashboard / Executive Report (approved-baseline
+      // weighting), rather than letting the internal fallback weight PV by budget lines.
+      baselines,
+      calendarType: project?.calendar_type || undefined,
     });
-  }, [project, activities, evm, budgetLines, boqItems, costTransactions, updates]);
+  }, [project, activities, evm, budgetLines, boqItems, costTransactions, updates, baselines]);
 
   // GAP-041: the CPM deterministic finish and the Earned Schedule trend forecast are different
   // methods. Both are named, both are shown, and the delta is reported; a non-computable trend

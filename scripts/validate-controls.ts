@@ -54,6 +54,16 @@ import { selectCanonicalEvm, canonicalEvmToComprehensive, quoteCanonicalEvm, CAN
 // cannot be imported here — it pulls in `@/lib/supabase`.
 import { buildGovernanceEvmCheck, formatGovernedSar, CANONICAL_EVM_ROW_MARKER, DIAGNOSTIC_ROW_MARKER } from '@/lib/governanceEvmPillar';
 import { getInitialSeedData } from '@/lib/mockSeed';
+// S19 (F9.6 Cross-Surface Control Reconciliation): the S-Curve, its pure time-phased adapter over F6,
+// and the governed forecast-presentation semantics. All three are supabase-free so this harness can
+// drive the exact functions the screens use.
+import { generateSCurveData } from '@/lib/sCurveEngine';
+import { evaluateTimePhasedEvm, phasePercentCompleteAsOf, phaseBaselinesForLateCurve, type TimePhasedEvmSources } from '@/lib/sCurveTimePhasing';
+import {
+  buildRatioPresentation, buildEacPresentation, buildFinishPresentation, reconcileEvmSurfaces,
+  UNQUALIFIED_EAC_LABEL_EN, UNQUALIFIED_EAC_LABEL_AR, UNQUALIFIED_FINISH_LABEL_EN, UNQUALIFIED_FINISH_LABEL_AR,
+  CANONICAL_COST_AUTHORITY, SCENARIO_COST_AUTHORITY, CANONICAL_SCHEDULE_AUTHORITY, STATISTICAL_SCHEDULE_AUTHORITY,
+} from '@/lib/forecastSemantics';
 import { applyReviewCostTransaction, unimplementedRpcError, reviewStateOf, selectGovernedBaselineActivities, type DemoDb } from '@/lib/demoDbContracts';
 import { reconcileFinishForecasts, calculateCpmDeterministicEarlyFinish } from '@/lib/forecastReconciliation';
 import { calculateControlHealth } from '@/lib/controlHealthEngine';
@@ -2252,6 +2262,687 @@ console.log('--- S18 Pilot Closure (F9.5)');
   ok('S18-E total delay is still never -310', clF5.project.totalDelayWd !== -310);
   eq('S18-E total delay still equals the working-day convention',
     clF5.project.totalDelayWd, refWdDelta(String(clF5.project.baselineFinish), String(clF5.project.forecastFinish)));
+}
+
+// ---------------------------------------------------------------------------
+// S19 — Cross-Surface Control Reconciliation (F9.6)
+//
+// ONE governed Data Date, ONE canonical current EVM fact set, clear forecast semantics.
+//
+// The pilot showed a single page publishing canonical PV 715,014.29 / EV 752,900 on its EVM cards while
+// its OWN S-Curve tooltip at the SAME governed Data Date 2026-09-09 showed PV 245,022 / EV 93,342 — and
+// AC 409,900 on both, which is what made the contradiction look like a data problem rather than a
+// derivation problem. Alongside it: an "SPI / CPI" card holding two bare numbers under one slash label,
+// a risk-adjusted EAC occupying the EAC slot of a block whose other cards are canonical, and an
+// SPI-trend + risk finish date presented where the management finish belongs.
+//
+// The fixture below is the REAL shipped seed project at the pilot's governed Data Date, and it
+// reproduces every reported figure exactly — so these checks pin the reported defect, not a stand-in.
+// Nothing here is hardcoded into production code; the pilot numbers appear only as expectations.
+// ---------------------------------------------------------------------------
+{
+  console.log('--- S19 Cross-Surface Control Reconciliation (F9.6)');
+
+  const s19Root = (() => {
+    const cwd = process.cwd();
+    if (existsSync(resolvePath(cwd, 'package.json'))) return cwd;
+    let dir = dirname(fileURLToPath(import.meta.url));
+    for (let i = 0; i < 8; i += 1) {
+      if (existsSync(resolvePath(dir, 'package.json'))) return dir;
+      dir = dirname(dir);
+    }
+    return cwd;
+  })();
+  const s19Src = (rel: string): string => readFileSync(resolvePath(s19Root, rel), 'utf8');
+
+  // ---- pilot-shaped fixture: the real seed project at the pilot's governed Data Date ----
+  const DD = '2026-09-09';
+  const seed = getInitialSeedData() as unknown as Record<string, unknown[]>;
+  const seedP = ((seed['projects'] || []) as unknown as Project[]).find((x) => x.id === 'proj-seed-001');
+  ok('S19 fixture resolved the seed project', !!seedP);
+  const rcProject = seedP as Project;
+  const rcActs = ((seed['activities'] || []) as unknown as Activity[]).filter((a) => a.project_id === rcProject.id);
+  const rcLinks = ((seed['activity_links'] || []) as unknown as ActivityLink[]).filter((l) => l.project_id === rcProject.id);
+  const rcIds = new Set(rcActs.map((a) => a.id));
+  const rcBaselines = ((seed['baseline_activities'] || []) as unknown as BaselineActivity[]).filter((b) => rcIds.has(b.activity_id));
+  const rcBudget = ((seed['budget_lines'] || []) as unknown as BudgetLine[]).filter((b) => b.project_id === rcProject.id);
+  const rcBoq = ((seed['boq_items'] || []) as unknown as BoqItem[]).filter((b) => b.project_id === rcProject.id);
+  const rcTxns = ((seed['cost_transactions'] || []) as unknown as CostTransaction[]).filter((c) => c.project_id === rcProject.id);
+  const rcUpdates = ((seed['progress_updates'] || []) as unknown as ProgressUpdate[]).filter((u) => u.project_id === rcProject.id);
+  const rcCal = rcProject.calendar_type || '6_days';
+  ok('S19 fixture has an approved baseline (F6 BAC basis)', rcBaselines.length > 0);
+  // The pilot's evidence includes an approved progress update dated AFTER the governed Data Date; it is
+  // what makes the historical/current boundary in this fixture a real test rather than a formality.
+  ok('S19 fixture holds a progress update dated after the governed Data Date',
+    rcUpdates.some((u) => u.status === 'approved' && isIsoDate(u.update_date) && u.update_date > DD));
+
+  const rcF6 = analyzeCostControl({
+    project: rcProject, activities: rcActs, baselines: rcBaselines, budgetLines: rcBudget,
+    costTransactions: rcTxns, progressUpdates: rcUpdates, wbsNodes: [], boqItems: rcBoq, allocations: [],
+    dataDate: DD, calendarType: rcCal,
+  });
+  const rcCanon = selectCanonicalEvm(rcF6);
+  const rcCurve = generateSCurveData(
+    rcActs, rcBaselines, rcUpdates, rcTxns, quoteCanonicalEvm(rcF6),
+    rcProject.start_date, rcProject.end_date, null,
+    { project: rcProject, budgetLines: rcBudget, boqItems: rcBoq, baselines: rcBaselines, calendarType: rcCal },
+  );
+  const rcF5 = analyzeScheduleControl({
+    activities: rcActs, links: rcLinks, baselines: rcBaselines,
+    progressUpdates: rcUpdates, previousSnapshot: null, dataDate: DD, calendarType: rcCal,
+    statusLogic: rcProject.status_logic || 'retained_logic',
+  });
+  const rcTrust = analyzeForecastTrust({
+    scheduleReport: rcF5, costReport: rcF6, decisionReport: null,
+    activities: rcActs, links: rcLinks, baselines: rcBaselines, progressUpdates: rcUpdates,
+    costTransactions: rcTxns, boqItems: rcBoq, allocations: [],
+    scheduleSnapshots: [], costSnapshots: [], dataDate: DD, calendarType: rcCal,
+  });
+
+  // The fixture must BE the reported pilot case, or passing proves nothing about the defect.
+  eq('S19 fixture reproduces the pilot canonical BAC', rcF6.project.bac, 2345150);
+  eq('S19 fixture reproduces the pilot canonical PV', rcF6.project.pv, 715014.29);
+  eq('S19 fixture reproduces the pilot canonical EV', rcF6.project.ev, 752900);
+  eq('S19 fixture reproduces the pilot canonical AC', rcF6.project.ac, 409900);
+  eq('S19 fixture reproduces the pilot canonical CPI', rcF6.project.cpi, 1.837);
+  eq('S19 fixture reproduces the pilot canonical SPI', rcF6.project.spi, 1.053);
+  eq('S19 fixture reproduces the pilot canonical EAC', rcF6.project.eac, 1276619.49);
+  eq('S19 fixture reproduces the pilot canonical VAC', rcF6.project.vac, 1068530.51);
+  eq('S19 fixture reproduces the pilot canonical F5 finish', rcF5.project.forecastFinish, '2027-03-02');
+  eq('S19 fixture reproduces the pilot baseline finish', rcF5.project.baselineFinish, '2027-02-28');
+  eq('S19 fixture reproduces the pilot delay of +2 working days', rcF5.project.totalDelayWd, 2);
+
+  // =========================================================================
+  // S19-A/B/C  At the governed Data Date the S-Curve reconciles to canonical F6.
+  //            Exact equality: the only legitimate difference is display rounding, and rounding is a
+  //            renderer concern — the data model must carry the cents F6 publishes.
+  // =========================================================================
+  ok('S19-A the curve located a Data Date bucket', rcCurve.dataDateIndex >= 0);
+  const rcDd = rcCurve.points[rcCurve.dataDateIndex];
+  eq('S19-A the Data Date bucket is dated at the governed Data Date', rcDd.date, DD);
+  eq('S19-A S-Curve PV at the governed Data Date === canonical F6 PV', rcDd.pvEarlyCumulative, rcF6.project.pv);
+  eq('S19-A S-Curve PV === the canonical EVM quote PV', rcDd.pvEarlyCumulative, rcCanon.pv);
+  eq('S19-B S-Curve EV at the governed Data Date === canonical F6 EV', rcDd.evCumulative, rcF6.project.ev);
+  eq('S19-B S-Curve EV === the canonical EVM quote EV', rcDd.evCumulative, rcCanon.ev);
+  eq('S19-C S-Curve AC at the governed Data Date === canonical F6 AC', rcDd.acCumulative, rcF6.project.ac);
+  eq('S19-C S-Curve AC === the canonical EVM quote AC', rcDd.acCumulative, rcCanon.ac);
+
+  // The chart headline and the plotted point are the same numbers: a chart may not publish one
+  // `currentEv` / `currentAc` scalar while its visible Data Date point shows another.
+  eq('S19-A the published currentPv scalar === the plotted Data Date PV', rcCurve.currentPv, rcDd.pvEarlyCumulative);
+  eq('S19-B the published currentEv scalar === the plotted Data Date EV', rcCurve.currentEv, rcDd.evCumulative);
+  eq('S19-C the published currentAc scalar === the plotted Data Date AC', rcCurve.currentAc, rcDd.acCumulative);
+  ok('S19-A the Data Date bucket is flagged as the current point', rcDd.isDataDate === true);
+  // Precision: PV must be able to display 715,014.29, not only 715,014.
+  ok('S19-A the Data Date PV retains the cents canonical F6 publishes', !Number.isInteger(rcDd.pvEarlyCumulative));
+  eq('S19-A the curve BAC is the canonical BAC', rcCurve.bac, rcF6.project.bac);
+  eq('S19-A the curve reports F6 baseline weighting as its BAC source', rcCurve.bacSource, 'baseline');
+  // Semantic 7: cumulative PV closes on BAC exactly at the final bucket.
+  const rcLast = rcCurve.points[rcCurve.points.length - 1];
+  eq('S19-A final cumulative PV closes on BAC exactly', rcLast.pvEarlyCumulative, rcCurve.bac);
+  // The forecast series converges on the canonical EAC, not on a scenario EAC.
+  eq('S19-A final forecast cumulative === canonical F6 EAC', rcLast.forecastCumulative, rcF6.project.eac);
+
+  // =========================================================================
+  // S19-D  The Data Date bucket exists EXACTLY once.
+  // =========================================================================
+  eq('S19-D exactly one bucket is dated at the governed Data Date', rcCurve.points.filter((p) => p.date === DD).length, 1);
+  eq('S19-D exactly one bucket carries the isDataDate flag', rcCurve.points.filter((p) => p.isDataDate).length, 1);
+  eq('S19-D dataDateIndex points at that single bucket', rcCurve.points[rcCurve.dataDateIndex].date, DD);
+  eq('S19-D bucket dates are unique (no duplicated cutoff)',
+    new Set(rcCurve.points.map((p) => p.date)).size, rcCurve.points.length);
+  // Every bucket strictly after the Data Date is forecast-only; every bucket up to it is actual.
+  ok('S19-D no bucket after the Data Date publishes EV or AC',
+    rcCurve.points.filter((p) => p.date > DD).every((p) => p.evCumulative === null && p.acCumulative === null));
+  ok('S19-D no bucket up to the Data Date publishes a forecast value',
+    rcCurve.points.filter((p) => p.date <= DD).every((p) => p.forecastCumulative === null));
+
+  // =========================================================================
+  // S19-E / S19-F  Historical cutoffs use evidence valid AS OF the cutoff: no future progress, no
+  //                future cost, no machine clock. A controlled fixture states the arithmetic exactly.
+  // =========================================================================
+  const hDD = '2026-03-01';
+  const hProject = { id: 'p1', contract_value: 0, data_date: hDD, calendar_type: '7_days' } as unknown as Project;
+  const hActs = [
+    act({ id: 'HX1', code: 'HX1', early_start: '2026-01-01', early_finish: '2026-01-31', late_start: '2026-01-01', late_finish: '2026-02-10', duration_days: 30, percent_complete: 80 }),
+    act({ id: 'HX2', code: 'HX2', early_start: '2026-02-01', early_finish: '2026-03-31', late_start: '2026-02-01', late_finish: '2026-04-15', duration_days: 58, percent_complete: 0 }),
+  ];
+  const hBaselines = [
+    base('hb1', 'HX1', '2026-01-01', '2026-01-31', 30, 1000),
+    base('hb2', 'HX2', '2026-02-01', '2026-03-31', 58, 1000),
+  ];
+  // BAC = 2000, so each activity's earned value is exactly 10 x its percent.
+  const hUpdates = [
+    upd('hu1', 'HX1', '2026-02-15', 50),   // in evidence at 2026-02-20
+    upd('hu2', 'HX1', '2026-02-25', 80),   // AFTER that cutoff: must not contribute
+    upd('hu3', 'HX2', '2026-03-05', 100),  // after the governed Data Date entirely
+  ];
+  const hTxns = [
+    txn('ht1', 'HX1', '2026-02-10', 100),
+    txn('ht2', 'HX1', '2026-02-20', 200),
+    txn('ht3', 'HX1', '2026-02-28', 400),      // AFTER the 2026-02-20 cutoff
+    txn('ht4', 'HX2', '2026-02-15', 999, 'submitted'), // never approved: never in AC
+    txn('ht5', 'HX2', '2026-03-10', 50),       // after the governed Data Date
+  ];
+  const hSources: TimePhasedEvmSources = {
+    project: hProject as unknown as TimePhasedEvmSources['project'],
+    activities: hActs, baselines: hBaselines, budgetLines: [], costTransactions: hTxns,
+    progressUpdates: hUpdates, boqItems: [], governedDataDate: hDD, calendarType: '7_days',
+  };
+
+  // S19-E: no progress update after the cutoff contributes to historical EV.
+  const hAt0220 = evaluateTimePhasedEvm(hSources, '2026-02-20');
+  eq('S19-E historical EV at 2026-02-20 counts only evidence dated on or before it', hAt0220.ev, 500);
+  ok('S19-E the later 80% update did NOT leak into the earlier bucket', hAt0220.ev !== 800);
+  eq('S19-E the cutoff is treated as historical, not current', hAt0220.isCurrent, false);
+  eq('S19-E the cutoff is evidence-phased', hAt0220.evidencePhased, true);
+  eq('S19-E percent phasing just before the first update is zero',
+    phasePercentCompleteAsOf(hActs[0], hUpdates, '2026-02-14', hDD).percent, 0);
+  eq('S19-E percent phasing on the first update date is that update',
+    phasePercentCompleteAsOf(hActs[0], hUpdates, '2026-02-15', hDD).percent, 50);
+  eq('S19-E percent phasing between updates keeps the earlier one (latest approved wins)',
+    phasePercentCompleteAsOf(hActs[0], hUpdates, '2026-02-24', hDD).percent, 50);
+  eq('S19-E percent phasing on the later update date advances to it',
+    phasePercentCompleteAsOf(hActs[0], hUpdates, '2026-02-25', hDD).percent, 80);
+  eq('S19-E an update dated after the governed Data Date does not reach a historical cutoff',
+    evaluateTimePhasedEvm(hSources, '2026-03-04').ev, 800);
+  // At the governed Data Date itself the persisted status is the governed current status (rule 1), and
+  // the post-Data-Date update for HX2 still does not inflate it.
+  const hAtDd = evaluateTimePhasedEvm(hSources, hDD);
+  eq('S19-E at the governed Data Date the point is the current one', hAtDd.isCurrent, true);
+  eq('S19-E at the governed Data Date no evidence phasing is applied', hAtDd.evidencePhased, false);
+  eq('S19-E a post-Data-Date approved update does not inflate current EV', hAtDd.ev, 800);
+  // The same rule seen through the rendered curve, on the real seed: the bucket before the Data Date
+  // must not contain the update dated after it.
+  const rcPreDd = rcCurve.points.filter((p) => p.date < DD && p.evCumulative !== null).slice(-1)[0];
+  ok('S19-E the seed curve has an actual bucket before the Data Date', !!rcPreDd);
+  ok('S19-E the pre-Data-Date seed bucket EV is below the current EV (history not flattened)',
+    (rcPreDd.evCumulative as number) < (rcDd.evCumulative as number));
+  eq('S19-E the pre-Data-Date seed bucket equals the evidence-phased canonical evaluation',
+    rcPreDd.evCumulative,
+    evaluateTimePhasedEvm({
+      project: rcProject as unknown as TimePhasedEvmSources['project'],
+      activities: rcActs, baselines: rcBaselines, budgetLines: rcBudget, costTransactions: rcTxns,
+      progressUpdates: rcUpdates, boqItems: rcBoq, governedDataDate: DD, calendarType: rcCal,
+    }, rcPreDd.date).ev);
+
+  // S19-F: no cost transaction after the cutoff contributes to historical AC.
+  eq('S19-F historical AC at 2026-02-20 counts only approved cost dated on or before it', hAt0220.ac, 300);
+  ok('S19-F the 2026-02-28 transaction did NOT leak into the earlier bucket', hAt0220.ac !== 700);
+  eq('S19-F an unapproved transaction never enters AC at any cutoff', evaluateTimePhasedEvm(hSources, hDD).ac, 700);
+  ok('S19-F the submitted 999 transaction is excluded from current AC', evaluateTimePhasedEvm(hSources, hDD).ac < 999);
+  eq('S19-F AC just before the first transaction is zero', evaluateTimePhasedEvm(hSources, '2026-02-09').ac, 0);
+  eq('S19-F AC on the first transaction date includes it', evaluateTimePhasedEvm(hSources, '2026-02-10').ac, 100);
+  // F6's own rule, stated once: a transaction dated after the governed Data Date is not current AC.
+  ok('S19-F a transaction dated after the governed Data Date is excluded from current AC',
+    hTxns.some((t) => t.transaction_date > hDD) && evaluateTimePhasedEvm(hSources, hDD).ac === 700);
+  // And the curve never publishes AC for a forecast bucket at all.
+  ok('S19-F the seed curve publishes no AC after the Data Date',
+    rcCurve.points.filter((p) => p.date > DD).every((p) => p.acCumulative === null));
+
+  // =========================================================================
+  // S19-G  A historical bucket is NOT simply the current Data Date values. Flattening history to the
+  //        endpoint would satisfy S19-A/B/C trivially, so it is explicitly excluded here.
+  // =========================================================================
+  const rcEarlier = rcCurve.points.filter((p) => p.date < DD && p.evCumulative !== null);
+  ok('S19-G the curve has several historical buckets', rcEarlier.length >= 3);
+  ok('S19-G no historical bucket equals the current PV', rcEarlier.every((p) => p.pvEarlyCumulative !== rcDd.pvEarlyCumulative));
+  ok('S19-G no historical bucket equals the current EV', rcEarlier.every((p) => p.evCumulative !== rcDd.evCumulative));
+  ok('S19-G no historical bucket equals the current AC', rcEarlier.every((p) => p.acCumulative !== rcDd.acCumulative));
+  ok('S19-G the first bucket starts at zero PV (history is not backcast)', rcCurve.points[0].pvEarlyCumulative === 0);
+  ok('S19-G cumulative PV is non-decreasing across the series',
+    rcCurve.points.every((p, i) => i === 0 || p.pvEarlyCumulative >= rcCurve.points[i - 1].pvEarlyCumulative));
+  ok('S19-G cumulative AC is non-decreasing across the actual series',
+    rcEarlier.every((p, i) => i === 0 || (p.acCumulative as number) >= (rcEarlier[i - 1].acCumulative as number)));
+  // History is evidence: an early bucket with no approved evidence reports zero, not an interpolation.
+  eq('S19-G a cutoff before any evidence reports zero EV in the controlled fixture',
+    evaluateTimePhasedEvm(hSources, '2026-01-15').ev, 0);
+  eq('S19-G a cutoff before any evidence reports zero AC in the controlled fixture',
+    evaluateTimePhasedEvm(hSources, '2026-01-15').ac, 0);
+  ok('S19-G the controlled fixture does not interpolate EV between evidence points',
+    evaluateTimePhasedEvm(hSources, '2026-02-20').ev === evaluateTimePhasedEvm(hSources, '2026-02-15').ev);
+
+  // =========================================================================
+  // S19-H/I/J  SPI and CPI: correct values, correctly labelled, and impossible to transpose.
+  // =========================================================================
+  const ratios = buildRatioPresentation(rcCanon);
+  const spiCard = ratios.find((r) => r.key === 'spi');
+  const cpiCard = ratios.find((r) => r.key === 'cpi');
+  ok('S19-H an SPI entry exists', !!spiCard);
+  ok('S19-I a CPI entry exists', !!cpiCard);
+  eq('S19-H the SPI-labelled value === canonical F6 SPI', spiCard?.value, rcF6.project.spi);
+  eq('S19-I the CPI-labelled value === canonical F6 CPI', cpiCard?.value, rcF6.project.cpi);
+  // The pilot's own arithmetic, checked independently of F6: SPI = EV/PV, CPI = EV/AC.
+  near('S19-H SPI equals EV/PV to three decimals', spiCard?.value ?? null,
+    Math.round(((rcF6.project.ev as number) / (rcF6.project.pv as number)) * 1000) / 1000, 0.001);
+  near('S19-I CPI equals EV/AC to three decimals', cpiCard?.value ?? null,
+    Math.round(((rcF6.project.ev as number) / rcF6.project.ac) * 1000) / 1000, 0.001);
+  ok('S19-H the SPI value is NOT the CPI value in this fixture', spiCard?.value !== cpiCard?.value);
+  ok('S19-H SPI is the smaller ratio here (the reported misreading)', (spiCard?.value ?? 0) < (cpiCard?.value ?? 0));
+  // Each entry carries its own label AND its formula, so no positional coupling remains.
+  eq('S19-J the SPI entry is labelled SPI', spiCard?.labelEn, 'SPI');
+  eq('S19-J the CPI entry is labelled CPI', cpiCard?.labelEn, 'CPI');
+  eq('S19-J the SPI entry states its own formula', spiCard?.formulaEn, 'SPI = EV / PV');
+  eq('S19-J the CPI entry states its own formula', cpiCard?.formulaEn, 'CPI = EV / AC');
+  ok('S19-J both ratios claim canonical F6 authority',
+    ratios.every((r) => r.authority === CANONICAL_COST_AUTHORITY));
+  // Reversing render order must not relabel anything: the binding travels with the value.
+  const reversed = ratios.slice().reverse();
+  eq('S19-J reversing the render order keeps SPI bound to the SPI value',
+    reversed.find((r) => r.key === 'spi')?.value, rcF6.project.spi);
+  eq('S19-J reversing the render order keeps CPI bound to the CPI value',
+    reversed.find((r) => r.key === 'cpi')?.value, rcF6.project.cpi);
+  eq('S19-J reversing the render order keeps each label with its own key',
+    reversed.map((r) => `${r.key}:${r.labelEn}:${r.value}`).sort(),
+    ratios.map((r) => `${r.key}:${r.labelEn}:${r.value}`).sort());
+  ok('S19-J no entry presents a bare unlabeled pair', ratios.every((r) => r.labelEn.length > 0 && r.key === r.labelEn.toLowerCase()));
+  // Honest N/A: an unmeasurable ratio is announced, never rendered as a plausible number.
+  const emptyRatios = buildRatioPresentation(null);
+  ok('S19-J an absent canonical report yields null ratios, not zeros',
+    emptyRatios.every((r) => r.value === null));
+  ok('S19-J an absent canonical report still labels each ratio', emptyRatios.every((r) => r.labelEn.length > 0));
+  eq('S19-J an absent canonical report explains itself', emptyRatios[0].status, 'empty_no_data');
+
+  // =========================================================================
+  // S19-K/L/M  EAC governance: the unqualified label is canonical F6, the scenario value is named and
+  //            differenced, and VAC still satisfies its identity against the CANONICAL EAC.
+  // =========================================================================
+  const SCENARIO_EAC = 1361150.033; // the pilot's reported risk-adjusted EAC — expectation only
+  const eacCards = buildEacPresentation({
+    canonicalEac: rcF6.project.eac,
+    canonicalMethod: rcF6.recommended ? rcF6.recommended.method : null,
+    canonicalBac: rcF6.project.bac,
+    canonicalVac: rcF6.project.vac,
+    scenarioEac: SCENARIO_EAC,
+    scenarioMethod: 'spi_cpi_trend_plus_open_risk_exposure',
+  });
+  eq('S19-K the unqualified EAC label is the bare canonical label', eacCards.canonical.labelEn, UNQUALIFIED_EAC_LABEL_EN);
+  eq('S19-K the unqualified EAC label is bare in Arabic too', eacCards.canonical.labelAr, UNQUALIFIED_EAC_LABEL_AR);
+  eq('S19-K an unqualified "EAC" maps only to canonical F6 EAC', eacCards.canonical.value, rcF6.project.eac);
+  eq('S19-K the canonical EAC is the pilot-reported recommended EAC', eacCards.canonical.value, 1276619.49);
+  eq('S19-K the canonical EAC claims canonical F6 authority', eacCards.canonical.authority, CANONICAL_COST_AUTHORITY);
+  eq('S19-K the canonical EAC states its explicit method', eacCards.canonical.method, 'eac_cpi');
+  eq('S19-K the canonical EAC equals F6 recommended EAC', eacCards.canonical.value, rcF6.recommended?.eac);
+  ok('S19-L a scenario EAC is present', !!eacCards.scenario);
+  eq('S19-L the scenario EAC keeps its own value', eacCards.scenario?.value, SCENARIO_EAC);
+  eq('S19-L the scenario EAC claims scenario authority, not canonical', eacCards.scenario?.authority, SCENARIO_COST_AUTHORITY);
+  ok('S19-L the scenario label is explicitly non-canonical',
+    !!eacCards.scenario && eacCards.scenario.labelEn !== UNQUALIFIED_EAC_LABEL_EN
+    && /risk/i.test(eacCards.scenario.labelEn) && /not canonical/i.test(eacCards.scenario.labelEn));
+  ok('S19-L the scenario label is explicitly non-canonical in Arabic too',
+    !!eacCards.scenario && eacCards.scenario.labelAr !== UNQUALIFIED_EAC_LABEL_AR);
+  ok('S19-L the scenario EAC preserves its own method',
+    !!eacCards.scenario && eacCards.scenario.method === 'spi_cpi_trend_plus_open_risk_exposure');
+  ok('S19-L the scenario method differs from the canonical method',
+    !!eacCards.scenario && eacCards.scenario.method !== eacCards.canonical.method);
+  // The scenario value never overwrites the canonical one.
+  ok('S19-L the canonical EAC is not overwritten by the scenario EAC',
+    eacCards.canonical.value !== eacCards.scenario?.value);
+  near('S19-L the scenario delta is scenario minus canonical', eacCards.scenario?.deltaVsCanonical ?? null, 84530.54, 0.01);
+  eq('S19-L the delta label names what it is against', eacCards.scenario?.deltaLabelEn, 'Delta vs canonical EAC');
+  ok('S19-L the delta is recomputable from the two published values',
+    !!eacCards.scenario && eacCards.scenario.deltaVsCanonical ===
+      Math.round((SCENARIO_EAC - (rcF6.project.eac as number)) * 100) / 100);
+  // S19-M: VAC = BAC - EAC against the CANONICAL EAC.
+  eq('S19-M the VAC identity carries canonical BAC', eacCards.vacIdentity.bac, rcF6.project.bac);
+  eq('S19-M the VAC identity carries canonical EAC', eacCards.vacIdentity.eac, rcF6.project.eac);
+  eq('S19-M the VAC identity carries canonical VAC', eacCards.vacIdentity.vac, rcF6.project.vac);
+  ok('S19-M VAC === BAC - EAC for the canonical EAC', eacCards.vacIdentity.satisfies);
+  near('S19-M BAC - EAC equals the published VAC', eacCards.vacIdentity.expectedVac, rcF6.project.vac as number, 0.01);
+  // The identity must FAIL if a scenario EAC is substituted — that is what makes the check meaningful.
+  const eacCardsPoisoned = buildEacPresentation({
+    canonicalEac: SCENARIO_EAC, canonicalMethod: 'eac_cpi',
+    canonicalBac: rcF6.project.bac, canonicalVac: rcF6.project.vac, scenarioEac: SCENARIO_EAC,
+  });
+  ok('S19-M substituting the scenario EAC breaks the canonical VAC identity',
+    eacCardsPoisoned.vacIdentity.satisfies === false);
+  // No scenario value at all => no scenario entry, and the canonical value is untouched.
+  const eacCardsCanonicalOnly = buildEacPresentation({
+    canonicalEac: rcF6.project.eac, canonicalMethod: rcF6.recommended?.method ?? null,
+    canonicalBac: rcF6.project.bac, canonicalVac: rcF6.project.vac, scenarioEac: null,
+  });
+  eq('S19-L with no scenario value there is no scenario entry', eacCardsCanonicalOnly.scenario, null);
+  eq('S19-L with no scenario value the canonical EAC is unchanged', eacCardsCanonicalOnly.canonical.value, rcF6.project.eac);
+  // Honest N/A when F6 cannot measure an EAC.
+  const eacCardsNa = buildEacPresentation({ canonicalEac: null, canonicalBac: null, canonicalVac: null, scenarioEac: SCENARIO_EAC });
+  eq('S19-K an unmeasurable canonical EAC stays null rather than becoming BAC', eacCardsNa.canonical.value, null);
+  eq('S19-M the VAC identity is not claimed without inputs', eacCardsNa.vacIdentity.satisfies, false);
+
+  // =========================================================================
+  // S19-N/O  Finish governance: the unqualified management finish is canonical F5; the statistical
+  //          SPI-trend + risk date is named as such and its variance is stated.
+  // =========================================================================
+  const STAT_FINISH = '2027-02-17'; // the pilot's reported statistical finish — expectation only
+  const finishCards = buildFinishPresentation({
+    canonicalFinish: rcF5.project.forecastFinish,
+    baselineFinish: rcF5.project.baselineFinish,
+    canonicalDelayWorkingDays: rcF5.project.totalDelayWd,
+    statisticalFinish: STAT_FINISH,
+    riskDaysAdded: 4,
+  });
+  eq('S19-N the unqualified finish label is the bare canonical label', finishCards.canonical.labelEn, UNQUALIFIED_FINISH_LABEL_EN);
+  eq('S19-N the unqualified management finish maps to canonical F5', finishCards.canonical.finish, rcF5.project.forecastFinish);
+  eq('S19-N the canonical finish is the pilot-reported management finish', finishCards.canonical.finish, '2027-03-02');
+  eq('S19-N the canonical finish claims canonical F5 authority', finishCards.canonical.authority, CANONICAL_SCHEDULE_AUTHORITY);
+  eq('S19-N the canonical delay is F5 own working-day delay', finishCards.canonical.delayWorkingDays, rcF5.project.totalDelayWd);
+  eq('S19-N the canonical delay is the pilot-reported +2 days', finishCards.canonical.delayWorkingDays, 2);
+  eq('S19-N the canonical entry carries the baseline finish it is measured against',
+    finishCards.canonical.baselineFinish, '2027-02-28');
+  ok('S19-O a statistical finish entry is present', !!finishCards.statistical);
+  eq('S19-O the statistical finish keeps its own date', finishCards.statistical?.finish, STAT_FINISH);
+  eq('S19-O the statistical finish claims statistical authority, not canonical',
+    finishCards.statistical?.authority, STATISTICAL_SCHEDULE_AUTHORITY);
+  ok('S19-O the statistical finish is explicitly not the management date',
+    !!finishCards.statistical && finishCards.statistical.labelEn !== UNQUALIFIED_FINISH_LABEL_EN
+    && /statistical/i.test(finishCards.statistical.labelEn) && /not the management date/i.test(finishCards.statistical.labelEn));
+  ok('S19-O the statistical finish is explicitly labelled in Arabic too',
+    !!finishCards.statistical && finishCards.statistical.labelAr !== UNQUALIFIED_FINISH_LABEL_AR);
+  ok('S19-O the statistical finish names its basis',
+    !!finishCards.statistical && /SPI/i.test(finishCards.statistical.labelEn) && /risk/i.test(finishCards.statistical.labelEn));
+  eq('S19-O the variance vs canonical is the pilot-reported -13 days',
+    finishCards.statistical?.varianceDaysVsCanonical, -13);
+  ok('S19-O a negative variance is reported as negative, not clamped to zero',
+    (finishCards.statistical?.varianceDaysVsCanonical ?? 0) < 0);
+  eq('S19-O the variance label names what it is against',
+    finishCards.statistical?.varianceLabelEn, 'Variance vs canonical forecast (days)');
+  eq('S19-O the risk days added are surfaced', finishCards.statistical?.riskDaysAdded, 4);
+  ok('S19-O neither forecast hides the other',
+    finishCards.canonical.finish !== null && finishCards.statistical?.finish !== null
+    && finishCards.canonical.finish !== finishCards.statistical?.finish);
+  // A statistical finish LATER than canonical must read positive, so the sign carries meaning.
+  const finishLater = buildFinishPresentation({
+    canonicalFinish: '2027-03-02', statisticalFinish: '2027-03-20', riskDaysAdded: 0,
+  });
+  eq('S19-O a later statistical finish yields a positive variance', finishLater.statistical?.varianceDaysVsCanonical, 18);
+  // No statistical model => no statistical entry, canonical untouched.
+  const finishCanonicalOnly = buildFinishPresentation({ canonicalFinish: rcF5.project.forecastFinish, statisticalFinish: null });
+  eq('S19-O with no statistical model there is no statistical entry', finishCanonicalOnly.statistical, null);
+  eq('S19-O with no statistical model the canonical finish is unchanged',
+    finishCanonicalOnly.canonical.finish, rcF5.project.forecastFinish);
+  // Honest N/A: a missing canonical finish is null, never substituted by the statistical date.
+  const finishNoCanonical = buildFinishPresentation({ canonicalFinish: null, statisticalFinish: STAT_FINISH });
+  eq('S19-N a missing canonical finish stays null', finishNoCanonical.canonical.finish, null);
+  eq('S19-N a missing canonical finish is not replaced by the statistical date',
+    finishNoCanonical.statistical?.finish, STAT_FINISH);
+  eq('S19-O no variance is claimed without a canonical finish', finishNoCanonical.statistical?.varianceDaysVsCanonical, null);
+  // F8 quotes the same canonical finish, so the two surfaces cannot disagree.
+  eq('S19-N F8 quotes the canonical F5 finish', rcTrust.trust.forecastFinish, rcF5.project.forecastFinish);
+  eq('S19-K F8 quotes the canonical F6 EAC', rcTrust.trust.eac, rcF6.project.eac);
+
+  // =========================================================================
+  // S19-P  Cross-surface reconciliation: every surface quotes the SAME canonical current EVM at the
+  //        SAME governed Data Date. Each quote is obtained through that surface's OWN code path, so
+  //        this is a real reconciliation rather than one object compared with itself.
+  // =========================================================================
+  const rcDashRatios = buildRatioPresentation(rcCanon);
+  const rcDashEac = buildEacPresentation({
+    canonicalEac: rcCanon.eac, canonicalMethod: rcF6.recommended?.method ?? null,
+    canonicalBac: rcCanon.bac, canonicalVac: rcCanon.vac, scenarioEac: SCENARIO_EAC,
+  });
+  // The Data Governance surface publishes its facts as a rendered bilingual string, so read them back
+  // off that string: parsing what a user actually sees is a stronger proof than re-quoting the object.
+  const rcGovRow = buildGovernanceEvmCheck({ canonical: rcCanon });
+  // Reads a published figure back off the governance row. The `(^|[^A-Z])` guard is load-bearing:
+  // without it a search for `AC` matches inside `BAC` and `CPI` matches inside `TCPI`.
+  const govValue = (row: string, label: string): number | null => {
+    for (const raw of row.split('|')) {
+      const seg = raw.trim().replace(/,/g, '');
+      const head = seg.match(new RegExp(`^${label} (-?\\d+(?:\\.\\d+)?)`));
+      if (head) return Number(head[1]);
+      const inner = seg.match(new RegExp(`(^|[^A-Z])${label} (-?\\d+(?:\\.\\d+)?)`));
+      if (inner) return Number(inner[2]);
+    }
+    return null;
+  };
+  // The variance line publishes IDENTITIES (`VAC = BAC - EAC = <value>`), so it needs its own reader;
+  // `[^=]*` stops at the first `=` so each identity yields its own result.
+  const govIdentityValue = (row: string, label: string): number | null => {
+    const m = row.replace(/,/g, '').match(new RegExp(`(^|[^A-Z])${label} = [^=]*= (-?\\d+(?:\\.\\d+)?)`));
+    return m ? Number(m[2]) : null;
+  };
+  const rcExecQuote = canonicalEvmToComprehensive(selectCanonicalEvm(rcF6));
+  const reconciliation = reconcileEvmSurfaces([
+    {
+      surface: 'f6_cost_control',
+      bac: rcF6.project.bac, pv: rcF6.project.pv, ev: rcF6.project.ev, ac: rcF6.project.ac,
+      cpi: rcF6.project.cpi, spi: rcF6.project.spi, etc: rcF6.project.etc, eac: rcF6.project.eac, vac: rcF6.project.vac,
+    },
+    {
+      surface: 'dashboard_cards',
+      bac: rcCanon.bac, pv: rcCanon.pv, ev: rcCanon.ev, ac: rcCanon.ac,
+      cpi: rcDashRatios.find((r) => r.key === 'cpi')?.value ?? null,
+      spi: rcDashRatios.find((r) => r.key === 'spi')?.value ?? null,
+      etc: rcCanon.etc, eac: rcDashEac.canonical.value, vac: rcCanon.vac,
+    },
+    {
+      // The plotted Data Date bucket: an independent path, and the surface that used to diverge.
+      surface: 's_curve_data_date_point',
+      bac: rcCurve.bac, pv: rcDd.pvEarlyCumulative, ev: rcDd.evCumulative, ac: rcDd.acCumulative,
+      cpi: undefined, spi: undefined, etc: undefined, eac: rcCurve.forecastEac, vac: undefined,
+    },
+    {
+      // F8 publishes only the facts it quotes; the rest are omitted rather than invented.
+      surface: 'f8_forecast_trust',
+      bac: undefined, pv: undefined, ev: undefined, ac: undefined,
+      cpi: undefined, spi: undefined, etc: undefined, eac: rcTrust.trust.eac, vac: undefined,
+    },
+    {
+      surface: 'data_governance_verifier',
+      bac: govValue(rcGovRow.actualValue, 'BAC'), pv: govValue(rcGovRow.actualValue, 'PV'),
+      ev: govValue(rcGovRow.actualValue, 'EV'), ac: govValue(rcGovRow.actualValue, 'AC'),
+      cpi: govValue(rcGovRow.actualValue, 'CPI'), spi: govValue(rcGovRow.actualValue, 'SPI'),
+      etc: govValue(rcGovRow.actualValue, 'ETC'), eac: govValue(rcGovRow.actualValue, 'EAC'),
+      vac: govIdentityValue(rcGovRow.variance, 'VAC'),
+    },
+    {
+      surface: 'executive_report',
+      bac: rcExecQuote.bac, pv: rcExecQuote.pv, ev: rcExecQuote.ev, ac: rcExecQuote.ac,
+      cpi: rcExecQuote.cpi, spi: rcExecQuote.spi, etc: rcExecQuote.etc, eac: rcExecQuote.eac, vac: rcExecQuote.vac,
+    },
+  ]);
+  eq('S19-P every required surface is represented', reconciliation.surfaces.length, 6);
+  eq('S19-P the reference surface is canonical F6', reconciliation.referenceSurface, 'f6_cost_control');
+  ok('S19-P the governance row parsed back into numbers (not all null)',
+    govValue(rcGovRow.actualValue, 'PV') !== null && govValue(rcGovRow.actualValue, 'EV') !== null);
+  eq('S19-P all six surfaces quote the same canonical current EVM', reconciliation.divergences, []);
+  ok('S19-P the cross-surface reconciliation reports reconciled', reconciliation.reconciled === true);
+  ok('S19-P BAC PV EV AC CPI SPI ETC EAC VAC are all in the compared-fact contract',
+    ['bac', 'pv', 'ev', 'ac', 'cpi', 'spi', 'etc', 'eac', 'vac'].every((f) =>
+      (reconciliation.comparedFacts as string[]).includes(f)));
+  // Guard against a vacuous green: a fact every surface omits would make `reconciled` trivially true.
+  ok('S19-P the core facts were ACTUALLY compared pairwise, not skipped as unpublished',
+    ['bac', 'pv', 'ev', 'ac', 'cpi', 'spi', 'eac'].every((f) =>
+      reconciliation.factsActuallyCompared.includes(f)));
+  ok('S19-P the S-Curve surface really contributed PV EV AC BAC to the comparison',
+    ['bac', 'pv', 'ev', 'ac'].every((f) => reconciliation.factsActuallyCompared.includes(f)));
+  ok('S19-P F8 contributes EAC rather than being skipped entirely',
+    reconciliation.factsActuallyCompared.includes('eac'));
+  // The reconciler must actually catch a divergence, or a green result means nothing.
+  const reconciliationPoisoned = reconcileEvmSurfaces([
+    { surface: 'f6_cost_control', bac: rcF6.project.bac, pv: rcF6.project.pv, ev: rcF6.project.ev, ac: rcF6.project.ac, cpi: rcF6.project.cpi, spi: rcF6.project.spi, eac: rcF6.project.eac },
+    { surface: 'a_divergent_surface', bac: rcF6.project.bac, pv: 245022, ev: 93342, ac: rcF6.project.ac, cpi: rcF6.project.cpi, spi: rcF6.project.spi, eac: rcF6.project.eac },
+  ]);
+  ok('S19-P a divergent surface is detected', reconciliationPoisoned.reconciled === false);
+  eq('S19-P the divergence names the offending surface and facts',
+    reconciliationPoisoned.divergences.map((d) => `${d.surface}:${d.fact}`).sort(), ['a_divergent_surface:ev', 'a_divergent_surface:pv']);
+  eq('S19-P the divergence reports the pilot legacy PV as the actual value',
+    reconciliationPoisoned.divergences.find((d) => d.fact === 'pv')?.actual, 245022);
+
+  // =========================================================================
+  // S19-Q  The fixture reproduces the OLD divergence, then the fixed path reconciles.
+  //        This is what makes S19-A/B/C a regression test rather than a tautology: the same project,
+  //        Data Date and inputs, evaluated the superseded way, still produce the reported numbers.
+  // =========================================================================
+  const legacyEvidenceActs = rcActs.map((a) => ({ ...a, percent_complete: 0 }));
+  const legacyAtDd = calculateProjectEvmAtDataDate(rcProject, legacyEvidenceActs, rcBudget, rcBoq, [], rcUpdates, DD);
+  eq('S19-Q the superseded derivation reproduces the pilot S-Curve PV', legacyAtDd.pv, 245022);
+  eq('S19-Q the superseded derivation reproduces the pilot S-Curve EV', legacyAtDd.ev, 93342);
+  ok('S19-Q the legacy PV differs materially from canonical F6 PV',
+    Math.abs(legacyAtDd.pv - (rcF6.project.pv as number)) > 0.25 * (rcF6.project.pv as number));
+  ok('S19-Q the legacy EV differs materially from canonical F6 EV',
+    Math.abs(legacyAtDd.ev - (rcF6.project.ev as number)) > 0.25 * (rcF6.project.ev as number));
+  // WHY AC MATCHED. The old engine call passed an EMPTY transaction list, so the superseded derivation
+  // reported its own current-state AC estimate — 689,900 here, not the 409,900 the chart showed. The
+  // chart published 409,900 because the S-Curve engine computed AC ITSELF as approved transactions
+  // dated <= cutoff: the same rule F6 uses. So PV and EV came from the superseded weighting while AC
+  // came from a second, correct implementation — which is exactly why AC agreed and the contradiction
+  // looked like a data problem rather than a derivation problem.
+  ok('S19-Q the superseded AC estimate was NOT the figure the chart published', legacyAtDd.ac !== rcF6.project.ac);
+  eq('S19-Q the chart AC came from the approved-transaction cutoff rule and matched F6',
+    rcDd.acCumulative, rcF6.project.ac);
+  const legacyWithTxns = calculateProjectEvmAtDataDate(rcProject, rcActs, rcBudget, rcBoq, rcTxns, rcUpdates, DD);
+  eq('S19-Q given the same transactions the superseded engine agrees on AC too (same rule)',
+    legacyWithTxns.ac, rcF6.project.ac);
+  ok('S19-Q the divergence is confined to PV and EV weighting, not to the AC rule',
+    legacyWithTxns.pv !== rcF6.project.pv && legacyWithTxns.ev !== rcF6.project.ev
+    && legacyWithTxns.ac === rcF6.project.ac);
+  // The fixed path reconciles on the very same inputs.
+  eq('S19-Q the fixed curve PV reconciles where the legacy path diverged', rcDd.pvEarlyCumulative, rcF6.project.pv);
+  eq('S19-Q the fixed curve EV reconciles where the legacy path diverged', rcDd.evCumulative, rcF6.project.ev);
+  ok('S19-Q the fixed curve no longer publishes the legacy PV anywhere in the actual series',
+    rcCurve.points.filter((p) => p.date <= DD).every((p) => p.pvEarlyCumulative !== 245022));
+  ok('S19-Q the fixed curve no longer publishes the legacy EV anywhere in the actual series',
+    rcCurve.points.filter((p) => p.date <= DD).every((p) => p.evCumulative !== 93342));
+  // Without the approved baseline the curve cannot be canonical: F6 would fall back to budget lines.
+  const rcCurveNoBaseline = generateSCurveData(
+    rcActs, [], rcUpdates, rcTxns, quoteCanonicalEvm(rcF6), rcProject.start_date, rcProject.end_date, null,
+    { project: rcProject, budgetLines: rcBudget, boqItems: rcBoq, calendarType: rcCal },
+  );
+  ok('S19-Q omitting the approved baseline downgrades the BAC source away from baseline',
+    rcCurveNoBaseline.bacSource !== 'baseline');
+  eq('S19-Q supplying the baseline keeps the BAC source canonical', rcCurve.bacSource, 'baseline');
+
+  // =========================================================================
+  // Determinism, finiteness and clock independence of the rebuilt curve.
+  // =========================================================================
+  noNonFinite('S19 the rebuilt S-Curve contains no NaN or Infinity', rcCurve);
+  const rcCurveAgain = generateSCurveData(
+    rcActs, rcBaselines, rcUpdates, rcTxns, quoteCanonicalEvm(rcF6),
+    rcProject.start_date, rcProject.end_date, null,
+    { project: rcProject, budgetLines: rcBudget, boqItems: rcBoq, baselines: rcBaselines, calendarType: rcCal },
+  );
+  const rcCurveNow = JSON.stringify(rcCurve);
+  eq('S19 the curve is deterministic for the same inputs', JSON.stringify(rcCurveAgain), rcCurveNow);
+  let rcCurveShifted = '';
+  withShiftedClock(400, () => {
+    rcCurveShifted = JSON.stringify(generateSCurveData(
+      rcActs, rcBaselines, rcUpdates, rcTxns, quoteCanonicalEvm(rcF6),
+      rcProject.start_date, rcProject.end_date, null,
+      { project: rcProject, budgetLines: rcBudget, boqItems: rcBoq, baselines: rcBaselines, calendarType: rcCal },
+    ));
+  });
+  eq('S19 the curve does not depend on the machine clock', rcCurveShifted, rcCurveNow);
+  // The late-window series is a real second series where late dates differ, and closes on BAC too.
+  const hCurve = generateSCurveData(
+    hActs, hBaselines, hUpdates, hTxns,
+    quoteCanonicalEvm(analyzeCostControl({
+      project: hProject, activities: hActs, baselines: hBaselines, budgetLines: [], costTransactions: hTxns,
+      progressUpdates: hUpdates, wbsNodes: [], boqItems: [], allocations: [], dataDate: hDD, calendarType: '7_days',
+    })),
+    '2026-01-01', '2026-04-15', null,
+    { project: hProject as unknown as { id: string }, budgetLines: [], boqItems: [], baselines: hBaselines, calendarType: '7_days' },
+  );
+  ok('S19 the late-window PV series differs from the early series where late dates differ',
+    hCurve.points.some((p) => p.pvLateCumulative !== p.pvEarlyCumulative));
+  ok('S19 the late-window baseline re-phasing keeps costs and moves only windows',
+    phaseBaselinesForLateCurve(hBaselines, hActs).every((b, i) => b.planned_cost === hBaselines[i].planned_cost));
+  eq('S19 the controlled fixture Data Date bucket reconciles to its own canonical F6',
+    hCurve.points[hCurve.dataDateIndex].evCumulative, 800);
+  eq('S19 the controlled fixture final PV closes on its BAC',
+    hCurve.points[hCurve.points.length - 1].pvEarlyCumulative, hCurve.bac);
+  // An empty project stays honest: no points, no fabricated curve, canonical scalars preserved.
+  const rcEmpty = generateSCurveData([], rcBaselines, [], [], quoteCanonicalEvm(rcF6), null, null, null,
+    { project: rcProject, baselines: rcBaselines });
+  eq('S19 an empty project yields no curve points', rcEmpty.points.length, 0);
+  eq('S19 an empty project reports no Data Date bucket', rcEmpty.dataDateIndex, -1);
+  eq('S19 an empty project still publishes the canonical current EV', rcEmpty.currentEv, rcF6.project.ev);
+  noNonFinite('S19 an empty project curve contains no NaN or Infinity', rcEmpty);
+
+  // =========================================================================
+  // Structural guards: the delegation itself cannot be quietly undone.
+  // =========================================================================
+  const sCurveSrc = s19Src('src/lib/sCurveEngine.ts');
+  ok('S19 the S-Curve engine no longer calls the superseded derivation',
+    !/calculateProjectEvmAtDataDate\s*\(/.test(sCurveSrc));
+  ok('S19 the S-Curve engine no longer imports the superseded derivation as a value',
+    !/import\s*{[^}]*\bcalculateProjectEvmAtDataDate\b/.test(sCurveSrc.replace(/\n/g, ' ')));
+  ok('S19 the S-Curve engine delegates to the pure time-phased adapter',
+    /from '@\/lib\/sCurveTimePhasing'/.test(sCurveSrc) && /evaluateTimePhasedEvm\s*\(/.test(sCurveSrc));
+  ok('S19 the S-Curve engine no longer rounds money to whole SAR',
+    !/Math\.round\(pvEarly\)/.test(sCurveSrc) && !/Math\.round\(atCutoff/.test(sCurveSrc));
+  ok('S19 the S-Curve engine keeps canonical precision via round2', /round2\(/.test(sCurveSrc));
+  ok('S19 the S-Curve engine no longer claims the superseded route is canonical',
+    !/canonical EVM is the single evaluation path/.test(sCurveSrc));
+  ok('S19 the adapter module imports no supabase client',
+    !/import[^;\n]*from\s+'@\/lib\/supabase'/.test(s19Src('src/lib/sCurveTimePhasing.ts')));
+  ok('S19 the adapter delegates to canonical F6 rather than re-implementing it',
+    /from '@\/lib\/costControlEngine'/.test(s19Src('src/lib/sCurveTimePhasing.ts'))
+    && /analyzeCostControl\s*\(/.test(s19Src('src/lib/sCurveTimePhasing.ts')));
+  // Comment-stripped before testing: both modules' docblocks contain the literal `new Date()` while
+  // stating that it is never used, so a substring test would fail on the explanation itself.
+  const codeOnly = (src: string): string => src
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^[ \t]*\/\/.*$/gm, '');
+  ok('S19 the comment stripper really strips (self-check)',
+    codeOnly('/* new Date() */\nvar x = 1;\n// new Date()').includes('new Date') === false);
+  ok('S19 the adapter reads no machine clock', !/new Date\(\s*\)/.test(codeOnly(s19Src('src/lib/sCurveTimePhasing.ts'))));
+  ok('S19 the S-Curve engine reads no machine clock', !/new Date\(\s*\)/.test(codeOnly(sCurveSrc)));
+
+  const dashSrc = s19Src('src/components/views/Dashboard.tsx');
+  ok('S19-J the dashboard no longer renders two bare ratios under one slash label',
+    !/\{evm\.spi\.toFixed\(2\)\}\s*\/\s*\{evm\.cpi\.toFixed\(2\)\}/.test(dashSrc));
+  ok('S19-H the dashboard renders the ratios through the governed presentation',
+    /buildRatioPresentation\s*\(/.test(dashSrc));
+  ok('S19-K the dashboard renders EAC through the governed presentation', /buildEacPresentation\s*\(/.test(dashSrc));
+  ok('S19-N the dashboard renders finish through the governed presentation', /buildFinishPresentation\s*\(/.test(dashSrc));
+  ok('S19-K the dashboard cards read the null-preserving canonical quote', /selectCanonicalEvm\s*\(\s*costStrip\s*\)/.test(dashSrc));
+  ok('S19-K the dashboard no longer binds the unqualified EAC slot to the risk-adjusted sum',
+    !/\{t\.forecast_eac\}[\s\S]{0,220}forecast\.cost\.realistic\s*\+\s*forecast\.riskExposure\.cost/.test(dashSrc));
+  ok('S19-N the dashboard no longer binds the unqualified finish slot to the statistical date',
+    !/\{t\.forecast_finish\}[\s\S]{0,260}\{riskAdjustedFinish\s*\|\|\s*'-'\}/.test(dashSrc));
+  ok('S19-N the dashboard no longer clamps the statistical delay with Math.max(0, ...)',
+    !/Math\.max\(0,\s*Math\.round\(\(new Date\(riskAdjustedFinish\)/.test(dashSrc));
+  // Wiring guards: the canonical slot must be FED from the canonical source. Without these, a mutation
+  // that keeps the presentation builders but feeds them the scenario value would still pass.
+  ok('S19-K the dashboard feeds the canonical EAC slot from the canonical quote',
+    /canonicalEac:\s*canonicalEvmQuote\.eac/.test(dashSrc));
+  ok('S19-K the dashboard does not feed the canonical EAC slot from the statistical forecast',
+    !/canonicalEac:[^,\n]*forecast\.cost/.test(dashSrc));
+  ok('S19-L the dashboard feeds the scenario EAC slot from the statistical forecast',
+    /scenarioEac:[^,\n]*scenarioEacRaw/.test(dashSrc));
+  ok('S19-N the dashboard feeds the canonical finish slot from F5',
+    /canonicalFinish:\s*control\s*\?\s*control\.project\.forecastFinish/.test(dashSrc));
+  ok('S19-N the dashboard does not feed the canonical finish slot from the statistical model',
+    !/canonicalFinish:[^,\n]*riskAdjustedFinish/.test(dashSrc));
+  ok('S19-O the dashboard feeds the statistical finish slot from the SPI-trend model',
+    /statisticalFinish:\s*riskAdjustedFinish/.test(dashSrc));
+  ok('S19-N the dashboard feeds the canonical delay from F5 working days',
+    /canonicalDelayWorkingDays:\s*control\s*\?\s*control\.project\.totalDelayWd/.test(dashSrc));
+  ok('S19-A the dashboard gives the curve the approved baseline',
+    /generateSCurveData\([\s\S]{0,900}baselines:\s*baselineActivities/.test(dashSrc));
+  ok('S19-A the dashboard gives the curve the project calendar',
+    /generateSCurveData\([\s\S]{0,900}calendarType:/.test(dashSrc));
+  ok('S19-A the dashboard money formatter preserves canonical cents',
+    /maximumFractionDigits:\s*2/.test(dashSrc));
+
+  const execSrc = s19Src('src/components/views/ExecutiveReportView.tsx');
+  ok('S19-P the executive report gives its curve the approved baseline',
+    /generateSCurveData\([\s\S]{0,900}baselines:\s*baselineActivities/.test(execSrc));
+
+  const chartSrc = s19Src('src/components/views/SCurveChart.tsx');
+  ok('S19-A the chart renders money at canonical precision', /maximumFractionDigits:\s*2/.test(chartSrc));
+  ok('S19-A the chart marks the governed Data Date point as the current canonical point',
+    /isDataDate/.test(chartSrc));
+
+  const esSrc = s19Src('src/lib/earnedScheduleEngine.ts');
+  ok('S19-P the earned-schedule fallback shares the canonical baseline weighting',
+    /baselines:\s*sources\.baselines/.test(esSrc) && /sources\.baselines\s*\|\|\s*\[\]/.test(esSrc));
+  const budgetSrc = s19Src('src/components/views/BudgetView.tsx');
+  const progressSrc = s19Src('src/components/views/ProgressView.tsx');
+  ok('S19-P the budget view passes the governed baseline into earned schedule',
+    /calculateEarnedSchedule\(\{[\s\S]{0,500}baselines,/.test(budgetSrc));
+  ok('S19-P the progress view passes the governed baseline into earned schedule',
+    /calculateEarnedSchedule\(\{[\s\S]{0,500}baselines,/.test(progressSrc));
 }
 
 // ---------------------------------------------------------------------------

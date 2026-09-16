@@ -416,8 +416,12 @@ export default function BudgetView({ project }: BudgetViewProps) {
         boqItems,
         costTransactions: transactions,
         progressUpdates,
+        // F9.6: without these the engine's internal S-Curve fallback would weight PV by budget lines
+        // instead of the approved baseline, inverting a different curve than the canonical screens.
+        baselines,
+        calendarType: project?.calendar_type || undefined,
       }),
-    [project, activities, evm, budgetLines, boqItems, transactions, progressUpdates],
+    [project, activities, evm, budgetLines, boqItems, transactions, progressUpdates, baselines],
   );
 
   // Case J: the engine returns zeros when there is nothing to measure. The card says N/A and names

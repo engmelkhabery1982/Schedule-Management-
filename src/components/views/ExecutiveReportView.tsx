@@ -201,9 +201,10 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
       project?.start_date,
       project?.end_date,
       project?.data_date,
-      // GAP-006: the canonical sources the curve needs so planned value is evaluated with the same
-      // cost allocation and the same BAC as the EVM above (final cumulative PV reconciles to BAC).
-      { project, budgetLines, boqItems },
+      // F9.6: the canonical sources the curve needs so planned value is evaluated with the SAME
+      // approved-baseline weighting and the same BAC as the EVM above — which is what makes the plotted
+      // Data Date point reconcile to canonical F6 and the final cumulative PV close on BAC exactly.
+      { project, budgetLines, boqItems, baselines: baselineActivities, calendarType: project?.calendar_type || undefined },
     );
   }, [activities, baselineActivities, progressUpdates, transactions, evmMetrics, project, budgetLines, boqItems]);
 

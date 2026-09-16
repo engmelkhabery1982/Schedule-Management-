@@ -24,7 +24,17 @@ import { analyzeForecast, calculateActivityCompletionAverage } from '@/lib/plann
 // F9.4 (defect 1): the dashboard QUOTES the canonical EVM from its own F6 report instead of running
 // a second, competing EVM derivation. F6 is canonical for the cost-control layer; F8 (below) already
 // quotes F6, so all three surfaces now read one source.
-import { quoteCanonicalEvm } from '@/lib/canonicalEvm';
+import { quoteCanonicalEvm, selectCanonicalEvm } from '@/lib/canonicalEvm';
+// F9.6 (Cross-Surface Control Reconciliation): governed forecast SEMANTICS. Canonical F6 owns the
+// unqualified "EAC", canonical F5 owns the unqualified finish, and every scenario/statistical value is
+// named as such with its delta against the canonical one. The builders are pure so S19 can pin them.
+import {
+  buildEacPresentation,
+  buildFinishPresentation,
+  buildRatioPresentation,
+  CANONICAL_COST_AUTHORITY,
+  SCENARIO_COST_AUTHORITY,
+} from '@/lib/forecastSemantics';
 import { generateScheduleAlerts } from '@/lib/alertEngine';
 import { generateResourceConflictAlerts } from '@/lib/resourceConflictEngine';
 import { calculateBaselineVariances, calculatePerformanceTrend, generateTrendAlerts } from '@/lib/trendEngine';
@@ -91,6 +101,18 @@ function trendBadgeClass(direction: string): string {
     : ['recovering', 'improving'].includes(direction)
     ? 'bg-emerald-100 text-emerald-700'
     : 'bg-slate-100 text-slate-600';
+}
+
+/**
+ * F9.6: money rendering for the canonical cards. Locale is PINNED so the same fact renders identically
+ * in every environment (deterministic output is a project invariant), and up to two decimals are kept
+ * because canonical F6 publishes cents — rounding here is what previously made a card show 715,014
+ * while F6 and the S-Curve published 715,014.29, so the two could not be reconciled even when the
+ * maths agreed. `null` renders as N/A rather than as a plausible 0.
+ */
+function fmtCanonicalMoney(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) return 'N/A';
+  return value.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 2 });
 }
 
 export default function Dashboard({ project, onNavigate }: DashboardProps) {
@@ -438,9 +460,42 @@ ${noticeForm.contractorName}`;
     return date.toISOString().split('T')[0];
   }, [forecastFinish, forecast.riskExposure.days]);
 
-  const forecastDelay = riskAdjustedFinish && endDate
-    ? Math.max(0, Math.round((new Date(riskAdjustedFinish).getTime() - new Date(endDate).getTime()) / 86400000))
-    : 0;
+  // F9.6 (defects 2-4): one canonical fact set, explicitly separated from the statistical layer.
+  //
+  // `selectCanonicalEvm` (not `quoteCanonicalEvm`) is used for the cards because it PRESERVES F6's
+  // nulls: the non-nullable adapter substitutes `eac ?? bac` and compatibility ratio values, which
+  // would render a fallback as a forecast. This is the same canonical object F8, Data Governance and
+  // the Executive Report quote, so the cards cannot drift from them.
+  const canonicalEvmQuote = useMemo(() => selectCanonicalEvm(costStrip), [costStrip]);
+
+  // Defect 2: SPI and CPI as separately labelled entries. Each carries its own label AND formula, so
+  // the two can never be transposed by render order — the previous card showed two bare numbers under
+  // one "SPI / CPI" slash label with nothing binding either number to its name.
+  const ratioCards = useMemo(() => buildRatioPresentation(canonicalEvmQuote), [canonicalEvmQuote]);
+
+  // Defect 3: canonical F6 EAC keeps the unqualified label; the SPI/CPI-trend + open-risk figure is
+  // named as a scenario and always shows its delta. The canonical value is never overwritten by it.
+  const scenarioEacRaw = forecast.cost.realistic + forecast.riskExposure.cost;
+  const eacCards = useMemo(() => buildEacPresentation({
+    canonicalEac: canonicalEvmQuote.eac,
+    canonicalMethod: costStrip?.recommended ? costStrip.recommended.method : null,
+    canonicalBac: canonicalEvmQuote.bac,
+    canonicalVac: canonicalEvmQuote.vac,
+    scenarioEac: Number.isFinite(scenarioEacRaw) ? scenarioEacRaw : null,
+    scenarioMethod: 'spi_cpi_trend_plus_open_risk_exposure',
+  }), [canonicalEvmQuote, costStrip, scenarioEacRaw]);
+
+  // Defect 4: canonical F5 statused-CPM finish is THE management date; the SPI-trend + risk date is a
+  // named statistical forecast shown with its variance. The former `forecastDelay` compared the
+  // STATISTICAL date to the baseline end date and clamped at zero, so a statistical finish earlier than
+  // baseline rendered as "0 days, green" while F5 reported a real delay.
+  const finishCards = useMemo(() => buildFinishPresentation({
+    canonicalFinish: control ? control.project.forecastFinish : null,
+    baselineFinish: control ? control.project.baselineFinish : null,
+    canonicalDelayWorkingDays: control ? control.project.totalDelayWd : null,
+    statisticalFinish: riskAdjustedFinish,
+    riskDaysAdded: forecast.riskExposure.days,
+  }), [control, riskAdjustedFinish, forecast.riskExposure.days]);
 
   const sCurveData = useMemo(() => {
     return generateSCurveData(
@@ -454,8 +509,10 @@ ${noticeForm.contractorName}`;
       // No explicit cutoff: the engine uses the canonical EVM's own governed data date, so the
       // actual series ends exactly at the Data Date instead of at the machine clock.
       null,
-      // GAP-006: canonical sources for planned-value weighting and BAC reconciliation.
-      { project, budgetLines, boqItems },
+      // F9.6: canonical sources for planned-value weighting and BAC reconciliation. `baselines` is
+      // what makes the plotted Data Date point equal canonical F6 PV/EV/AC instead of the superseded
+      // planningEngine weighting, and `calendarType` gives F6 the project's working-day calendar.
+      { project, budgetLines, boqItems, baselines: baselineActivities, calendarType: project?.calendar_type || undefined },
     );
   }, [activities, baselineActivities, progressUpdates, costTransactions, evm, project, startDate, endDate, budgetLines, boqItems]);
 
@@ -1391,16 +1448,77 @@ ${noticeForm.contractorName}`;
         </div>
       </div>
 
-      {/* EVM Metric Cards */}
+      {/* EVM Metric Cards — F9.6: canonical F6/F5 facts on the first row; the scenario/statistical
+          layer is visually subordinate below, named as non-canonical, and always shows its delta. */}
       <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
         <h3 className="font-semibold text-slate-800 mb-3 text-sm">{t.evm_title}</h3>
-        <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 text-xs">
-          <div className="bg-slate-50 p-3 rounded-lg"><p className="text-slate-500">{t.planned_pv}</p><p className="font-bold text-slate-800 text-sm mt-0.5">{evm.pv.toLocaleString()}</p></div>
-          <div className="bg-emerald-50 p-3 rounded-lg"><p className="text-emerald-700">{t.earned_ev}</p><p className="font-bold text-emerald-800 text-sm mt-0.5">{evm.ev.toLocaleString()}</p></div>
-          <div className="bg-blue-50 p-3 rounded-lg"><p className="text-blue-700">{t.spi_cpi}</p><p className="font-bold text-blue-800 text-sm mt-0.5">{evm.spi.toFixed(2)} / {evm.cpi.toFixed(2)}</p></div>
-          <div className="bg-amber-50 p-3 rounded-lg"><p className="text-amber-700">{t.forecast_eac}</p><p className="font-bold text-amber-800 text-sm mt-0.5">{(forecast.cost.realistic + forecast.riskExposure.cost).toLocaleString()}</p></div>
-          <div className="bg-slate-50 p-3 rounded-lg"><p className="text-slate-500">{t.forecast_finish}</p><p className={`font-bold text-sm mt-0.5 ${forecastDelay > 0 ? 'text-red-700' : 'text-emerald-700'}`}>{riskAdjustedFinish || '-'}</p></div>
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 text-xs">
+          <div className="bg-slate-50 p-3 rounded-lg"><p className="text-slate-500">{t.planned_pv}</p><p className="font-bold text-slate-800 text-sm mt-0.5">{fmtCanonicalMoney(canonicalEvmQuote.pv)}</p></div>
+          <div className="bg-emerald-50 p-3 rounded-lg"><p className="text-emerald-700">{t.earned_ev}</p><p className="font-bold text-emerald-800 text-sm mt-0.5">{fmtCanonicalMoney(canonicalEvmQuote.ev)}</p></div>
+          {ratioCards.map((ratio) => (
+            <div key={ratio.key} className="bg-blue-50 p-3 rounded-lg" data-authority={CANONICAL_COST_AUTHORITY} data-ratio={ratio.key}>
+              <p className="text-blue-700">{lang === 'ar' ? ratio.labelAr : ratio.labelEn}</p>
+              <p className="font-bold text-blue-800 text-sm mt-0.5">{ratio.value !== null ? ratio.value.toFixed(3) : 'N/A'}</p>
+              <p className="text-[10px] text-blue-400 font-mono mt-0.5">{lang === 'ar' ? ratio.formulaAr : ratio.formulaEn}</p>
+            </div>
+          ))}
+          <div className="bg-amber-50 p-3 rounded-lg" data-authority={CANONICAL_COST_AUTHORITY}>
+            <p className="text-amber-700">{lang === 'ar' ? eacCards.canonical.labelAr : eacCards.canonical.labelEn}</p>
+            <p className="font-bold text-amber-800 text-sm mt-0.5">{fmtCanonicalMoney(eacCards.canonical.value)}</p>
+            <p className="text-[10px] text-amber-500 font-mono mt-0.5">{eacCards.canonical.method || 'N/A'}</p>
+          </div>
+          <div className="bg-slate-50 p-3 rounded-lg">
+            <p className="text-slate-500">{lang === 'ar' ? finishCards.canonical.labelAr : finishCards.canonical.labelEn}</p>
+            <p className={`font-bold text-sm mt-0.5 ${finishCards.canonical.delayWorkingDays === null ? 'text-slate-800' : finishCards.canonical.delayWorkingDays > 0 ? 'text-red-700' : 'text-emerald-700'}`}>
+              {finishCards.canonical.finish || 'N/A'}
+            </p>
+            <p className="text-[10px] text-slate-400 mt-0.5">
+              {finishCards.canonical.delayWorkingDays !== null
+                ? `${lang === 'ar' ? finishCards.canonical.delayLabelAr : finishCards.canonical.delayLabelEn}: ${finishCards.canonical.delayWorkingDays > 0 ? '+' : ''}${finishCards.canonical.delayWorkingDays}`
+                : (lang === 'ar' ? 'التأخير غير مقاس (N/A)' : 'Delay N/A')}
+            </p>
+          </div>
         </div>
+
+        {(eacCards.scenario || finishCards.statistical) && (
+          <div className="mt-3 pt-3 border-t border-dashed border-slate-200">
+            <p className="text-[10px] font-bold uppercase tracking-wide text-slate-400 mb-2">
+              {lang === 'ar' ? 'طبقة السيناريو والإحصاء — ليست قيماً قانونية' : 'Scenario / statistical layer — not canonical values'}
+            </p>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+              {eacCards.scenario && (
+                <div className="bg-amber-50/40 p-3 rounded-lg border border-amber-100" data-authority={SCENARIO_COST_AUTHORITY}>
+                  <p className="text-amber-700">{lang === 'ar' ? eacCards.scenario.labelAr : eacCards.scenario.labelEn}</p>
+                  <p className="font-bold text-amber-800 text-sm mt-0.5">{fmtCanonicalMoney(eacCards.scenario.value)}</p>
+                  <p className="text-[10px] text-amber-600 mt-0.5">
+                    {lang === 'ar' ? eacCards.scenario.deltaLabelAr : eacCards.scenario.deltaLabelEn}:{' '}
+                    {eacCards.scenario.deltaVsCanonical !== null
+                      ? `${eacCards.scenario.deltaVsCanonical > 0 ? '+' : ''}${fmtCanonicalMoney(eacCards.scenario.deltaVsCanonical)}`
+                      : 'N/A'}
+                  </p>
+                  <p className="text-[10px] text-amber-400 font-mono mt-0.5">{eacCards.scenario.method}</p>
+                </div>
+              )}
+              {finishCards.statistical && (
+                <div className="bg-slate-50 p-3 rounded-lg border border-slate-200">
+                  <p className="text-slate-600">{lang === 'ar' ? finishCards.statistical.labelAr : finishCards.statistical.labelEn}</p>
+                  <p className="font-bold text-slate-800 text-sm mt-0.5">{finishCards.statistical.finish}</p>
+                  <p className="text-[10px] text-slate-500 mt-0.5">
+                    {lang === 'ar' ? finishCards.statistical.varianceLabelAr : finishCards.statistical.varianceLabelEn}:{' '}
+                    {finishCards.statistical.varianceDaysVsCanonical !== null
+                      ? `${finishCards.statistical.varianceDaysVsCanonical > 0 ? '+' : ''}${finishCards.statistical.varianceDaysVsCanonical} ${lang === 'ar' ? 'يوم' : 'days'}`
+                      : 'N/A'}
+                  </p>
+                  {finishCards.statistical.riskDaysAdded !== null && (
+                    <p className="text-[10px] text-slate-400 font-mono mt-0.5">
+                      {lang === 'ar' ? 'أيام المخاطر المضافة' : 'risk days added'}: {finishCards.statistical.riskDaysAdded}
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* S-Curve Interactive Analysis */}

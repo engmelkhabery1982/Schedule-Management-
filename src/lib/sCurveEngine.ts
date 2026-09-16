@@ -1,9 +1,47 @@
-import type { Activity, BaselineActivity, BoqItem, CostTransaction, ProgressUpdate } from '@/types';
-import { calculateProjectEvmAtDataDate, type ComprehensiveProjectEvm, type EvmBudgetLineInput } from '@/lib/planningEngine';
+import type {
+  Activity,
+  ActivityBoqAllocation,
+  BaselineActivity,
+  BoqItem,
+  BudgetLine,
+  CalendarType,
+  CostTransaction,
+  ProgressUpdate,
+  WbsNode,
+} from '@/types';
+import type { ComprehensiveProjectEvm } from '@/lib/planningEngine';
 import { DEFAULT_DATA_DATE } from '@/lib/projectControlsConstants';
+import { evaluateTimePhasedEvm, type TimePhasedEvmSources } from '@/lib/sCurveTimePhasing';
 
 /**
  * Financial S-Curve engine (planned / earned / actual / forecast cumulative curves).
+ *
+ * F9.6 (Cross-Surface Control Reconciliation) — CANONICAL SOURCE
+ * --------------------------------------------------------------
+ * Every monetary point on this curve is produced by **F6 (`costControlEngine.analyzeCostControl`)**
+ * through the pure time-phased adapter `@/lib/sCurveTimePhasing`. This module owns the BUCKET
+ * SCHEDULE and nothing else: it decides which cutoffs to evaluate, then asks F6 for BAC / PV / EV /
+ * AC at each one. There is no PV formula, no EV formula and no AC rule in this file.
+ *
+ * That replaces `planningEngine.calculateProjectEvmAtDataDate`, which this engine used to call at
+ * every cutoff. An earlier revision of this docblock called that route "the canonical EVM … the single
+ * evaluation path". Since F9.4/F9.5 that statement was false, and the divergence was visible: on the
+ * pilot project at the governed Data Date 2026-09-09 the curve plotted PV 245,022 / EV 93,342 while
+ * canonical F6 — quoted on the same screen, from the same data — published PV 715,014.29 / EV 752,900.
+ * Two causes, both in the superseded derivation:
+ *   - PV: it weights activities by CBS budget lines matched on `wbs_node_id` (one line handed in full
+ *     to every activity in the node, then re-scaled) and prorates in calendar time, whereas F6 weights
+ *     by the APPROVED BASELINE's `planned_cost` and prorates in WORKING DAYS on the project calendar.
+ *   - EV: it applies that same non-canonical weighting to the evidence percent, whereas F6 applies the
+ *     baseline weighting to the governed current `percent_complete`.
+ * The superseded derivation is no longer imported here at all, not even as a diagnostic: a financial
+ * S-Curve is a user-facing canonical surface, and publishing a second set of PV/EV numbers on it —
+ * however labelled — is what produced the reported contradiction. The divergence is instead pinned by
+ * regression S19-Q, which calls the legacy engine directly in the harness.
+ *
+ * Note that `baselineActivities` was already a parameter of `generateSCurveData` before F9.6 and was
+ * never used in the body: the canonical weights were being passed in and ignored. They are now the
+ * weighting basis, via F6.
  *
  * TIME-PHASED SEMANTICS — one convention, documented because every invariant below depends on it:
  *
@@ -20,28 +58,40 @@ import { DEFAULT_DATA_DATE } from '@/lib/projectControlsConstants';
  *  5. Forecast buckets are exactly those strictly after the Data Date. On actual buckets
  *     `forecastCumulative` is null; on forecast buckets `evCumulative` / `acCumulative` are null,
  *     so actual history and forecast can never be mixed inside one series.
- *  6. Final cumulative PV reconciles to BAC by construction: PV is evaluated by the canonical
- *     EVM engine (`calculateProjectEvmAtDataDate`) at each cutoff, and the last cutoff is at or
- *     after every activity finish and the project end date, where the canonical engine has
- *     already normalised the per-activity cost allocation to sum exactly to BAC.
+ *  6. THE DATA DATE POINT IS THE CURRENT POINT. At the governed Data Date the adapter passes the
+ *     activities through unchanged, so F6 is being asked the same question with the same inputs the
+ *     caller already asked it: `pvEarlyCumulative`, `evCumulative` and `acCumulative` on that bucket
+ *     are therefore the canonical F6 PV / EV / AC to the cent, not an approximation of them. The
+ *     `currentPv` / `currentEv` / `currentAc` scalars published alongside the series are the same
+ *     numbers, so the chart can never headline one "current" value while its visible Data Date point
+ *     shows another.
+ *  7. Final cumulative PV closes on BAC exactly: at a cutoff on or after every activity finish each
+ *     F6 proration fraction is 1, so PV is the sum of the baseline `planned_cost` rows, which is BAC.
  *
- * Cost weighting (GAP-006): the curve is weighted by the CANONICAL cost allocation — CBS budget
- * lines matched to activities through `wbs_node_id`, falling back to an even `BAC / activityCount`
- * share for an activity with no budget line, then normalised to BAC. Physical quantities are never
- * used as financial weights: `planned_quantity` values carry heterogeneous units (m3, m2, points,
- * tons, lots) and summing them invents an exchange rate between units. There is likewise no
- * hidden SAR-per-unit conversion: BAC is the canonical EVM BAC, never `quantity * 100`.
+ * HISTORICAL BUCKETS (GAP-024, GAP-025) — history is evidence only, and stays historical:
+ *  - EV at cutoff T < Data Date is F6 applied to activities whose `percent_complete` has been phased
+ *    back to the LATEST APPROVED progress update dated `<= T` (absolute percent, latest wins — the
+ *    same rule `approve_progress_update` applies to the stored column), or ZERO when there is none.
+ *    Today's progress is never retro-written into an earlier period, and no elapsed-time
+ *    interpolation invents earned value where no evidence exists.
+ *  - AC at cutoff T is F6's own rule: approved transactions dated on or before T, and zero when there
+ *    are none. No current-state AC estimate is backcast into history.
+ *  - An earlier bucket is therefore expected to differ from the Data Date bucket; a curve whose history
+ *    equals its endpoint has been flattened and is wrong.
+ *  - Where evidence is insufficient a period reports the smaller honest number rather than a
+ *    fabricated one. The curve does not interpolate between evidence points.
  *
- * Historical EV / AC (GAP-024, GAP-025): history is evidence only.
- *  - EV at cutoff T is the canonical earned-value roll-up of APPROVED progress updates dated
- *    `<= T`. An activity with no approved update at T contributes ZERO, never its current
- *    `percent_complete` — today's progress is not retroactively written into earlier periods.
- *  - AC at cutoff T is the sum of APPROVED cost transactions dated `<= T`, and ZERO when there
- *    are none. The canonical engine's current-state AC estimate (used when a project has no
- *    transactions yet) is deliberately NOT backcast into history, and no `timeRatio` linear
- *    interpolation is used anywhere: an empty period reports an empty period.
- * The canonical EV / AC / EAC scalars at the Data Date remain the authoritative "current" values
- * returned as `currentEv` / `currentAc` / `forecastEac`.
+ * PRECISION — deliberate decision (F9.6):
+ *  Monetary values are kept at F6's own published precision (2 decimal places) inside the series and
+ *  are NOT rounded to whole SAR. Rounding to integers here used to make the Data Date point publish PV
+ *  715,014 while canonical F6 published 715,014.29, so the two could not be reconciled even when the
+ *  underlying maths agreed. Rounding is a RENDERING concern and belongs to `SCurveChart`, which formats
+ *  for display; the data model stays exact. Period increments are floored at zero so an approved
+ *  downward correction in a cumulative series cannot render as negative work in a bar chart, while the
+ *  cumulative series still shows it.
+ *
+ * No machine clock is read anywhere in this file (GAP-007): same project + same governed Data Date =>
+ * the same curve, always.
  */
 
 export interface SCurvePoint {
@@ -55,35 +105,55 @@ export interface SCurvePoint {
   periodPv: number;
   periodEv: number | null;
   periodAc: number | null;
+  /**
+   * F9.6: true on the single bucket whose date is the governed Data Date. That bucket is the current
+   * canonical point (semantic 6); every other actual bucket is evidence-phased history.
+   */
+  isDataDate: boolean;
 }
 
 export interface SCurveData {
   points: SCurvePoint[];
   bac: number;
+  /** Canonical F6 scalars at the governed Data Date — identical to the Data Date bucket's values. */
+  currentPv: number | null;
   currentEv: number;
   currentAc: number;
   forecastEac: number;
   dataDate: string;
+  /** Index of the governed Data Date bucket in `points`, or -1 when the series is empty. */
+  dataDateIndex: number;
+  /** F6's BAC basis for the curve, so a consumer can state where the weights came from. */
+  bacSource: string;
 }
 
 /**
- * Source data the canonical EVM needs in order to evaluate the planned curve at arbitrary cutoffs.
+ * Source data the canonical F6 evaluation needs at each cutoff.
  *
- * Both are the SAME inputs the caller already passed to `calculateProjectEvmAtDataDate`, which is
- * what makes the final cumulative PV reconcile to `evm.bac` exactly instead of approximately.
+ * `baselines` is the important one: it is F6's BAC basis and its PV/EV weighting. Without it F6 falls
+ * back to budget-line totals, which is a different (unfrozen) plan and would put the curve back out of
+ * reconciliation with the canonical cards on the same screen.
  */
 export interface SCurveCanonicalSources {
-  /** Structural subset of `Project` consumed by the canonical EVM (contract value and dates). */
+  /** Structural subset of `Project` consumed by F6 (identity, contract value and dates). */
   project?: {
+    id?: string;
     contract_value?: number | null;
     start_date?: string | null;
     end_date?: string | null;
     data_date?: string | null;
   } | null;
-  /** CBS budget lines — the legitimate per-activity cost allocation, matched by `wbs_node_id`. */
-  budgetLines?: EvmBudgetLineInput[];
-  /** BOQ items — canonical BAC fallback when there is neither a contract value nor budget lines. */
+  /** CBS budget lines — F6's BAC fallback when no approved baseline rows are supplied. */
+  budgetLines?: BudgetLine[];
+  /** BOQ items — F6's last-resort BAC basis. */
   boqItems?: BoqItem[];
+  /** F9.6: ACTIVE APPROVED baseline rows — the canonical BAC basis and PV/EV weighting. */
+  baselines?: BaselineActivity[];
+  /** F9.6: project calendar for F6's working-day PV proration. Defaults to F6's own default. */
+  calendarType?: CalendarType;
+  wbsNodes?: WbsNode[];
+  allocations?: ActivityBoqAllocation[];
+  manualEtc?: number | null;
 }
 
 function parseDate(d: string): number {
@@ -92,6 +162,16 @@ function parseDate(d: string): number {
 
 function formatDate(timestamp: number): string {
   return new Date(timestamp).toISOString().split('T')[0];
+}
+
+/** 2-decimal money, matching F6's own published precision. Non-finite input becomes 0, never NaN. */
+function round2(n: number): number {
+  return Number.isFinite(n) ? Math.round(n * 100) / 100 : 0;
+}
+
+function finite(n: unknown, fallback = 0): number {
+  const v = Number(n);
+  return Number.isFinite(v) ? v : fallback;
 }
 
 export function generateSCurveData(
@@ -112,28 +192,56 @@ export function generateSCurveData(
   const effectiveDataDateTime = parseDate(effectiveDataDate);
 
   // Canonical BAC is authoritative. It is never replaced by a quantity-derived synthetic value.
-  const totalBac = Number(evm.bac || 0);
+  const totalBac = finite(evm.bac, 0);
 
-  if (activities.length === 0) {
-    return {
-      points: [],
-      bac: totalBac,
-      currentEv: evm.ev,
-      currentAc: evm.ac,
-      forecastEac: evm.eac,
-      dataDate: effectiveDataDate,
-    };
-  }
+  // The baselines the caller already fetched for F6. Prefer the explicit source (which is what the
+  // canonical cards used) and fall back to the positional argument — the two are the same governed
+  // ACTIVE APPROVED rows in every caller, and using them is what makes the weights canonical.
+  const baselines = canonicalSources.baselines ?? baselineActivities ?? [];
+
+  const emptyResult = (bacSource: string): SCurveData => ({
+    points: [],
+    bac: totalBac,
+    currentPv: evm.pv ?? null,
+    currentEv: finite(evm.ev),
+    currentAc: finite(evm.ac),
+    forecastEac: finite(evm.eac),
+    dataDate: effectiveDataDate,
+    dataDateIndex: -1,
+    bacSource,
+  });
+
+  if (activities.length === 0) return emptyResult('unavailable');
 
   const budgetLines = canonicalSources.budgetLines || [];
   const boqItems = canonicalSources.boqItems || [];
-  // Without a project the canonical engine would resolve its own BAC fallback; supplying the
-  // canonical BAC the caller already computed keeps the curve reconciled to it exactly.
+  // F6 requires a project identity; without one it would resolve its own BAC fallback, so supply the
+  // canonical BAC the caller already computed to keep the curve reconciled to it.
   const canonicalProject = canonicalSources.project ?? {
+    id: 'scurve-unscoped',
     contract_value: totalBac,
     start_date: projectStartDate ?? null,
     end_date: projectEndDate ?? null,
     data_date: effectiveDataDate,
+  };
+
+  const phasedSources: TimePhasedEvmSources = {
+    project: {
+      id: canonicalProject.id ?? 'scurve-unscoped',
+      contract_value: canonicalProject.contract_value ?? null,
+      data_date: canonicalProject.data_date ?? effectiveDataDate,
+    },
+    activities,
+    baselines,
+    budgetLines,
+    costTransactions,
+    progressUpdates,
+    boqItems,
+    wbsNodes: canonicalSources.wbsNodes || [],
+    allocations: canonicalSources.allocations || [],
+    calendarType: canonicalSources.calendarType,
+    governedDataDate: effectiveDataDate,
+    manualEtc: canonicalSources.manualEtc ?? null,
   };
 
   // Determine overall project date span
@@ -168,29 +276,15 @@ export function generateSCurveData(
     currentCutoff += stepMs;
   }
   // The Data Date is always a bucket: the actual series must END on the Data Date and the forecast
-  // must BEGIN after it, and the planned value on that bucket must equal the canonical EV/PV state.
+  // must BEGIN after it, and the planned value on that bucket must equal the canonical F6 PV/EV/AC.
   if (!cutOffDates.includes(effectiveDataDateTime)) {
     cutOffDates.push(effectiveDataDateTime);
   }
   cutOffDates.sort((a, b) => a - b);
 
-  // The canonical EVM is the single evaluation path for the planned curve. Evaluating it at each
-  // cutoff reuses BOTH its cost allocation and its planned-value progression, so no second PV
-  // formula exists here. Earned value on the same call is evidence-only because the activities are
-  // passed with `percent_complete` zeroed: only approved progress updates dated on or before the
-  // cutoff can then contribute, which is exactly the GAP-024 rule.
-  const evidenceActivities = activities.map((act) => ({ ...act, percent_complete: 0 }));
-  const lateEvidenceActivities = evidenceActivities.map((act) => ({
-    ...act,
-    early_start: act.late_start || act.early_start,
-    early_finish: act.late_finish || act.early_finish,
-  }));
-
-  const approvedCosts = [...costTransactions]
-    .filter((c) => c.status === 'approved')
-    .sort((a, b) => a.transaction_date.localeCompare(b.transaction_date));
-
   const points: SCurvePoint[] = [];
+  let dataDateIndex = -1;
+  let bacSource = 'unavailable';
 
   for (let i = 0; i < cutOffDates.length; i++) {
     const cutoff = cutOffDates[i];
@@ -198,54 +292,38 @@ export function generateSCurveData(
     const d = new Date(cutoff);
     const label = d.toLocaleDateString('ar-SA', { month: 'short', day: 'numeric' });
 
-    const atCutoff = calculateProjectEvmAtDataDate(
-      canonicalProject,
-      evidenceActivities,
-      budgetLines,
-      boqItems,
-      [],
-      progressUpdates,
-      cutoffStr,
-    );
-    const atCutoffLate = calculateProjectEvmAtDataDate(
-      canonicalProject,
-      lateEvidenceActivities,
-      budgetLines,
-      boqItems,
-      [],
-      progressUpdates,
-      cutoffStr,
-    );
+    // ONE canonical evaluation per cutoff (plus one for the secondary late-window PV series). F6 does
+    // all the arithmetic; the adapter only phases the inputs. See `sCurveTimePhasing` rules 1-5.
+    const atCutoff = evaluateTimePhasedEvm(phasedSources, cutoffStr);
+    const atCutoffLate = evaluateTimePhasedEvm(phasedSources, cutoffStr, { late: true });
+    bacSource = atCutoff.bacSource;
 
-    const pvEarly = atCutoff.pv;
-    const pvLate = atCutoffLate.pv;
+    const pvEarly = round2(finite(atCutoff.pv, 0));
+    const pvLate = round2(finite(atCutoffLate.pv, pvEarly));
 
     // A bucket is actual iff it is on or before the Data Date (no half-step grace).
     const isPastOrPresent = cutoff <= effectiveDataDateTime;
+    const isDataDate = cutoff === effectiveDataDateTime;
+    if (isDataDate) dataDateIndex = i;
 
     let evVal: number | null = null;
     let acVal: number | null = null;
     let forecastVal: number | null = null;
 
     if (isPastOrPresent) {
-      // Evidence-only earned value: approved progress updates dated <= cutoff, valued with the
-      // canonical cost allocation. No current `percent_complete`, no time interpolation.
-      evVal = Math.round(atCutoff.ev);
-      // Evidence-only actual cost: approved transactions dated <= cutoff. Zero when there are none,
+      // Evidence-only earned value below the Data Date; the governed current value at it (semantic 6).
+      evVal = atCutoff.ev === null ? null : round2(finite(atCutoff.ev, 0));
+      // Evidence-only actual cost: F6's approved-and-not-after-cutoff rule. Zero when there are none,
       // because the canonical current-state AC estimate must not be backcast into history.
-      acVal = Math.round(
-        approvedCosts
-          .filter((c) => c.transaction_date <= cutoffStr)
-          .reduce((sum, c) => sum + Number(c.amount || 0), 0),
-      );
+      acVal = round2(finite(atCutoff.ac, 0));
     } else {
       // Forecast: canonical EAC less canonical AC at the Data Date, spread over the remaining
       // planned span. It starts from the canonical current cost, never from fabricated history.
       const remainingTime = maxTime - effectiveDataDateTime;
       const currentOffset = cutoff - effectiveDataDateTime;
       const progressFactor = remainingTime > 0 ? Math.min(1, Math.max(0, currentOffset / remainingTime)) : 1;
-      const remainingCost = Math.max(0, Number(evm.eac || 0) - Number(evm.ac || 0));
-      forecastVal = Math.round(Number(evm.ac || 0) + remainingCost * progressFactor);
+      const remainingCost = Math.max(0, finite(evm.eac) - finite(evm.ac));
+      forecastVal = round2(finite(evm.ac) + remainingCost * progressFactor);
     }
 
     const prevPv = i > 0 ? points[i - 1].pvEarlyCumulative : 0;
@@ -255,27 +333,31 @@ export function generateSCurveData(
     points.push({
       date: cutoffStr,
       label,
-      pvEarlyCumulative: Math.round(pvEarly),
-      pvLateCumulative: Math.round(pvLate),
+      pvEarlyCumulative: pvEarly,
+      pvLateCumulative: pvLate,
       evCumulative: evVal,
       acCumulative: acVal,
       forecastCumulative: forecastVal,
       // Incremental periods are floored at zero so an approved downward correction in a cumulative
       // series cannot render as negative work in a bar chart; the cumulative series still shows it.
-      periodPv: Math.max(0, Math.round(pvEarly - prevPv)),
-      periodEv: evVal !== null ? Math.max(0, Math.round(evVal - prevEv)) : null,
-      periodAc: acVal !== null ? Math.max(0, Math.round(acVal - prevAc)) : null,
+      periodPv: Math.max(0, round2(pvEarly - prevPv)),
+      periodEv: evVal !== null ? Math.max(0, round2(evVal - prevEv)) : null,
+      periodAc: acVal !== null ? Math.max(0, round2(acVal - prevAc)) : null,
+      isDataDate,
     });
   }
 
   return {
     points,
     bac: totalBac,
-    // Canonical scalars at the Data Date (SSOT), not the evidence-only roll-up and not a fallback
-    // chain that would silently substitute one for the other.
-    currentEv: evm.ev,
-    currentAc: evm.ac,
-    forecastEac: evm.eac,
+    dataDateIndex,
+    bacSource,
+    // Canonical scalars at the Data Date (SSOT). Semantic 6 guarantees the Data Date bucket carries
+    // these same values, so the headline and the plotted point cannot disagree.
+    currentPv: evm.pv ?? null,
+    currentEv: finite(evm.ev),
+    currentAc: finite(evm.ac),
+    forecastEac: finite(evm.eac),
     dataDate: effectiveDataDate,
   };
 }

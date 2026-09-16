@@ -1,5 +1,5 @@
-import type { Activity, BoqItem, CostTransaction, ProgressUpdate, Project } from '@/types';
-import { calculateProjectEvmAtDataDate, type ComprehensiveProjectEvm, type EvmBudgetLineInput } from '@/lib/planningEngine';
+import type { Activity, BaselineActivity, BoqItem, BudgetLine, CalendarType, CostTransaction, ProgressUpdate, Project } from '@/types';
+import { calculateProjectEvmAtDataDate, type ComprehensiveProjectEvm } from '@/lib/planningEngine';
 import { generateSCurveData, type SCurveData } from '@/lib/sCurveEngine';
 import { DEFAULT_DATA_DATE } from '@/lib/projectControlsConstants';
 
@@ -56,6 +56,14 @@ export interface EarnedScheduleResult {
  * that same canonical function exactly once with the source data below. `sCurve` is the canonical
  * financial S-Curve whose planned-value curve Earned Schedule maps EV onto; when absent it is
  * generated once from the same sources, so both features always share ONE PV curve.
+ *
+ * F9.6: that shared curve is now produced by canonical F6 through `@/lib/sCurveTimePhasing`, weighted
+ * by the APPROVED BASELINE. `baselines` and `calendarType` therefore have to reach the internal
+ * fallback below — without them F6 would fall back to budget-line totals and this engine would invert
+ * a different PV curve than the one the Dashboard and Executive Report render, re-opening exactly the
+ * cross-surface divergence F9.6 closes. `evm` above remains whatever canonical object the caller
+ * holds; the legacy `calculateProjectEvmAtDataDate` call below is a dormant fallback used only when a
+ * caller supplies no `evm` at all (all three current callers supply one).
  */
 export interface EarnedScheduleSources {
   project: Project | null;
@@ -65,8 +73,16 @@ export interface EarnedScheduleSources {
   /** Canonical S-Curve. Preferred: the same object rendered by the S-Curve chart. */
   sCurve?: SCurveData;
   /** Source data used only when `evm` / `sCurve` are not supplied (canonical EVM, called once). */
-  budgetLines?: EvmBudgetLineInput[];
+  budgetLines?: BudgetLine[];
   boqItems?: BoqItem[];
+  /**
+   * F9.6: ACTIVE APPROVED baseline rows — the canonical BAC basis and PV/EV weighting for the shared
+   * S-Curve when this engine has to generate it itself. Omitting them silently downgrades the curve to
+   * budget-line weighting, so every caller that has the governed baseline should pass it.
+   */
+  baselines?: BaselineActivity[];
+  /** F9.6: project calendar for F6's working-day PV proration. */
+  calendarType?: CalendarType;
   costTransactions?: CostTransaction[];
   progressUpdates?: ProgressUpdate[];
   /** Explicit cutoff; otherwise `evm.dataDate` -> `project.data_date` -> governed DEFAULT_DATA_DATE. */
@@ -189,14 +205,20 @@ export function calculateEarnedSchedule(sources: EarnedScheduleSources): EarnedS
     sources.sCurve ||
     generateSCurveData(
       activities,
-      [],
+      sources.baselines || [],
       sources.progressUpdates || [],
       sources.costTransactions || [],
       evm,
       project.start_date,
       project.end_date,
       dataDate,
-      { project, budgetLines: sources.budgetLines || [], boqItems: sources.boqItems || [] },
+      {
+        project,
+        budgetLines: sources.budgetLines || [],
+        boqItems: sources.boqItems || [],
+        baselines: sources.baselines || [],
+        calendarType: sources.calendarType,
+      },
     );
 
   const curvePoints = sCurve.points;

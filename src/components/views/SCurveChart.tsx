@@ -7,6 +7,17 @@ interface SCurveChartProps {
   currency?: string;
 }
 
+/**
+ * F9.6: chart-side money rendering. The engine keeps canonical F6 precision (2 decimals) and rounding
+ * happens HERE, at render — so the Data Date point can display PV 715,014.29 rather than only 715,014
+ * and reconcile to the canonical cards on the same screen. Locale is pinned for determinism, and a null
+ * renders as N/A instead of a plausible zero.
+ */
+function fmtMoney(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return 'N/A';
+  return value.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 2 });
+}
+
 export default function SCurveChart({ data, currency = 'ريال' }: SCurveChartProps) {
   const [hoveredPoint, setHoveredPoint] = useState<SCurvePoint | null>(null);
   const [showPvLate, setShowPvLate] = useState(true);
@@ -348,13 +359,18 @@ export default function SCurveChart({ data, currency = 'ريال' }: SCurveChart
             <div>
               <span className="text-slate-400 block">التاريخ</span>
               <span className="font-semibold text-white">{hoveredPoint.date}</span>
+              {hoveredPoint.isDataDate && (
+                <span className="text-[10px] text-emerald-300 block mt-0.5" data-scurve-current-point="true">
+                  تاريخ البيانات المعتمد — النقطة الحالية القانونية (F6)
+                </span>
+              )}
             </div>
             <div>
               <span className="text-blue-300 block flex items-center gap-1">
                 <span className="w-2 h-2 rounded-full bg-blue-500 inline-block" />
                 المخطط المبكر (PV Early)
               </span>
-              <span className="font-semibold">{hoveredPoint.pvEarlyCumulative.toLocaleString()} {currency}</span>
+              <span className="font-semibold">{fmtMoney(hoveredPoint.pvEarlyCumulative)} {currency}</span>
             </div>
             <div>
               <span className="text-emerald-300 block flex items-center gap-1">
@@ -362,7 +378,7 @@ export default function SCurveChart({ data, currency = 'ريال' }: SCurveChart
                 المكتسب الفعلي (EV)
               </span>
               <span className="font-semibold">
-                {hoveredPoint.evCumulative !== null ? `${hoveredPoint.evCumulative.toLocaleString()} ${currency}` : 'قيد التنفيذ'}
+                {hoveredPoint.evCumulative !== null ? `${fmtMoney(hoveredPoint.evCumulative)} ${currency}` : 'قيد التنفيذ'}
               </span>
             </div>
             <div>
@@ -371,7 +387,7 @@ export default function SCurveChart({ data, currency = 'ريال' }: SCurveChart
                 التكلفة الفعلية (AC)
               </span>
               <span className="font-semibold">
-                {hoveredPoint.acCumulative !== null ? `${hoveredPoint.acCumulative.toLocaleString()} ${currency}` : 'قيد التنفيذ'}
+                {hoveredPoint.acCumulative !== null ? `${fmtMoney(hoveredPoint.acCumulative)} ${currency}` : 'قيد التنفيذ'}
               </span>
             </div>
           </div>
@@ -408,7 +424,7 @@ export default function SCurveChart({ data, currency = 'ريال' }: SCurveChart
         </div>
 
         <div className="text-slate-500">
-          الميزانية الإجمالية (BAC): <span className="font-bold text-slate-800">{bac.toLocaleString()} {currency}</span>
+          الميزانية الإجمالية (BAC): <span className="font-bold text-slate-800">{fmtMoney(bac)} {currency}</span>
         </div>
       </div>
     </div>
