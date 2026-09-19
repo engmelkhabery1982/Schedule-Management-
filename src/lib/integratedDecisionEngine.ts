@@ -164,6 +164,76 @@ export const ACTION_PLAYBOOK: Record<string, string> = {
   time_only: 'Use available float or monitor; no cost action is warranted.',
 };
 
+/**
+ * P2A1-H03 — how strongly a recommendation may be worded.
+ *
+ * The vocabulary is the one this repository already uses for capped decision strength
+ * (`forecastTrustEngine.CappedDecisionAction.recommendationStrength`), so F7 and F8 speak with one
+ * mouth: F8 re-caps F7 actions against the integrated forecast confidence using exactly these three
+ * words, and now F7 itself will not emit a `directive` where the evidence is Low.
+ *
+ *   directive        — an authoritative execution instruction. Requires evidence-backed confidence.
+ *   advisory         — guidance that may inform a decision but does not authorise execution.
+ *   investigate_only — diagnostic guidance / evidence collection / diagnostic hold only.
+ */
+export type DecisionRecommendationStrength = 'directive' | 'advisory' | 'investigate_only';
+
+/**
+ * P2A1-H03: the downgraded counterpart of `ACTION_PLAYBOOK`, key for key.
+ *
+ * Every entry states a DIAGNOSTIC or EVIDENCE-GATHERING step, never an execution instruction: F7
+ * must not authorise crashing, re-sequencing, re-planning or spend containment on Low-confidence
+ * evidence. Nothing is hidden — the action is still emitted, with its issue, evidence, impact and
+ * measured rerun intact, so management still sees what to go and look at.
+ */
+export const DECISION_ADVISORY_PLAYBOOK: Record<string, string> = {
+  late_start: 'Advisory only: verify the late start and its supporting records before committing recovery spend — diagnose the driving predecessor first.',
+  predecessor_delay: 'Advisory only: confirm the driving predecessor delay from progress records before acting; accelerating this activity alone is unproven.',
+  duration_growth: 'Advisory only: re-measure the grown scope and collect quantity/estimate evidence before re-planning the gap.',
+  resource_constraint: 'Advisory only: collect resource and productivity evidence (crew counts, output rates) before adding crew or equipment.',
+  low_production: 'Advisory only: investigate the production rate (method, supervision, crew skill) and gather output records before corrective works.',
+  remaining_increase: 'Advisory only: reconcile the stated remaining duration against progress evidence before re-forecasting.',
+  logic_change: 'Advisory only: review the logic change with planning and collect the revision record before accelerating.',
+  calendar_change: 'Advisory only: review the calendar change with planning and confirm the approved calendar before accelerating.',
+  correlative: 'Diagnostic hold: time and cost signals coincide without a proven cause — investigate jointly and collect evidence before acting.',
+  unproven: 'Diagnostic hold: collect evidence (progress, actuals, constraints) before any execution decision.',
+  cost_only: 'Advisory only: verify the cost records and re-pricing evidence before containing spend.',
+  time_only: 'Advisory only: monitor the available float and confirm the schedule evidence before acting.',
+};
+
+/**
+ * P2A1-H03: the one rule that turns source confidence into recommendation strength.
+ *
+ * Exported so the rule is testable and so no consumer re-implements it:
+ *   * the issue's own weakest-source confidence is Low  => `investigate_only`. The action's
+ *     evidence does not support any instruction, only diagnosis.
+ *   * the issue is Medium/High but the OVERALL gate (the weaker of F5's forecast-finish confidence
+ *     and F6's forecast confidence) is Low => `advisory`. The issue may be well-evidenced, but the
+ *     forecast it would be executed against is not, so management gets guidance, not a directive.
+ *   * otherwise => `directive` — byte-identical to the behaviour F7 has always had.
+ */
+export function resolveRecommendationStrength(
+  issueConfidence: ConfidenceLevel,
+  overallConfidence: ConfidenceLevel,
+): DecisionRecommendationStrength {
+  if (issueConfidence === 'Low') return 'investigate_only';
+  if (overallConfidence === 'Low') return 'advisory';
+  return 'directive';
+}
+
+/** Weakest of two strengths, in the order directive > advisory > investigate_only. */
+const STRENGTH_RANK: Record<DecisionRecommendationStrength, number> = {
+  directive: 3,
+  advisory: 2,
+  investigate_only: 1,
+};
+export function weakRecommendationStrength(
+  a: DecisionRecommendationStrength,
+  b: DecisionRecommendationStrength,
+): DecisionRecommendationStrength {
+  return STRENGTH_RANK[a] <= STRENGTH_RANK[b] ? a : b;
+}
+
 export type IssueSide = 'time' | 'cost' | 'time_cost';
 export type Criticality = 'critical' | 'near_critical' | 'non_critical' | 'unknown';
 
@@ -250,6 +320,14 @@ export interface DecisionAction {
   rootCause: { category: string; confidence: CauseConfidence } | null;
   rootCauseNote: string;
   recommendedAction: string;
+  /**
+   * P2A1-H03: `directive` only when the evidence supports an execution instruction. `advisory` /
+   * `investigate_only` keep the action, its evidence and its measured rerun, but the wording is
+   * diagnostic — see `resolveRecommendationStrength`.
+   */
+  recommendationStrength: DecisionRecommendationStrength;
+  /** P2A1-H03: why this action is — or is not — worded as a directive. */
+  strengthNote: string;
   expectedBenefit: { daysSaved: number; costDelta: number | null } | null;
   expectedBenefitNote: string;
   confidence: ConfidenceLevel;
@@ -301,6 +379,12 @@ export interface ManagementSummary {
   overallConfidence: ConfidenceLevel;
   scheduleSource: ConfidenceLevel;
   costSource: ConfidenceLevel;
+  /**
+   * P2A1-H03: the weakest strength across the emitted actions (`directive` when none were emitted,
+   * since there is nothing to constrain). A consumer renders the top decision as guidance — never as
+   * an execution directive — whenever this is not `directive`.
+   */
+  recommendationStrength: DecisionRecommendationStrength;
   overallNotes: string[];
 }
 
@@ -829,6 +913,11 @@ export function analyzeIntegratedDecisions(input: IntegratedDecisionInput): Inte
   };
 
   // --- Top management actions (traceable to issues, evidence, and reruns). ---
+  // P2A1-H03: the overall gate is resolved BEFORE the actions are worded, because recommendation
+  // strength has to respect the confidence of the sources a directive would be executed against.
+  // `schedSource` / `costSource` are read straight off the two reports; the summary below quotes the
+  // same value, so the gate is computed exactly once.
+  const overallGate = gateConfidence(f5.confidence.forecastFinish.level, f6.confidence.forecast.level);
   const actions: DecisionAction[] = [];
   for (const it of issues.slice(0, MAX_DECISION_ACTIONS)) {
     const proven = it.cause.confidence === 'High' || it.cause.confidence === 'Medium';
@@ -840,6 +929,8 @@ export function analyzeIntegratedDecisions(input: IntegratedDecisionInput): Inte
     const set = scenarios[it.id] || [];
     const rec = cand?.recommended && cand.scenario
       ? set.find((s) => s.preset === cand.scenario) : undefined;
+    // P2A1-H03: recommendation strength is a function of confidence, never of wording convenience.
+    const strength = resolveRecommendationStrength(it.confidence.overall, overallGate);
     actions.push({
       rank: actions.length + 1,
       issueId: it.id,
@@ -851,7 +942,19 @@ export function analyzeIntegratedDecisions(input: IntegratedDecisionInput): Inte
       rootCause: proven && it.cause.category
         ? { category: it.cause.category, confidence: it.cause.confidence } : null,
       rootCauseNote: proven ? it.cause.basis : `${it.cause.basis} (no proven root cause claimed)`,
-      recommendedAction: ACTION_PLAYBOOK[playKey] || ACTION_PLAYBOOK.unproven,
+      // P2A1-H03: a Low-confidence source cannot authorise an execution directive. The action keeps
+      // its rank, title, evidence, impacts and measured rerun — only the instruction is downgraded to
+      // advisory / diagnostic guidance, so nothing is hidden and nothing is over-claimed.
+      recommendedAction: strength === 'directive'
+        ? (ACTION_PLAYBOOK[playKey] || ACTION_PLAYBOOK.unproven)
+        : (DECISION_ADVISORY_PLAYBOOK[playKey] || DECISION_ADVISORY_PLAYBOOK.unproven),
+      recommendationStrength: strength,
+      strengthNote:
+        strength === 'directive'
+          ? `Directive: issue confidence ${it.confidence.overall} within an overall gate of ${overallGate}.`
+          : strength === 'advisory'
+            ? `Advisory: the overall gate is ${overallGate} (schedule ${f5.confidence.forecastFinish.level}, cost ${f6.confidence.forecast.level}), so this is guidance to consider — not an execution directive.`
+            : `Investigate only: this issue's evidence is ${it.confidence.overall} confidence, so it authorises diagnosis and evidence collection, not execution.`,
       expectedBenefit: rec && rec.daysSaved !== null
         ? { daysSaved: rec.daysSaved, costDelta: rec.costImpact } : null,
       expectedBenefitNote: rec && rec.daysSaved !== null
@@ -1004,20 +1107,34 @@ export function analyzeIntegratedDecisions(input: IntegratedDecisionInput): Inte
   // --- Management summary (weakest-source overall confidence). ---
   const schedSource = f5.confidence.forecastFinish.level;
   const costSource = f6.confidence.forecast.level;
+  // P2A1-H03: the summary's strength is the weakest across the emitted actions, so the headline
+  // decision can never be stronger than the weakest action underneath it.
+  const summaryStrength = actions.reduce<DecisionRecommendationStrength>(
+    (acc, a) => weakRecommendationStrength(acc, a.recommendationStrength),
+    'directive',
+  );
   const summary: ManagementSummary = {
     forecastFinish: currentFinish,
     delayVsBaselineWd: f5.project.totalDelayWd,
     recommendedEac: currentEac,
     vac: f6.project.vac,
     topRisk: issues.length > 0 ? issues[0].title : null,
+    // `topDecision` is a field read of the top action, whose wording is already gated (P2A1-H03):
+    // on Low-confidence evidence it is the advisory / diagnostic text, never an assertive directive.
     topDecision: actions.length > 0 ? actions[0].recommendedAction : null,
-    overallConfidence: gateConfidence(schedSource, costSource),
+    overallConfidence: overallGate,
     scheduleSource: schedSource,
     costSource,
+    recommendationStrength: summaryStrength,
     overallNotes: [
       `schedule source (F5 forecast finish): ${schedSource}`,
       `cost source (F6 forecast): ${costSource}`,
-      `overall capped at the weaker source: ${gateConfidence(schedSource, costSource)}`,
+      `overall capped at the weaker source: ${overallGate}`,
+      summaryStrength === 'directive'
+        ? 'recommendation strength: directive (evidence supports execution decisions)'
+        : summaryStrength === 'advisory'
+          ? `recommendation strength: advisory — the overall gate is ${overallGate}, so actions are guidance to consider, not execution directives`
+          : `recommendation strength: investigate only — at least one action rests on Low-confidence evidence, so it authorises diagnosis and evidence collection only`,
     ],
   };
 

@@ -5,6 +5,7 @@ import type {
   Project,
   Activity,
   ActivityLink,
+  BaselineActivity,
   BoqItem,
   BudgetLine,
   CostTransaction,
@@ -20,9 +21,13 @@ import {
   simulateComplexProjectScenario,
   runPrecisionWatchdogAudit,
   calculateScenarioSensitivityTornado,
+  // P2A1-B01: the ONE canonical producer of the measured baseline this view simulates against.
+  buildScenarioEvmBaseline,
   type ScenarioEvmBaseline,
 } from '@/lib/complexScenarioSimulator';
-import { calculateProjectEvmAtDataDate } from '@/lib/planningEngine';
+import { resolveDataDate } from '@/lib/chronologyGuard';
+// P2A1-B01: the canonical provenance marker, so the view can state the basis it simulates against.
+import { CANONICAL_EVM_SOURCE } from '@/lib/canonicalEvm';
 import {
   Sparkles,
   Sliders,
@@ -65,6 +70,11 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
   const [budgetLines, setBudgetLines] = useState<BudgetLine[]>([]);
   // Canonical EVM sources (GAP-040): the simulator no longer invents EV/AC, so this view loads the
   // records the canonical engine needs and hands it the measured baseline.
+  // P2A1-B01: `baselineActivities` is the governed ACTIVE APPROVED baseline — the same rows
+  // Dashboard / BudgetView / ProgressView feed F6, fetched through the same `project_baselines`
+  // scope. Without it F6 would fall back to budget-line totals and this simulator would seed every
+  // scenario with a different BAC, EV, CPI and EAC than the screens it is meant to reconcile with.
+  const [baselineActivities, setBaselineActivities] = useState<BaselineActivity[]>([]);
   const [boqItems, setBoqItems] = useState<BoqItem[]>([]);
   const [costTransactions, setCostTransactions] = useState<CostTransaction[]>([]);
   const [progressUpdates, setProgressUpdates] = useState<ProgressUpdate[]>([]);
@@ -114,18 +124,33 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
   }
 
   async function loadProjectDetails(projId: string) {
-    const [{ data: actData }, { data: lnkData }, { data: bgtData }, { data: boqData }, { data: txData }, { data: progressData }, { data: riskData }] = await Promise.all([
+    const [{ data: actData }, { data: lnkData }, { data: bgtData }, { data: baseData }, { data: boqData }, { data: txData }, { data: progressData }, { data: riskData }] = await Promise.all([
       supabase.from('activities').select('*').eq('project_id', projId).order('sort_order'),
       supabase.from('activity_links').select('*').eq('project_id', projId),
       supabase.from('budget_lines').select('*').eq('project_id', projId),
+      // P2A1-B01: the identical governed baseline query every canonical-F6 screen uses — scope
+      // through `project_baselines` (the parent carrying `project_id`) to the revision that is both
+      // ACTIVE and APPROVED, so a historical revision can never inflate F6's BAC here.
+      supabase.from('baseline_activities')
+        .select('*, project_baselines!inner(project_id, is_active, status)')
+        .eq('project_baselines.project_id', projId)
+        .eq('project_baselines.is_active', true)
+        .eq('project_baselines.status', 'approved'),
       supabase.from('boq_items').select('*').eq('project_id', projId),
       supabase.from('cost_transactions').select('*').eq('project_id', projId),
       supabase.from('progress_updates').select('*').eq('project_id', projId),
       supabase.from('risks').select('*').eq('project_id', projId).order('severity', { ascending: false }),
     ]);
-    setActivities(actData || []);
+    const actList = (actData || []) as Activity[];
+    setActivities(actList);
     setLinks(lnkData || []);
     setBudgetLines(bgtData || []);
+    // Defence in depth, as on the other screens: the query above is the authoritative governance
+    // filter; this pass additionally drops any row whose activity is not one of this project's.
+    const projectActivityIds = new Set(actList.map((a) => a.id));
+    setBaselineActivities(
+      ((baseData || []) as BaselineActivity[]).filter((b) => projectActivityIds.has(b.activity_id)),
+    );
     setBoqItems((boqData || []) as BoqItem[]);
     setCostTransactions((txData || []) as CostTransaction[]);
     setProgressUpdates((progressData || []) as ProgressUpdate[]);
@@ -139,28 +164,42 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
 
   const isRtl = lang === 'ar';
 
-  // Canonical EVM baseline (SSOT) supplied to every scenario run, so simulated deltas are applied
-  // to measured facts instead of to a fabricated "35% spent" position.
+  // P2A1-B01: the scenario baseline is a VERBATIM QUOTE of canonical F6 at the governed Data Date.
+  //
+  // This view used to build it with `planningEngine.calculateProjectEvmAtDataDate` — the second EVM
+  // derivation that weights each activity by the FIRST budget line matching its WBS node (that one
+  // line's cost handed in full to every activity in the node) and time-prorates the recorded
+  // percent. On the shipped pilot project, at the same governed Data Date, that seeded every
+  // scenario with EV 275,358 / CPI 0.400 / EAC 5,862,875 / VAC -3,517,725 while F6 (and therefore
+  // Dashboard, BudgetView, ProgressView and the Executive Report) measured EV 752,900 / CPI 1.091 /
+  // EAC 2,149,541.7 / VAC +195,608.3. The simulator was modelling a different project from the one
+  // every other screen reported — and it did so under the label "canonical".
+  //
+  // `buildScenarioEvmBaseline` runs `analyzeCostControl` + `selectCanonicalEvm` (no arithmetic of
+  // its own), fed with the same governed rows and the same resolved Data Date the other screens
+  // use, so the baseline cannot drift from them. Contract value is deliberately NOT opted in: F6's
+  // labelled last resort would otherwise replace an absent authorized budget here while every other
+  // screen reported N/A.
+  const governedDataDate = useMemo(() => resolveDataDate(activeProject), [activeProject]);
   const canonicalEvm: ScenarioEvmBaseline | null = useMemo(() => {
     if (!activeProject) return null;
-    const evm = calculateProjectEvmAtDataDate(
-      activeProject,
+    return buildScenarioEvmBaseline({
+      project: activeProject,
       activities,
+      baselines: baselineActivities,
       budgetLines,
-      boqItems,
       costTransactions,
       progressUpdates,
-    );
-    return {
-      bac: evm.bac,
-      ev: evm.ev,
-      ac: evm.ac,
-      cpi: evm.cpi,
-      spi: evm.spi,
-      tcpi: evm.tcpi,
-      tcpiStatus: evm.tcpiStatus,
-    };
-  }, [activeProject, activities, budgetLines, boqItems, costTransactions, progressUpdates]);
+      // `wbsNodes` / `allocations` are not loaded by this screen and are passed empty, exactly as
+      // ProgressView and ExecutiveReportView do: they drive F6's WBS roll-up and BOQ trace, not the
+      // project-level EVM facts this baseline quotes.
+      wbsNodes: [],
+      boqItems,
+      allocations: [],
+      dataDate: governedDataDate,
+      calendarType: activeProject.calendar_type,
+    });
+  }, [activeProject, activities, baselineActivities, budgetLines, costTransactions, progressUpdates, boqItems, governedDataDate]);
 
   /** A model whose denominator is not measurable is rendered as N/A, never as its placeholder. */
   const renderEac = (value: number | null, status: ForecastModelStatus) =>
@@ -174,6 +213,13 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
   /** A scenario figure that is null because the schedule basis was unavailable renders as N/A. */
   const num = (v: number | null, suffix = '') => (v === null ? NA : `${v.toLocaleString()}${suffix}`);
   const idx = (v: number | null) => (v === null ? NA : v.toFixed(2));
+  /**
+   * P2A1-B01: the measured canonical SPI/CPI pair is nullable — F6 reports N/A where an index is
+   * not measurable, and quoting that as `0.00 / 0.00` would publish a measurement that was never
+   * taken. The scenario's own indices are a separate, simulated pair and keep their own rendering.
+   */
+  const baselinePair = (spi: number | null, cpi: number | null): string =>
+    spi === null || cpi === null ? NA : `${spi.toFixed(2)} / ${cpi.toFixed(2)}`;
   const dateOr = (v: string | null) => v ?? NA;
   /** Honest signed formatting for measured deltas — '+' only when the value really is positive. */
   const fmtSigned = (v: number) => `${v > 0 ? '+' : ''}${v.toLocaleString()}`;
@@ -390,6 +436,49 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
         </div>
       </div>
 
+      {/* P2A1-B01: the measured baseline every scenario below is simulated against, quoted from
+          canonical F6 at the governed Data Date. It is rendered as a quote (never recomputed) so the
+          figures a scenario starts from can be read against the same numbers Dashboard, BudgetView
+          and the Executive Report publish for this project at this Data Date. */}
+      {canonicalEvm && (
+        <div className="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-4">
+          <div className="flex items-center justify-between flex-wrap gap-2 mb-3">
+            <span className="text-xs font-bold text-slate-500 uppercase tracking-wider">
+              {isRtl ? 'أساس القياس المعتمد للمحاكاة (F6 القانوني)' : 'Measured Simulation Baseline (Canonical F6)'}
+            </span>
+            <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-bold bg-indigo-50 text-indigo-700 border border-indigo-200">
+              {canonicalEvm.source === CANONICAL_EVM_SOURCE
+                ? (isRtl ? `مقتبس من F6 · تاريخ البيانات ${canonicalEvm.dataDate}` : `quoted from F6 · Data Date ${canonicalEvm.dataDate}`)
+                : canonicalEvm.source}
+            </span>
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-7 gap-2 text-center">
+            {([
+              ['BAC', canonicalEvm.bac],
+              ['PV', canonicalEvm.pv],
+              ['EV', canonicalEvm.ev],
+              ['AC', canonicalEvm.ac],
+              ['SPI', canonicalEvm.spi],
+              ['CPI', canonicalEvm.cpi],
+              ['EAC', canonicalEvm.eac],
+              ['VAC', canonicalEvm.vac],
+            ] as Array<[string, number | null]>).map(([label, value]) => (
+              <div key={label} className="p-2 bg-slate-50 rounded-xl border border-slate-200">
+                <span className="text-[10px] text-slate-500 font-bold block">{label}</span>
+                <span className="text-sm font-black font-mono text-slate-900">
+                  {value === null ? NA : (label === 'SPI' || label === 'CPI' ? value.toFixed(3) : value.toLocaleString())}
+                </span>
+              </div>
+            ))}
+          </div>
+          <p className="text-[10px] text-slate-500 mt-2">
+            {isRtl
+              ? 'كل سيناريو أدناه يطبق فروقه على هذه القيم المقاسة فقط؛ لا يُعاد اشتقاق أي قيمة مالية في هذه الشاشة، وكل مقياس بلا بيانات كافية يظهر (N/A).'
+              : 'Every scenario below applies its deltas to these measured values only. No financial figure is re-derived on this screen, and any metric without sufficient data is shown as N/A.'}
+          </p>
+        </div>
+      )}
+
       {/* Navigation Tabs */}
       <div className="bg-white p-2 rounded-2xl border border-slate-200/80 shadow-xs flex flex-wrap gap-2">
         <button
@@ -575,8 +664,8 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
                           {/* Scenario-adjusted indices: the measured canonical pair with the simulated delta applied. */}
                           <span className="text-[9px] block text-slate-400 font-sans">
                             {isRtl
-                              ? `القانوني: ${s.baselineSpi.toFixed(2)} / ${s.baselineCpi.toFixed(2)}`
-                              : `canonical: ${s.baselineSpi.toFixed(2)} / ${s.baselineCpi.toFixed(2)}`}
+                              ? `القانوني: ${baselinePair(s.baselineSpi, s.baselineCpi)}`
+                              : `canonical: ${baselinePair(s.baselineSpi, s.baselineCpi)}`}
                           </span>
                         </td>
 
@@ -672,8 +761,8 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
                   </div>
                   <p className="text-[9px] text-slate-500 font-sans pt-1 border-t border-slate-700">
                     {isRtl
-                      ? `EV/AC مقاسان حتى تاريخ البيانات: ${selectedScenarioDetail.canonicalEvSar.toLocaleString()} / ${selectedScenarioDetail.canonicalAcSar.toLocaleString()} ر.س · التكلفة المحاكاة: ${selectedScenarioDetail.simulatedCostOutcomeSar === null ? NA : selectedScenarioDetail.simulatedCostOutcomeSar.toLocaleString()} ر.س`
-                      : `Measured EV/AC at the Data Date: ${selectedScenarioDetail.canonicalEvSar.toLocaleString()} / ${selectedScenarioDetail.canonicalAcSar.toLocaleString()} SAR · simulated cost outcome: ${selectedScenarioDetail.simulatedCostOutcomeSar === null ? NA : selectedScenarioDetail.simulatedCostOutcomeSar.toLocaleString()} SAR`}
+                      ? `EV/AC مقاسان حتى تاريخ البيانات: ${num(selectedScenarioDetail.canonicalEvSar)} / ${selectedScenarioDetail.canonicalAcSar.toLocaleString()} ر.س · التكلفة المحاكاة: ${selectedScenarioDetail.simulatedCostOutcomeSar === null ? NA : selectedScenarioDetail.simulatedCostOutcomeSar.toLocaleString()} ر.س`
+                      : `Measured EV/AC at the Data Date: ${num(selectedScenarioDetail.canonicalEvSar)} / ${selectedScenarioDetail.canonicalAcSar.toLocaleString()} SAR · simulated cost outcome: ${selectedScenarioDetail.simulatedCostOutcomeSar === null ? NA : selectedScenarioDetail.simulatedCostOutcomeSar.toLocaleString()} SAR`}
                   </p>
                 </div>
 
@@ -957,8 +1046,8 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
                     </span>
                     <span className="text-[9px] block text-slate-500 font-sans">
                       {isRtl
-                        ? `القانوني المقاس: ${customScenarioResult.baselineSpi.toFixed(2)} / ${customScenarioResult.baselineCpi.toFixed(2)}`
-                        : `measured canonical: ${customScenarioResult.baselineSpi.toFixed(2)} / ${customScenarioResult.baselineCpi.toFixed(2)}`}
+                        ? `القانوني المقاس: ${baselinePair(customScenarioResult.baselineSpi, customScenarioResult.baselineCpi)}`
+                        : `measured canonical: ${baselinePair(customScenarioResult.baselineSpi, customScenarioResult.baselineCpi)}`}
                     </span>
                   </div>
 

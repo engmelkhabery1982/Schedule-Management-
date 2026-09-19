@@ -963,13 +963,27 @@ export interface ComplexScenarioResult {
   baselineBacSar: number;
   /** Explicit scenario budget delta, so the simulated part is separable from the measured part. */
   variationOrderValueSar: number;
-  /** Measured EV at the Data Date. A fact, not a simulation input (GAP-040). */
-  canonicalEvSar: number;
+  /**
+   * Measured EV at the Data Date. A fact, not a simulation input (GAP-040).
+   * P2A1-B01: quoted from canonical F6, so it is null exactly where F6 reports EV as N/A — the
+   * absence of a measurement is never published as a measured zero.
+   */
+  canonicalEvSar: number | null;
   /** Measured AC at the Data Date. A fact, not a simulation input (GAP-040). */
   canonicalAcSar: number;
-  /** Measured canonical indices the scenario deltas are applied to. */
-  baselineCpi: number;
-  baselineSpi: number;
+  /**
+   * Measured canonical indices the scenario deltas are applied to. Quoted from F6, so null where
+   * F6 reports them as not measurable (P2A1-B01).
+   */
+  baselineCpi: number | null;
+  baselineSpi: number | null;
+  /**
+   * P2A1-B01: the rest of the canonical F6 block the scenario simulates against, quoted verbatim
+   * so this surface reconciles with Dashboard / BudgetView at the same governed Data Date.
+   */
+  baselinePvSar: number | null;
+  baselineEacSar: number | null;
+  baselineVacSar: number | null;
   /** The simulation's own cost outcome (formerly reported as `eacBottomUp`). Null when it would
    * have to be derived from an unavailable schedule basis (F9.1). */
   simulatedCostOutcomeSar: number | null;

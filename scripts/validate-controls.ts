@@ -60,7 +60,11 @@ import {
   // S20 (Batch A / H02): the one business key that both detects and excludes a duplicate.
   costTransactionBusinessKey, dedupeByBusinessKey,
 } from '@/lib/costControlEngine';
-import { analyzeIntegratedDecisions, gateConfidence } from '@/lib/integratedDecisionEngine';
+import {
+  analyzeIntegratedDecisions, gateConfidence,
+  // S21 (Batch B / H03): recommendation strength must respect source confidence.
+  ACTION_PLAYBOOK, DECISION_ADVISORY_PLAYBOOK, resolveRecommendationStrength,
+} from '@/lib/integratedDecisionEngine';
 import { analyzeForecastTrust } from '@/lib/forecastTrustEngine';
 import { selectCanonicalEvm, canonicalEvmToComprehensive, quoteCanonicalEvm, CANONICAL_EVM_SOURCE } from '@/lib/canonicalEvm';
 // S18 (F9.5 Pilot Closure): the governance EVM pillar is a PURE module precisely so this harness can
@@ -90,11 +94,19 @@ import {
 import {
   applyGovernedProgress, resolveGovernedProgress, indexProgressHistory, latestApprovedUpdateOnOrBefore,
 } from '@/lib/governedProgress';
-import { reconcileFinishForecasts, calculateCpmDeterministicEarlyFinish } from '@/lib/forecastReconciliation';
+import {
+  reconcileFinishForecasts, calculateCpmDeterministicEarlyFinish,
+  // S21 (Batch B / NG03): the statused F5 CPM is the authoritative deterministic finish.
+  resolveDeterministicForecastFinish,
+} from '@/lib/forecastReconciliation';
+// S21 (Batch B / NG04): Earned Schedule must consume canonical F6, never the legacy planning EVM.
+import { calculateEarnedSchedule } from '@/lib/earnedScheduleEngine';
 import { calculateControlHealth } from '@/lib/controlHealthEngine';
 import {
   simulateComplexProjectScenario, resolveScenarioScheduleBasis, runPrecisionWatchdogAudit,
   calculateScenarioSensitivityTornado, STANDARD_COMPLEX_SCENARIOS,
+  // S21 (Batch B / B01): the one canonical producer of the scenario's measured EVM baseline.
+  buildScenarioEvmBaseline,
 } from '@/lib/complexScenarioSimulator';
 import type {
   Activity, ActivityBoqAllocation, ActivityLink, ActivityResource, BaselineActivity, BoqItem, BudgetLine,
@@ -3497,6 +3509,424 @@ console.log('--- S18 Pilot Closure (F9.5)');
       /analyzeForecast\([\s\S]{0,900}\{\s*cpi:\s*evm\.cpiStatus,\s*spi:\s*evm\.spiStatus\s*\}/.test(dashSrcB));
     ok('S20-H04 the dashboard still treats a null realistic finish as N/A, not as a date',
       /if\s*\(!forecastFinish\)\s*return\s*null;/.test(dashSrcB));
+  }
+}
+
+// ===========================================================================
+// S21 — Batch B (P2A1): cross-engine reconciliation closures.
+//
+//   B01  Multi-Scenario uses the wrong EVM      The simulator's measured baseline was a SECOND EVM
+//                                               derivation; it must quote canonical F6.
+//   NG04 Earned Schedule legacy fallback        `calculateEarnedSchedule` fell back to the legacy
+//                                               planning EVM; it must fall back to canonical F6.
+//   NG03 Reconciliation uses stored early_finish The deterministic finish was a frozen activity
+//                                               column; it must be the statused F5 CPM forecast.
+//   H03  F7 ignores low confidence              F7 issued directive actions on Low-confidence
+//                                               evidence; strength must respect source confidence.
+//
+// The fixture is the SHIPPED pilot seed (no synthetic data, no seed edits), at the project's own
+// governed Data Date — the exact input on which the divergence was reported. Each subsection first
+// proves the divergent path really did disagree with canonical F6 (a regression test that cannot
+// fail on the pre-fix code is not a regression test), then asserts the reconciled behaviour.
+// ---------------------------------------------------------------------------
+{
+  console.log('--- S21 Batch B (P2A1) cross-engine reconciliation closures');
+
+  // Source-reading root: the screens pull in `@/lib/supabase` and cannot be bundled for node ESM,
+  // so their shipped sources are read as text (the same approach S17-E / S20 use).
+  const s21Root = (() => {
+    const cwd = process.cwd();
+    if (existsSync(resolvePath(cwd, 'package.json'))) return cwd;
+    let dir = dirname(fileURLToPath(import.meta.url));
+    for (let i = 0; i < 8; i += 1) {
+      if (existsSync(resolvePath(dir, 'package.json'))) return dir;
+      dir = dirname(dir);
+    }
+    return cwd;
+  })();
+  const s21Src = (rel: string): string => readFileSync(resolvePath(s21Root, rel), 'utf8');
+
+  // ---------------------------------------------------------------------
+  // Shared fixture: project `proj-seed-001` at its governed Data Date.
+  // ---------------------------------------------------------------------
+  const s21Seed = getInitialSeedData() as Record<string, unknown[]>;
+  const s21Projects = (s21Seed['projects'] || []) as unknown as Project[];
+  const s21P1 = s21Projects.find((p) => p.id === 'proj-seed-001') as Project;
+  const s21P2 = s21Projects.find((p) => p.id === 'proj-seed-002') as Project;
+  const s21Acts = ((s21Seed['activities'] || []) as unknown as Activity[]).filter((a) => a.project_id === s21P1.id);
+  const s21Links = ((s21Seed['activity_links'] || []) as unknown as ActivityLink[]).filter((l) => l.project_id === s21P1.id);
+  const s21Bgts = ((s21Seed['budget_lines'] || []) as unknown as BudgetLine[]).filter((b) => b.project_id === s21P1.id);
+  const s21Txns = ((s21Seed['cost_transactions'] || []) as unknown as CostTransaction[]).filter((t) => t.project_id === s21P1.id);
+  const s21Prgs = ((s21Seed['progress_updates'] || []) as unknown as ProgressUpdate[]).filter((u) => u.project_id === s21P1.id);
+  const s21Boqs = ((s21Seed['boq_items'] || []) as unknown as BoqItem[]).filter((b) => b.project_id === s21P1.id);
+  const s21ActIds = new Set(s21Acts.map((a) => a.id));
+  const s21Bsls = ((s21Seed['baseline_activities'] || []) as unknown as BaselineActivity[]).filter((b) => s21ActIds.has(b.activity_id));
+  const s21Dd = s21P1.data_date || DD;
+
+  /** Canonical F6 for a project/Data Date — the single source of truth under test. */
+  const s21F6 = (
+    project: Project, acts: Activity[], bsls: BaselineActivity[], bgts: BudgetLine[],
+    txns: CostTransaction[], prgs: ProgressUpdate[], boqs: BoqItem[], dataDate: string,
+  ) => analyzeCostControl({
+    project, activities: acts, baselines: bsls, budgetLines: bgts, costTransactions: txns,
+    progressUpdates: prgs, wbsNodes: [], boqItems: boqs, allocations: [], dataDate,
+    calendarType: project.calendar_type || '6_days',
+  });
+  const s21Canon = selectCanonicalEvm(s21F6(s21P1, s21Acts, s21Bsls, s21Bgts, s21Txns, s21Prgs, s21Boqs, s21Dd));
+  /** The superseded derivation Batch B removes from every simulation/ES fallback path. */
+  const s21Legacy = calculateProjectEvmAtDataDate(s21P1, s21Acts, s21Bgts, s21Boqs, s21Txns, s21Prgs);
+  const s21Base = buildScenarioEvmBaseline({
+    project: s21P1, activities: s21Acts, baselines: s21Bsls, budgetLines: s21Bgts,
+    costTransactions: s21Txns, progressUpdates: s21Prgs, wbsNodes: [], boqItems: s21Boqs,
+    allocations: [], dataDate: s21Dd, calendarType: s21P1.calendar_type as '6_days',
+  });
+  const s21RunOpts = { seed: 7, iterations: 20, risks: [] };
+  const s21Sim = simulateComplexProjectScenario(
+    s21P1, s21Acts, s21Links, s21Bgts, STANDARD_COMPLEX_SCENARIOS[0], s21Base, s21RunOpts,
+  );
+
+  const s21F5 = analyzeScheduleControl({
+    activities: s21Acts, links: s21Links, baselines: s21Bsls, progressUpdates: s21Prgs,
+    previousSnapshot: null, dataDate: s21Dd, calendarType: s21P1.calendar_type || '6_days',
+    statusLogic: s21P1.status_logic || 'retained_logic',
+  });
+
+  ok('S21 the fixture is the shipped pilot project', s21P1 !== undefined && s21Acts.length > 0);
+  ok('S21 the fixture really is divergent: the legacy derivation disagrees with canonical F6',
+    s21Legacy.ev !== s21Canon.ev && s21Legacy.cpi !== s21Canon.cpi && s21Legacy.eac !== s21Canon.eac);
+
+  // =====================================================================
+  // B01 — Multi-Scenario Simulation must use the canonical F6 EVM basis.
+  // =====================================================================
+  {
+    // A / B / C / D: the four figures named in the gap, quoted from F6 by the simulation baseline.
+    eq('S21-B01-A simulation baseline EV === canonical F6 EV', s21Base.ev, s21Canon.ev);
+    eq('S21-B01-A simulation EV is not the legacy derivation', s21Base.ev, s21Canon.ev);
+    ok('S21-B01-A the legacy derivation is materially different (the defect being closed)',
+      s21Legacy.ev !== s21Canon.ev);
+    eq('S21-B01-B simulation baseline CPI === canonical F6 CPI', s21Base.cpi, s21Canon.cpi);
+    ok('S21-B01-B the legacy CPI is materially different', s21Legacy.cpi !== s21Canon.cpi);
+    eq('S21-B01-C simulation baseline EAC === canonical F6 EAC', s21Base.eac, s21Canon.eac);
+    ok('S21-B01-C the legacy EAC is materially different', s21Legacy.eac !== s21Canon.eac);
+    eq('S21-B01-D simulation baseline VAC === canonical F6 VAC', s21Base.vac, s21Canon.vac);
+    ok('S21-B01-D the legacy VAC is materially different', s21Legacy.vac !== s21Canon.vac);
+    // The rest of the reconciled block (the gap names PV and AC too).
+    eq('S21-B01 simulation baseline PV === canonical F6 PV', s21Base.pv, s21Canon.pv);
+    eq('S21-B01 simulation baseline AC === canonical F6 AC', s21Base.ac, s21Canon.ac);
+    eq('S21-B01 simulation baseline BAC === canonical F6 BAC', s21Base.bac, s21Canon.bac);
+    eq('S21-B01 simulation baseline SPI === canonical F6 SPI', s21Base.spi, s21Canon.spi);
+    eq('S21-B01 the baseline states its canonical provenance', s21Base.source, CANONICAL_EVM_SOURCE);
+    eq('S21-B01 the baseline is anchored at the governed Data Date', s21Base.dataDate, s21Dd);
+
+    // The published scenario result quotes the same measured facts, so the screen reconciles.
+    eq('S21-B01-A the published scenario EV === canonical F6 EV', s21Sim.canonicalEvSar, Math.round(s21Canon.ev as number));
+    eq('S21-B01-B the published scenario baseline CPI === canonical F6 CPI', s21Sim.baselineCpi, s21Canon.cpi);
+    eq('S21-B01-C the published scenario baseline EAC === canonical F6 EAC', s21Sim.baselineEacSar, Math.round(s21Canon.eac as number));
+    eq('S21-B01-D the published scenario baseline VAC === canonical F6 VAC', s21Sim.baselineVacSar, Math.round(s21Canon.vac as number));
+    eq('S21-B01 the published scenario baseline PV === canonical F6 PV', s21Sim.baselinePvSar, Math.round(s21Canon.pv as number));
+    eq('S21-B01 the published scenario baseline AC === canonical F6 AC', s21Sim.canonicalAcSar, Math.round(s21Canon.ac));
+
+    // E: changing the Data Date, or the project, must not reintroduce a divergent basis.
+    const s21Dd2 = '2026-09-01';
+    const s21Canon2 = selectCanonicalEvm(s21F6(s21P1, s21Acts, s21Bsls, s21Bgts, s21Txns, s21Prgs, s21Boqs, s21Dd2));
+    const s21Legacy2 = calculateProjectEvmAtDataDate(s21P1, s21Acts, s21Bgts, s21Boqs, s21Txns, s21Prgs, s21Dd2);
+    const s21Base2 = buildScenarioEvmBaseline({
+      project: s21P1, activities: s21Acts, baselines: s21Bsls, budgetLines: s21Bgts,
+      costTransactions: s21Txns, progressUpdates: s21Prgs, wbsNodes: [], boqItems: s21Boqs,
+      allocations: [], dataDate: s21Dd2, calendarType: s21P1.calendar_type as '6_days',
+    });
+    ok('S21-B01-E the two Data Dates really do measure different positions', s21Canon2.ev !== s21Canon.ev);
+    eq('S21-B01-E a different Data Date still quotes canonical F6 EV', s21Base2.ev, s21Canon2.ev);
+    eq('S21-B01-E a different Data Date still quotes canonical F6 CPI', s21Base2.cpi, s21Canon2.cpi);
+    eq('S21-B01-E a different Data Date still quotes canonical F6 EAC', s21Base2.eac, s21Canon2.eac);
+    ok('S21-B01-E the legacy derivation diverges at the second Data Date too', s21Legacy2.ev !== s21Canon2.ev);
+    eq('S21-B01-E the baseline follows the governed Data Date', s21Base2.dataDate, s21Dd2);
+
+    const s21Acts2 = ((s21Seed['activities'] || []) as unknown as Activity[]).filter((a) => a.project_id === s21P2.id);
+    const s21Ids2 = new Set(s21Acts2.map((a) => a.id));
+    const s21Bsls2 = ((s21Seed['baseline_activities'] || []) as unknown as BaselineActivity[]).filter((b) => s21Ids2.has(b.activity_id));
+    const s21DdP2 = s21P2.data_date || DD;
+    const s21Canon3 = selectCanonicalEvm(s21F6(s21P2, s21Acts2, s21Bsls2, [], [], [], [], s21DdP2));
+    const s21Legacy3 = calculateProjectEvmAtDataDate(s21P2, s21Acts2, [], [], [], []);
+    const s21Base3 = buildScenarioEvmBaseline({
+      project: s21P2, activities: s21Acts2, baselines: s21Bsls2, budgetLines: [],
+      costTransactions: [], progressUpdates: [], wbsNodes: [], boqItems: [], allocations: [],
+      dataDate: s21DdP2, calendarType: s21P2.calendar_type as '6_days',
+    });
+    eq('S21-B01-E a different project still quotes canonical F6 EV', s21Base3.ev, s21Canon3.ev);
+    eq('S21-B01-E a different project still quotes canonical F6 CPI', s21Base3.cpi, s21Canon3.cpi);
+    ok('S21-B01-E the legacy derivation diverges on the second project too', s21Legacy3.ev !== s21Canon3.ev);
+
+    // No second source of truth: the legacy derivation is gone from the simulation path.
+    const simSrc = s21Src('src/lib/complexScenarioSimulator.ts');
+    ok('S21-B01 the scenario engine no longer imports the legacy EVM derivation',
+      !/import\s*{[^}]*\bcalculateProjectEvmAtDataDate\b/.test(simSrc.replace(/\n/g, ' ')));
+    ok('S21-B01 the scenario engine no longer calls the legacy EVM derivation',
+      !/calculateProjectEvmAtDataDate\s*\(/.test(simSrc));
+    ok('S21-B01 the scenario engine builds its baseline from canonical F6',
+      /buildScenarioEvmBaseline\([\s\S]{0,400}analyzeCostControl\(/.test(simSrc)
+      && /selectCanonicalEvm\(report\)/.test(simSrc));
+    const simViewSrc = s21Src('src/components/views/MultiScenarioSimulationView.tsx');
+    ok('S21-B01 the simulation screen no longer imports the legacy EVM derivation',
+      !/import\s*{[^}]*\bcalculateProjectEvmAtDataDate\b/.test(simViewSrc.replace(/\n/g, ' ')));
+    ok('S21-B01 the simulation screen builds its baseline through the canonical helper',
+      /buildScenarioEvmBaseline\(\{/.test(simViewSrc));
+    ok('S21-B01 the simulation screen loads the governed active approved baseline',
+      /project_baselines!inner\(project_id, is_active, status\)/.test(simViewSrc));
+    // The degraded "no cost evidence supplied" branch must still land on F6, not on a third path.
+    const s21Fallback = simulateComplexProjectScenario(s21P1, s21Acts, s21Links, s21Bgts, STANDARD_COMPLEX_SCENARIOS[0], null, s21RunOpts);
+    ok('S21-B01 the internal fallback stays on canonical F6 (BAC from the governed baseline)',
+      s21Fallback.baselineBacSar === Math.round(s21Canon.bac as number));
+    noNonFinite('S21-B01 simulation result scan', s21Sim);
+    noNonFinite('S21-B01 baseline scan', s21Base);
+  }
+
+  // =====================================================================
+  // NG04 — Earned Schedule must consume canonical F6, never the legacy EVM.
+  // =====================================================================
+  {
+    const s21EsSources = {
+      project: s21P1, activities: s21Acts, baselines: s21Bsls,
+      calendarType: s21P1.calendar_type as '6_days', costTransactions: s21Txns,
+      progressUpdates: s21Prgs, budgetLines: s21Bgts, boqItems: s21Boqs,
+    };
+    // B: no `evm` supplied => the engine must derive canonical F6, not the legacy planning EVM.
+    const esFallback = calculateEarnedSchedule(s21EsSources);
+    eq('S21-NG04-B the fallback EVM CPI === canonical F6 CPI', esFallback.costPerformanceIndex, s21Canon.cpi);
+    ok('S21-NG04-B the legacy planning EVM is NOT used (its CPI differs materially)',
+      Math.abs(esFallback.costPerformanceIndex - s21Legacy.cpi) > 0.5);
+    ok('S21-NG04-B the legacy planning EVM would have produced a different forecast',
+      Math.abs(esFallback.costPerformanceIndex - s21Legacy.cpi) > 0.001);
+
+    // A: an explicitly supplied canonical EVM is used verbatim and is never replaced.
+    const s21EsBasis = canonicalEvmToComprehensive(s21Canon);
+    const esExplicit = calculateEarnedSchedule({ ...s21EsSources, evm: s21EsBasis });
+    eq('S21-NG04-A an explicitly supplied canonical EVM is consumed unchanged',
+      esExplicit.costPerformanceIndex, s21EsBasis.cpi);
+    eq('S21-NG04-A an explicitly supplied EVM reproduces the same earned schedule',
+      JSON.stringify(esExplicit), JSON.stringify(esFallback));
+    // A distinctive supplied EVM must win over the fallback (proves the supplied path is live).
+    const s21Distinct = { ...s21EsBasis, cpi: 2.5, ev: 1234, pv: 617, ac: 617 };
+    const esDistinct = calculateEarnedSchedule({ ...s21EsSources, evm: s21Distinct });
+    eq('S21-NG04-A a supplied EVM is never overwritten by the F6 fallback',
+      esDistinct.costPerformanceIndex, 2.5);
+
+    // C: the legacy planning EVM is gone from the Earned Schedule engine entirely.
+    const esSrc = s21Src('src/lib/earnedScheduleEngine.ts');
+    ok('S21-NG04-C the Earned Schedule engine no longer imports the legacy EVM derivation',
+      !/import\s*{[^}]*\bcalculateProjectEvmAtDataDate\b/.test(esSrc.replace(/\n/g, ' ')));
+    ok('S21-NG04-C the Earned Schedule engine no longer calls the legacy EVM derivation',
+      !/calculateProjectEvmAtDataDate\s*\(/.test(esSrc));
+    ok('S21-NG04-C the Earned Schedule fallback runs canonical F6',
+      /analyzeCostControl\(\{/.test(esSrc) && /quoteCanonicalEvm\(/.test(esSrc));
+
+    // D: the published output is internally consistent with the canonical PV/EV basis.
+    eq('S21-NG04-D the published SV is the canonical EV - PV',
+      esFallback.comparisonWithTraditionalEvm.evmSvAmount, Math.round((s21Canon.ev as number) - (s21Canon.pv as number)));
+    eq('S21-NG04-D the published SPI is the canonical SPI', esFallback.comparisonWithTraditionalEvm.evmSpi, s21Canon.spi);
+    eq('S21-NG04-D the published CPI is the canonical CPI', esFallback.costPerformanceIndex, s21Canon.cpi);
+    ok('S21-NG04-D the earned schedule stays inside the planned span',
+      esFallback.earnedScheduleDays >= 0 && esFallback.earnedScheduleDays <= esFallback.plannedDurationDays);
+    noNonFinite('S21-NG04 earned schedule scan', esFallback);
+  }
+
+  // =====================================================================
+  // NG03 — the deterministic finish must be the statused F5 CPM forecast.
+  // =====================================================================
+  {
+    const storedFinish = calculateCpmDeterministicEarlyFinish(s21Acts);
+    ok('S21-NG03 the fixture reproduces the defect: the stored column disagrees with F5',
+      storedFinish !== null && s21F5.project.forecastFinish !== null && storedFinish !== s21F5.project.forecastFinish);
+
+    // A: the helper derives the governed statused CPM finish, and reconciliation quotes it.
+    const derived = resolveDeterministicForecastFinish({
+      activities: s21Acts, links: s21Links, baselines: s21Bsls, progressUpdates: s21Prgs,
+      dataDate: s21Dd, calendarType: s21P1.calendar_type as '6_days',
+      statusLogic: s21P1.status_logic || 'retained_logic',
+    });
+    eq('S21-NG03-A the derived deterministic finish === F5 forecast finish', derived, s21F5.project.forecastFinish);
+    const recon = reconcileFinishForecasts(s21Acts, null, s21F5.project.forecastFinish);
+    eq('S21-NG03-A reconciliation deterministic finish === F5 forecast finish', recon.cpmEarlyFinish, s21F5.project.forecastFinish);
+    eq('S21-NG03-A reconciliation states the F5 basis', recon.deterministicFinishSource, 'f5_statused_cpm');
+    ok('S21-NG03-A reconciliation is not quoting the stored early_finish column', recon.cpmEarlyFinish !== storedFinish);
+
+    // D: a delayed statused schedule must not fall back to the original stored early_finish.
+    eq('S21-NG03-D the statused schedule really is delayed against the stored plan', recon.cpmEarlyFinish !== storedFinish, true);
+    ok('S21-NG03-D the stored date is never substituted for the statused forecast',
+      recon.cpmEarlyFinish === s21F5.project.forecastFinish && storedFinish !== s21F5.project.forecastFinish);
+    eq('S21-NG03-D without an F5 finish the stored date is still named as such',
+      reconcileFinishForecasts(s21Acts, null).deterministicFinishSource, 'stored_early_finish');
+
+    // B / C: the two screens that reported the stale finish now consume the statused CPM.
+    const progSrc = s21Src('src/components/views/ProgressView.tsx');
+    const execSrc = s21Src('src/components/views/ExecutiveReportView.tsx');
+    const statusedArg = /reconcileFinishForecasts\(\s*activities,\s*earnedScheduleData,\s*statusedForecastFinish\s*\)/;
+    ok('S21-NG03-B ProgressView derives the statused deterministic finish',
+      /resolveDeterministicForecastFinish\(\{/.test(progSrc));
+    ok('S21-NG03-B ProgressView reconciles against the statused finish',
+      statusedArg.test(progSrc));
+    ok('S21-NG03-C ExecutiveReportView derives the statused deterministic finish',
+      /resolveDeterministicForecastFinish\(\{/.test(execSrc));
+    ok('S21-NG03-C ExecutiveReportView reconciles against the statused finish',
+      statusedArg.test(execSrc));
+    // One authoritative producer: both screens call the same helper, neither recomputes it.
+    const recSrc = s21Src('src/lib/forecastReconciliation.ts');
+    ok('S21-NG03 the reconciliation helper derives the finish from the statused CPM engine',
+      /analyzeScheduleControl\(\{/.test(recSrc) && /report\.project\.forecastFinish/.test(recSrc));
+    ok('S21-NG03 the stored-column reader is documented as not the current forecast',
+      /NOT the current project forecast/.test(recSrc));
+  }
+
+  // =====================================================================
+  // H03 — F7 recommendation strength must respect source confidence.
+  // =====================================================================
+  {
+    // The strength rule itself (exported, so the rule is testable and never re-implemented).
+    eq('S21-H03 the rule: Low issue confidence is investigate-only', resolveRecommendationStrength('Low', 'Low'), 'investigate_only');
+    eq('S21-H03 the rule: Low issue confidence is investigate-only even under a High gate', resolveRecommendationStrength('Low', 'High'), 'investigate_only');
+    eq('S21-H03 the rule: a Low overall gate downgrades a well-evidenced issue to advisory', resolveRecommendationStrength('High', 'Low'), 'advisory');
+    eq('S21-H03 the rule: Medium/High leaves the directive intact', resolveRecommendationStrength('High', 'High'), 'directive');
+    eq('S21-H03 the rule: Medium issue + Medium gate stays a directive', resolveRecommendationStrength('Medium', 'Medium'), 'directive');
+
+    // --- Low schedule + Low cost confidence fixture ---------------------
+    // One baseline row across four activities: F5 baseline coverage 0.25 (< 0.8) puts the F5
+    // forecast-finish confidence at Low, and the same coverage puts F6's BAC basis (and therefore
+    // its forecast confidence) at Low. The one baselined activity carries a real delay and a real
+    // cost overrun, so F7 still has an issue to act on.
+    const h3Dd = '2026-09-01';
+    const h3Project = {
+      id: 'p1', contract_value: 1000000, data_date: h3Dd, calendar_type: '6_days',
+      start_date: '2026-08-01', end_date: '2026-09-30', duration_days: 45,
+    } as unknown as Project;
+    const h3Acts = [
+      act({ id: 'H1', code: 'H1', duration_days: 8, early_start: '2026-08-01', early_finish: '2026-08-10', actual_start: '2026-08-05', percent_complete: 30, planned_quantity: 100, actual_quantity: 30 }),
+      act({ id: 'H2', code: 'H2', duration_days: 5, early_start: '2026-08-11', early_finish: '2026-08-17' }),
+      act({ id: 'H3', code: 'H3', duration_days: 4, early_start: '2026-08-18', early_finish: '2026-08-23' }),
+      act({ id: 'H4', code: 'H4', duration_days: 3, early_start: '2026-08-24', early_finish: '2026-08-28' }),
+    ];
+    const h3Links = [link('HL1', 'H1', 'H2'), link('HL2', 'H2', 'H3'), link('HL3', 'H3', 'H4')];
+    const h3Bsls = [base('HB1', 'H1', '2026-08-01', '2026-08-10', 8, 100000)];
+    const h3Txns = [txn('HT1', 'H1', '2026-08-20', 60000, 'approved')];
+    const h3F5 = analyzeScheduleControl({
+      activities: h3Acts, links: h3Links, baselines: h3Bsls, progressUpdates: [],
+      previousSnapshot: null, dataDate: h3Dd, calendarType: '6_days', statusLogic: 'retained_logic',
+    });
+    const h3F6 = analyzeCostControl({
+      project: h3Project, activities: h3Acts, baselines: h3Bsls, budgetLines: [],
+      costTransactions: h3Txns, progressUpdates: [], wbsNodes: [], boqItems: [], allocations: [],
+      dataDate: h3Dd, calendarType: '6_days',
+    });
+    const h3F7 = analyzeIntegratedDecisions({
+      scheduleReport: h3F5, costReport: h3F6, activities: h3Acts, links: h3Links, baselines: h3Bsls,
+      progressUpdates: [], previousScheduleSnapshot: null, previousCostSnapshot: null,
+      dataDate: h3Dd, calendarType: '6_days',
+    });
+    eq('S21-H03-A the fixture really is Low schedule confidence', h3F5.confidence.forecastFinish.level, 'Low');
+    eq('S21-H03-A the fixture really is Low cost confidence', h3F6.confidence.forecast.level, 'Low');
+    eq('S21-H03-A the overall gate is Low', h3F7.summary.overallConfidence, 'Low');
+    ok('S21-H03-A the fixture does produce decisions to gate', h3F7.actions.length > 0);
+
+    // A: no High-confidence directive action.
+    ok('S21-H03-A no directive action is issued on Low confidence',
+      h3F7.actions.every((a) => a.recommendationStrength !== 'directive'));
+    eq('S21-H03-A the summary strength is not directive', h3F7.summary.recommendationStrength !== 'directive', true);
+
+    // B: the top decision is guidance, not an assertive management directive.
+    const h3DirectiveTexts = Object.values(ACTION_PLAYBOOK);
+    const h3AdvisoryTexts = Object.values(DECISION_ADVISORY_PLAYBOOK);
+    ok('S21-H03-B the top decision is not one of the directive playbook texts',
+      h3F7.summary.topDecision !== null && !h3DirectiveTexts.includes(h3F7.summary.topDecision as string));
+    ok('S21-H03-B the top decision is advisory / diagnostic guidance',
+      h3F7.summary.topDecision !== null && h3AdvisoryTexts.includes(h3F7.summary.topDecision as string));
+    ok('S21-H03-B no emitted action carries a directive text',
+      h3F7.actions.every((a) => !h3DirectiveTexts.includes(a.recommendedAction)));
+    ok('S21-H03-B every action says why it is not a directive',
+      h3F7.actions.every((a) => a.strengthNote.length > 0));
+
+    // C: guidance IS still generated — nothing is hidden.
+    ok('S21-H03-C diagnostic/advisory guidance is still generated', h3F7.actions.length > 0);
+    ok('S21-H03-C the guidance keeps its evidence', h3F7.actions.every((a) => a.evidence.length > 0));
+    ok('S21-H03-C the guidance keeps its issue identity', h3F7.actions.every((a) => a.issueId.length > 0 && a.title.length > 0));
+    ok('S21-H03-C the underlying issue is still reported', h3F7.issues.length > 0);
+    ok('S21-H03-C the measured scenario benefit is still published with the guidance',
+      h3F7.actions.every((a) => a.expectedBenefit === null || a.expectedBenefitNote.length > 0));
+    ok('S21-H03-C the downgrade is explained in the summary notes',
+      h3F7.summary.overallNotes.some((n) => n.includes('recommendation strength')));
+
+    // D: Medium/High confidence behaviour is unchanged — the pilot seed (F5 High, F6 Medium).
+    const s21F7 = analyzeIntegratedDecisions({
+      scheduleReport: s21F5, costReport: s21F6(s21P1, s21Acts, s21Bsls, s21Bgts, s21Txns, s21Prgs, s21Boqs, s21Dd),
+      activities: s21Acts, links: s21Links, baselines: s21Bsls, progressUpdates: s21Prgs,
+      previousScheduleSnapshot: null, previousCostSnapshot: null, dataDate: s21Dd, calendarType: '6_days',
+    });
+    ok('S21-H03-D the seed fixture is not Low confidence', s21F7.summary.overallConfidence !== 'Low');
+    ok('S21-H03-D the seed fixture does produce decisions', s21F7.actions.length > 0);
+    ok('S21-H03-D Medium/High confidence still yields directive actions',
+      s21F7.actions.every((a) => a.recommendationStrength === 'directive'));
+    ok('S21-H03-D directive actions keep the original playbook wording',
+      s21F7.actions.every((a) => h3DirectiveTexts.includes(a.recommendedAction)));
+    eq('S21-H03-D the summary strength stays directive', s21F7.summary.recommendationStrength, 'directive');
+    // And the gate is really the weakest of the two sources.
+    eq('S21-H03-D the overall gate is the weaker source', s21F7.summary.overallConfidence,
+      gateConfidence(s21F5.confidence.forecastFinish.level, s21F6(s21P1, s21Acts, s21Bsls, s21Bgts, s21Txns, s21Prgs, s21Boqs, s21Dd).confidence.forecast.level));
+
+    // One rule, one place: the engine exports it and the dashboard renders it.
+    const f7Src = s21Src('src/lib/integratedDecisionEngine.ts');
+    ok('S21-H03 the strength rule lives in F7 and is applied to every action',
+      /resolveRecommendationStrength\(it\.confidence\.overall, overallGate\)/.test(f7Src));
+    ok('S21-H03 the advisory playbook covers every directive playbook key',
+      Object.keys(ACTION_PLAYBOOK).every((k) => typeof DECISION_ADVISORY_PLAYBOOK[k] === 'string'));
+    const dashSrcC = s21Src('src/components/views/Dashboard.tsx');
+    ok('S21-H03 the dashboard labels a non-directive top decision',
+      /decisions\.summary\.recommendationStrength !== 'directive'/.test(dashSrcC));
+    noNonFinite('S21-H03 F7 report scan', s21F7);
+    noNonFinite('S21-H03 low-confidence F7 report scan', h3F7);
+  }
+
+  // =====================================================================
+  // Batch-wide reconciliation: one project, one governed Data Date, one answer.
+  // =====================================================================
+  {
+    const recF6 = s21F6(s21P1, s21Acts, s21Bsls, s21Bgts, s21Txns, s21Prgs, s21Boqs, s21Dd);
+    const recCanon = selectCanonicalEvm(recF6);
+    const recBase = buildScenarioEvmBaseline({
+      project: s21P1, activities: s21Acts, baselines: s21Bsls, budgetLines: s21Bgts,
+      costTransactions: s21Txns, progressUpdates: s21Prgs, wbsNodes: [], boqItems: s21Boqs,
+      allocations: [], dataDate: s21Dd, calendarType: s21P1.calendar_type as '6_days',
+    });
+    const recEs = calculateEarnedSchedule({
+      project: s21P1, activities: s21Acts, baselines: s21Bsls,
+      calendarType: s21P1.calendar_type as '6_days', costTransactions: s21Txns,
+      progressUpdates: s21Prgs, budgetLines: s21Bgts, boqItems: s21Boqs,
+    });
+    const recF7 = analyzeIntegratedDecisions({
+      scheduleReport: s21F5, costReport: recF6, activities: s21Acts, links: s21Links,
+      baselines: s21Bsls, progressUpdates: s21Prgs, previousScheduleSnapshot: null,
+      previousCostSnapshot: null, dataDate: s21Dd, calendarType: '6_days',
+    });
+    // F6 vs the Multi-Scenario baseline (PV/EV/AC/SPI/CPI/EAC/VAC).
+    eq('S21-reconcile F6 PV === simulation baseline PV', recCanon.pv, recBase.pv);
+    eq('S21-reconcile F6 EV === simulation baseline EV', recCanon.ev, recBase.ev);
+    eq('S21-reconcile F6 AC === simulation baseline AC', recCanon.ac, recBase.ac);
+    eq('S21-reconcile F6 SPI === simulation baseline SPI', recCanon.spi, recBase.spi);
+    eq('S21-reconcile F6 CPI === simulation baseline CPI', recCanon.cpi, recBase.cpi);
+    eq('S21-reconcile F6 EAC === simulation baseline EAC', recCanon.eac, recBase.eac);
+    eq('S21-reconcile F6 VAC === simulation baseline VAC', recCanon.vac, recBase.vac);
+    // F6 vs F7 (F7 quotes F6 by reference).
+    eq('S21-reconcile F7 totals quote F6 PV', recF7.totals.pv, recF6.project.pv);
+    eq('S21-reconcile F7 totals quote F6 EV', recF7.totals.ev, recF6.project.ev);
+    eq('S21-reconcile F7 totals quote F6 AC', recF7.totals.ac, recF6.project.ac);
+    eq('S21-reconcile F7 totals quote F6 EAC', recF7.totals.eac, recF6.project.eac);
+    eq('S21-reconcile F7 totals quote F6 VAC', recF7.totals.vac, recF6.project.vac);
+    // F6 vs Earned Schedule (same EV/CPI basis, no legacy fallback).
+    eq('S21-reconcile Earned Schedule CPI === F6 CPI', recEs.costPerformanceIndex, recCanon.cpi);
+    eq('S21-reconcile Earned Schedule SPI === F6 SPI', recEs.comparisonWithTraditionalEvm.evmSpi, recCanon.spi);
+    // F5 deterministic finish vs the reconciliation surface every screen reads.
+    eq('S21-reconcile the deterministic finish === F5 forecast finish',
+      reconcileFinishForecasts(s21Acts, recEs, s21F5.project.forecastFinish).cpmEarlyFinish,
+      s21F5.project.forecastFinish);
+    eq('S21-reconcile F5 and F7 agree on the forecast finish', recF7.summary.forecastFinish, s21F5.project.forecastFinish);
+    eq('S21-reconcile F7 publishes its recommendation strength', typeof recF7.summary.recommendationStrength, 'string');
   }
 }
 

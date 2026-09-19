@@ -1,11 +1,16 @@
 import type {
   Project,
   Activity,
+  ActivityBoqAllocation,
   ActivityLink,
+  BaselineActivity,
   BoqItem,
   BudgetLine,
+  CalendarType,
   CostTransaction,
+  ProgressUpdate,
   Risk,
+  WbsNode,
   ComplexScenarioModel,
   ComplexScenarioResult,
   PrecisionWatchdogMetric,
@@ -14,27 +19,130 @@ import type {
   ScenarioTornadoBar,
 } from '@/types';
 import { addWorkingDays, countWorkingDays, getCalendar } from '@/lib/calendarEngine';
-import { earliestDate, isIsoDate } from '@/lib/chronologyGuard';
-import { calculateProjectEvmAtDataDate, type TcpiStatus } from '@/lib/planningEngine';
+import { earliestDate, isIsoDate, resolveDataDate } from '@/lib/chronologyGuard';
+import type { TcpiStatus } from '@/lib/planningEngine';
+import { analyzeCostControl } from '@/lib/costControlEngine';
+import { CANONICAL_EVM_SOURCE, selectCanonicalEvm, type CanonicalEvmSource } from '@/lib/canonicalEvm';
 import { calculateMultiEacForecast } from '@/lib/budgetForecastEngine';
 import { calculateDeterministicNetworkDuration, runMonteCarloSimulation } from '@/lib/monteCarloEngine';
 
 /**
- * Canonical EVM baseline a caller supplies to a scenario run (GAP-040).
+ * Canonical EVM baseline a caller supplies to a scenario run (GAP-040 / P2A1-B01).
  *
- * These five scalars plus the canonical TCPI reading are measured facts at the governed Data Date.
- * A scenario simulates the FUTURE against them; it never invents them. When a caller cannot supply
- * them, the simulator derives them by calling the canonical engine exactly once with the sources it
- * was given — it no longer fabricates `AC = 35% of BAC` and `EV = AC x SPI`.
+ * These scalars plus the canonical TCPI reading are measured facts at the governed Data Date,
+ * QUOTED from the canonical F6 cost-control report (`analyzeCostControl` + `selectCanonicalEvm`) —
+ * the same object Dashboard, BudgetView, ProgressView, ExecutiveReportView and PortfolioView read.
+ * A scenario simulates the FUTURE against them; it never invents them.
+ *
+ * Every measurement field is nullable exactly where F6 is nullable: a project with no authorized
+ * BAC, no earned value or no measured index has NONE of those facts, and the scenario must not
+ * treat their absence as a measured zero. `ac` and `tcpi` stay non-nullable because F6's own
+ * contract types them that way (0 recorded spend; the documented TCPI sentinel).
+ *
+ * B01 removed the second derivation this baseline used to come from
+ * (`planningEngine.calculateProjectEvmAtDataDate`), which weighted each activity by the FIRST
+ * budget line matching its WBS node and time-prorated the recorded percent. On the shipped pilot
+ * seed, at the same governed Data Date, that produced EV 275,358 / CPI 0.400 / EAC 5,862,875 /
+ * VAC -3,517,725 against F6's EV 752,900 / CPI 1.091 / EAC 2,149,541.7 / VAC +195,608.3 — so every
+ * scenario in this file was simulating against a budget position that contradicted every other
+ * screen. `buildScenarioEvmBaseline` below is now the ONLY producer.
  */
 export interface ScenarioEvmBaseline {
-  bac: number;
-  ev: number;
+  /** Provenance: always `CANONICAL_EVM_SOURCE`, so a screen can state what it simulated against. */
+  source: CanonicalEvmSource;
+  /** The governed Data Date the measured facts were read at. */
+  dataDate: string;
+  bac: number | null;
+  pv: number | null;
+  ev: number | null;
   ac: number;
-  cpi: number;
-  spi: number;
+  cpi: number | null;
+  spi: number | null;
+  eac: number | null;
+  vac: number | null;
   tcpi: number;
   tcpiStatus: TcpiStatus;
+}
+
+/**
+ * P2A1-B01: the sources `buildScenarioEvmBaseline` needs — exactly the governed rows the canonical
+ * F6 caller on every other screen supplies.
+ */
+export interface ScenarioEvmBaselineSources {
+  project: {
+    id: string;
+    data_date?: string | null;
+    contract_value?: number | null;
+    calendar_type?: string | null;
+    manual_etc_override?: number | null;
+  };
+  activities: Activity[];
+  baselines?: BaselineActivity[];
+  budgetLines?: BudgetLine[];
+  costTransactions?: CostTransaction[];
+  progressUpdates?: ProgressUpdate[];
+  wbsNodes?: WbsNode[];
+  boqItems?: BoqItem[];
+  allocations?: ActivityBoqAllocation[];
+  /** Governed Data Date. Omit to use `resolveDataDate(project)`. */
+  dataDate?: string;
+  calendarType?: CalendarType;
+  /** Persisted manual ETC override, so the recommended EAC method resolves as it does elsewhere. */
+  manualEtc?: number | null;
+  /**
+   * Explicit opt-in ONLY: let contract value stand in for BAC when there is no approved baseline
+   * and no budget line. F6 labels that basis `contract_value_explicit` and reports EV/PV as N/A
+   * because it cannot be distributed. Callers that hold real cost evidence must NOT opt in — the
+   * internal fallback below is the only place that does, and only because a caller that supplies
+   * no baseline at all would otherwise leave the simulator with no budget basis whatsoever.
+   */
+  allowContractValueBac?: boolean;
+}
+
+/**
+ * P2A1-B01: build the canonical scenario EVM baseline — the ONE place this file obtains measured
+ * EV facts.
+ *
+ * It performs no arithmetic of its own: `analyzeCostControl` (F6) produces the project EVM block
+ * and `selectCanonicalEvm` copies BAC/PV/EV/AC/CPI/SPI/EAC/VAC verbatim, including F6's own
+ * rounding and its nulls. A screen therefore simulates against the identical numbers it renders
+ * elsewhere, which is the whole point of the reconciliation B01 closes.
+ */
+export function buildScenarioEvmBaseline(sources: ScenarioEvmBaselineSources): ScenarioEvmBaseline {
+  const { project } = sources;
+  const dataDate = sources.dataDate || resolveDataDate(project);
+  const report = analyzeCostControl({
+    project,
+    activities: sources.activities || [],
+    baselines: sources.baselines || [],
+    budgetLines: sources.budgetLines || [],
+    costTransactions: sources.costTransactions || [],
+    progressUpdates: sources.progressUpdates || [],
+    wbsNodes: sources.wbsNodes || [],
+    boqItems: sources.boqItems || [],
+    allocations: sources.allocations || [],
+    dataDate,
+    calendarType: sources.calendarType || (project.calendar_type as CalendarType | undefined),
+    manualEtc: sources.manualEtc !== undefined
+      ? sources.manualEtc
+      : (typeof project.manual_etc_override === 'number' ? project.manual_etc_override : null),
+    allowContractValueBac: sources.allowContractValueBac,
+  });
+  const canonical = selectCanonicalEvm(report);
+  return {
+    source: CANONICAL_EVM_SOURCE,
+    dataDate: canonical.dataDate,
+    bac: canonical.bac,
+    pv: canonical.pv,
+    ev: canonical.ev,
+    ac: canonical.ac,
+    cpi: canonical.cpi,
+    spi: canonical.spi,
+    eac: canonical.eac,
+    vac: canonical.vac,
+    tcpi: canonical.tcpi,
+    tcpiStatus: canonical.tcpiStatus,
+  };
 }
 
 /**
@@ -391,20 +499,25 @@ export function simulateComplexProjectScenario(
   // Canonical baseline (SSOT). The former `contract_value || 1000000` and
   // `sum(budget_lines.planned_cost) || contract_value` chain produced a BAC that could disagree
   // with every other consumer; the canonical engine's BAC is now the only source.
+  //
+  // P2A1-B01: the measured facts come from canonical F6 through `buildScenarioEvmBaseline`, never
+  // from `planningEngine.calculateProjectEvmAtDataDate` (the second derivation that weighted each
+  // activity by the first budget line of its WBS node and time-prorated the recorded percent).
+  // A caller that supplies nothing still gets F6 — the same engine, called once with the sources
+  // this function holds — so no code path here can fall back to a divergent EVM.
   const baseline: ScenarioEvmBaseline = canonicalEvm
     ? canonicalEvm
-    : (() => {
-        const evm = calculateProjectEvmAtDataDate(project, activities, budgetLines, [], [], []);
-        return {
-          bac: evm.bac,
-          ev: evm.ev,
-          ac: evm.ac,
-          cpi: evm.cpi,
-          spi: evm.spi,
-          tcpi: evm.tcpi,
-          tcpiStatus: evm.tcpiStatus,
-        };
-      })();
+    : buildScenarioEvmBaseline({
+        project,
+        activities,
+        budgetLines,
+        // A caller that hands the simulator no cost evidence at all cannot expect a measured
+        // baseline, so this degraded path opts in to F6's labelled contract-value last resort
+        // (BAC only; F6 reports EV/PV as N/A because the value cannot be distributed). Every real
+        // caller — the simulation view — supplies the governed baseline, transactions and
+        // progress updates, and this branch never runs.
+        allowContractValueBac: true,
+      });
   // F9.1: the schedule basis comes ONLY from valid project/canonical data. The former
   // `|| 195` / `|| '2026-09-15'` / `|| '2027-04-30'` fallbacks fabricated a schedule window and
   // every duration/cost output built on it. When the basis is missing, those outputs become N/A.
@@ -703,10 +816,17 @@ export function simulateComplexProjectScenario(
     bac: newBac,
     baselineBacSar: Math.round(Number(baseline.bac || 0)),
     variationOrderValueSar,
-    canonicalEvSar: Math.round(Number(baseline.ev || 0)),
+    // P2A1-B01: the measured facts are QUOTED, so "F6 reports N/A" stays N/A here instead of being
+    // laundered into a measured 0. The scenario's own derived indices (`cpi` / `spi` below) are a
+    // different thing: they are simulation outputs and keep their existing neutral-0 behaviour when
+    // the canonical index is not measurable.
+    canonicalEvSar: baseline.ev === null ? null : Math.round(Number(baseline.ev)),
     canonicalAcSar: Math.round(Number(baseline.ac || 0)),
-    baselineCpi: Number(baseline.cpi || 0),
-    baselineSpi: Number(baseline.spi || 0),
+    baselineCpi: baseline.cpi,
+    baselineSpi: baseline.spi,
+    baselinePvSar: baseline.pv === null ? null : Math.round(Number(baseline.pv)),
+    baselineEacSar: baseline.eac === null ? null : Math.round(Number(baseline.eac)),
+    baselineVacSar: baseline.vac === null ? null : Math.round(Number(baseline.vac)),
     simulatedCostOutcomeSar,
     eacOptimistic,
     eacRealistic,
@@ -805,18 +925,22 @@ export function runPrecisionWatchdogAudit(
     // published scenario figures and report the true difference instead of a hardcoded 0.
     const expectedRealisticEac = res.cpi > 0 ? Math.round(res.bac / res.cpi) : res.bac;
     const deviation = Math.abs(expectedRealisticEac - res.eacRealistic);
+    // P2A1-B01: the canonical indices are nullable (F6 reports N/A when they are not measurable),
+    // so they are rendered as N/A rather than as a quoted 0.000.
+    const fmtBaselineIndex = (v: number | null): string => (v === null ? 'N/A' : v.toFixed(3));
+    const fmtSar = (v: number | null): string => (v === null ? 'N/A' : v.toLocaleString());
     metrics.push({
       id: `WATCH-EVM-${res.scenarioId}`,
       category: 'evm_conservation',
       labelAr: `الدقة الرياضية لـ EVM: ${res.scenarioNameAr.slice(0, 30)}...`,
       labelEn: `EVM Precision: ${res.scenarioNameEn.slice(0, 30)}...`,
       formula: 'EAC(realistic) = BAC / CPI  |  BAC(scenario) = BAC(canonical) + VO',
-      calculatedValue: `SPI: ${res.spi.toFixed(3)} (canonical ${res.baselineSpi.toFixed(3)}) | CPI: ${res.cpi.toFixed(3)} (canonical ${res.baselineCpi.toFixed(3)}) | EAC: ${res.eacRealistic.toLocaleString()} ر.س | BAC: ${res.bac.toLocaleString()} = ${res.baselineBacSar.toLocaleString()} + VO ${res.variationOrderValueSar.toLocaleString()}`,
+      calculatedValue: `SPI: ${res.spi.toFixed(3)} (canonical ${fmtBaselineIndex(res.baselineSpi)}) | CPI: ${res.cpi.toFixed(3)} (canonical ${fmtBaselineIndex(res.baselineCpi)}) | EAC: ${res.eacRealistic.toLocaleString()} ر.س | BAC: ${res.bac.toLocaleString()} = ${res.baselineBacSar.toLocaleString()} + VO ${res.variationOrderValueSar.toLocaleString()}`,
       expectedValue: `EAC(realistic) == ${expectedRealisticEac.toLocaleString()} ر.س`,
       deviation,
       precisionStatus: deviation === 0 ? 'exact' : deviation <= 1 ? 'acceptable' : 'drift_detected',
-      notesAr: `EV/AC القانونيان حتى تاريخ البيانات: ${res.canonicalEvSar.toLocaleString()} / ${res.canonicalAcSar.toLocaleString()} ر.س (قيم مقاسة، لا تُحاكى). التكلفة المحاكاة للسيناريو: ${res.simulatedCostOutcomeSar.toLocaleString()} ر.س.`,
-      notesEn: `Canonical EV/AC at the Data Date: ${res.canonicalEvSar.toLocaleString()} / ${res.canonicalAcSar.toLocaleString()} SAR (measured, never simulated). Simulated scenario cost outcome: ${res.simulatedCostOutcomeSar.toLocaleString()} SAR.`,
+      notesAr: `EV/AC القانونيان حتى تاريخ البيانات: ${fmtSar(res.canonicalEvSar)} / ${res.canonicalAcSar.toLocaleString()} ر.س (قيم مقاسة، لا تُحاكى). التكلفة المحاكاة للسيناريو: ${res.simulatedCostOutcomeSar.toLocaleString()} ر.س.`,
+      notesEn: `Canonical EV/AC at the Data Date: ${fmtSar(res.canonicalEvSar)} / ${res.canonicalAcSar.toLocaleString()} SAR (measured, never simulated). Simulated scenario cost outcome: ${res.simulatedCostOutcomeSar.toLocaleString()} SAR.`,
     });
   });
 

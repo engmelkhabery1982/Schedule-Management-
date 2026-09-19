@@ -20,7 +20,11 @@ import { type ComprehensiveProjectEvm } from '@/lib/planningEngine';
 import { analyzeCostControl, type CostControlReport } from '@/lib/costControlEngine';
 import { summarizeCanonicalCriticality } from '@/lib/scheduleControlEngine';
 import { canonicalEvmToComprehensive, selectCanonicalEvm, type CanonicalEvm } from '@/lib/canonicalEvm';
-import { reconcileFinishForecasts } from '@/lib/forecastReconciliation';
+import {
+  reconcileFinishForecasts,
+  // P2A1-NEW-GAP-03: the statused F5 CPM is the authoritative deterministic finish.
+  resolveDeterministicForecastFinish,
+} from '@/lib/forecastReconciliation';
 import { DEFAULT_DATA_DATE } from '@/lib/projectControlsConstants';
 import SCurveChart from '@/components/views/SCurveChart';
 import {
@@ -223,10 +227,28 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
     });
   }, [project, activities, evmMetrics, sCurveData, budgetLines, boqItems, transactions, progressUpdates]);
 
+  // P2A1-NEW-GAP-03: the authoritative deterministic finish is the F5 STATUSSED CPM forecast finish
+  // for this project at this report's governed Data Date — the same engine Dashboard, ScheduleView
+  // and ProgressView publish. The stored `activities.early_finish` column is a snapshot of an earlier
+  // CPM run and does not move when the schedule is statused, so quoting it here reported a project
+  // finish that disagreed with every other screen for the same project and Data Date.
+  const statusedForecastFinish = useMemo(() => {
+    if (!project) return null;
+    return resolveDeterministicForecastFinish({
+      activities,
+      links,
+      baselines: baselineActivities,
+      progressUpdates,
+      dataDate: dcmaDataDate,
+      calendarType: project.calendar_type || '6_days',
+      statusLogic: project.status_logic || 'retained_logic',
+    });
+  }, [project, activities, links, baselineActivities, progressUpdates, dcmaDataDate]);
+
   // GAP-041: name both finish methods and their delta instead of showing one ambiguous date.
   const finishReconciliation = useMemo(
-    () => reconcileFinishForecasts(activities, earnedScheduleData),
-    [activities, earnedScheduleData],
+    () => reconcileFinishForecasts(activities, earnedScheduleData, statusedForecastFinish),
+    [activities, earnedScheduleData, statusedForecastFinish],
   );
 
   // Lookahead activities (next 3 weeks from the canonical Data Date).

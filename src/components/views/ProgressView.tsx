@@ -28,7 +28,11 @@ import { calculateActivityCompletionAverage } from '@/lib/planningEngine';
 // cost-control report, not a second EVM derivation.
 import { analyzeCostControl, type CostControlReport } from '@/lib/costControlEngine';
 import { quoteCanonicalEvm } from '@/lib/canonicalEvm';
-import { reconcileFinishForecasts } from '@/lib/forecastReconciliation';
+import {
+  reconcileFinishForecasts,
+  // P2A1-NEW-GAP-03: the statused F5 CPM is the authoritative deterministic finish.
+  resolveDeterministicForecastFinish,
+} from '@/lib/forecastReconciliation';
 import {
   getSubcontractPackages,
   loadSubcontractPackages,
@@ -220,6 +224,9 @@ export default function ProgressView({ project }: ProgressViewProps) {
   // now loads the project's ACTIVE APPROVED baseline rows — scoped through `project_baselines`, the
   // same join BudgetView and Dashboard use, because `baseline_activities` carries no `project_id`.
   const [baselines, setBaselines] = useState<BaselineActivity[]>([]);
+  // P2A1-NEW-GAP-03: the activity network, kept so the deterministic finish can be read from the
+  // statused F5 CPM instead of from the frozen `activities.early_finish` column.
+  const [links, setLinks] = useState<ActivityLink[]>([]);
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState('');
   const [saving, setSaving] = useState(false);
@@ -328,6 +335,7 @@ export default function ProgressView({ project }: ProgressViewProps) {
     });
 
     setActivities(hydratedActivities);
+    setLinks(linksList);
     setUpdates(updRes.data || []);
     setInspections((inspectionRes.data || []) as InspectionRequest[]);
     setBoqItems((boqRes.data || []) as BoqItem[]);
@@ -517,12 +525,31 @@ export default function ProgressView({ project }: ProgressViewProps) {
     });
   }, [project, activities, evm, budgetLines, boqItems, costTransactions, updates, baselines]);
 
+  // P2A1-NEW-GAP-03: the authoritative deterministic finish is the F5 STATUSSED CPM forecast finish
+  // for this project at the governed Data Date — the same engine (and therefore the same date)
+  // Dashboard, ScheduleView and F5 itself publish. The stored `activities.early_finish` column is a
+  // snapshot of an earlier CPM run: on the shipped seed it says 2027-02-28 while the statused
+  // schedule forecasts 2027-03-03, so quoting the column here showed a project finish that
+  // contradicted every other screen.
+  const statusedForecastFinish = useMemo(() => {
+    if (!project) return null;
+    return resolveDeterministicForecastFinish({
+      activities,
+      links,
+      baselines,
+      progressUpdates: updates,
+      dataDate: governedDataDate,
+      calendarType: project.calendar_type || '6_days',
+      statusLogic: project.status_logic || 'retained_logic',
+    });
+  }, [project, activities, links, baselines, updates, governedDataDate]);
+
   // GAP-041: the CPM deterministic finish and the Earned Schedule trend forecast are different
   // methods. Both are named, both are shown, and the delta is reported; a non-computable trend
   // forecast surfaces as N/A rather than as a fabricated date.
   const finishReconciliation = useMemo(
-    () => reconcileFinishForecasts(activities, earnedScheduleData),
-    [activities, earnedScheduleData],
+    () => reconcileFinishForecasts(activities, earnedScheduleData, statusedForecastFinish),
+    [activities, earnedScheduleData, statusedForecastFinish],
   );
 
   // Project-control totals. Every money/progress figure here is a field read of the canonical EVM —

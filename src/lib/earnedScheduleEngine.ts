@@ -1,7 +1,16 @@
 import type { Activity, BaselineActivity, BoqItem, BudgetLine, CalendarType, CostTransaction, ProgressUpdate, Project } from '@/types';
-import { calculateProjectEvmAtDataDate, type ComprehensiveProjectEvm } from '@/lib/planningEngine';
+import type { ComprehensiveProjectEvm } from '@/lib/planningEngine';
 import { generateSCurveData, type SCurveData } from '@/lib/sCurveEngine';
 import { DEFAULT_DATA_DATE } from '@/lib/projectControlsConstants';
+// P2A1-NEW-GAP-04: the canonical cost-control path. Earned Schedule must invert the SAME
+// earned-value basis F6 publishes, so when a caller supplies no EVM the engine asks F6 — never the
+// superseded `planningEngine.calculateProjectEvmAtDataDate` derivation, which weights each activity
+// by the first budget line of its WBS node and time-prorates the recorded percent. Mixing that
+// legacy EV with a canonical baseline-weighted PV curve maps one governance model's money onto
+// another's time axis: on the shipped pilot seed it returned CPI 0.400 and a completion forecast of
+// 2027-12-06 where canonical F6 measures CPI 1.091 and 2027-03-06.
+import { analyzeCostControl } from '@/lib/costControlEngine';
+import { quoteCanonicalEvm } from '@/lib/canonicalEvm';
 
 export interface MonthlyDataPoint {
   /**
@@ -62,8 +71,9 @@ export interface EarnedScheduleResult {
  * fallback below — without them F6 would fall back to budget-line totals and this engine would invert
  * a different PV curve than the one the Dashboard and Executive Report render, re-opening exactly the
  * cross-surface divergence F9.6 closes. `evm` above remains whatever canonical object the caller
- * holds; the legacy `calculateProjectEvmAtDataDate` call below is a dormant fallback used only when a
- * caller supplies no `evm` at all (all three current callers supply one).
+ * holds; the F6 fallback below is dormant for the three current callers (all supply an `evm`), and
+ * P2A1-NEW-GAP-04 made it canonical so that a future caller without one still lands on F6 rather
+ * than on the superseded planningEngine derivation.
  */
 export interface EarnedScheduleSources {
   project: Project | null;
@@ -188,16 +198,32 @@ export function calculateEarnedSchedule(sources: EarnedScheduleSources): EarnedS
 
   // Canonical EVM — consumed when supplied, otherwise computed here exactly once. There is no
   // second EVM implementation in this engine: BAC, PV, EV, AC, CPI and SPI all come from it.
+  //
+  // P2A1-NEW-GAP-04: the fallback is canonical F6 (`analyzeCostControl` + `quoteCanonicalEvm`),
+  // fed with the same governed sources and the same resolved Data Date the caller's own canonical
+  // EVM would have used. It is therefore the SAME basis, not an alternative one: the earned value
+  // this engine maps onto the PV curve and the PV curve itself are both produced by F6 under one
+  // Data-Date governance model. `planningEngine.calculateProjectEvmAtDataDate` is no longer called
+  // anywhere in this file.
   const evm =
     sources.evm ||
-    calculateProjectEvmAtDataDate(
-      project,
-      activities,
-      sources.budgetLines || [],
-      sources.boqItems || [],
-      sources.costTransactions || [],
-      sources.progressUpdates || [],
-      dataDate,
+    quoteCanonicalEvm(
+      analyzeCostControl({
+        project,
+        activities,
+        baselines: sources.baselines || [],
+        budgetLines: sources.budgetLines || [],
+        costTransactions: sources.costTransactions || [],
+        progressUpdates: sources.progressUpdates || [],
+        // `wbsNodes` / `allocations` are not part of this engine's source contract; they drive F6's
+        // WBS roll-up and BOQ trace, not the project-level EVM facts consumed below.
+        wbsNodes: [],
+        boqItems: sources.boqItems || [],
+        allocations: [],
+        dataDate,
+        calendarType: project.calendar_type || '6_days',
+        manualEtc: typeof project.manual_etc_override === 'number' ? project.manual_etc_override : null,
+      }),
     );
 
   // The SAME planned-value curve the S-Curve feature renders (shared, not duplicated).

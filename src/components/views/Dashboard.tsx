@@ -1088,6 +1088,15 @@ ${noticeForm.contractorName}`;
               <div className="p-2.5 bg-slate-50 rounded-xl border border-slate-200 col-span-2 sm:col-span-1">
                 <span className="text-[11px] text-slate-500 font-bold block">{lang === 'ar' ? 'القرار المطلوب' : 'Top decision'}</span>
                 <span className="text-xs font-bold text-slate-900">{decisions.summary.topDecision || '—'}</span>
+                {/* P2A1-H03: a top decision that is not evidence-backed enough to be a directive is
+                    labelled as guidance, so it is never read as an execution instruction. */}
+                {decisions.summary.recommendationStrength !== 'directive' && (
+                  <span className="text-[10px] block mt-1 font-bold text-amber-700">
+                    {decisions.summary.recommendationStrength === 'investigate_only'
+                      ? (lang === 'ar' ? 'تحقيق فقط — ليس توجيهاً تنفيذياً' : 'investigate only — not an execution directive')
+                      : (lang === 'ar' ? 'توجيه استرشادي — ليس أمراً تنفيذياً' : 'advisory — not an execution directive')}
+                  </span>
+                )}
               </div>
             </div>
           </div>
@@ -1121,6 +1130,15 @@ ${noticeForm.contractorName}`;
                     </div>
                     <p className="text-slate-600 mt-1 font-mono text-[11px]">{a.evidence.slice(0, 4).join(' · ')}</p>
                     {a.rootCause && <p className="text-slate-600 text-[11px]"><span className="font-bold">Cause:</span> {a.rootCause.category} ({a.rootCause.confidence})</p>}
+                    {/* P2A1-H03: the strength the engine resolved for this action — directive, or the
+                        advisory / investigate-only downgrade the confidence gate forced. */}
+                    {a.recommendationStrength !== 'directive' && (
+                      <span className="inline-block px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-800 mt-1">
+                        {a.recommendationStrength === 'investigate_only'
+                          ? (lang === 'ar' ? 'تحقيق فقط' : 'investigate only')
+                          : (lang === 'ar' ? 'استرشادي' : 'advisory')}
+                      </span>
+                    )}
                     <p className="text-slate-800 mt-0.5"><span className="font-bold">Action:</span> {a.recommendedAction}</p>
                     <p className="text-slate-600 text-[11px]"><span className="font-bold">Benefit:</span> {a.expectedBenefit ? `−${a.expectedBenefit.daysSaved}d${a.expectedBenefit.costDelta !== null ? `, ${a.expectedBenefit.costDelta.toLocaleString()} SAR` : ''}` : a.expectedBenefitNote}</p>
                     {cap && cap.evidenceGaps.length > 0 && (
