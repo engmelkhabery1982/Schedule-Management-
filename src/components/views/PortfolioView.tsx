@@ -5,7 +5,7 @@ import type { Project, ViewName, ProjectSector, Activity, BudgetLine, BoqItem, C
 // F9.4 (Controlled Pilot defect 1): every project's EVM here is a QUOTE of the canonical F6
 // cost-control report, the same source the project screens and the Executive Report read.
 import { analyzeCostControl } from '@/lib/costControlEngine';
-import { selectCanonicalEvm } from '@/lib/canonicalEvm';
+import { rollUpPortfolioIndices, selectCanonicalEvm } from '@/lib/canonicalEvm';
 // Case N: the portfolio DCMA figure is the canonical 14-point audit result, not a constant.
 import { runDcma14PointAudit } from '@/lib/scheduleQualityEngine';
 import { DEFAULT_DATA_DATE } from '@/lib/projectControlsConstants';
@@ -189,11 +189,16 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
       // two; the card now shows the contract's own value and the EVM fields are the canonical ones.
       const contractVal = Number(p.contract_value) || 0;
       const progress = canonical.earnedProgressPercent ?? 0;
-      const pv = canonical.pv ?? 0;
-      const ev = canonical.ev ?? 0;
+      // P2A1-NEW-GAP-05: PV/EV/SPI/CPI keep the nulls F6 publishes. A project with no measurable
+      // planned value or no recorded actual cost has NO index, and laundering that into `0` (or the
+      // portfolio's former `1.0` default) is exactly the synthetic-health defect this closes.
+      const pv = canonical.pv;
+      const ev = canonical.ev;
       const ac = canonical.ac;
-      const spi = canonical.spi ?? 0;
-      const cpi = canonical.cpi ?? 0;
+      const spi = canonical.spi;
+      const cpi = canonical.cpi;
+      const spiStatus = canonical.spiStatus;
+      const cpiStatus = canonical.cpiStatus;
       // Case N (GAP-010 wave): the portfolio used to show a fabricated schedule-quality score
       // (100 / 90 chosen by "does the project have activities") and fabricated EOT days
       // (14 / 0 chosen by contract duration). The score now comes from the canonical DCMA 14-point
@@ -219,6 +224,8 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
         progress,
         spi,
         cpi,
+        spiStatus,
+        cpiStatus,
         dcmaScore,
         dcmaStatus,
         activeRisks,
@@ -244,11 +251,15 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
 
   // Aggregated Portfolio KPIs
   const totalPortfolioValue = portfolioProjects.reduce((sum, p) => sum + p.contractVal, 0);
-  const totalPortfolioPv = portfolioProjects.reduce((sum, p) => sum + p.pv, 0);
-  const totalPortfolioEv = portfolioProjects.reduce((sum, p) => sum + p.ev, 0);
-  const totalPortfolioAc = portfolioProjects.reduce((sum, p) => sum + p.ac, 0);
-  const portfolioSpi = totalPortfolioPv > 0 ? Number((totalPortfolioEv / totalPortfolioPv).toFixed(2)) : 1.0;
-  const portfolioCpi = totalPortfolioAc > 0 ? Number((totalPortfolioEv / totalPortfolioAc).toFixed(2)) : 1.0;
+  // P2A1-NEW-GAP-05: the portfolio indices are rolled up ONLY from projects whose own F6 ratio is
+  // valid, and the sums therefore cover the measured evidence rather than every row. An empty
+  // portfolio (or one where no project carries a positive PV / recorded AC) yields `null`, which
+  // the cards render as N/A — the former `: 1.0` fallback turned missing evidence into a claim of
+  // perfect performance. `portfolioIndices.spiProjectCount` / `.cpiProjectCount` say how many
+  // projects the published figure actually covers.
+  const portfolioIndices = rollUpPortfolioIndices(portfolioProjects);
+  const portfolioSpi = portfolioIndices.spi;
+  const portfolioCpi = portfolioIndices.cpi;
   // Portfolio schedule quality is reported only where an audit was possible; the rest is N/A.
   const auditedProjectCount = portfolioProjects.filter((p) => p.dcmaScore !== null).length;
   const portfolioDcmaAverage = auditedProjectCount > 0
@@ -401,10 +412,24 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
             SPI
           </div>
           <div>
-            <div className={`text-xl font-black ${portfolioSpi >= 1.0 ? 'text-emerald-700' : 'text-amber-700'}`}>
-              {portfolioSpi}
+            {/* P2A1-NEW-GAP-05: no-data renders N/A in the muted colour the DCMA tile already uses,
+                so a missing measurement can never be mistaken for a measured 1.00. When the figure
+                IS measured it is suffixed with the project count it actually covers. */}
+            <div className={`text-xl font-black ${
+              portfolioSpi === null
+                ? 'text-slate-400'
+                : portfolioSpi >= 1.0
+                  ? 'text-emerald-700'
+                  : 'text-amber-700'
+            }`}>
+              {portfolioSpi === null ? 'N/A' : portfolioSpi.toFixed(2)}
             </div>
-            <span className="text-[11px] text-slate-500 font-semibold">{lang === 'ar' ? 'مؤشر الأداء الزمني للمحفظة' : 'Portfolio SPI'}</span>
+            <span className="text-[11px] text-slate-500 font-semibold">
+              {lang === 'ar' ? 'مؤشر الأداء الزمني للمحفظة' : 'Portfolio SPI'}
+              {portfolioSpi === null
+                ? (lang === 'ar' ? ' (لا قيمة مخططة)' : ' (no planned value)')
+                : ` · ${portfolioIndices.spiProjectCount}/${portfolioProjects.length} ${lang === 'ar' ? 'مشروع' : 'projects'}`}
+            </span>
           </div>
         </div>
 
@@ -413,10 +438,21 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
             CPI
           </div>
           <div>
-            <div className={`text-xl font-black ${portfolioCpi >= 1.0 ? 'text-emerald-700' : 'text-rose-700'}`}>
-              {portfolioCpi}
+            <div className={`text-xl font-black ${
+              portfolioCpi === null
+                ? 'text-slate-400'
+                : portfolioCpi >= 1.0
+                  ? 'text-emerald-700'
+                  : 'text-rose-700'
+            }`}>
+              {portfolioCpi === null ? 'N/A' : portfolioCpi.toFixed(2)}
             </div>
-            <span className="text-[11px] text-slate-500 font-semibold">{lang === 'ar' ? 'مؤشر أداء التكلفة (CPI)' : 'Portfolio CPI'}</span>
+            <span className="text-[11px] text-slate-500 font-semibold">
+              {lang === 'ar' ? 'مؤشر أداء التكلفة (CPI)' : 'Portfolio CPI'}
+              {portfolioCpi === null
+                ? (lang === 'ar' ? ' (لا تكلفة فعلية)' : ' (no actual cost)')
+                : ` · ${portfolioIndices.cpiProjectCount}/${portfolioProjects.length} ${lang === 'ar' ? 'مشروع' : 'projects'}`}
+            </span>
           </div>
         </div>
 
@@ -528,13 +564,28 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
                     <span className="text-slate-400 block text-[10px]">قيمة العقد</span>
                     <span className="font-mono font-bold text-slate-900">{(p.contractVal / 1000000).toFixed(1)}M</span>
                   </div>
+                  {/* P2A1-NEW-GAP-05: a project with no measurable planned value / no actual cost
+                      has no index at all. It renders N/A — the same convention the DCMA tile below
+                      already uses — instead of a `0` that reads as measured under-performance. */}
                   <div className="p-2 bg-white rounded-lg border border-slate-200">
                     <span className="text-slate-400 block text-[10px]">SPI</span>
-                    <span className={`font-mono font-bold ${p.spi >= 1.0 ? 'text-emerald-700' : 'text-amber-700'}`}>{p.spi}</span>
+                    {p.spi === null ? (
+                      <span className="font-mono font-bold text-slate-400" title={lang === 'ar' ? 'لا قيمة مخططة قابلة للقياس' : 'No measurable planned value'}>
+                        N/A
+                      </span>
+                    ) : (
+                      <span className={`font-mono font-bold ${p.spi >= 1.0 ? 'text-emerald-700' : 'text-amber-700'}`}>{p.spi}</span>
+                    )}
                   </div>
                   <div className="p-2 bg-white rounded-lg border border-slate-200">
                     <span className="text-slate-400 block text-[10px]">CPI</span>
-                    <span className={`font-mono font-bold ${p.cpi >= 1.0 ? 'text-emerald-700' : 'text-rose-700'}`}>{p.cpi}</span>
+                    {p.cpi === null ? (
+                      <span className="font-mono font-bold text-slate-400" title={lang === 'ar' ? 'لا تكلفة فعلية مسجلة' : 'No recorded actual cost'}>
+                        N/A
+                      </span>
+                    ) : (
+                      <span className={`font-mono font-bold ${p.cpi >= 1.0 ? 'text-emerald-700' : 'text-rose-700'}`}>{p.cpi}</span>
+                    )}
                   </div>
                   <div className="p-2 bg-white rounded-lg border border-slate-200">
                     <span className="text-slate-400 block text-[10px]">DCMA</span>

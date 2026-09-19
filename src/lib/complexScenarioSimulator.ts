@@ -868,6 +868,141 @@ export function simulateComplexProjectScenario(
 }
 
 /**
+ * P2A1-NEW-GAP-02: one activity whose persisted Total Float disagrees with its persisted
+ * Late Finish / Early Finish pair under the project's own CPM calendar semantics.
+ */
+export interface TotalFloatMismatch {
+  activityId: string;
+  activityCode: string;
+  earlyFinish: string;
+  lateFinish: string;
+  /** The persisted `activities.total_float` column. */
+  storedTotalFloat: number;
+  /** TF recomputed with the CPM engine's own law: `countWorkingDays(EF, LF) - 1`. */
+  expectedTotalFloat: number;
+  /** `stored - expected` in working days. Positive means the stored float is too generous. */
+  driftDays: number;
+}
+
+/**
+ * P2A1-NEW-GAP-02: the result of a real Total Float conservation audit.
+ *
+ * Every count is measured from the activities actually handed in — none of them is a constant, so
+ * the audit cannot pass on a project it never looked at.
+ */
+export interface TotalFloatConservationCheck {
+  /** Non-milestone activities carrying a complete EF/LF/TF record. The denominator of the law. */
+  evaluatedCount: number;
+  /** Evaluated activities whose stored float equals the recomputed float. */
+  matchedCount: number;
+  /** Evaluated activities that violate TF = LF - EF. Zero is the only passing value. */
+  failedCount: number;
+  /** Non-milestone activities with an incomplete CPM record — reported, never silently counted as
+   *  passing. They cannot satisfy the law because the law cannot be evaluated for them. */
+  notEvaluableCount: number;
+  /** Signed drift of the worst evaluated activity; `null` when nothing was evaluated. */
+  maxDriftDays: number | null;
+  failures: TotalFloatMismatch[];
+  /** Codes of the activities that could not be evaluated. */
+  notEvaluableActivityCodes: string[];
+}
+
+/**
+ * P2A1-NEW-GAP-02: verify the CPM float law TF = LF - EF on the activities actually handed in.
+ *
+ * WHY THE FORMER METRIC COULD NEVER FAIL
+ * --------------------------------------
+ * WATCH-FLOAT-01 used to push a hardcoded `exact` / deviation 0 metric whose notes claimed "zero
+ * decimal drift across all 10 activities". Its filter closed with `return false;` — it evaluated
+ * nothing — and the count, the drift and the verdict were all literals. It therefore reported a
+ * clean audit for a project with no activities at all, and for a project with a corrupted float
+ * column. This function replaces that pseudo-audit with the real comparison.
+ *
+ * THE LAW AS THE CANONICAL CPM ENGINE DEFINES IT
+ * ---------------------------------------------
+ * `cpmEngine.calculateCpm` computes float on the ACTIVITY's OWN CALENDAR as
+ *
+ *     EF === LF            -> 0
+ *     LF  > EF             -> countWorkingDays(EF, LF, cal) - 1
+ *     LF  < EF             -> -(countWorkingDays(LF, EF, cal) - 1)
+ *
+ * and publishes `Math.round(totalFloat)`. This audit reproduces exactly that expression on the
+ * same calendar (`activity.calendar_type`, else the project calendar, else the CPM engine's own
+ * `6_days` default) and compares it with the stored `total_float`. Raw calendar-day subtraction is
+ * deliberately NOT used: the shipped pilot seed stores `total_float` values that equal LF - EF in
+ * CALENDAR days (e.g. ACT-004 EF 2026-08-25 / LF 2026-08-30 stored as 5, where the project's
+ * 6-day working calendar measures 4), which is precisely the divergence this check exists to find.
+ *
+ * Milestones are excluded by the same rule the CPM engine applies in its forward pass
+ * (`is_milestone` or a start/finish-milestone `activity_type`), so an activity the CPM never
+ * spreads a duration over is never held to a float law here.
+ */
+export function auditTotalFloatConservation(
+  activities: Activity[],
+  calendarType?: CalendarType | null,
+): TotalFloatConservationCheck {
+  const failures: TotalFloatMismatch[] = [];
+  const notEvaluableActivityCodes: string[] = [];
+  let evaluatedCount = 0;
+  let maxDriftDays: number | null = null;
+
+  for (const activity of activities || []) {
+    const isMilestone = activity.is_milestone
+      || activity.activity_type === 'start_milestone'
+      || activity.activity_type === 'finish_milestone';
+    if (isMilestone) continue;
+
+    const earlyFinish = activity.early_finish;
+    const lateFinish = activity.late_finish;
+    const storedTotalFloat = activity.total_float;
+    if (
+      !isIsoDate(earlyFinish)
+      || !isIsoDate(lateFinish)
+      || typeof storedTotalFloat !== 'number'
+      || !Number.isFinite(storedTotalFloat)
+    ) {
+      notEvaluableActivityCodes.push(activity.code || activity.id);
+      continue;
+    }
+
+    const calendar = getCalendar((activity.calendar_type || calendarType || '6_days') as CalendarType);
+    const expectedTotalFloat = Math.round(
+      earlyFinish === lateFinish
+        ? 0
+        : lateFinish > earlyFinish
+          ? countWorkingDays(earlyFinish, lateFinish, calendar) - 1
+          : -(countWorkingDays(lateFinish, earlyFinish, calendar) - 1),
+    );
+    const driftDays = storedTotalFloat - expectedTotalFloat;
+    evaluatedCount += 1;
+    if (maxDriftDays === null || Math.abs(driftDays) > Math.abs(maxDriftDays)) {
+      maxDriftDays = driftDays;
+    }
+    if (driftDays !== 0) {
+      failures.push({
+        activityId: activity.id,
+        activityCode: activity.code || activity.id,
+        earlyFinish,
+        lateFinish,
+        storedTotalFloat,
+        expectedTotalFloat,
+        driftDays,
+      });
+    }
+  }
+
+  return {
+    evaluatedCount,
+    matchedCount: evaluatedCount - failures.length,
+    failedCount: failures.length,
+    notEvaluableCount: notEvaluableActivityCodes.length,
+    maxDriftDays,
+    failures,
+    notEvaluableActivityCodes,
+  };
+}
+
+/**
  * Precision Watchdog Engine: Audits numerical integrity, float conservation, EVM bounds, and cash flow consistency
  */
 export function runPrecisionWatchdogAudit(
@@ -881,24 +1016,40 @@ export function runPrecisionWatchdogAudit(
   // that no metric in this audit actually used. Every figure below comes from the scenario result,
   // whose baseline is the canonical EVM (see `simulateComplexProjectScenario`).
 
-  // 1. CPM Float Law Conservation
-  const floatDriftActs = activities.filter((a) => {
-    if (a.is_milestone) return false;
-    // Total Float should theoretically equal Late Finish - Early Finish in calendar days
-    return false; // Verified exact by CPM engine
-  });
+  // 1. CPM Float Law Conservation — P2A1-NEW-GAP-02: measured by `auditTotalFloatConservation`.
+  // The counts, the drift and the verdict below are all read off that audit; nothing is asserted.
+  const floatCheck = auditTotalFloatConservation(activities, project.calendar_type);
+  const floatMeasured = floatCheck.evaluatedCount > 0;
+  const floatDriftDays = floatCheck.maxDriftDays === null ? null : Math.abs(floatCheck.maxDriftDays);
+  const floatFailureEvidence = floatCheck.failures
+    .slice(0, 5)
+    .map((f) => `${f.activityCode}: TF ${f.storedTotalFloat} vs ${f.expectedTotalFloat} (${f.driftDays > 0 ? '+' : ''}${f.driftDays}d, EF ${f.earlyFinish} / LF ${f.lateFinish})`)
+    .join(' · ');
   metrics.push({
     id: 'WATCH-FLOAT-01',
     category: 'cpm_float',
     labelAr: 'قانون انحفاظ الهوامش الزمنية (CPM Total Float Conservation)',
-    labelEn: 'CPM Float Law Precision (TF = LF - EF = LS - ES)',
-    formula: 'Total Float (TF) = Late Finish (LF) - Early Finish (EF)',
-    calculatedValue: '100.00% مطابق لكافة الأنشطة',
-    expectedValue: 'TF == LF - EF (0 يوم تباين)',
-    deviation: 0,
-    precisionStatus: 'exact',
-    notesAr: 'تم التحقق من مطابقة الحساب التراجعي والأمامي لكافة الأنشطة الـ 10 دون أي كسر في علاقات التبعية.',
-    notesEn: 'Forward and backward pass equations hold with zero decimal drift across all 10 activities.',
+    labelEn: 'CPM Float Law Precision (TF = LF - EF on the activity calendar)',
+    formula: 'Total Float (TF) = countWorkingDays(EF, LF) - 1 (negative when LF < EF)',
+    calculatedValue: floatMeasured
+      ? `${floatCheck.matchedCount}/${floatCheck.evaluatedCount} نشاط مطابق · أقصى انحراف ${floatDriftDays ?? 0} يوم عمل`
+      : 'N/A — لا نشاط قابل للفحص (لا يوجد سجل هوامش/تواريخ مكتمل)',
+    expectedValue: floatMeasured
+      ? `TF == LF - EF for all ${floatCheck.evaluatedCount} evaluated non-milestone activities`
+      : 'N/A — no evaluable activity, so no float law to verify',
+    deviation: floatMeasured ? floatDriftDays : null,
+    // Nothing evaluated => no precision is claimed at all. A violated law is drift, never 'exact'.
+    precisionStatus: !floatMeasured
+      ? 'not_measured'
+      : floatCheck.failedCount === 0
+        ? 'exact'
+        : 'drift_detected',
+    notesAr: floatMeasured
+      ? `فُحص ${floatCheck.evaluatedCount} نشاطاً غير رئيسي (معالم مستثناة) على تقويم المشروع بأيام العمل: ${floatCheck.matchedCount} مطابق و${floatCheck.failedCount} غير مطابق.${floatCheck.notEvaluableCount ? ` تم تخطي ${floatCheck.notEvaluableCount} نشاطاً لعدم اكتمال سجل EF/LF/TF.` : ''}${floatFailureEvidence ? ` أكبر انحراف: ${floatFailureEvidence}.` : ''}`
+      : 'لم يُفحص أي نشاط: لا يوجد نشاط غير رئيسي يحمل EF/LF/TF مكتملاً، لذا لا يُدعى أي تطابق.',
+    notesEn: floatMeasured
+      ? `Evaluated ${floatCheck.evaluatedCount} non-milestone activities on the project calendar in working days: ${floatCheck.matchedCount} satisfy TF = LF - EF and ${floatCheck.failedCount} do not.${floatCheck.notEvaluableCount ? ` Skipped ${floatCheck.notEvaluableCount} without a complete EF/LF/TF record.` : ''}${floatFailureEvidence ? ` Largest drift: ${floatFailureEvidence}.` : ''}`
+      : 'No activity was evaluated: no non-milestone activity carries a complete EF/LF/TF record, so no parity is claimed.',
   });
 
   // 2. EVM Conservation Law — the deviation is measured, not asserted.
@@ -1007,6 +1158,177 @@ export function runPrecisionWatchdogAudit(
   });
 
   return metrics;
+}
+
+/** Bilingual label for a watchdog audit category, so a screen can name what was (not) measured. */
+const WATCHDOG_CATEGORY_LABELS: Record<PrecisionWatchdogMetric['category'], { ar: string; en: string }> = {
+  cpm_float: { ar: 'الهوامش الزمنية', en: 'Float' },
+  evm_conservation: { ar: 'قوانين EVM', en: 'EVM' },
+  ssot_cost: { ar: 'تكلفة المصدر الوحيد', en: 'SSOT cost' },
+  cashflow_integrity: { ar: 'توازن السيولة', en: 'Cash flow' },
+  statistical_bounds: { ar: 'الحدود الإحصائية', en: 'Statistical bounds' },
+};
+
+/**
+ * P2A1-NEW-GAP-01: one top-level simulation KPI.
+ *
+ * `value === null` is the governed "not measured" state — it means no scenario produced a value for
+ * this KPI, so the screen must render N/A rather than a plausible-looking number.
+ */
+export interface SimulationKpiReading {
+  /** The measured value, or `null` when no scenario produced one. */
+  value: number | null;
+  /** The scenario the extreme came from; `null` with an unmeasured KPI. */
+  scenarioId: string | null;
+  scenarioNameAr: string | null;
+  scenarioNameEn: string | null;
+}
+
+/**
+ * P2A1-NEW-GAP-01: the top-level Multi-Scenario KPI card values, ALL derived from the current
+ * scenario results and the current watchdog audit.
+ *
+ * WHY THIS EXISTS
+ * ---------------
+ * The four headline cards were literals: "100% Precision Parity", "+55 Days Max Schedule Drift",
+ * "+515,933 SAR Max Simulated Cost Overrun" and "-30 Days Compression". They never changed when the
+ * project or the scenarios changed, and on the shipped pilot seed they contradicted the real outputs
+ * (which measure +108 days of drift, a +620,627 SAR overrun and -46 days of compression for that
+ * project). Worse, the first card claimed the float, EVM AND cash-flow laws were "strictly
+ * verified" while the cash-flow audit publishes `not_measured` for every project — no authoritative
+ * cash-flow basis is wired in, so there is nothing to verify.
+ *
+ * This function introduces no new calculation: every figure is either a published scenario field
+ * (`varianceDays`, `costVarianceSar`) or a count over the published watchdog metrics. It is a
+ * SELECTION over existing authoritative outputs, which is why the screen is allowed to render it
+ * without becoming a second source of truth.
+ */
+export interface SimulationControlKpiSummary {
+  /**
+   * Percentage of MEASURED watchdog checks that are within tolerance. `null` when no check was
+   * measured at all — an audit that measured nothing has no parity percentage, not 100%.
+   */
+  precisionParityPercent: number | null;
+  measuredCheckCount: number;
+  withinToleranceCount: number;
+  driftCount: number;
+  /** Checks the watchdog explicitly reported as `not_measured`. They are excluded from the parity
+   *  denominator and named separately, so an unverified law is never counted as a verified one. */
+  notMeasuredCount: number;
+  measuredCategories: PrecisionWatchdogMetric['category'][];
+  notMeasuredCategories: PrecisionWatchdogMetric['category'][];
+  /** Largest modelled schedule DELAY across the scenarios (`varianceDays > 0`). */
+  maxScheduleDrift: SimulationKpiReading;
+  /** Largest modelled cost OVERRUN across the scenarios (`costVarianceSar > 0`). */
+  maxCostOverrun: SimulationKpiReading;
+  /** Largest modelled schedule COMPRESSION across the scenarios (`varianceDays < 0`). */
+  maxCompression: SimulationKpiReading;
+  /**
+   * Bilingual statement of exactly which control laws were measured and which were not. The screen
+   * renders this verbatim, so an unmeasured law (cash flow today) can never be presented as
+   * verified.
+   */
+  verificationScopeAr: string;
+  verificationScopeEn: string;
+}
+
+const UNMEASURED_KPI: SimulationKpiReading = {
+  value: null,
+  scenarioId: null,
+  scenarioNameAr: null,
+  scenarioNameEn: null,
+};
+
+/** Pick the scenario holding the extreme value of one published numeric field. */
+function pickExtremeScenario(
+  pool: ComplexScenarioResult[],
+  read: (result: ComplexScenarioResult) => number,
+  direction: 'max' | 'min',
+): SimulationKpiReading {
+  let best: ComplexScenarioResult | null = null;
+  let bestValue = 0;
+  for (const result of pool) {
+    const value = read(result);
+    if (!Number.isFinite(value)) continue;
+    if (best === null || (direction === 'max' ? value > bestValue : value < bestValue)) {
+      best = result;
+      bestValue = value;
+    }
+  }
+  if (!best) return UNMEASURED_KPI;
+  return {
+    value: bestValue,
+    scenarioId: best.scenarioId,
+    scenarioNameAr: best.scenarioNameAr,
+    scenarioNameEn: best.scenarioNameEn,
+  };
+}
+
+function describeCategories(
+  categories: PrecisionWatchdogMetric['category'][],
+  lang: 'ar' | 'en',
+): string {
+  return categories.map((c) => WATCHDOG_CATEGORY_LABELS[c][lang]).join(', ');
+}
+
+/**
+ * P2A1-NEW-GAP-01: derive the four headline simulation KPIs from the current scenario results and
+ * the current watchdog audit. Nothing here is a constant and nothing is recomputed.
+ */
+export function summarizeSimulationControlKpis(
+  results: ComplexScenarioResult[],
+  watchdogMetrics: PrecisionWatchdogMetric[],
+): SimulationControlKpiSummary {
+  const scenarios = results || [];
+  const metrics = watchdogMetrics || [];
+
+  const measured = metrics.filter((m) => m.precisionStatus !== 'not_measured');
+  const notMeasured = metrics.filter((m) => m.precisionStatus === 'not_measured');
+  const driftCount = measured.filter((m) => m.precisionStatus === 'drift_detected').length;
+  const withinToleranceCount = measured.length - driftCount;
+
+  const measuredCategories = [...new Set(measured.map((m) => m.category))];
+  const notMeasuredCategories = [...new Set(notMeasured.map((m) => m.category))];
+
+  const delayed = scenarios.filter((r) => Number.isFinite(r.varianceDays) && r.varianceDays > 0);
+  const compressed = scenarios.filter((r) => Number.isFinite(r.varianceDays) && r.varianceDays < 0);
+  const overruns = scenarios.filter(
+    (r) => typeof r.costVarianceSar === 'number' && Number.isFinite(r.costVarianceSar) && r.costVarianceSar > 0,
+  );
+
+  const measuredLabelAr = describeCategories(measuredCategories, 'ar');
+  const measuredLabelEn = describeCategories(measuredCategories, 'en');
+  const notMeasuredLabelAr = describeCategories(notMeasuredCategories, 'ar');
+  const notMeasuredLabelEn = describeCategories(notMeasuredCategories, 'en');
+  const scopeMeasuredAr = measuredCategories.length
+    ? `تم قياس: ${measuredLabelAr} (${withinToleranceCount}/${measured.length} ضمن التسامح)`
+    : 'لا يوجد تدقيق مقاس';
+  const scopeMeasuredEn = measuredCategories.length
+    ? `Measured: ${measuredLabelEn} (${withinToleranceCount}/${measured.length} within tolerance)`
+    : 'No measured audit';
+  const scopeNotMeasuredAr = notMeasuredCategories.length
+    ? ` · غير مقاس (N/A): ${notMeasuredLabelAr}`
+    : '';
+  const scopeNotMeasuredEn = notMeasuredCategories.length
+    ? ` · not measured (N/A): ${notMeasuredLabelEn}`
+    : '';
+
+  return {
+    precisionParityPercent: measured.length > 0
+      ? Math.round((withinToleranceCount / measured.length) * 100)
+      : null,
+    measuredCheckCount: measured.length,
+    withinToleranceCount,
+    driftCount,
+    notMeasuredCount: notMeasured.length,
+    measuredCategories,
+    notMeasuredCategories,
+    maxScheduleDrift: pickExtremeScenario(delayed, (r) => r.varianceDays, 'max'),
+    maxCostOverrun: pickExtremeScenario(overruns, (r) => r.costVarianceSar as number, 'max'),
+    maxCompression: pickExtremeScenario(compressed, (r) => r.varianceDays, 'min'),
+    verificationScopeAr: `${scopeMeasuredAr}${scopeNotMeasuredAr}`,
+    verificationScopeEn: `${scopeMeasuredEn}${scopeNotMeasuredEn}`,
+  };
 }
 
 /**

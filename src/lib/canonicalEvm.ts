@@ -234,6 +234,109 @@ export const EMPTY_CANONICAL_EVM: CanonicalEvm = {
 };
 
 /**
+ * P2A1-NEW-GAP-05: one project's contribution to a portfolio index roll-up.
+ *
+ * The statuses are the point: they are F6's own zero-denominator verdict for that project's ratio
+ * (see `ratioStatus`), so the roll-up can tell "no evidence" apart from "measured" without
+ * re-deriving anything.
+ */
+export interface PortfolioIndexContributor {
+  /** Earned value at the project's governed Data Date; null when F6 reports it as not measurable. */
+  ev: number | null;
+  /** Planned value; null when F6 reports it as not measurable. */
+  pv: number | null;
+  /** Actual cost; F6 types this as a non-nullable number (0 recorded spend). */
+  ac: number;
+  spiStatus: EvmRatioStatus;
+  cpiStatus: EvmRatioStatus;
+}
+
+/**
+ * P2A1-NEW-GAP-05: the portfolio-level SPI/CPI roll-up.
+ *
+ * NO DATA IS NOT 1.00
+ * -------------------
+ * PortfolioView used to compute `portfolioSpi = totalPortfolioPv > 0 ? EV/PV : 1.0` and
+ * `portfolioCpi = totalPortfolioAc > 0 ? EV/AC : 1.0`. A portfolio with no planned value, or with
+ * no recorded actual cost, therefore displayed a perfectly healthy 1.00 — the worst possible
+ * reading, because it is indistinguishable from measured perfection and it hides the fact that
+ * nothing was measured. On the shipped pilot seed with no loaded cost transactions every project
+ * reports AC 0 and the portfolio published CPI 1.00.
+ *
+ * The rule enforced here: an index is published only from projects whose OWN ratio is `valid`
+ * (F6 measured a positive denominator for it). Numerator and denominator are always summed over the
+ * SAME contributing set, so the ratio stays coherent. When no project contributes valid evidence
+ * the index is `null` and `spiStatus`/`cpiStatus` say why — `empty_no_data` for a genuinely empty
+ * portfolio, `anomalous_zero_denominator` when earned value exists with no denominator (a
+ * data-quality finding that must never read as healthy). A measured 1.00 survives untouched.
+ */
+export interface PortfolioIndexRollup {
+  /** Sums taken over ONLY the projects carrying valid evidence for that index. */
+  spiEvSar: number;
+  spiPvSar: number;
+  cpiEvSar: number;
+  cpiAcSar: number;
+  /** How many projects contributed valid evidence to each index. */
+  spiProjectCount: number;
+  cpiProjectCount: number;
+  /** The portfolio index, or `null` when no valid evidence exists. Never a synthetic 1.0. */
+  spi: number | null;
+  cpi: number | null;
+  spiStatus: EvmRatioStatus;
+  cpiStatus: EvmRatioStatus;
+}
+
+/**
+ * P2A1-NEW-GAP-05: roll portfolio SPI/CPI up from each project's canonical F6 quote.
+ *
+ * This performs no EVM arithmetic of its own beyond the two ratios the roll-up is named for: the
+ * money facts are quoted per project by `selectCanonicalEvm`, and the validity of each contribution
+ * is F6's own ratio status. No secondary index is produced, and a portfolio with no evidence gets
+ * `null` rather than a default.
+ */
+export function rollUpPortfolioIndices(
+  contributors: PortfolioIndexContributor[],
+): PortfolioIndexRollup {
+  const list = contributors || [];
+
+  const spiContributors = list.filter(
+    (c) => c.spiStatus === 'valid' && typeof c.pv === 'number' && c.pv > 0 && typeof c.ev === 'number',
+  );
+  const cpiContributors = list.filter(
+    (c) => c.cpiStatus === 'valid' && typeof c.ac === 'number' && c.ac > 0 && typeof c.ev === 'number',
+  );
+
+  const spiEvSar = spiContributors.reduce((sum, c) => sum + (c.ev as number), 0);
+  const spiPvSar = spiContributors.reduce((sum, c) => sum + (c.pv as number), 0);
+  const cpiEvSar = cpiContributors.reduce((sum, c) => sum + (c.ev as number), 0);
+  const cpiAcSar = cpiContributors.reduce((sum, c) => sum + c.ac, 0);
+
+  const spi = spiPvSar > 0 ? round2(spiEvSar / spiPvSar) : null;
+  const cpi = cpiAcSar > 0 ? round2(cpiEvSar / cpiAcSar) : null;
+
+  // An aggregate with no valid contributor still says WHY it is unavailable: earned value with no
+  // denominator anywhere in the portfolio is an anomaly, not an empty portfolio.
+  const anyEv = list.some((c) => typeof c.ev === 'number' && (c.ev as number) > 0);
+
+  return {
+    spiEvSar,
+    spiPvSar,
+    cpiEvSar,
+    cpiAcSar,
+    spiProjectCount: spiContributors.length,
+    cpiProjectCount: cpiContributors.length,
+    spi,
+    cpi,
+    spiStatus: spi !== null ? 'valid' : anyEv ? 'anomalous_zero_denominator' : 'empty_no_data',
+    cpiStatus: cpi !== null ? 'valid' : anyEv ? 'anomalous_zero_denominator' : 'empty_no_data',
+  };
+}
+
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
+}
+
+/**
  * Adapter for engines that require the non-nullable `ComprehensiveProjectEvm` shape (S-curve,
  * earned schedule, control health, alerts, recovery, budget forecast).
  *

@@ -23,7 +23,10 @@ import {
   calculateScenarioSensitivityTornado,
   // P2A1-B01: the ONE canonical producer of the measured baseline this view simulates against.
   buildScenarioEvmBaseline,
+  // P2A1-NEW-GAP-01: the headline KPI values, derived from the real scenario + watchdog outputs.
+  summarizeSimulationControlKpis,
   type ScenarioEvmBaseline,
+  type SimulationKpiReading,
 } from '@/lib/complexScenarioSimulator';
 import { resolveDataDate } from '@/lib/chronologyGuard';
 // P2A1-B01: the canonical provenance marker, so the view can state the basis it simulates against.
@@ -270,6 +273,24 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
   const watchdogDriftCount = watchdogMetrics.filter((m) => m.precisionStatus === 'drift_detected').length;
   const watchdogNotMeasuredCount = watchdogMetrics.filter((m) => m.precisionStatus === 'not_measured').length;
 
+  // P2A1-NEW-GAP-01: the four headline KPI cards. They used to be literals ("100% Precision
+  // Parity", "+55 Days", "+515,933 SAR", "-30 Days") that never moved when the project or the
+  // scenarios changed and contradicted the real outputs. Every card now reads
+  // `summarizeSimulationControlKpis`, which is a SELECTION over the published scenario results and
+  // the published watchdog metrics — no figure is recomputed here and none is a constant.
+  const controlKpis = useMemo(
+    () => summarizeSimulationControlKpis(
+      customScenarioResult ? [...scenarioResults, customScenarioResult] : scenarioResults,
+      watchdogMetrics,
+    ),
+    [scenarioResults, customScenarioResult, watchdogMetrics],
+  );
+  /** A KPI no scenario produced is rendered N/A — never a plausible-looking zero or constant. */
+  const kpiValue = (reading: SimulationKpiReading, format: (v: number) => string): string =>
+    reading.value === null ? NA : format(reading.value);
+  const kpiScenario = (reading: SimulationKpiReading): string | null =>
+    reading.value === null ? null : (isRtl ? reading.scenarioNameAr : reading.scenarioNameEn);
+
   const selectedScenarioDetail = useMemo(() => {
     if (selectedScenarioId === 'SCN-CUSTOM-USER') return customScenarioResult;
     return scenarioResults.find((s) => s.scenarioId === selectedScenarioId) || scenarioResults[1];
@@ -355,28 +376,50 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
 
       {/* Top 4 Real-time Monitored Metrics Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        {/* Card 1: Precision Watchdog Status */}
+        {/* Card 1: Precision Watchdog Status — P2A1-NEW-GAP-01: the percentage, the drift count and
+            the verification scope are all read off the actual watchdog audit. An audit that
+            measured nothing has NO percentage (N/A), and a law the watchdog reported as not
+            measured is named as such instead of being counted as verified. */}
         <div className="bg-white p-5 rounded-2xl border border-slate-200/80 shadow-xs hover:shadow-md transition-shadow">
           <div className="flex items-center justify-between mb-3">
             <span className="text-xs font-bold text-slate-500 uppercase tracking-wider">
               {isRtl ? 'دقة ومطابقة الأرقام (Watchdog)' : 'Precision Parity'}
             </span>
-            <div className="w-9 h-9 rounded-xl bg-emerald-50 text-emerald-600 flex items-center justify-center font-bold">
-              <CheckCircle2 size={18} />
+            <div className={`w-9 h-9 rounded-xl flex items-center justify-center font-bold ${
+              controlKpis.driftCount > 0
+                ? 'bg-rose-50 text-rose-600'
+                : controlKpis.measuredCheckCount === 0
+                  ? 'bg-slate-100 text-slate-500'
+                  : 'bg-emerald-50 text-emerald-600'
+            }`}>
+              {controlKpis.driftCount > 0 ? <AlertTriangle size={18} /> : <CheckCircle2 size={18} />}
             </div>
           </div>
           <div className="flex items-baseline gap-2 mb-1">
-            <span className="text-3xl font-black text-emerald-600 font-mono">100%</span>
-            <span className="text-xs font-bold text-emerald-800 bg-emerald-100 px-2 py-0.5 rounded">
-              0.00 ر.س فارق
+            <span className={`text-3xl font-black font-mono ${
+              controlKpis.precisionParityPercent === null
+                ? 'text-slate-400'
+                : controlKpis.driftCount > 0
+                  ? 'text-rose-600'
+                  : 'text-emerald-600'
+            }`}>
+              {controlKpis.precisionParityPercent === null ? NA : `${controlKpis.precisionParityPercent}%`}
+            </span>
+            <span className="text-xs font-bold text-slate-600 bg-slate-100 px-2 py-0.5 rounded">
+              {controlKpis.measuredCheckCount === 0
+                ? (isRtl ? 'لا تدقيق مقاس' : 'no measured audit')
+                : `${controlKpis.withinToleranceCount}/${controlKpis.measuredCheckCount} ${isRtl ? 'ضمن التسامح' : 'within tolerance'}`}
+              {controlKpis.notMeasuredCount > 0
+                ? ` · ${controlKpis.notMeasuredCount} ${isRtl ? 'غير مقاس (N/A)' : 'not measured (N/A)'}`
+                : ''}
             </span>
           </div>
           <p className="text-[11px] text-slate-500 mt-2">
-            {isRtl ? 'انطباط قوانين الهوامش و EVM وتوازن السيولة' : 'Float, EVM & Cash flow laws strictly verified'}
+            {isRtl ? controlKpis.verificationScopeAr : controlKpis.verificationScopeEn}
           </p>
         </div>
 
-        {/* Card 2: Highest Schedule Variance */}
+        {/* Card 2: Highest Schedule Variance — the largest modelled delay across the scenarios. */}
         <div className="bg-white p-5 rounded-2xl border border-slate-200/80 shadow-xs hover:shadow-md transition-shadow">
           <div className="flex items-center justify-between mb-3">
             <span className="text-xs font-bold text-slate-500 uppercase tracking-wider">
@@ -387,15 +430,19 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
             </div>
           </div>
           <div className="flex items-baseline gap-2 mb-1">
-            <span className="text-3xl font-black text-rose-600 font-mono">+55</span>
-            <span className="text-xs font-bold text-slate-500">{isRtl ? 'يوماً تقويمياً' : 'Days'}</span>
+            <span className={`text-3xl font-black font-mono ${controlKpis.maxScheduleDrift.value === null ? 'text-slate-400' : 'text-rose-600'}`}>
+              {kpiValue(controlKpis.maxScheduleDrift, (v) => `+${v.toLocaleString()}`)}
+            </span>
+            <span className="text-xs font-bold text-slate-500">{isRtl ? 'يوماً' : 'Days'}</span>
           </div>
           <p className="text-[11px] text-slate-500 mt-2">
-            {isRtl ? 'في سيناريو أزمة السيولة وتأخر المستخلصات' : 'Triggered under Client Cash Squeeze scenario'}
+            {kpiScenario(controlKpis.maxScheduleDrift)
+              ?? (isRtl ? 'لا سيناريو ينتج تأخيراً لهذا المشروع' : 'No scenario delays this project')}
           </p>
         </div>
 
-        {/* Card 3: Highest Cost Variance */}
+        {/* Card 3: Highest Cost Variance — N/A when no scenario produced a cost outcome (the
+            schedule basis was unavailable, so there is no measured overrun to report). */}
         <div className="bg-white p-5 rounded-2xl border border-slate-200/80 shadow-xs hover:shadow-md transition-shadow">
           <div className="flex items-center justify-between mb-3">
             <span className="text-xs font-bold text-slate-500 uppercase tracking-wider">
@@ -406,15 +453,19 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
             </div>
           </div>
           <div className="flex items-baseline gap-2 mb-1">
-            <span className="text-2xl font-black text-amber-600 font-mono">+515,933</span>
-            <span className="text-xs font-bold text-slate-500">ر.س</span>
+            <span className={`text-2xl font-black font-mono ${controlKpis.maxCostOverrun.value === null ? 'text-slate-400' : 'text-amber-600'}`}>
+              {kpiValue(controlKpis.maxCostOverrun, (v) => `+${v.toLocaleString()}`)}
+            </span>
+            <span className="text-xs font-bold text-slate-500">{isRtl ? 'ر.س' : 'SAR'}</span>
           </div>
           <p className="text-[11px] text-slate-500 mt-2">
-            {isRtl ? 'في سيناريو أزمة سلاسل الإمداد وحديد التسليح' : 'Triggered under Supply Chain Inflation (+22%)'}
+            {kpiScenario(controlKpis.maxCostOverrun)
+              ?? (isRtl ? 'لا تكلفة محاكاة مقاسة لهذا المشروع' : 'No simulated cost measured for this project')}
           </p>
         </div>
 
-        {/* Card 4: Acceleration Potential */}
+        {/* Card 4: Acceleration Potential — the largest modelled compression, N/A when no scenario
+            compresses the schedule. */}
         <div className="bg-white p-5 rounded-2xl border border-slate-200/80 shadow-xs hover:shadow-md transition-shadow">
           <div className="flex items-center justify-between mb-3">
             <span className="text-xs font-bold text-slate-500 uppercase tracking-wider">
@@ -425,13 +476,16 @@ export default function MultiScenarioSimulationView({ project }: MultiScenarioSi
             </div>
           </div>
           <div className="flex items-baseline gap-2 mb-1">
-            <span className="text-3xl font-black text-blue-600 font-mono">-30</span>
+            <span className={`text-3xl font-black font-mono ${controlKpis.maxCompression.value === null ? 'text-slate-400' : 'text-blue-600'}`}>
+              {kpiValue(controlKpis.maxCompression, (v) => v.toLocaleString())}
+            </span>
             <span className="text-xs font-bold text-blue-800 bg-blue-100 px-2 py-0.5 rounded">
               {isRtl ? 'يوم استرداد' : 'Days Compression'}
             </span>
           </div>
           <p className="text-[11px] text-slate-500 mt-2">
-            {isRtl ? 'عبر خطة التعجيل القصوى بنظام العمل الإضافي 24/7' : 'Via Turbo Fast-Tracking & Crashing'}
+            {kpiScenario(controlKpis.maxCompression)
+              ?? (isRtl ? 'لا سيناريو يضغط الجدول لهذا المشروع' : 'No scenario compresses this project')}
           </p>
         </div>
       </div>

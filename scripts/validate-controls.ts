@@ -67,6 +67,8 @@ import {
 } from '@/lib/integratedDecisionEngine';
 import { analyzeForecastTrust } from '@/lib/forecastTrustEngine';
 import { selectCanonicalEvm, canonicalEvmToComprehensive, quoteCanonicalEvm, CANONICAL_EVM_SOURCE } from '@/lib/canonicalEvm';
+// S22 (Batch C / NG05): the portfolio index roll-up that must publish null instead of 1.00.
+import { rollUpPortfolioIndices, type PortfolioIndexContributor } from '@/lib/canonicalEvm';
 // S18 (F9.5 Pilot Closure): the governance EVM pillar is a PURE module precisely so this harness can
 // drive the same function that renders the visible `EVM-01/02/03` row. `dataGovernanceEngine` itself
 // cannot be imported here — it pulls in `@/lib/supabase`.
@@ -107,6 +109,10 @@ import {
   calculateScenarioSensitivityTornado, STANDARD_COMPLEX_SCENARIOS,
   // S21 (Batch B / B01): the one canonical producer of the scenario's measured EVM baseline.
   buildScenarioEvmBaseline,
+  // S22 (Batch C / NG02): the real Total Float conservation audit behind WATCH-FLOAT-01.
+  auditTotalFloatConservation,
+  // S22 (Batch C / NG01): the headline simulation KPIs, derived from scenario + watchdog outputs.
+  summarizeSimulationControlKpis,
 } from '@/lib/complexScenarioSimulator';
 import type {
   Activity, ActivityBoqAllocation, ActivityLink, ActivityResource, BaselineActivity, BoqItem, BudgetLine,
@@ -3928,6 +3934,453 @@ console.log('--- S18 Pilot Closure (F9.5)');
     eq('S21-reconcile F5 and F7 agree on the forecast finish', recF7.summary.forecastFinish, s21F5.project.forecastFinish);
     eq('S21-reconcile F7 publishes its recommendation strength', typeof recF7.summary.recommendationStrength, 'string');
   }
+}
+
+
+// ---------------------------------------------------------------------------
+// S22 — Batch C (P2A1): NO STATIC CONTROL CLAIMS / NO FAKE AUDIT PASS /
+//                       NO SYNTHETIC HEALTHY KPI FROM MISSING DATA.
+//
+//   NG02  WATCH-FLOAT-01 was a pseudo-audit: a filter closing with `return false;`
+//         plus a hardcoded `exact` / deviation 0 verdict claiming "zero decimal drift
+//         across all 10 activities". It must perform a real TF = LF - EF check on the
+//         project's own working-day calendar, count activities dynamically, and be able
+//         to FAIL.
+//   NG01  the four headline Multi-Scenario KPI cards were literals ("100% Precision
+//         Parity", "+55 Days", "+515,933 SAR", "-30 Days"). They must be derived from the
+//         current scenario results and the current watchdog audit, and an unmeasured law
+//         (cash flow) must never be presented as verified.
+//   NG05  PortfolioView published SPI = 1.0 / CPI = 1.0 when the denominator was zero.
+//         No evidence must render N/A; a measured 1.00 must survive.
+//
+// The fixtures are the SHIPPED pilot seed (no seed edits) plus injections built from the
+// canonical engines' own output. Where a defect is data-dependent (NG02 on the seed), the
+// test asserts the audit DETECTS it — a check that passed before the fix would not bind.
+// ---------------------------------------------------------------------------
+{
+  console.log('--- S22 Batch C (P2A1) static-claim / pseudo-audit / no-data closures');
+
+  const s22Root = (() => {
+    const cwd = process.cwd();
+    if (existsSync(resolvePath(cwd, 'package.json'))) return cwd;
+    let dir = dirname(fileURLToPath(import.meta.url));
+    for (let i = 0; i < 8; i += 1) {
+      if (existsSync(resolvePath(dir, 'package.json'))) return dir;
+      dir = dirname(dir);
+    }
+    return cwd;
+  })();
+  const s22Src = (rel: string): string => readFileSync(resolvePath(s22Root, rel), 'utf8');
+  /** The shipped source minus comments, for constant checks the defect documentation must not trip. */
+  const s22Code = (rel: string): string => s22Src(rel)
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .split('\n')
+    .filter((line) => !/^\s*\/\//.test(line))
+    .join('\n');
+  const simulatorSrc = s22Src('src/lib/complexScenarioSimulator.ts');
+  const portfolioSrc = s22Src('src/components/views/PortfolioView.tsx');
+  const simulationViewSrc = s22Src('src/components/views/MultiScenarioSimulationView.tsx');
+  const cpmSrc = s22Src('src/lib/cpmEngine.ts');
+
+  // ---------------------------------------------------------------------
+  // Shared fixture: the shipped pilot seed, at each project's Data Date.
+  // ---------------------------------------------------------------------
+  const s22Seed = getInitialSeedData() as Record<string, unknown[]>;
+  const s22Projects = (s22Seed['projects'] || []) as unknown as Project[];
+  const s22P1 = s22Projects.find((p) => p.id === 'proj-seed-001') as Project;
+  const s22P2 = s22Projects.find((p) => p.id === 'proj-seed-002') as Project;
+  const s22ActsOf = (pid: string): Activity[] =>
+    ((s22Seed['activities'] || []) as unknown as Activity[]).filter((a) => a.project_id === pid);
+  const s22LinksOf = (pid: string): ActivityLink[] =>
+    ((s22Seed['activity_links'] || []) as unknown as ActivityLink[]).filter((l) => l.project_id === pid);
+  const s22Acts = s22ActsOf(s22P1.id);
+  const s22Links = s22LinksOf(s22P1.id);
+  const s22Dd = s22P1.data_date || DD;
+  const s22Cal = (s22P1.calendar_type || '6_days') as CalendarType;
+
+  const s22FloatMetric = (project: Project, acts: Activity[]) =>
+    runPrecisionWatchdogAudit(project, acts, [], []).find((m) => m.id === 'WATCH-FLOAT-01');
+
+  // =====================================================================
+  // NEW-GAP-02 — WATCH-FLOAT-01 must be a real Total Float conservation
+  //              check that can fail.
+  // =====================================================================
+
+  // A CPM-consistent record: EF/LF/TF taken from the canonical CPM engine's own output, so the
+  // law TF = LF - EF holds by construction on the project's working-day calendar.
+  const s22Cpm = calculateCpm(s22Acts, s22Links, { calendarType: s22Cal, dataDate: s22Dd });
+  const s22Consistent: Activity[] = s22Acts.map((a) => {
+    const r = s22Cpm.results.find((x) => x.activityId === a.id);
+    return r
+      ? { ...a, early_finish: r.earlyFinish, late_finish: r.lateFinish, total_float: r.totalFloat }
+      : a;
+  });
+  const s22NonMilestoneCount = s22Consistent.filter(
+    (a) => !a.is_milestone && a.activity_type !== 'start_milestone' && a.activity_type !== 'finish_milestone',
+  ).length;
+
+  // --- NG02-A: valid CPM float data => PASS -------------------------------
+  const s22OkCheck = auditTotalFloatConservation(s22Consistent, s22Cal);
+  eq('S22-NG02-A every non-milestone activity is evaluated', s22OkCheck.evaluatedCount, s22NonMilestoneCount);
+  eq('S22-NG02-A a CPM-consistent record violates nothing', s22OkCheck.failedCount, 0);
+  eq('S22-NG02-A the worst drift on a consistent record is 0', s22OkCheck.maxDriftDays, 0);
+  const s22OkMetric = s22FloatMetric(s22P1, s22Consistent);
+  eq('S22-NG02-A WATCH-FLOAT-01 is exact on valid float data', s22OkMetric?.precisionStatus, 'exact');
+  eq('S22-NG02-A WATCH-FLOAT-01 reports zero deviation', s22OkMetric?.deviation, 0);
+  ok('S22-NG02-A the evaluated count is dynamic, not the hardcoded 10',
+    s22OkMetric !== undefined && s22OkMetric.expectedValue.includes(`all ${s22NonMilestoneCount} evaluated`));
+
+  // --- NG02-B: inject one incorrect total_float => FAIL -------------------
+  const s22Victim = s22Consistent[3];
+  const s22Broken: Activity[] = s22Consistent.map((a) =>
+    a.id === s22Victim.id ? { ...a, total_float: (a.total_float ?? 0) + 7 } : a);
+  const s22BadCheck = auditTotalFloatConservation(s22Broken, s22Cal);
+  eq('S22-NG02-B one injected float produces exactly one violation', s22BadCheck.failedCount, 1);
+  eq('S22-NG02-B the violation is counted against the evaluated total',
+    s22BadCheck.matchedCount, s22BadCheck.evaluatedCount - 1);
+  eq('S22-NG02-B the drift is the injected amount', s22BadCheck.maxDriftDays, 7);
+  const s22BadMetric = s22FloatMetric(s22P1, s22Broken);
+  eq('S22-NG02-B WATCH-FLOAT-01 FAILS when the float is wrong', s22BadMetric?.precisionStatus, 'drift_detected');
+  eq('S22-NG02-B the published deviation is the measured drift', s22BadMetric?.deviation, 7);
+  ok('S22-NG02-B a wrong float can no longer be published as an exact audit',
+    s22BadMetric?.precisionStatus !== 'exact' && s22BadMetric?.deviation !== 0);
+
+  // --- NG02-C: the failure identifies the actual mismatch -----------------
+  const s22Failure = s22BadCheck.failures[0];
+  eq('S22-NG02-C the reported activity is the injected one', s22Failure?.activityCode, s22Victim.code);
+  eq('S22-NG02-C the reported stored float is the corrupted one',
+    s22Failure?.storedTotalFloat, (s22Victim.total_float ?? 0) + 7);
+  ok('S22-NG02-C the reported expected float is recomputed, not copied',
+    s22Failure !== undefined && s22Failure.expectedTotalFloat !== s22Failure.storedTotalFloat);
+  ok('S22-NG02-C the evidence carries the EF/LF pair that was compared',
+    s22Failure !== undefined && s22Failure.earlyFinish.length === 10 && s22Failure.lateFinish.length === 10);
+  ok('S22-NG02-C the metric note names the failing activity and both figures',
+    s22BadMetric !== undefined
+    && s22BadMetric.notesEn.includes(String(s22Victim.code))
+    && s22BadMetric.notesEn.includes(String(s22Failure?.storedTotalFloat))
+    && s22BadMetric.notesEn.includes(String(s22Failure?.expectedTotalFloat)));
+
+  // --- NG02-D: the evaluated activity count is dynamic ---------------------
+  const s22Half = auditTotalFloatConservation(s22Consistent.slice(0, 5), s22Cal);
+  eq('S22-NG02-D the count follows the activities handed in', s22Half.evaluatedCount, 5);
+  ok('S22-NG02-D the count is not the hardcoded 10', s22Half.evaluatedCount !== 10);
+  const s22HalfMetric = s22FloatMetric(s22P1, s22Consistent.slice(0, 5));
+  ok('S22-NG02-D the published expectation quotes the real count',
+    s22HalfMetric !== undefined && s22HalfMetric.expectedValue.includes('all 5 evaluated'));
+  ok('S22-NG02-D the note never claims a fixed activity count',
+    s22HalfMetric !== undefined && !/all 10 activities/.test(s22HalfMetric.notesEn));
+  // Scope the constant check to the emitted WATCH-FLOAT-01 block: the surrounding documentation
+  // legitimately quotes the retired wording when explaining what the defect was.
+  const s22FloatBlock = (() => {
+    const i = simulatorSrc.indexOf("id: 'WATCH-FLOAT-01'");
+    const j = simulatorSrc.indexOf('\n  });', i);
+    return i >= 0 && j > i ? simulatorSrc.slice(i, j) : '';
+  })();
+  ok('S22-NG02-D the WATCH-FLOAT-01 block was located', s22FloatBlock.length > 0);
+  ok('S22-NG02-D the emitted metric contains no hardcoded activity count',
+    !/10/.test(s22FloatBlock) && !/all \d+ activities/.test(s22FloatBlock));
+  ok('S22-NG02-D the exact verdict is conditional on the measured failure count',
+    /floatCheck\.failedCount === 0[\s\S]{0,30}\?\s*'exact'/.test(s22FloatBlock)
+    && /!floatMeasured[\s\S]{0,30}\?\s*'not_measured'/.test(s22FloatBlock));
+
+  // --- NG02-E: milestones / excluded activities follow the CPM engine ------
+  const s22WithMilestones: Activity[] = [
+    ...s22Consistent,
+    {
+      ...s22Consistent[0], id: 'S22-MS-A', code: 'S22-MS-A', is_milestone: true, total_float: 999,
+    } as Activity,
+    {
+      ...s22Consistent[1], id: 'S22-MS-B', code: 'S22-MS-B', is_milestone: false,
+      activity_type: 'finish_milestone' as Activity['activity_type'], total_float: 999,
+    } as Activity,
+  ];
+  const s22MsCheck = auditTotalFloatConservation(s22WithMilestones, s22Cal);
+  eq('S22-NG02-E milestones are excluded exactly as CPM excludes them',
+    s22MsCheck.evaluatedCount, s22NonMilestoneCount);
+  eq('S22-NG02-E a milestone float is never held to the law', s22MsCheck.failedCount, 0);
+  ok('S22-NG02-E the milestone test mirrors the canonical CPM engine rule',
+    /activity\.is_milestone\s*\|\|[\s\S]{0,120}activity_type === 'start_milestone'[\s\S]{0,80}activity_type === 'finish_milestone'/.test(simulatorSrc)
+    && /isMilestone = activity\.is_milestone \|\| activity\.activity_type === 'start_milestone' \|\| activity\.activity_type === 'finish_milestone'/.test(cpmSrc));
+  const s22NoRecord = auditTotalFloatConservation(
+    s22Consistent.map((a) => ({ ...a, late_finish: null })) as Activity[], s22Cal);
+  eq('S22-NG02-E an activity with no LF is not evaluated', s22NoRecord.evaluatedCount, 0);
+  eq('S22-NG02-E ... and is reported, never silently skipped', s22NoRecord.notEvaluableCount, s22NonMilestoneCount);
+
+  // --- NG02-F: working-day / calendar semantics match the CPM engine -------
+  // EF 2026-08-25 (Tue) -> LF 2026-08-30 (Sun): 5 CALENDAR days but only 4 working days on the
+  // project's 6-day week (Friday off). The seed stores the calendar-day value.
+  const s22FriSpan: Activity[] = [{
+    ...s22Consistent[0], id: 'S22-F', code: 'S22-F', is_milestone: false,
+    early_finish: '2026-08-25', late_finish: '2026-08-30', total_float: 5,
+  } as Activity];
+  const s22Fri = auditTotalFloatConservation(s22FriSpan, '6_days');
+  const s22CalDays = Math.round(
+    (Date.parse('2026-08-30') - Date.parse('2026-08-25')) / 86400000);
+  eq('S22-NG02-F the calendar-day reading of the same span is 5', s22CalDays, 5);
+  eq('S22-NG02-F the audit counts WORKING days, not calendar days',
+    s22Fri.failures[0]?.expectedTotalFloat, countWorkingDays('2026-08-25', '2026-08-30', getCalendar('6_days')) - 1);
+  eq('S22-NG02-F ... which is 4 on a 6-day week', s22Fri.failures[0]?.expectedTotalFloat, 4);
+  eq('S22-NG02-F the stored calendar-day float is reported as a 1-day drift',
+    s22Fri.failures[0]?.driftDays, 1);
+  eq('S22-NG02-F the same span on a 5-day week yields 3 working days',
+    auditTotalFloatConservation(s22FriSpan, '5_days').failures[0]?.expectedTotalFloat, 3);
+  ok('S22-NG02-F the audit uses the shared working-day engine',
+    /countWorkingDays\(/.test(simulatorSrc) && /getCalendar\(/.test(simulatorSrc));
+  ok('S22-NG02-F the audit never subtracts raw calendar days',
+    !/86400000/.test(simulatorSrc) && !/Date\.parse\([^)]*\)\s*-\s*Date\.parse/.test(simulatorSrc));
+
+  // --- the audit must be able to fail on real data, and never pass on nothing ---
+  const s22SeedMetric = s22FloatMetric(s22P1, s22Acts);
+  eq('S22-NG02 the shipped seed no longer passes a float law it violates',
+    s22SeedMetric?.precisionStatus, 'drift_detected');
+  ok('S22-NG02 the seed violation is a real measured drift, not an assertion',
+    (s22SeedMetric?.deviation ?? 0) > 0
+    && auditTotalFloatConservation(s22Acts, s22Cal).failedCount > 0);
+  ok('S22-NG02 the seed drift is the calendar-day float stored on ACT-004/ACT-007',
+    auditTotalFloatConservation(s22Acts, s22Cal).failures.map((f) => f.activityCode).join(',') === 'ACT-004,ACT-007');
+  const s22EmptyMetric = s22FloatMetric(s22P1, []);
+  eq('S22-NG02 an audit that evaluated nothing is not_measured', s22EmptyMetric?.precisionStatus, 'not_measured');
+  eq('S22-NG02 ... and publishes no deviation at all', s22EmptyMetric?.deviation, null);
+  ok('S22-NG02 ... and never claims parity', s22EmptyMetric?.precisionStatus !== 'exact');
+  noNonFinite('S22-NG02 the float audit output is finite', {
+    ok: s22OkCheck, bad: s22BadCheck, empty: auditTotalFloatConservation([], '6_days'),
+  });
+
+  // =====================================================================
+  // NEW-GAP-01 — every headline simulation KPI must be derived.
+  // =====================================================================
+  const s22BaselineOf = (project: Project, acts: Activity[], bsls: BaselineActivity[]) =>
+    buildScenarioEvmBaseline({
+      project, activities: acts, baselines: bsls, budgetLines: [], costTransactions: [],
+      progressUpdates: [], wbsNodes: [], boqItems: [], allocations: [],
+      dataDate: project.data_date || DD, calendarType: (project.calendar_type || '6_days') as CalendarType,
+    });
+  const s22ActIds = new Set(s22Acts.map((a) => a.id));
+  const s22Bsls = ((s22Seed['baseline_activities'] || []) as unknown as BaselineActivity[])
+    .filter((b) => s22ActIds.has(b.activity_id));
+  const s22P2Acts = s22ActsOf(s22P2.id);
+  const s22P2Ids = new Set(s22P2Acts.map((a) => a.id));
+  const s22P2Bsls = ((s22Seed['baseline_activities'] || []) as unknown as BaselineActivity[])
+    .filter((b) => s22P2Ids.has(b.activity_id));
+
+  const s22Base1 = s22BaselineOf(s22P1, s22Acts, s22Bsls);
+  const s22Base2 = s22BaselineOf(s22P2, s22P2Acts, s22P2Bsls);
+  const s22RunOpts = { seed: 11, iterations: 20, risks: [] };
+
+  // --- NG01-A: changing scenario results changes the KPI -------------------
+  const s22Neutral = simulateComplexProjectScenario(
+    s22P1, s22Acts, s22Links, [], STANDARD_COMPLEX_SCENARIOS[0], s22Base1, s22RunOpts);
+  const s22Delayed = simulateComplexProjectScenario(
+    s22P1, s22Acts, s22Links, [], STANDARD_COMPLEX_SCENARIOS[3], s22Base1, s22RunOpts);
+  const s22Accelerated = simulateComplexProjectScenario(
+    s22P1, s22Acts, s22Links, [], STANDARD_COMPLEX_SCENARIOS[6], s22Base1, s22RunOpts);
+  ok('S22-NG01-A the three probe scenarios really do differ',
+    s22Neutral.varianceDays !== s22Delayed.varianceDays
+    && s22Delayed.varianceDays !== s22Accelerated.varianceDays);
+
+  const s22KpiNeutral = summarizeSimulationControlKpis([s22Neutral], []);
+  eq('S22-NG01-A a neutral-only set measures no schedule drift',
+    s22KpiNeutral.maxScheduleDrift.value, null);
+  const s22KpiDelayed = summarizeSimulationControlKpis([s22Neutral, s22Delayed], []);
+  eq('S22-NG01-A adding the delaying scenario changes the drift KPI',
+    s22KpiDelayed.maxScheduleDrift.value, s22Delayed.varianceDays);
+  eq('S22-NG01-A ... and it names the scenario that produced it',
+    s22KpiDelayed.maxScheduleDrift.scenarioId, s22Delayed.scenarioId);
+  const s22KpiAccel = summarizeSimulationControlKpis([s22Neutral, s22Delayed, s22Accelerated], []);
+  eq('S22-NG01-A the compression KPI is the most negative variance',
+    s22KpiAccel.maxCompression.value, s22Accelerated.varianceDays);
+  eq('S22-NG01-A the cost KPI tracks the largest measured overrun',
+    s22KpiAccel.maxCostOverrun.value,
+    Math.max(...[s22Neutral, s22Delayed, s22Accelerated]
+      .map((r) => r.costVarianceSar)
+      .filter((v): v is number => v !== null && v > 0)));
+
+  // --- NG01-B: changing active project does not leave stale fixed values ---
+  const s22P1Results = STANDARD_COMPLEX_SCENARIOS.map((m) =>
+    simulateComplexProjectScenario(s22P1, s22Acts, s22Links, [], m, s22Base1, s22RunOpts));
+  const s22P2Results = STANDARD_COMPLEX_SCENARIOS.map((m) =>
+    simulateComplexProjectScenario(s22P2, s22P2Acts, s22LinksOf(s22P2.id), [], m, s22Base2, s22RunOpts));
+  const s22KpiP1 = summarizeSimulationControlKpis(s22P1Results, runPrecisionWatchdogAudit(s22P1, s22Acts, [], s22P1Results));
+  const s22KpiP2 = summarizeSimulationControlKpis(s22P2Results, runPrecisionWatchdogAudit(s22P2, s22P2Acts, [], s22P2Results));
+  const s22P1MaxCost = Math.max(...s22P1Results.map((r) => r.costVarianceSar).filter((v): v is number => v !== null && v > 0));
+  const s22P2MaxCost = Math.max(...s22P2Results.map((r) => r.costVarianceSar).filter((v): v is number => v !== null && v > 0));
+  ok('S22-NG01-B the two projects really do produce different overruns', s22P1MaxCost !== s22P2MaxCost);
+  eq('S22-NG01-B project 1 card value is project 1 own maximum', s22KpiP1.maxCostOverrun.value, s22P1MaxCost);
+  eq('S22-NG01-B project 2 card value is project 2 own maximum', s22KpiP2.maxCostOverrun.value, s22P2MaxCost);
+  ok('S22-NG01-B switching project changes the card value',
+    s22KpiP1.maxCostOverrun.value !== s22KpiP2.maxCostOverrun.value);
+  ok('S22-NG01-B no card value is the retired hardcoded constant',
+    s22KpiP1.maxCostOverrun.value !== 515933
+    && s22KpiP1.maxScheduleDrift.value !== 55
+    && s22KpiP1.maxCompression.value !== -30);
+
+  // --- NG01-C: missing / unmeasured metric renders N/A ---------------------
+  const s22NoAudit = summarizeSimulationControlKpis(s22P1Results, []);
+  eq('S22-NG01-C no watchdog output means no parity percentage', s22NoAudit.precisionParityPercent, null);
+  eq('S22-NG01-C ... and nothing is counted as measured', s22NoAudit.measuredCheckCount, 0);
+  const s22AllNotMeasured = runPrecisionWatchdogAudit(s22P1, [], [], s22P1Results).map((m) => ({
+    ...m, precisionStatus: 'not_measured' as const, deviation: null,
+  }));
+  eq('S22-NG01-C an all-not-measured audit yields N/A, never 100%',
+    summarizeSimulationControlKpis(s22P1Results, s22AllNotMeasured).precisionParityPercent, null);
+  const s22CostlessResults: ComplexScenarioResult[] = s22P1Results.map((r) => ({ ...r, costVarianceSar: null }));
+  eq('S22-NG01-C an unmeasured cost outcome renders N/A',
+    summarizeSimulationControlKpis(s22CostlessResults, []).maxCostOverrun.value, null);
+  eq('S22-NG01-C ... with no scenario attribution', summarizeSimulationControlKpis(s22CostlessResults, []).maxCostOverrun.scenarioId, null);
+  eq('S22-NG01-C an unmeasured compression renders N/A',
+    summarizeSimulationControlKpis([s22Neutral], []).maxCompression.value, null);
+
+  // --- NG01-D: an unmeasured law cannot be presented as verified -----------
+  const s22Watch = runPrecisionWatchdogAudit(s22P1, s22Acts, [], s22P1Results);
+  const s22Cash = s22Watch.find((m) => m.id === 'WATCH-CASH-01');
+  eq('S22-NG01-D the cash-flow audit really is unmeasured on this project',
+    s22Cash?.precisionStatus, 'not_measured');
+  const s22KpiFull = summarizeSimulationControlKpis(s22P1Results, s22Watch);
+  ok('S22-NG01-D cash flow is listed as NOT measured',
+    s22KpiFull.notMeasuredCategories.includes('cashflow_integrity'));
+  ok('S22-NG01-D cash flow is not counted among the measured laws',
+    !s22KpiFull.measuredCategories.includes('cashflow_integrity'));
+  ok('S22-NG01-D the unmeasured law is excluded from the parity denominator',
+    s22KpiFull.measuredCheckCount === s22Watch.filter((m) => m.precisionStatus !== 'not_measured').length);
+  ok('S22-NG01-D the published scope names what was measured and what was not',
+    s22KpiFull.verificationScopeEn.includes('Measured:')
+    && s22KpiFull.verificationScopeEn.includes('not measured (N/A): Cash flow'));
+  ok('S22-NG01-D the scope text never claims an unmeasured law is verified',
+    !/strictly verified/.test(s22KpiFull.verificationScopeEn)
+    && !/verified/i.test(s22KpiFull.verificationScopeEn.split('not measured')[1] || ''));
+  ok('S22-NG01-D the screen no longer carries the "strictly verified" claim',
+    !/strictly verified/.test(simulationViewSrc));
+  ok('S22-NG01-D the parity percentage reflects the drift the audit found',
+    s22KpiFull.precisionParityPercent
+      === Math.round(((s22KpiFull.measuredCheckCount - s22KpiFull.driftCount) / s22KpiFull.measuredCheckCount) * 100));
+
+  // --- NG01-E: no hardcoded constants remain in the top cards --------------
+  const s22CardBlock = (() => {
+    const start = simulationViewSrc.indexOf('Top 4 Real-time Monitored Metrics Cards');
+    const end = simulationViewSrc.indexOf('Navigation Tabs', start);
+    return start >= 0 && end > start ? simulationViewSrc.slice(start, end) : '';
+  })();
+  ok('S22-NG01-E the top-cards block was located', s22CardBlock.length > 0);
+  for (const banned of ['100%', '+55', '515,933', '515933', '-30', '0.00 ر.س']) {
+    ok(`S22-NG01-E the top cards no longer contain the constant ${banned}`,
+      !s22CardBlock.includes(banned));
+  }
+  ok('S22-NG01-E every card reads the derived summary', (s22CardBlock.match(/controlKpis\./g) || []).length >= 12);
+  const s22ViewCode = s22Code('src/components/views/MultiScenarioSimulationView.tsx');
+  ok('S22-NG01-E the retired cost constant is gone from the whole screen',
+    !/515,?933/.test(s22ViewCode));
+  ok('S22-NG01-E the retired drift constants are gone as rendered KPI text',
+    !/>\s*\+55\s*</.test(s22ViewCode) && !/>\s*-30\s*</.test(s22ViewCode));
+  noNonFinite('S22-NG01-E the KPI summary is finite', { p1: s22KpiP1, p2: s22KpiP2 });
+
+  // =====================================================================
+  // NEW-GAP-05 — portfolio SPI/CPI: no data is not 1.00.
+  // =====================================================================
+  const s22Contrib = (
+    ev: number | null, pv: number | null, ac: number,
+    spiStatus?: PortfolioIndexContributor['spiStatus'],
+    cpiStatus?: PortfolioIndexContributor['cpiStatus'],
+  ): PortfolioIndexContributor => ({
+    ev, pv, ac,
+    spiStatus: spiStatus ?? (pv !== null && pv > 0 ? 'valid' : ev !== null && ev > 0 ? 'anomalous_zero_denominator' : 'empty_no_data'),
+    cpiStatus: cpiStatus ?? (ac > 0 ? 'valid' : ev !== null && ev > 0 ? 'anomalous_zero_denominator' : 'empty_no_data'),
+  });
+
+  // --- NG05-A: zero / no PV => SPI N/A, not 1.00 --------------------------
+  eq('S22-NG05-A zero planned value yields no SPI', rollUpPortfolioIndices([s22Contrib(0, 0, 1000)]).spi, null);
+  eq('S22-NG05-A ... and says the portfolio is empty', rollUpPortfolioIndices([s22Contrib(0, 0, 1000)]).spiStatus, 'empty_no_data');
+  eq('S22-NG05-A an unmeasurable planned value yields no SPI', rollUpPortfolioIndices([s22Contrib(500, null, 1000)]).spi, null);
+  eq('S22-NG05-A zero planned value still measures CPI', rollUpPortfolioIndices([s22Contrib(500, 0, 1000)]).cpi, 0.5);
+  eq('S22-NG05-A an empty portfolio yields no SPI', rollUpPortfolioIndices([]).spi, null);
+  eq('S22-NG05-A an empty portfolio yields no CPI', rollUpPortfolioIndices([]).cpi, null);
+
+  // --- NG05-B: zero / no AC => CPI N/A, not 1.00 --------------------------
+  const s22NoAc = rollUpPortfolioIndices([s22Contrib(500, 1000, 0)]);
+  eq('S22-NG05-B no actual cost yields no CPI', s22NoAc.cpi, null);
+  eq('S22-NG05-B ... and flags the anomaly instead of a healthy 1.00',
+    s22NoAc.cpiStatus, 'anomalous_zero_denominator');
+  ok('S22-NG05-B the reported CPI is not the synthetic 1.0', s22NoAc.cpi !== 1);
+  eq('S22-NG05-B no actual cost still measures SPI', s22NoAc.spi, 0.5);
+  eq('S22-NG05-B a project with no AC contributes nothing to the CPI', s22NoAc.cpiProjectCount, 0);
+  const s22MixedNoAc = rollUpPortfolioIndices([s22Contrib(500, 1000, 0), s22Contrib(2000, 1000, 1000)]);
+  eq('S22-NG05-B the CPI covers only the projects with valid evidence', s22MixedNoAc.cpiProjectCount, 1);
+  eq('S22-NG05-B ... and sums numerator and denominator over the same set', s22MixedNoAc.cpi, 2);
+  eq('S22-NG05-B the CPI denominator excludes the evidenceless project', s22MixedNoAc.cpiAcSar, 1000);
+  eq('S22-NG05-B the CPI numerator excludes the evidenceless project', s22MixedNoAc.cpiEvSar, 2000);
+
+  // --- NG05-C: a genuine measured SPI of 1.00 remains 1.00 ----------------
+  const s22PerfectSpi = rollUpPortfolioIndices([s22Contrib(1000, 1000, 500)]);
+  eq('S22-NG05-C a measured SPI of 1.00 is still published', s22PerfectSpi.spi, 1);
+  eq('S22-NG05-C ... and is flagged valid', s22PerfectSpi.spiStatus, 'valid');
+  const s22MixedSpi = rollUpPortfolioIndices([s22Contrib(600, 600, 100), s22Contrib(900, null, 100)]);
+  eq('S22-NG05-C a measured 1.00 survives a neighbour with no PV', s22MixedSpi.spi, 1);
+  eq('S22-NG05-C ... and the coverage is reported', s22MixedSpi.spiProjectCount, 1);
+  ok('S22-NG05-C a measured 1.00 is distinguishable from no data',
+    s22MixedSpi.spi === 1 && rollUpPortfolioIndices([s22Contrib(0, 0, 0)]).spi === null);
+
+  // --- NG05-D: a genuine measured CPI of 1.00 remains 1.00 ----------------
+  const s22PerfectCpi = rollUpPortfolioIndices([s22Contrib(1000, 1000, 1000)]);
+  eq('S22-NG05-D a measured CPI of 1.00 is still published', s22PerfectCpi.cpi, 1);
+  eq('S22-NG05-D ... and is flagged valid', s22PerfectCpi.cpiStatus, 'valid');
+  const s22MixedCpi = rollUpPortfolioIndices([s22Contrib(700, 700, 700), s22Contrib(900, 900, 0)]);
+  eq('S22-NG05-D a measured 1.00 survives a neighbour with no AC', s22MixedCpi.cpi, 1);
+  eq('S22-NG05-D ... and the coverage is reported', s22MixedCpi.cpiProjectCount, 1);
+
+  // --- NG05-E: the portfolio cards distinguish no-data from 1.00 ----------
+  ok('S22-NG05-E the SPI card renders N/A when the index is null',
+    /portfolioSpi === null \? 'N\/A' : portfolioSpi\.toFixed\(2\)/.test(portfolioSrc));
+  ok('S22-NG05-E the CPI card renders N/A when the index is null',
+    /portfolioCpi === null \? 'N\/A' : portfolioCpi\.toFixed\(2\)/.test(portfolioSrc));
+  ok('S22-NG05-E no fallback can publish a synthetic 1.0 index',
+    !/\?\s*1\.0\b/.test(s22Code('src/components/views/PortfolioView.tsx'))
+    && !/:\s*1\.0\b/.test(s22Code('src/components/views/PortfolioView.tsx')));
+  ok('S22-NG05-E the portfolio indices come from the canonical roll-up',
+    /rollUpPortfolioIndices\(portfolioProjects\)/.test(portfolioSrc)
+    && /portfolioIndices\.spi/.test(portfolioSrc) && /portfolioIndices\.cpi/.test(portfolioSrc));
+  ok('S22-NG05-E the cards state how many projects the figure covers',
+    /portfolioIndices\.spiProjectCount/.test(portfolioSrc) && /portfolioIndices\.cpiProjectCount/.test(portfolioSrc));
+  ok('S22-NG05-E a project with no index renders N/A rather than 0',
+    /p\.spi === null \? \([\s\S]{0,220}N\/A/.test(portfolioSrc)
+    && /p\.cpi === null \? \([\s\S]{0,220}N\/A/.test(portfolioSrc));
+
+  // --- the shipped portfolio is unaffected: every project carries real evidence ---
+  const s22SeedContributors: PortfolioIndexContributor[] = s22Projects.slice(0, 4).map((proj) => {
+    const acts = s22ActsOf(proj.id);
+    const ids = new Set(acts.map((a) => a.id));
+    const bsls = ((s22Seed['baseline_activities'] || []) as unknown as BaselineActivity[])
+      .filter((b) => ids.has(b.activity_id));
+    const canon = selectCanonicalEvm(analyzeCostControl({
+      project: proj, activities: acts, baselines: bsls, budgetLines: [],
+      costTransactions: ((s22Seed['cost_transactions'] || []) as unknown as CostTransaction[])
+        .filter((t) => t.project_id === proj.id),
+      progressUpdates: [], wbsNodes: [], boqItems: [], allocations: [],
+      dataDate: proj.data_date || DD, calendarType: (proj.calendar_type || '6_days') as CalendarType,
+    }));
+    return { ev: canon.ev, pv: canon.pv, ac: canon.ac, spiStatus: canon.spiStatus, cpiStatus: canon.cpiStatus };
+  });
+  const s22SeedRollup = rollUpPortfolioIndices(s22SeedContributors);
+  ok('S22-NG05 the shipped portfolio still publishes a measured SPI', s22SeedRollup.spi !== null);
+  ok('S22-NG05 the shipped portfolio still publishes a measured CPI', s22SeedRollup.cpi !== null);
+  eq('S22-NG05 every shipped project contributes valid evidence',
+    s22SeedRollup.spiProjectCount, s22SeedContributors.length);
+  ok('S22-NG05 the roll-up matches the same ratio over the same evidence',
+    Math.abs((s22SeedRollup.spi as number) - s22SeedRollup.spiEvSar / s22SeedRollup.spiPvSar) <= 0.01
+    && Math.abs((s22SeedRollup.cpi as number) - s22SeedRollup.cpiEvSar / s22SeedRollup.cpiAcSar) <= 0.01);
+  noNonFinite('S22-NG05 the portfolio roll-up is finite', s22SeedRollup);
+
+  // =====================================================================
+  // Batch-wide: nothing in Batch C introduces a static claim or a zero
+  // denominator presented as health.
+  // =====================================================================
+  ok('S22 the float audit is the only producer of WATCH-FLOAT-01 figures',
+    /auditTotalFloatConservation\(activities, project\.calendar_type\)/.test(simulatorSrc));
+  ok('S22 the float audit no longer short-circuits to success',
+    !/Verified exact by CPM engine/.test(simulatorSrc) && !/return false; \/\/ Verified/.test(simulatorSrc));
+  ok('S22 the KPI summary is the only producer of the headline card values',
+    /summarizeSimulationControlKpis\(/.test(simulationViewSrc));
+  ok('S22 the portfolio never divides by a denominator it did not validate',
+    !/totalPortfolioPv > 0 \?/.test(portfolioSrc) && !/totalPortfolioAc > 0 \?/.test(portfolioSrc));
+  eq('S22 the watchdog still reports the cash-flow audit as unmeasured', s22Cash?.deviation, null);
 }
 
 // ---------------------------------------------------------------------------
