@@ -69,6 +69,9 @@ const ESM_STATUS_LABELS: Record<EarnedScheduleResult['status'], { ar: string; en
   on_track: { ar: 'على المسار الزمني المخطط', en: 'On the planned time track', className: 'bg-blue-100 text-blue-800 border-blue-200' },
   delayed: { ar: 'تأخير زمني مقاس', en: 'Measured time delay', className: 'bg-amber-100 text-amber-900 border-amber-200' },
   critical_delay: { ar: 'تأخير حرج — لا يوجد جدول مكتسب', en: 'Critical delay — no earned schedule', className: 'bg-rose-100 text-rose-800 border-rose-200' },
+  // P2A1-NEW-GAP-04: the no-data state. The engine measured nothing, so no performance state is
+  // claimed — never "on track", which is what the empty path used to report.
+  unmeasured: { ar: 'غير مقاس — لا توجد بيانات كافية', en: 'Unmeasured — insufficient data', className: 'bg-slate-100 text-slate-500 border-slate-200' },
 };
 
 /** Day/month formatting for engine output: finite numbers only, everything else is N/A. */
@@ -229,6 +232,8 @@ export default function BudgetView({ project }: BudgetViewProps) {
   const scheduleReport: ScheduleControlReport | null = useMemo(() => {
     if (!project) return null;
     return analyzeScheduleControl({
+      // P2A1-M01: the project, so the report can state the provenance of its Data Date.
+      project,
       activities,
       links,
       baselines,
@@ -442,7 +447,7 @@ export default function BudgetView({ project }: BudgetViewProps) {
     activities.length > 0 &&
     earnedSchedule.plannedDurationDays > 0 &&
     earnedSchedule.actualTimeElapsedDays > 0;
-  const esmIeacComputable = esmComputable && earnedSchedule.schedulePerformanceIndexTime > 0;
+  const esmIeacComputable = esmComputable && (earnedSchedule.schedulePerformanceIndexTime ?? 0) > 0;
   /** The Data Date every figure in this card was computed at — read from the canonical EVM result. */
   const earnedScheduleDateLabel = evm.dataDate;
   const esmMissingInputAr = !project
@@ -1095,7 +1100,7 @@ export default function BudgetView({ project }: BudgetViewProps) {
               </div>
               <div className="p-3 bg-slate-50 rounded-xl border border-slate-200">
                 <span className="text-slate-500 block text-[11px]">{lang === 'ar' ? 'مؤشر الأداء الزمني SPI(t):' : 'Time-based SPI(t):'}</span>
-                <span className={`font-mono font-black text-base ${earnedSchedule.schedulePerformanceIndexTime >= 1 ? 'text-emerald-700' : 'text-amber-700'}`}>
+                <span className={`font-mono font-black text-base ${(earnedSchedule.schedulePerformanceIndexTime ?? 0) >= 1 ? 'text-emerald-700' : 'text-amber-700'}`}>
                   {esmComputable ? formatEsmNumber(earnedSchedule.schedulePerformanceIndexTime, 2) : (lang === 'ar' ? 'غير قابل للحساب (N/A)' : 'Not computable (N/A)')}
                 </span>
                 <span className="text-[10px] text-slate-500 font-mono block">

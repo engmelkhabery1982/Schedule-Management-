@@ -30,6 +30,8 @@
 import { countWorkingDays, getCalendar } from './calendarEngine';
 import { calendarDaysBetween, isAfterDataDate, isIsoDate } from './chronologyGuard';
 import { applyGovernedProgress } from './governedProgress';
+// P2A1-M01: the Data Date provenance that must travel with every report that publishes one.
+import { resolveDataDateProvenance, type DataDateSource } from './chronologyGuard';
 import { controlRecordCrossesProjectBoundary } from './demoDbContracts';
 import type { ScheduleControlReport } from './scheduleControlEngine';
 import type {
@@ -269,6 +271,14 @@ export interface CostControlInput {
 
 export interface CostControlReport {
   dataDate: string;
+  /**
+   * P2A1-M01: whether `dataDate` is the project's own governed status date or the governed DEFAULT
+   * standing in for one. Provenance must travel with the report so that no consumer can label a
+   * fallback as an explicitly governed Data Date.
+   */
+  dataDateSource: DataDateSource;
+  /** Convenience: `dataDateSource === FALLBACK_DEFAULT_DATE`. */
+  dataDateIsFallback: boolean;
   bac: BacBasis;
   pvMethod: 'linear_baseline' | 'linear_cpm_proxy' | 'mixed' | 'unavailable';
   project: {
@@ -363,12 +373,51 @@ function minLevel(levels: CostConfidence[]): CostConfidence {
 // ---------------------------------------------------------------------------
 
 /**
+ * P2A1-H02: normalize one key component so that "the same value written two ways" keys the same.
+ *
+ * `null`, `undefined` and the empty string all mean "not stated"; surrounding whitespace and letter
+ * case carry no accounting meaning (a vendor entered as "ACME " is the vendor "acme"). Numbers are
+ * normalized numerically, so `50000` and `50,000.00` cannot diverge.
+ */
+function keyPart(value: unknown): string | number | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value === 'boolean') return value ? 'true' : 'false';
+  const s = String(value).trim().toLowerCase();
+  if (s === '') return null;
+  const n = Number(s);
+  // A numeric-looking string (amounts typed as text) must key as the number it represents.
+  return Number.isFinite(n) && /^[+-]?(\d+(\.\d+)?|\.\d+)$/.test(s) ? n : s;
+}
+
+/**
  * The business key that defines "the same cost transaction twice" (H02, P2A1-H02).
  *
- * Two rows carrying the same key are the SAME economic event recorded twice — same date, same
- * amount, same activity / BOQ references, same vendor, same invoice number, same description. The
- * database id is deliberately NOT part of the key: two distinct rows with distinct ids are exactly
- * the duplicate this detects, and deduplicating by id would detect nothing at all.
+ * A duplicate is the SAME ECONOMIC EVENT recorded twice. The key therefore joins two halves:
+ *
+ *   1. THE EVENT — when, how much, from whom, for what:
+ *        project_id, transaction_date, amount, activity_id, boq_item_id,
+ *        vendor, invoice_number, description.
+ *   2. THE ACCOUNTING IDENTITY — how that event is classified and allocated:
+ *        category, cost_type, source, wbs_node_id, budget_line_id.
+ *
+ * P2A1-H02 CLOSURE: the first revision keyed on the event half only. Two rows that are the SAME
+ * event booked DIFFERENTLY were then collapsed into one, so legitimate accounting was discarded —
+ * and because detection and AC aggregation share this function, the discarded row was dropped from
+ * AC silently. The classification and allocation half of the key is what separates them:
+ *
+ *   - `cost_type`  — a direct charge and an indirect/overhead charge of the same invoice are two
+ *                    postings, not one posting twice.
+ *   - `category`   — the same invoice split across cost categories (works / materials) is split
+ *                    accounting, not a repeat.
+ *   - `source`     — a different booking system is a different provenance; merging an ERP row into
+ *                    an INV row would silently drop one system's record.
+ *   - `wbs_node_id` / `budget_line_id` — a different allocation target is a different charge, even
+ *                    when the invoice, date and amount are identical (a split across two budget
+ *                    lines, or the same cost charged to two WBS branches).
+ *
+ * The database id is deliberately NOT part of the key: two distinct rows with distinct ids are
+ * exactly the duplicate this detects, and deduplicating by id would detect nothing at all.
  *
  * This is the single definition used by BOTH consumers of the rule:
  *   - `checkCostIntegrity`, which reports the duplicate in the register; and
@@ -379,8 +428,13 @@ function minLevel(levels: CostConfidence[]): CostConfidence {
  */
 export function costTransactionBusinessKey(t: CostTransaction): string {
   return JSON.stringify([
-    t.transaction_date, Number(t.amount), t.activity_id, t.boq_item_id,
-    t.vendor ?? null, t.invoice_number ?? null, t.description,
+    // 1. the economic event
+    keyPart(t.project_id), keyPart(t.transaction_date), keyPart(t.amount),
+    keyPart(t.activity_id), keyPart(t.boq_item_id),
+    keyPart(t.vendor), keyPart(t.invoice_number), keyPart(t.description),
+    // 2. its accounting identity: classification and allocation
+    keyPart(t.category), keyPart(t.cost_type), keyPart(t.source),
+    keyPart(t.wbs_node_id), keyPart(t.budget_line_id),
   ]);
 }
 
@@ -588,6 +642,16 @@ export function analyzeCostControl(input: CostControlInput): CostControlReport {
   const manualEtc = finiteNum(input.manualEtc) !== null && (input.manualEtc as number) >= 0
     ? (input.manualEtc as number) : null;
   const ruler = getCalendar(calendarType);
+  // P2A1-M01: the provenance of the Data Date this report was built at. The VALUE is whatever the
+  // caller resolved (unchanged); only the record of where it came from is new, and it is the same
+  // provenance the app shell already displays for the same project.
+  //
+  // The override is deliberately NOT passed: every caller supplies an explicit `dataDate`, so
+  // including it would resolve to `EXPLICIT_GOVERNED_DATE` for every project and could never report
+  // a fallback. The provenance question a report must answer is "does this PROJECT state a status
+  // date of its own?" — if it does not, the date above is the governed default standing in, and the
+  // report has to say so. Only `source` / `isFallback` are read; `dataDate` remains the caller's.
+  const dataDateResolution = resolveDataDateProvenance(project);
   // H01: earned value is a function of the GOVERNED as-of progress, not of the materialised
   // `activities.percent_complete` column. `progress_updates` (approved, on/before the Data Date) is
   // the source of truth — see `src/lib/governedProgress.ts`. Plan fields (dates, WBS, quantities)
@@ -1518,7 +1582,10 @@ export function analyzeCostControl(input: CostControlInput): CostControlReport {
   trend[trend.length - 1].confidence = confidence.forecast.level;
 
   return {
-    dataDate, bac, pvMethod,
+    dataDate,
+    dataDateSource: dataDateResolution.source,
+    dataDateIsFallback: dataDateResolution.isFallback,
+    bac, pvMethod,
     project: {
       bac: bacV, pv: projectPv, ev: projectEv, ac: projectAc,
       acSource: acTxns.length > 0 ? 'approved_transactions' : 'none_recorded',

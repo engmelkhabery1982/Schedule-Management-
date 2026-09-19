@@ -297,6 +297,8 @@ export default function ScheduleView({ project }: ScheduleViewProps) {
   const control: ScheduleControlReport | null = useMemo(() => {
     if (!project) return null;
     return analyzeScheduleControl({
+      // P2A1-M01: the project, so the report can state the provenance of its Data Date.
+      project,
       activities,
       links,
       baselines: baselineActivities,

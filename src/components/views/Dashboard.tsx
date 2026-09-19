@@ -329,6 +329,8 @@ ${noticeForm.contractorName}`;
     if (!project) return null;
     const ordered = [...snapshots].sort((a, b) => (a.data_date < b.data_date ? 1 : -1));
     return analyzeScheduleControl({
+      // P2A1-M01: the project, so the report can state the provenance of its Data Date.
+      project,
       activities,
       links,
       baselines: baselineActivities,
@@ -481,7 +483,13 @@ ${noticeForm.contractorName}`;
 
   // Defect 3: canonical F6 EAC keeps the unqualified label; the SPI/CPI-trend + open-risk figure is
   // named as a scenario and always shows its delta. The canonical value is never overwritten by it.
-  const scenarioEacRaw = forecast.cost.realistic + forecast.riskExposure.cost;
+  // P2A1-H04: an UNMEASURED forecast publishes no scenario EAC. `forecast.measured` is false
+  // whenever a governing CPI/SPI is not a measured value, and the engine then reports every cost
+  // scenario as null — so the budget (the old no-data compatibility value) can never be rendered as
+  // a completion estimate. The risk exposure is only ever ADDED to a measured EAC.
+  const scenarioEacRaw = forecast.measured && forecast.cost.realistic !== null
+    ? forecast.cost.realistic + forecast.riskExposure.cost
+    : null;
   const eacCards = useMemo(() => buildEacPresentation({
     canonicalEac: canonicalEvmQuote.eac,
     canonicalMethod: costStrip?.recommended ? costStrip.recommended.method : null,
@@ -1504,13 +1512,13 @@ ${noticeForm.contractorName}`;
           </div>
         </div>
 
-        {(eacCards.scenario || finishCards.statistical) && (
+        {(eacCards.scenario || finishCards.statistical || !forecast.measured) && (
           <div className="mt-3 pt-3 border-t border-dashed border-slate-200">
             <p className="text-[10px] font-bold uppercase tracking-wide text-slate-400 mb-2">
               {lang === 'ar' ? 'طبقة السيناريو والإحصاء — ليست قيماً قانونية' : 'Scenario / statistical layer — not canonical values'}
             </p>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
-              {eacCards.scenario && (
+              {eacCards.scenario ? (
                 <div className="bg-amber-50/40 p-3 rounded-lg border border-amber-100" data-authority={SCENARIO_COST_AUTHORITY}>
                   <p className="text-amber-700">{lang === 'ar' ? eacCards.scenario.labelAr : eacCards.scenario.labelEn}</p>
                   <p className="font-bold text-amber-800 text-sm mt-0.5">{fmtCanonicalMoney(eacCards.scenario.value)}</p>
@@ -1521,6 +1529,22 @@ ${noticeForm.contractorName}`;
                       : 'N/A'}
                   </p>
                   <p className="text-[10px] text-amber-400 font-mono mt-0.5">{eacCards.scenario.method}</p>
+                </div>
+              ) : (
+                /* P2A1-H04: the forecast is UNMEASURED, so no scenario EAC is published. The card
+                   states that (with the engine's reason) instead of rendering the budget — the old
+                   no-data compatibility value — as a measured completion estimate. */
+                <div className="bg-slate-50 p-3 rounded-lg border border-slate-200" data-authority={SCENARIO_COST_AUTHORITY}>
+                  <p className="text-slate-600">
+                    {lang === 'ar' ? 'EAC المعدّل بالمخاطر (سيناريو — ليس القانوني)' : 'Risk-Adjusted EAC (scenario, not canonical)'}
+                  </p>
+                  <p className="font-bold text-slate-400 text-sm mt-0.5">N/A</p>
+                  <p className="text-[10px] text-slate-500 mt-0.5">
+                    {lang === 'ar'
+                      ? 'غير مقاس: مؤشرا CPI/SPI غير مقيسين، فلا يُنشر أي EAC سيناريو.'
+                      : 'Not measured: the CPI/SPI are unmeasured, so no scenario EAC is published.'}
+                  </p>
+                  {forecast.note && <p className="text-[10px] text-slate-400 mt-0.5">{forecast.note}</p>}
                 </div>
               )}
               {finishCards.statistical && (

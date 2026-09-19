@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo } from 'react';
 import { supabase } from '@/lib/supabase';
-import type { Project, Activity, ActivityLink, BaselineActivity, ActivityResource, DcmaAuditResult } from '@/types';
+import type { Project, Activity, ActivityLink, BaselineActivity, ActivityResource, DcmaAuditResult, ProgressUpdate } from '@/types';
 import { runDcma14PointAudit, autoFixDcmaIssues } from '@/lib/scheduleQualityEngine';
 // F9.4 (Controlled Pilot defect 4): the float profile's critical bucket must use the same canonical
 // criticality as F5, the dashboard and the Executive Report — not the cached `is_critical` column.
@@ -32,6 +32,8 @@ export default function DcmaAuditView({ project }: DcmaAuditViewProps) {
   const [links, setLinks] = useState<ActivityLink[]>([]);
   const [baselineActivities, setBaselineActivities] = useState<BaselineActivity[]>([]);
   const [assignments, setAssignments] = useState<ActivityResource[]>([]);
+  // P2A1-H01: the governed progress history — the evidence behind the statused CPM below.
+  const [progressUpdates, setProgressUpdates] = useState<ProgressUpdate[]>([]);
   const [loading, setLoading] = useState(true);
   const [expandedPoint, setExpandedPoint] = useState<number | null>(null);
   const [message, setMessage] = useState('');
@@ -52,16 +54,20 @@ export default function DcmaAuditView({ project }: DcmaAuditViewProps) {
   async function loadData() {
     if (!project) return;
     setLoading(true);
-    const [actRes, linkRes, baselineRes, assignRes] = await Promise.all([
+    const [actRes, linkRes, baselineRes, assignRes, progRes] = await Promise.all([
       supabase.from('activities').select('*').eq('project_id', project.id).order('sort_order'),
       supabase.from('activity_links').select('*').eq('project_id', project.id),
       supabase.from('baseline_activities').select('*'),
       supabase.from('activity_resources').select('*').eq('project_id', project.id),
+      // P2A1-H01: the governed progress history, so the canonical criticality below is computed on
+      // the same statused activities F5 uses rather than on the materialised column.
+      supabase.from('progress_updates').select('*').eq('project_id', project.id),
     ]);
     setActivities(actRes.data || []);
     setLinks((linkRes.data || []) as ActivityLink[]);
     setBaselineActivities((baselineRes.data || []) as BaselineActivity[]);
     setAssignments((assignRes.data || []) as ActivityResource[]);
+    setProgressUpdates((progRes.data || []) as ProgressUpdate[]);
     setLoading(false);
   }
 
@@ -83,8 +89,12 @@ export default function DcmaAuditView({ project }: DcmaAuditViewProps) {
       dataDate: dcmaDataDate,
       calendarType: project?.calendar_type || '6_days',
       statusLogic: project?.status_logic || 'retained_logic',
+      // P2A1-H01: the GOVERNED as-of status, so this canonical count is computed on exactly the
+      // same statused activities F5 uses. Without it the helper would read the materialised column
+      // and could report a different criticality than F5 for an unsupported materialised value.
+      progressUpdates,
     }),
-    [activities, links, dcmaDataDate, project?.calendar_type, project?.status_logic],
+    [activities, links, dcmaDataDate, project?.calendar_type, project?.status_logic, progressUpdates],
   );
   const floatProfile = useMemo(() => {
     let critical = 0;

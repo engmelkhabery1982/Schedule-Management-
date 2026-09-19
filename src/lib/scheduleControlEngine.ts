@@ -22,7 +22,11 @@
 
 import { calculateCpm } from './cpmEngine';
 import { countWorkingDays, getCalendar } from './calendarEngine';
-import { calendarDaysBetween, isAfterDataDate, isIsoDate } from './chronologyGuard';
+import {
+  calendarDaysBetween, isAfterDataDate, isIsoDate,
+  // P2A1-M01: the Data Date provenance that must travel with the report.
+  resolveDataDateProvenance, type DataDateSource,
+} from './chronologyGuard';
 import { applyGovernedProgress } from './governedProgress';
 import type {
   Activity,
@@ -225,6 +229,12 @@ export interface ScheduleControlInput {
   activities: Activity[];
   links: ActivityLink[];
   baselines: BaselineActivity[];
+  /**
+   * P2A1-M01: the project these rows belong to, used ONLY to record the provenance of the Data Date
+   * (`dataDateSource`). Optional and additive: a caller that omits it keeps the previous behaviour,
+   * and the date itself is still the caller's explicit `dataDate`.
+   */
+  project?: { data_date?: string | null } | null;
   progressUpdates?: ProgressUpdate[];
   previousSnapshot?: ScheduleUpdateSnapshot | null;
   dataDate: string;
@@ -236,6 +246,13 @@ export interface ScheduleControlInput {
 
 export interface ScheduleControlReport {
   dataDate: string;
+  /**
+   * P2A1-M01: whether `dataDate` is the project's own governed status date or the governed DEFAULT
+   * standing in for one, so a consumer can never label a fallback as an explicitly governed date.
+   */
+  dataDateSource: DataDateSource;
+  /** Convenience: `dataDateSource === FALLBACK_DEFAULT_DATE`. */
+  dataDateIsFallback: boolean;
   statusLogic: 'retained_logic' | 'progress_override';
   integrity: IntegrityFinding[];
   /** Sorted ids of currently driving links; stored so the next update can diff migration. */
@@ -608,6 +625,17 @@ export function analyzeScheduleControl(input: ScheduleControlInput): ScheduleCon
   } = input;
   const progressUpdates = input.progressUpdates || [];
   const previousSnapshot = input.previousSnapshot || null;
+  // P2A1-M01: record the provenance of this report's Data Date, with the same resolver the app shell
+  // uses, so a screen badge and the engine report can never disagree about it.
+  //
+  // As in F6, the caller's explicit `dataDate` is deliberately not passed as an override: every
+  // caller supplies one, so it would always resolve to `EXPLICIT_GOVERNED_DATE` and a fallback
+  // could never be reported. The question is whether the PROJECT governs a status date of its own.
+  // A caller that supplies no project at all cannot answer it, and is recorded as governed-by-
+  // assertion rather than being falsely branded a fallback.
+  const dataDateResolution = input.project
+    ? resolveDataDateProvenance(input.project)
+    : resolveDataDateProvenance(null, dataDate);
   const prevDD = previousSnapshot && isIsoDate(previousSnapshot.data_date) ? previousSnapshot.data_date : null;
 
   // Integrity auditing runs on the RECORDED rows: a stored violation (future actual, bad date …)
@@ -1166,7 +1194,10 @@ export function analyzeScheduleControl(input: ScheduleControlInput): ScheduleCon
   };
 
   return {
-    dataDate, statusLogic, integrity, drivingLinkIds: drivingLinkIdList, statused,
+    dataDate,
+    dataDateSource: dataDateResolution.source,
+    dataDateIsFallback: dataDateResolution.isFallback,
+    statusLogic, integrity, drivingLinkIds: drivingLinkIdList, statused,
     project: {
       baselineFinish, forecastFinish, totalDelayWd, delayVsPreviousWd,
       criticalCount, nearCriticalCount: nearCriticalList.length,
@@ -1249,19 +1280,35 @@ export function summarizeCanonicalCriticality(
     dataDate: string;
     calendarType?: CalendarType;
     statusLogic?: 'retained_logic' | 'progress_override';
+    /**
+     * P2A1-H01 (closure): the governed progress history of these activities. When supplied, the
+     * statused state this helper reads is the GOVERNED as-of state — the same one F5 computes via
+     * `applyGovernedProgress` — instead of the materialised `activities.percent_complete` column.
+     * F5 and this helper are asserted to agree everywhere ("one definition, two consumers"), and
+     * once H01 stopped treating an unsupported materialised value as evidence they could only keep
+     * agreeing if this helper reads the same governed status.
+     *
+     * Omitted (the historical signature) preserves the previous behaviour exactly, so no existing
+     * caller changes.
+     */
+    progressUpdates?: readonly ProgressUpdate[];
   },
 ): CanonicalCriticality {
-  const { dataDate, calendarType = '6_days', statusLogic = 'retained_logic' } = options;
+  const { dataDate, calendarType = '6_days', statusLogic = 'retained_logic', progressUpdates } = options;
   const byId = new Map<string, CanonicalActivityCriticality>();
 
   if (activities.length === 0) {
     return { dataDate, totalCritical: 0, remainingCritical: 0, criticalIds: [], remainingCriticalIds: [], byId };
   }
 
-  const cpm = calculateCpm(activities, links, { calendarType, dataDate, statusLogic });
+  // The statused rows: governed when the caller supplied the progress history, recorded otherwise.
+  const statused = progressUpdates
+    ? applyGovernedProgress(activities, progressUpdates, dataDate)
+    : activities;
+  const cpm = calculateCpm(statused, links, { calendarType, dataDate, statusLogic });
   const resultById = new Map(cpm.results.map((r) => [r.activityId, r]));
 
-  for (const a of activities) {
+  for (const a of statused) {
     const r = resultById.get(a.id);
     const pct = Number(a.percent_complete) || 0;
     byId.set(a.id, {

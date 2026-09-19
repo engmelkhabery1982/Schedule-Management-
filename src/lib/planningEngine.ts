@@ -722,10 +722,20 @@ export interface ForecastScenarios {
 
 export interface ForecastAnalysis {
   scenarios: ForecastScenarios;
+  /**
+   * The cost scenarios (EAC). `null` whenever the forecast is not MEASURED — P2A1-H04 closure.
+   *
+   * The first revision returned `bac` here when the CPI was unmeasured, on the grounds that
+   * `assessEvmRatios` uses "EAC = BAC" as its no-data compatibility value. That convention exists
+   * to keep a non-nullable numeric SHAPE, not to publish a forecast: a consumer that renders this
+   * field as a scenario EAC therefore presented the budget as a measured completion estimate
+   * whenever cost performance had never been measured. The compatibility value stays inside
+   * `assessEvmRatios`; a FORECAST that has no measured efficiency publishes no number.
+   */
   cost: {
-    optimistic: number;
-    realistic: number;
-    pessimistic: number;
+    optimistic: number | null;
+    realistic: number | null;
+    pessimistic: number | null;
   };
   /**
    * P2A1-H04: null when the forecast is not computable because a governing performance index is not
@@ -856,13 +866,17 @@ export function analyzeForecast(
       plannedStart, plannedFinish, actualProgress, safeSpi, new Date(`${dataDate}T00:00:00Z`), spiStatus,
     ),
     cost: {
-      // P2A1-H04: with no measured cost index the EAC convention shared with `assessEvmRatios` and
-      // `budgetForecastEngine` applies — do not divide by a non-measured index, fall back to BAC.
-      // The synthetic `1.0` (and the anomaly's `0`, which inflated the forecast fourfold) are both
-      // excluded: neither is evidence of cost performance.
-      optimistic: cpiMeasured ? actualCost + (bac * remaining) / Math.max(1, safeCpi * 1.15) : bac,
-      realistic: cpiMeasured ? actualCost + (bac * remaining) / safeCpi : bac,
-      pessimistic: cpiMeasured ? actualCost + (bac * remaining) / Math.max(0.25, safeCpi * 0.8) : bac,
+      // P2A1-H04 CLOSURE: an UNMEASURED cost efficiency publishes NO EAC at all.
+      //
+      // `assessEvmRatios` keeps "EAC = BAC" as its no-data compatibility VALUE so that engines with
+      // a non-nullable numeric contract stay finite; that is a shape convention, not a forecast.
+      // Publishing it here let a screen render the budget as a measured completion estimate, and
+      // the anomaly's `0` inflated the same field fourfold. Neither is cost evidence, so when the
+      // caller reports the index as not `valid` every scenario is null and the consumer renders
+      // N/A. The synthetic `1.0` and the anomaly's `0` are both excluded from the division.
+      optimistic: cpiMeasured ? actualCost + (bac * remaining) / Math.max(1, safeCpi * 1.15) : null,
+      realistic: cpiMeasured ? actualCost + (bac * remaining) / safeCpi : null,
+      pessimistic: cpiMeasured ? actualCost + (bac * remaining) / Math.max(0.25, safeCpi * 0.8) : null,
     },
     confidence,
     volatility,

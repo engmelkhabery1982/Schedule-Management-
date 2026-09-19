@@ -71,6 +71,9 @@ export type EsForecastAvailability =
   | 'computable'
   | 'no_earned_schedule' // no Earned Schedule result was supplied
   | 'no_planned_duration' // PD = 0: no project span to forecast against
+  /** P2A1-NEW-GAP-04: the Earned Schedule run measured nothing (no project / no activities), so
+   *  there is no trend forecast — not a zero index, an absence of evidence. */
+  | 'es_unmeasured'
   | 'spi_t_zero'; // SPI(t) = 0: IEAC(t) = PD / SPI(t) is unbounded (Wave 5 reports a PD floor)
 
 /**
@@ -213,11 +216,18 @@ export function reconcileFinishForecasts(
 
   let esAvailability: EsForecastAvailability = 'computable';
   if (!earnedSchedule) esAvailability = 'no_earned_schedule';
+  // P2A1-NEW-GAP-04: an unmeasured Earned Schedule (no project / no activities) has no trend
+  // forecast at all. It is not "SPI(t) = 0" — that label describes a measured zero index — and it
+  // must be named as the no-data state it is so a screen can say so instead of implying a forecast.
+  else if (earnedSchedule.measured === false || earnedSchedule.schedulePerformanceIndexTime === null) {
+    esAvailability = 'es_unmeasured';
+  }
   else if (!(earnedSchedule.plannedDurationDays > 0)) esAvailability = 'no_planned_duration';
   else if (!(earnedSchedule.schedulePerformanceIndexTime > 0)) esAvailability = 'spi_t_zero';
 
   const esComputable = esAvailability === 'computable';
   const esTrendFinish = esComputable && earnedSchedule ? earnedSchedule.forecastCompletionDate : null;
+  // `forecastCompletionDate` is null whenever the run measured nothing, so both guards agree.
 
   const bothAvailable = cpmEarlyFinish !== null && esTrendFinish !== null;
   const deltaDays = bothAvailable ? daysBetweenIso(cpmEarlyFinish as string, esTrendFinish as string) : null;

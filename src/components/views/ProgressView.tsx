@@ -2548,13 +2548,18 @@ export default function ProgressView({ project }: ProgressViewProps) {
                 <div className="flex justify-between py-2 border-b border-slate-100">
                   <span className="text-slate-500">مؤشر كفاءة الجدول المالي SPI:</span>
                   <span className="font-mono font-bold text-slate-900">
-                    {earnedScheduleData.comparisonWithTraditionalEvm.evmSpi.toFixed(3)}
+                    {/* P2A1-NEW-GAP-04: unmeasured => N/A, never the synthetic 1.000. */}
+                    {earnedScheduleData.comparisonWithTraditionalEvm.evmSpi === null
+                      ? 'N/A'
+                      : earnedScheduleData.comparisonWithTraditionalEvm.evmSpi.toFixed(3)}
                   </span>
                 </div>
                 <div className="flex justify-between py-2">
                   <span className="text-slate-500">مؤشر كفاءة التكلفة CPI:</span>
                   <span className="font-mono font-bold text-emerald-600">
-                    {earnedScheduleData.costPerformanceIndex.toFixed(3)}
+                    {earnedScheduleData.costPerformanceIndex === null
+                      ? 'N/A'
+                      : earnedScheduleData.costPerformanceIndex.toFixed(3)}
                   </span>
                 </div>
               </div>
@@ -2581,7 +2586,9 @@ export default function ProgressView({ project }: ProgressViewProps) {
                 <div className="flex justify-between py-2 border-b border-amber-100">
                   <span className="text-slate-600">مؤشر الأداء الزمني SPI(t):</span>
                   <span className="font-mono font-bold text-amber-900">
-                    {earnedScheduleData.schedulePerformanceIndexTime.toFixed(3)}
+                    {earnedScheduleData.schedulePerformanceIndexTime === null
+                      ? 'N/A'
+                      : earnedScheduleData.schedulePerformanceIndexTime.toFixed(3)}
                   </span>
                 </div>
                 <div className="flex justify-between py-2">
@@ -2594,7 +2601,7 @@ export default function ProgressView({ project }: ProgressViewProps) {
                 </div>
                 {!finishReconciliation.esComputable && (
                   <p className="text-[11px] text-rose-700 pt-1">
-                    لا يمكن حساب IEAC(t) ({finishReconciliation.esAvailability === 'spi_t_zero' ? 'SPI(t) = 0' : finishReconciliation.esAvailability === 'no_planned_duration' ? 'لا توجد مدة مخططة PD' : 'لا توجد نتائج جدول مكتسب'})؛ لا يُعرض أي تاريخ بديل.
+                    لا يمكن حساب IEAC(t) ({finishReconciliation.esAvailability === 'spi_t_zero' ? 'SPI(t) = 0' : finishReconciliation.esAvailability === 'no_planned_duration' ? 'لا توجد مدة مخططة PD' : finishReconciliation.esAvailability === 'es_unmeasured' ? 'الجدول المكتسب غير مقاس (لا توجد بيانات)' : 'لا توجد نتائج جدول مكتسب'})؛ لا يُعرض أي تاريخ بديل.
                   </p>
                 )}
 

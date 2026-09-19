@@ -37,21 +37,43 @@ export interface EarnedScheduleResult {
   earnedScheduleDays: number;
   scheduleVarianceTimeMonths: number; // SV(t) = ES - AT
   scheduleVarianceTimeDays: number;
-  schedulePerformanceIndexTime: number; // SPI(t) = ES / AT
-  costPerformanceIndex: number; // CPI = EV / AC (canonical EVM)
+  /**
+   * SPI(t) = ES / AT. `null` when the engine could not measure one — P2A1-NEW-GAP-04: an empty /
+   * no-activity run has no schedule performance to report, so it is N/A rather than the neutral
+   * `1.0` the empty path used to publish.
+   */
+  schedulePerformanceIndexTime: number | null; // SPI(t) = ES / AT
+  /**
+   * CPI = EV / AC (canonical EVM). `null` when there is no measured cost efficiency
+   * (P2A1-NEW-GAP-04), so "not measured" is never rendered as a perfectly on-budget `1.00`.
+   */
+  costPerformanceIndex: number | null;
   estimatedDurationAtCompletionMonths: number; // IEAC(t) = PD / SPI(t)
   estimatedDurationAtCompletionDays: number;
   varianceAtCompletionTimeMonths: number; // VAC(t) = PD - IEAC(t)
   varianceAtCompletionTimeDays: number;
-  forecastCompletionDate: string;
+  /** The ES-trend finish forecast, or `null` when there is nothing to forecast from. */
+  forecastCompletionDate: string | null;
   plannedCompletionDate: string;
-  status: 'ahead' | 'on_track' | 'delayed' | 'critical_delay';
+  /**
+   * `unmeasured` (P2A1-NEW-GAP-04): the run produced no performance evidence at all, so no
+   * performance state is claimed. Every other value is a MEASURED state and requires evidence.
+   */
+  status: 'ahead' | 'on_track' | 'delayed' | 'critical_delay' | 'unmeasured';
+  /**
+   * P2A1-NEW-GAP-04: true only when this result carries measured performance evidence. `false`
+   * means the two indices are null, `status` is `unmeasured` and no forecast date is published —
+   * the no-data state, never perfect performance.
+   */
+  measured: boolean;
   timeDivergenceNote: string;
   comparisonWithTraditionalEvm: {
     evmSvAmount: number; // SV = EV - PV
-    evmSpi: number; // SPI = EV / PV
+    /** SPI = EV / PV; `null` when the index is not measurable (P2A1-NEW-GAP-04). */
+    evmSpi: number | null;
     esmSvDays: number; // SV(t) in days
-    esmSpi: number; // SPI(t)
+    /** SPI(t); `null` when the index is not measurable (P2A1-NEW-GAP-04). */
+    esmSpi: number | null;
     paradoxExplanation: string;
   };
   sCurvePoints: MonthlyDataPoint[];
@@ -165,6 +187,13 @@ export function calculateEarnedSchedule(sources: EarnedScheduleSources): EarnedS
   const dataDate =
     sources.overrideDataDate || sources.evm?.dataDate || project?.data_date || DEFAULT_DATA_DATE;
 
+  // P2A1-NEW-GAP-04: EMPTY IS UNMEASURED, NOT PERFECT.
+  //
+  // This early return used to publish CPI = 1.0, SPI(t) = 1.0, `on_track` and a forecast completion
+  // date equal to the Data Date — a complete, healthy-looking performance record synthesized from
+  // no activities at all, returned BEFORE canonical F6 was ever consulted (so it also ignored any
+  // measured EVM the caller already held). Absence of evidence is not performance: every index is
+  // null, the state is `unmeasured`, and no forecast date is invented.
   if (!project || activities.length === 0) {
     return {
       actualTimeElapsedMonths: 0,
@@ -175,21 +204,22 @@ export function calculateEarnedSchedule(sources: EarnedScheduleSources): EarnedS
       earnedScheduleDays: 0,
       scheduleVarianceTimeMonths: 0,
       scheduleVarianceTimeDays: 0,
-      schedulePerformanceIndexTime: 1.0,
-      costPerformanceIndex: 1.0,
+      schedulePerformanceIndexTime: null,
+      costPerformanceIndex: null,
       estimatedDurationAtCompletionMonths: 0,
       estimatedDurationAtCompletionDays: 0,
       varianceAtCompletionTimeMonths: 0,
       varianceAtCompletionTimeDays: 0,
-      forecastCompletionDate: dataDate,
+      forecastCompletionDate: null,
       plannedCompletionDate: project?.end_date || dataDate,
-      status: 'on_track',
-      timeDivergenceNote: 'لا توجد بيانات كافية للحساب.',
+      status: 'unmeasured',
+      measured: false,
+      timeDivergenceNote: 'لا توجد بيانات كافية للحساب: لا يوجد مشروع أو لا توجد أنشطة، لذا لا يُنشر أي قياس أداء.',
       comparisonWithTraditionalEvm: {
         evmSvAmount: 0,
-        evmSpi: 1.0,
+        evmSpi: null,
         esmSvDays: 0,
-        esmSpi: 1.0,
+        esmSpi: null,
         paradoxExplanation: 'البيانات قيد الإعداد.',
       },
       sCurvePoints: [],
@@ -351,18 +381,22 @@ export function calculateEarnedSchedule(sources: EarnedScheduleSources): EarnedS
     timeDivergenceNote = `المشروع ضمن النطاق المقبول للتذبذب الزمني (تأخير طفيف قدره ${Math.abs(Math.round(scheduleVarianceTimeDays))} يوماً).`;
   } else if (scheduleVarianceTimeDays >= -21) {
     status = 'delayed';
-    timeDivergenceNote = `يوجد تأخير زمني قدره ${Math.abs(Math.round(scheduleVarianceTimeDays))} يوماً بمعدل كفاءة زمنية SPI(t) = ${schedulePerformanceIndexTime.toFixed(2)}. يتطلب تدابير تصحيحية.`;
+    timeDivergenceNote = `يوجد تأخير زمني قدره ${Math.abs(Math.round(scheduleVarianceTimeDays))} يوماً بمعدل كفاءة زمنية SPI(t) = ${(schedulePerformanceIndexTime ?? 0).toFixed(2)}. يتطلب تدابير تصحيحية.`;
   } else {
     status = 'critical_delay';
     timeDivergenceNote = `تأخير زمني حرج قدره ${Math.abs(Math.round(scheduleVarianceTimeDays))} يوماً. التاريخ المتوقع لإنهاء المشروع سيتأخر حتى ${forecastCompletionDate}. يوصى بتفعيل خطة التعجيل الفوري (Schedule Crashing).`;
   }
 
   const paradoxExplanation =
-    evmSpi < 0.95 && schedulePerformanceIndexTime < 0.95
+    evmSpi !== null && schedulePerformanceIndexTime !== null
+      && evmSpi < 0.95 && schedulePerformanceIndexTime < 0.95
       ? 'يتوافق المؤشران الزمني والمالي على وجود تأخر، إلا أن SPI(t) يعطي تقديراً أدق بالوحدات الزمنية الفعلية (أيام/أشهر) بدلاً من الفروقات النقدية.'
       : 'تظهر ميزة Earned Schedule في إلغاء الانحراف الشهير لمؤشر SPI الكلاسيكي الذي يتقارب بشكل مضلل نحو 1.0 مع اقتراب نهاية المشروع حتى في حال استمرار التأخير.';
 
   return {
+    // P2A1-NEW-GAP-04: this result is MEASURED — it came from real activities and a canonical EVM,
+    // so its indices are real numbers (a genuine 1.00 included) and its status is a real state.
+    measured: true,
     actualTimeElapsedMonths: Number(actualMonthsElapsed.toFixed(2)),
     actualTimeElapsedDays: actualDaysElapsed,
     plannedDurationMonths: Number(plannedDurationMonths.toFixed(2)),

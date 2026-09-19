@@ -26,6 +26,10 @@ import {
   resolveDeterministicForecastFinish,
 } from '@/lib/forecastReconciliation';
 import { DEFAULT_DATA_DATE } from '@/lib/projectControlsConstants';
+// P2A1-M01: the Data Date provenance constants, so this report can label the date it shows.
+import {
+  resolveDataDateProvenance, EXPLICIT_GOVERNED_DATE, FALLBACK_DEFAULT_DATE,
+} from '@/lib/chronologyGuard';
 import SCurveChart from '@/components/views/SCurveChart';
 import {
   Printer,
@@ -167,6 +171,13 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
   // instead of becoming a plausible 0). F8 quotes the same `f6.project.*` block, so this report, the
   // dashboard's F8 panel and F6 itself cannot disagree.
   const canonical: CanonicalEvm = useMemo(() => selectCanonicalEvm(costReport), [costReport]);
+  // P2A1-M01: the Data Date provenance quoted from the canonical F6 report — the same report every
+  // figure in this document comes from, so the badge cannot disagree with the numbers.
+  const dataDateIsFallback = costReport?.dataDateIsFallback ?? false;
+  const dataDateNote = useMemo(
+    () => resolveDataDateProvenance(project).note,
+    [project],
+  );
 
   // Shape adapter for the engines below that require the non-nullable `ComprehensiveProjectEvm`
   // (S-curve, earned schedule). It carries the SAME canonical numbers — no second derivation.
@@ -187,8 +198,12 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
       dataDate: dcmaDataDate,
       calendarType: project?.calendar_type || '6_days',
       statusLogic: project?.status_logic || 'retained_logic',
+      // P2A1-H01: the GOVERNED as-of status, so this canonical count is computed on exactly the
+      // same statused activities F5 uses. Without it the helper would read the materialised column
+      // and could report a different criticality than F5 for an unsupported materialised value.
+      progressUpdates,
     }),
-    [activities, links, dcmaDataDate, project?.calendar_type, project?.status_logic],
+    [activities, links, dcmaDataDate, project?.calendar_type, project?.status_logic, progressUpdates],
   );
   const criticalActivitiesList = useMemo(
     () => activities.filter((a) => criticality.byId.get(a.id)?.critical),
@@ -333,12 +348,26 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
           </div>
 
           <div className="text-left space-y-1">
-            <div className="bg-amber-50 border border-amber-200 px-3 py-1.5 rounded-lg text-right">
-              <div className="text-[10px] text-amber-800 font-bold uppercase">تاريخ خط الحالة (Data Date)</div>
+            {/* P2A1-M01: the Data Date carries its PROVENANCE. When the project states no status
+                date of its own, the date below is the governed default standing in, and the report
+                must say so — otherwise a fallback is presented as a governed project status date.
+                The provenance is quoted from the canonical F6 report (the same resolver the app
+                shell badge uses), never re-derived here. */}
+            <div className={dataDateIsFallback
+              ? 'bg-rose-50 border border-rose-300 px-3 py-1.5 rounded-lg text-right'
+              : 'bg-amber-50 border border-amber-200 px-3 py-1.5 rounded-lg text-right'}>
+              <div className={`text-[10px] font-bold uppercase ${dataDateIsFallback ? 'text-rose-800' : 'text-amber-800'}`}>
+                تاريخ خط الحالة (Data Date)
+              </div>
               {/* The Data Date every figure below was computed at, read from the canonical result —
                   not a view-level literal, which disagreed with the engine whenever data_date was
                   null and made this report unreconcilable against the other screens. */}
               <div className="text-sm font-black font-mono text-slate-900">{evmMetrics.dataDate}</div>
+              <div className={`text-[9px] font-bold mt-0.5 leading-snug ${dataDateIsFallback ? 'text-rose-700' : 'text-emerald-700'}`}>
+                {dataDateIsFallback
+                  ? `⚠ تاريخ افتراضي (${FALLBACK_DEFAULT_DATE}) — المشروع لا يحدد تاريخ بيانات خاصاً به. ${dataDateNote}`
+                  : `✓ تاريخ بيانات محكوم صريحاً من المشروع (${EXPLICIT_GOVERNED_DATE}).`}
+              </div>
             </div>
             <div className="text-left space-y-0.5">
               <div className="text-[10px] text-slate-400 font-mono">
@@ -355,8 +384,15 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3.5">
           <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-xl">
             <span className="text-[11px] text-slate-500 font-semibold">مؤشر أداء الجدول الزمني SPI(t)</span>
-            <div className={`text-2xl font-black mt-1 ${earnedScheduleData.schedulePerformanceIndexTime >= 1 ? 'text-emerald-700' : 'text-rose-700'}`}>
-              {earnedScheduleData.schedulePerformanceIndexTime.toFixed(2)}
+            <div className={`text-2xl font-black mt-1 ${
+              earnedScheduleData.schedulePerformanceIndexTime === null
+                ? 'text-slate-400'
+                : earnedScheduleData.schedulePerformanceIndexTime >= 1 ? 'text-emerald-700' : 'text-rose-700'
+            }`}>
+              {/* P2A1-NEW-GAP-04: an unmeasured run renders N/A, never a synthetic 1.00. */}
+              {earnedScheduleData.schedulePerformanceIndexTime === null
+                ? 'N/A'
+                : earnedScheduleData.schedulePerformanceIndexTime.toFixed(2)}
             </div>
             <span className="text-[10px] font-mono text-slate-500">
               الجدول المكتسب: {earnedScheduleData.earnedScheduleDays} يوم
@@ -386,7 +422,7 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
               </span>
             ) : (
               <span className="text-[10px] text-slate-500 font-bold">
-                IEAC(t) غير قابل للحساب ({finishReconciliation.esAvailability === 'spi_t_zero' ? 'SPI(t) = 0' : finishReconciliation.esAvailability === 'no_planned_duration' ? 'لا توجد مدة مخططة' : 'لا توجد نتائج جدول مكتسب'}) — لا يُعرض تاريخ بديل.
+                IEAC(t) غير قابل للحساب ({finishReconciliation.esAvailability === 'spi_t_zero' ? 'SPI(t) = 0' : finishReconciliation.esAvailability === 'no_planned_duration' ? 'لا توجد مدة مخططة' : finishReconciliation.esAvailability === 'es_unmeasured' ? 'الجدول المكتسب غير مقاس (لا توجد بيانات)' : 'لا توجد نتائج جدول مكتسب'}) — لا يُعرض تاريخ بديل.
               </span>
             )}
           </div>

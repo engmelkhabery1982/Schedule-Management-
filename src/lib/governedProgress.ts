@@ -46,20 +46,24 @@ import type { Activity, ProgressUpdate } from '@/types';
 /**
  * Where an activity's as-of progress came from.
  *
- * - `approved_update`                 — governed evidence: an approved update inside the Data Date.
- * - `no_governed_evidence`            — the activity has a progress history, but nothing in it is
- *                                       approved and inside the Data Date: UNREACHED as of the date.
- * - `recorded_no_governed_history`    — the activity has NO progress history at all, so there is no
- *                                       governed evidence to override the recorded status with. The
- *                                       recorded value stands, chronology-guarded. This is the
- *                                       imported / hand-statused schedule case (XER import, manual
- *                                       status update): zeroing it would destroy recorded status that
- *                                       no progress history ever claimed to govern.
+ * - `approved_update`       — governed evidence: an approved update inside the Data Date.
+ * - `no_governed_evidence`  — NO approved update exists on or before the Data Date, whether because
+ *                             the activity has no history at all or because nothing in its history
+ *                             qualifies. The activity is UNREACHED as of the date: 0 %, no governed
+ *                             quantity, no actual start, no actual finish.
+ *
+ * `no_governed_evidence` is the ONLY non-evidence state. An earlier revision carried a third value,
+ * `recorded_no_governed_history`, which let a MATERIALISED column (`activities.percent_complete`,
+ * `actual_quantity`, `actual_start`, `actual_finish`) stand as as-of progress whenever the activity
+ * happened to have no `progress_updates` rows. That is the defect P2A1-H01 closes for good:
+ * `percent_complete` is written by `approve_progress_update`, so reading it back as evidence creates
+ * progress that no approved, in-period record supports — the very thing this module exists to
+ * prevent. A materialised value may still be displayed for compatibility, but it is never governed
+ * as-of evidence, and it never reaches F5 / F6 / EV again.
  */
 export type GovernedProgressSource =
   | 'approved_update'
-  | 'no_governed_evidence'
-  | 'recorded_no_governed_history';
+  | 'no_governed_evidence';
 
 /** The governed as-of state of one activity at one Data Date. */
 export interface GovernedActivityProgress {
@@ -154,7 +158,6 @@ export function resolveGovernedProgress(
 ): GovernedActivityProgress {
   const activityId = activity.id;
   const evidence = latestApprovedUpdateOnOrBefore(index, activityId, dataDate);
-  const history = index.get(activityId);
 
   let percentComplete: number;
   let actualQuantity: number;
@@ -171,16 +174,21 @@ export function resolveGovernedProgress(
     source = 'approved_update';
     evidenceUpdateId = evidence.id;
     evidenceUpdateDate = evidence.update_date;
-  } else if (!history || history.length === 0) {
-    // No governed history at all: nothing overrides the recorded status, so it stands — but it is
-    // still an actual, so the Data Date chronology guard applies to its dates.
-    percentComplete = clampPct(activity.percent_complete);
-    actualQuantity = numOr0(activity.actual_quantity);
-    source = 'recorded_no_governed_history';
   } else {
-    // A history exists but nothing in it is approved and inside the Data Date: the materialised
-    // value is the product of unapproved or future evidence, so as of this Data Date the activity
-    // is unreached. Absence of evidence stays absence — it is never laundered into performance.
+    // NO HISTORY MEANS UNREACHED (P2A1-H01).
+    //
+    // No approved update exists on or before the Data Date — either the activity has no history at
+    // all, or nothing in its history qualifies (unapproved, undated, or after the Data Date). In
+    // every one of those cases there is no governed evidence of progress, so as of this Data Date
+    // the activity is unreached: 0 %, no governed quantity, no actual start, no actual finish.
+    //
+    // The materialised columns are deliberately NOT consulted here. `activities.percent_complete`
+    // and `activities.actual_quantity` are a materialisation of the SAME history (written by
+    // `approve_progress_update`), so a value with no qualifying row behind it is unsupported
+    // progress: it can be displayed, but it cannot be governed evidence and it must never reach F5,
+    // F6 or earned value. Absence of evidence stays absence — it is never laundered into
+    // performance, and an activity with no approved as-of record is not "partly done", it is
+    // unreached.
     percentComplete = 0;
     actualQuantity = 0;
     source = 'no_governed_evidence';
