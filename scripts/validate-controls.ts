@@ -34,7 +34,13 @@ import { readFileSync, existsSync } from 'node:fs';
 import { dirname, resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DEFAULT_DATA_DATE, governedDefaultToday } from '@/lib/projectControlsConstants';
-import { resolveDataDate, isIsoDate, isAfterDataDate, isOnOrBeforeDataDate, calendarDaysBetween, classifyByDate, latestDate, earliestDate } from '@/lib/chronologyGuard';
+import {
+  resolveDataDate, isIsoDate, isAfterDataDate, isOnOrBeforeDataDate, calendarDaysBetween, classifyByDate,
+  latestDate, earliestDate,
+  // S20 (Batch A / M01): the Data Date provenance API.
+  resolveDataDateProvenance, isFallbackDataDate, EXPLICIT_GOVERNED_DATE, FALLBACK_DEFAULT_DATE,
+  type DataDateBearer,
+} from '@/lib/chronologyGuard';
 import { calculateCpm } from '@/lib/cpmEngine';
 import { getCalendar, countWorkingDays, addWorkingDays } from '@/lib/calendarEngine';
 import { calculateBaselineVariances } from '@/lib/trendEngine';
@@ -43,9 +49,17 @@ import { calculateRecoveryPlan } from '@/lib/recoveryEngine';
 import { levelScheduleResources } from '@/lib/resourceLevelingEngine';
 import { parseXerContent } from '@/lib/xerImporter';
 import { generateBoqPlan, emptyBoqOverrides } from '@/lib/boqPlanningEngine';
-import { calculateProjectEvmAtDataDate, deriveEvmFromScalars, assessEvmRatios } from '@/lib/planningEngine';
+import {
+  calculateProjectEvmAtDataDate, deriveEvmFromScalars, assessEvmRatios,
+  // S20 (Batch A / H04): the finish-forecast family, gated on the canonical index statuses.
+  analyzeForecast, forecastFinishScenarios,
+} from '@/lib/planningEngine';
 import { analyzeScheduleControl, buildUpdateSnapshot, workingDayDelta, summarizeCanonicalCriticality, type StatusedActivity } from '@/lib/scheduleControlEngine';
-import { analyzeCostControl, buildCostSnapshot } from '@/lib/costControlEngine';
+import {
+  analyzeCostControl, buildCostSnapshot,
+  // S20 (Batch A / H02): the one business key that both detects and excludes a duplicate.
+  costTransactionBusinessKey, dedupeByBusinessKey,
+} from '@/lib/costControlEngine';
 import { analyzeIntegratedDecisions, gateConfidence } from '@/lib/integratedDecisionEngine';
 import { analyzeForecastTrust } from '@/lib/forecastTrustEngine';
 import { selectCanonicalEvm, canonicalEvmToComprehensive, quoteCanonicalEvm, CANONICAL_EVM_SOURCE } from '@/lib/canonicalEvm';
@@ -64,7 +78,18 @@ import {
   UNQUALIFIED_EAC_LABEL_EN, UNQUALIFIED_EAC_LABEL_AR, UNQUALIFIED_FINISH_LABEL_EN, UNQUALIFIED_FINISH_LABEL_AR,
   CANONICAL_COST_AUTHORITY, SCENARIO_COST_AUTHORITY, CANONICAL_SCHEDULE_AUTHORITY, STATISTICAL_SCHEDULE_AUTHORITY,
 } from '@/lib/forecastSemantics';
-import { applyReviewCostTransaction, unimplementedRpcError, reviewStateOf, selectGovernedBaselineActivities, type DemoDb } from '@/lib/demoDbContracts';
+import {
+  applyReviewCostTransaction, unimplementedRpcError, reviewStateOf, selectGovernedBaselineActivities,
+  // S20 (Batch A / M02): the cost-transaction project boundary, mirrored from the live SQL trigger.
+  checkControlRecordProjectBoundary, controlRecordCrossesProjectBoundary,
+  type DemoDb,
+} from '@/lib/demoDbContracts';
+
+// S20 (Batch A / H01): the governed as-of progress resolver — the single definition F5, F6 and the
+// S-Curve's historical phasing all share.
+import {
+  applyGovernedProgress, resolveGovernedProgress, indexProgressHistory, latestApprovedUpdateOnOrBefore,
+} from '@/lib/governedProgress';
 import { reconcileFinishForecasts, calculateCpmDeterministicEarlyFinish } from '@/lib/forecastReconciliation';
 import { calculateControlHealth } from '@/lib/controlHealthEngine';
 import {
@@ -2340,17 +2365,44 @@ console.log('--- S18 Pilot Closure (F9.5)');
   });
 
   // The fixture must BE the reported pilot case, or passing proves nothing about the defect.
+  // =====================================================================================
+  // P2A1-H01 CORRECTION — read before comparing these numbers with the original pilot report.
+  //
+  // This fixture evaluates the shipped seed project at Data Date 2026-09-09, and the seed holds an
+  // approved progress update for ACT-005 dated 2026-09-12 — AFTER that Data Date (the `ok(...)` just
+  // above exists precisely to prove the fixture contains it). Before H01, F5/F6 read the
+  // MATERIALISED `activities.percent_complete`, which that update had written, so 70% of ACT-005's
+  // 468,000 SAR baseline — 327,600 SAR — was earned at a status date three days before the work was
+  // approved. That is the confirmed defect, and it inflated every figure below.
+  //
+  // Governed as-of progress now comes from the approved history inside the Data Date, so ACT-005
+  // earns nothing here (it has no approved update on or before 2026-09-09) and EV is 425,300 — the
+  // four activities with in-period approved evidence only. CPI, SPI, EAC, VAC, the F5 finish and the
+  // delay all move with it. These are not weakened expectations: they are the same identities,
+  // evaluated on the same fixture, with the post-Data-Date evidence removed.
+  //
+  // Unchanged by H01: BAC 2,345,150 (baseline), PV 715,014.29 (baseline window proration) and
+  // AC 409,900 (approved transactions on or before the Data Date) — none of them depends on
+  // materialised progress.
+  // =====================================================================================
   eq('S19 fixture reproduces the pilot canonical BAC', rcF6.project.bac, 2345150);
   eq('S19 fixture reproduces the pilot canonical PV', rcF6.project.pv, 715014.29);
-  eq('S19 fixture reproduces the pilot canonical EV', rcF6.project.ev, 752900);
   eq('S19 fixture reproduces the pilot canonical AC', rcF6.project.ac, 409900);
-  eq('S19 fixture reproduces the pilot canonical CPI', rcF6.project.cpi, 1.837);
-  eq('S19 fixture reproduces the pilot canonical SPI', rcF6.project.spi, 1.053);
-  eq('S19 fixture reproduces the pilot canonical EAC', rcF6.project.eac, 1276619.49);
-  eq('S19 fixture reproduces the pilot canonical VAC', rcF6.project.vac, 1068530.51);
-  eq('S19 fixture reproduces the pilot canonical F5 finish', rcF5.project.forecastFinish, '2027-03-02');
   eq('S19 fixture reproduces the pilot baseline finish', rcF5.project.baselineFinish, '2027-02-28');
-  eq('S19 fixture reproduces the pilot delay of +2 working days', rcF5.project.totalDelayWd, 2);
+  // H01: 425,300 = 42,000 + 39,900 + 323,150 + 20,250 (the four activities with approved evidence
+  // inside the Data Date). NOT 752,900 — that figure earned ACT-005's 327,600 from the 2026-09-12
+  // update, which is dated three days after this Data Date.
+  eq('S19 fixture reproduces the pilot canonical EV (H01: no post-Data-Date progress)', rcF6.project.ev, 425300);
+  ok('S19 the post-Data-Date update no longer contributes the 327,600 it used to',
+    rcF6.project.ev !== 752900 && (rcF6.project.ev as number) === 752900 - 327600);
+  eq('S19 fixture reproduces the pilot canonical CPI (H01)', rcF6.project.cpi, 1.038);
+  eq('S19 fixture reproduces the pilot canonical SPI (H01)', rcF6.project.spi, 0.595);
+  eq('S19 fixture reproduces the pilot canonical EAC (H01)', rcF6.project.eac, 2259296.72);
+  eq('S19 fixture reproduces the pilot canonical VAC (H01)', rcF6.project.vac, 85853.28);
+  eq('S19 fixture reproduces the pilot canonical F5 finish (H01)', rcF5.project.forecastFinish, '2027-03-17');
+  // H01: ACT-005 is unreached at this Data Date, so its full 22-day remaining duration is still in
+  // front of the project instead of the ~7 days the ungoverned 70% implied.
+  eq('S19 fixture reproduces the pilot delay (H01: +15 working days)', rcF5.project.totalDelayWd, 15);
 
   // =========================================================================
   // S19-A/B/C  At the governed Data Date the S-Curve reconciles to canonical F6.
@@ -2456,8 +2508,14 @@ console.log('--- S18 Pilot Closure (F9.5)');
   // must not contain the update dated after it.
   const rcPreDd = rcCurve.points.filter((p) => p.date < DD && p.evCumulative !== null).slice(-1)[0];
   ok('S19-E the seed curve has an actual bucket before the Data Date', !!rcPreDd);
-  ok('S19-E the pre-Data-Date seed bucket EV is below the current EV (history not flattened)',
-    (rcPreDd.evCumulative as number) < (rcDd.evCumulative as number));
+  // H01: the current EV is now the SAME figure the last in-period bucket already reported, because
+  // no governed evidence arrived between it and the Data Date (the only update in between is dated
+  // 2026-09-12, after it). Equality therefore no longer proves flattening — so the anti-flattening
+  // guard is stated as it can honestly be stated, and strengthened with the exact governed figure.
+  ok('S19-E the pre-Data-Date seed bucket never exceeds the current EV (history is not flattened)',
+    (rcPreDd.evCumulative as number) <= (rcDd.evCumulative as number));
+  eq('S19-E the current EV is the governed figure, not the 752,900 the post-Data-Date update gave',
+    rcDd.evCumulative, 425300);
   eq('S19-E the pre-Data-Date seed bucket equals the evidence-phased canonical evaluation',
     rcPreDd.evCumulative,
     evaluateTimePhasedEvm({
@@ -2487,7 +2545,15 @@ console.log('--- S18 Pilot Closure (F9.5)');
   const rcEarlier = rcCurve.points.filter((p) => p.date < DD && p.evCumulative !== null);
   ok('S19-G the curve has several historical buckets', rcEarlier.length >= 3);
   ok('S19-G no historical bucket equals the current PV', rcEarlier.every((p) => p.pvEarlyCumulative !== rcDd.pvEarlyCumulative));
-  ok('S19-G no historical bucket equals the current EV', rcEarlier.every((p) => p.evCumulative !== rcDd.evCumulative));
+  // H01: EV is legitimately flat across the buckets between 2026-08-25 and the Data Date, because
+  // the only progress evidence in that window is dated after it. The anti-flattening claim is
+  // therefore stated as it can honestly be stated: no historical bucket may EXCEED the current point
+  // (history is never back-written from the present), while PV — which is date-driven and independent
+  // of progress — still proves the series is not flat.
+  ok('S19-G no historical bucket exceeds the current EV (history is not backcast)',
+    rcEarlier.every((p) => (p.evCumulative as number) <= (rcDd.evCumulative as number)));
+  ok('S19-G the series is not flat: historical buckets differ from the current PV',
+    rcEarlier.some((p) => p.pvEarlyCumulative !== rcDd.pvEarlyCumulative));
   ok('S19-G no historical bucket equals the current AC', rcEarlier.every((p) => p.acCumulative !== rcDd.acCumulative));
   ok('S19-G the first bucket starts at zero PV (history is not backcast)', rcCurve.points[0].pvEarlyCumulative === 0);
   ok('S19-G cumulative PV is non-decreasing across the series',
@@ -2559,7 +2625,8 @@ console.log('--- S18 Pilot Closure (F9.5)');
   eq('S19-K the unqualified EAC label is the bare canonical label', eacCards.canonical.labelEn, UNQUALIFIED_EAC_LABEL_EN);
   eq('S19-K the unqualified EAC label is bare in Arabic too', eacCards.canonical.labelAr, UNQUALIFIED_EAC_LABEL_AR);
   eq('S19-K an unqualified "EAC" maps only to canonical F6 EAC', eacCards.canonical.value, rcF6.project.eac);
-  eq('S19-K the canonical EAC is the pilot-reported recommended EAC', eacCards.canonical.value, 1276619.49);
+  // H01: the recommended EAC follows the corrected CPI (BAC / 1.038).
+  eq('S19-K the canonical EAC is the pilot-reported recommended EAC (H01)', eacCards.canonical.value, 2259296.72);
   eq('S19-K the canonical EAC claims canonical F6 authority', eacCards.canonical.authority, CANONICAL_COST_AUTHORITY);
   eq('S19-K the canonical EAC states its explicit method', eacCards.canonical.method, 'eac_cpi');
   eq('S19-K the canonical EAC equals F6 recommended EAC', eacCards.canonical.value, rcF6.recommended?.eac);
@@ -2578,7 +2645,8 @@ console.log('--- S18 Pilot Closure (F9.5)');
   // The scenario value never overwrites the canonical one.
   ok('S19-L the canonical EAC is not overwritten by the scenario EAC',
     eacCards.canonical.value !== eacCards.scenario?.value);
-  near('S19-L the scenario delta is scenario minus canonical', eacCards.scenario?.deltaVsCanonical ?? null, 84530.54, 0.01);
+  // H01: the delta moves with the corrected canonical EAC (SCENARIO_EAC is an expectation constant).
+  near('S19-L the scenario delta is scenario minus canonical', eacCards.scenario?.deltaVsCanonical ?? null, -898146.69, 0.01);
   eq('S19-L the delta label names what it is against', eacCards.scenario?.deltaLabelEn, 'Delta vs canonical EAC');
   ok('S19-L the delta is recomputable from the two published values',
     !!eacCards.scenario && eacCards.scenario.deltaVsCanonical ===
@@ -2622,10 +2690,10 @@ console.log('--- S18 Pilot Closure (F9.5)');
   });
   eq('S19-N the unqualified finish label is the bare canonical label', finishCards.canonical.labelEn, UNQUALIFIED_FINISH_LABEL_EN);
   eq('S19-N the unqualified management finish maps to canonical F5', finishCards.canonical.finish, rcF5.project.forecastFinish);
-  eq('S19-N the canonical finish is the pilot-reported management finish', finishCards.canonical.finish, '2027-03-02');
+  eq('S19-N the canonical finish is the pilot-reported management finish (H01)', finishCards.canonical.finish, '2027-03-17');
   eq('S19-N the canonical finish claims canonical F5 authority', finishCards.canonical.authority, CANONICAL_SCHEDULE_AUTHORITY);
   eq('S19-N the canonical delay is F5 own working-day delay', finishCards.canonical.delayWorkingDays, rcF5.project.totalDelayWd);
-  eq('S19-N the canonical delay is the pilot-reported +2 days', finishCards.canonical.delayWorkingDays, 2);
+  eq('S19-N the canonical delay is the pilot-reported delay (H01: +15 days)', finishCards.canonical.delayWorkingDays, 15);
   eq('S19-N the canonical entry carries the baseline finish it is measured against',
     finishCards.canonical.baselineFinish, '2027-02-28');
   ok('S19-O a statistical finish entry is present', !!finishCards.statistical);
@@ -2639,8 +2707,9 @@ console.log('--- S18 Pilot Closure (F9.5)');
     !!finishCards.statistical && finishCards.statistical.labelAr !== UNQUALIFIED_FINISH_LABEL_AR);
   ok('S19-O the statistical finish names its basis',
     !!finishCards.statistical && /SPI/i.test(finishCards.statistical.labelEn) && /risk/i.test(finishCards.statistical.labelEn));
-  eq('S19-O the variance vs canonical is the pilot-reported -13 days',
-    finishCards.statistical?.varianceDaysVsCanonical, -13);
+  // H01: STAT_FINISH is ahead of the corrected canonical F5 finish by 28 days (was 13).
+  eq('S19-O the variance vs canonical is the pilot-reported variance (H01: -28 days)',
+    finishCards.statistical?.varianceDaysVsCanonical, -28);
   ok('S19-O a negative variance is reported as negative, not clamped to zero',
     (finishCards.statistical?.varianceDaysVsCanonical ?? 0) < 0);
   eq('S19-O the variance label names what it is against',
@@ -2943,6 +3012,492 @@ console.log('--- S18 Pilot Closure (F9.5)');
     /calculateEarnedSchedule\(\{[\s\S]{0,500}baselines,/.test(budgetSrc));
   ok('S19-P the progress view passes the governed baseline into earned schedule',
     /calculateEarnedSchedule\(\{[\s\S]{0,500}baselines,/.test(progressSrc));
+}
+
+// ---------------------------------------------------------------------------
+// S20 — Batch A (P2A1) verified defect closures.
+//
+//   H01  Data-Date governed progress      F5/F6 must read the approved progress history, never the
+//                                         materialised activity columns the Data Date does not govern.
+//   H02  Duplicate actual cost            The business key that detects a duplicate must also stop it
+//                                         being summed into AC (and therefore CPI / EAC / VAC).
+//   M02  Orphan / foreign actual cost     An activity-bound transaction is valid only inside its own
+//                                         project — at the write boundary AND in canonical AC.
+//   M01  Data Date provenance             A fallback Data Date must be visibly distinguishable from an
+//                                         explicitly governed one.
+//   H04  No-data EVM forecast             NO DATA is not CPI = SPI = 1 with a realistic finish and
+//                                         100% confidence.
+//
+// Each subsection first proves the fixture REPRODUCES the reported symptom, then asserts the fixed
+// behaviour: a regression test that cannot fail on the pre-fix code is not a regression test.
+// ---------------------------------------------------------------------------
+{
+  console.log('--- S20 Batch A (P2A1) verified defect closures');
+
+  // Source-reading root: the harness reads the shipped screen sources as text, because the screens
+  // pull in `@/lib/supabase` and cannot be bundled for node ESM.
+  const s20Root = (() => {
+    const cwd = process.cwd();
+    if (existsSync(resolvePath(cwd, 'package.json'))) return cwd;
+    let dir = dirname(fileURLToPath(import.meta.url));
+    for (let i = 0; i < 8; i += 1) {
+      if (existsSync(resolvePath(dir, 'package.json'))) return dir;
+      dir = dirname(dir);
+    }
+    return cwd;
+  })();
+
+  const BDD = '2026-09-13';
+  const s20Project = {
+    id: 'p1', contract_value: 200000, data_date: BDD, calendar_type: '6_days',
+  } as unknown as Project;
+  const s20Acts = [
+    act({ id: 'G1', code: 'G1', early_start: '2026-09-01', early_finish: '2026-09-10', duration_days: 10, percent_complete: 0 }),
+    act({ id: 'G2', code: 'G2', early_start: '2026-09-11', early_finish: '2026-09-20', duration_days: 10, percent_complete: 0 }),
+  ];
+  const s20Links = [link('GL1', 'G1', 'G2')];
+  const s20Baselines = [
+    base('GB1', 'G1', '2026-09-01', '2026-09-10', 10, 100000),
+    base('GB2', 'G2', '2026-09-11', '2026-09-20', 10, 100000),
+  ];
+  const s20Txn = (id: string, actId: string | null, amount: number, extra: Partial<CostTransaction> = {}): CostTransaction => ({
+    ...txn(id, actId, '2026-09-05', amount, 'approved', 'INV-S20'),
+    description: 'S20 ledger row', vendor: 'ACME', invoice_number: 'INV-S20', ...extra,
+  } as CostTransaction);
+
+  const f6With = (
+    updates: ProgressUpdate[],
+    txns: CostTransaction[] = [s20Txn('S20T1', 'G1', 50000)],
+    acts: Activity[] = s20Acts,
+  ) => analyzeCostControl({
+    project: s20Project, activities: acts, baselines: s20Baselines, budgetLines: [],
+    costTransactions: txns, progressUpdates: updates, wbsNodes: [], boqItems: [], allocations: [],
+    previousSnapshots: [], dataDate: BDD, calendarType: '6_days',
+  });
+  const f5With = (updates: ProgressUpdate[], acts: Activity[] = s20Acts) => analyzeScheduleControl({
+    activities: acts, links: s20Links, baselines: s20Baselines, progressUpdates: updates,
+    previousSnapshot: null, dataDate: BDD, calendarType: '6_days',
+  });
+  const g1 = (r: ReturnType<typeof f5With>): StatusedActivity =>
+    r.statused.find((s) => s.id === 'G1') as StatusedActivity;
+
+  // =========================================================================
+  // S20-H01  Data-Date governed progress
+  // =========================================================================
+  {
+    // --- the pre-fix symptom, reproduced: the materialised column is what used to be read. ---
+    const materialised = act({ ...s20Acts[0], percent_complete: 60 });
+    eq('S20-H01 the fixture activity really is materialised at 60% (the pre-fix input)',
+      Number(materialised.percent_complete), 60);
+    eq('S20-H01 the governed resolver ignores a materialised value with no approved history behind it',
+      resolveGovernedProgress(materialised, indexProgressHistory([]), BDD).source,
+      'recorded_no_governed_history');
+    eq('S20-H01 the recorded-status compatibility path is named, so it can never be read as evidence',
+      resolveGovernedProgress(materialised, indexProgressHistory([]), BDD).source === 'approved_update', false);
+
+    // --- H01-A: an approved update BEFORE the Data Date drives both F5 and F6. ---
+    const beforeDd = [upd('HU-A', 'G1', '2026-09-10', 60)];
+    const f6A = f6With(beforeDd);
+    const f5A = f5With(beforeDd);
+    eq('S20-H01-A an approved update before the Data Date earns EV (60% of G1 100,000)', f6A.project.ev, 60000);
+    eq('S20-H01-A the same evidence statuses G1 in F5', g1(f5A).percentComplete, 60);
+    eq('S20-H01-A the governed percent is quoted back with its evidence', g1(f5A).started, true);
+    eq('S20-H01-A G1 is not complete at 60%', g1(f5A).completed, false);
+
+    // --- H01-B: an approved update EXACTLY ON the Data Date is included. ---
+    const onDd = [upd('HU-B', 'G1', BDD, 80)];
+    eq('S20-H01-B an approved update dated exactly on the Data Date is included (EV = 80,000)',
+      f6With(onDd).project.ev, 80000);
+    eq('S20-H01-B the on-Data-Date update statuses G1 in F5', g1(f5With(onDd)).percentComplete, 80);
+    eq('S20-H01-B the boundary itself: one day earlier is also inside',
+      f6With([upd('HU-B2', 'G1', '2026-09-12', 80)]).project.ev, 80000);
+
+    // --- H01-C: an approved update AFTER the Data Date has ZERO effect. ---
+    const afterDd = [upd('HU-C', 'G1', '2026-09-20', 90)];
+    eq('S20-H01-C an approved update after the Data Date earns nothing (EV = 0)', f6With(afterDd).project.ev, 0);
+    eq('S20-H01-C it does not status G1 in F5 either', g1(f5With(afterDd)).percentComplete, 0);
+    eq('S20-H01-C G1 is unreached, not started', g1(f5With(afterDd)).started, false);
+    eq('S20-H01-C G1 is unreached, not complete', g1(f5With(afterDd)).completed, false);
+    // Combined with a valid in-period update, the future one still must not win.
+    const both = [upd('HU-A', 'G1', '2026-09-10', 60), upd('HU-C', 'G1', '2026-09-20', 90)];
+    eq('S20-H01-C the latest APPROVED-IN-PERIOD update wins, not the latest approved overall',
+      f6With(both).project.ev, 60000);
+    eq('S20-H01-C the same rule holds in F5', g1(f5With(both)).percentComplete, 60);
+
+    // --- H01-D: a submitted / pending update has ZERO effect. ---
+    const submitted = [upd('HU-D', 'G1', '2026-09-10', 90, 'submitted')];
+    eq('S20-H01-D a submitted update earns nothing (EV = 0)', f6With(submitted).project.ev, 0);
+    eq('S20-H01-D a submitted update does not status G1', g1(f5With(submitted)).percentComplete, 0);
+    eq('S20-H01-D a draft update earns nothing', f6With([upd('HU-D2', 'G1', '2026-09-10', 90, 'draft')]).project.ev, 0);
+    eq('S20-H01-D a rejected update earns nothing', f6With([upd('HU-D3', 'G1', '2026-09-10', 90, 'rejected')]).project.ev, 0);
+    // It also cannot REDUCE governed progress: valid in-period evidence still wins.
+    const validPlusSubmitted = [upd('HU-A', 'G1', '2026-09-10', 60), upd('HU-D', 'G1', '2026-09-11', 90, 'submitted')];
+    eq('S20-H01-D a submitted update cannot displace approved in-period evidence',
+      f6With(validPlusSubmitted).project.ev, 60000);
+
+    // --- H01-E: removing every valid pre-Data-Date update returns the governed ZERO / UNREACHED state. ---
+    const evBefore = f6With(beforeDd).project.ev;
+    ok('S20-H01-E the fixture really had earned value to lose', evBefore === 60000);
+    // (i) the in-period update is replaced by a submitted one — no approved evidence remains.
+    const onlySubmitted = [upd('HU-E1', 'G1', '2026-09-10', 90, 'submitted')];
+    eq('S20-H01-E with no approved in-period evidence EV returns to zero', f6With(onlySubmitted).project.ev, 0);
+    const unreached = g1(f5With(onlySubmitted));
+    eq('S20-H01-E the state is UNREACHED: 0%', unreached.percentComplete, 0);
+    eq('S20-H01-E the state is UNREACHED: not started', unreached.started, false);
+    eq('S20-H01-E the state is UNREACHED: not complete', unreached.completed, false);
+    eq('S20-H01-E the state is UNREACHED: no actual start', unreached.actualStart, null);
+    eq('S20-H01-E the state is UNREACHED: no actual finish', unreached.actualFinish, null);
+    // (ii) same result when the only remaining update is approved but dated after the Data Date.
+    const onlyFuture = [upd('HU-E2', 'G1', '2026-09-20', 90)];
+    eq('S20-H01-E a future-only history is also unreached', f6With(onlyFuture).project.ev, 0);
+    eq('S20-H01-E a future-only history leaves G1 not started', g1(f5With(onlyFuture)).started, false);
+    // (iii) the resolver states so explicitly, so a consumer can render N/A rather than a bare 0.
+    const idx = indexProgressHistory(onlySubmitted);
+    eq('S20-H01-E the resolver names the unreached state', resolveGovernedProgress(s20Acts[0], idx, BDD).source, 'no_governed_evidence');
+    eq('S20-H01-E the unreached state carries no evidence id', resolveGovernedProgress(s20Acts[0], idx, BDD).evidenceUpdateId, null);
+    eq('S20-H01-E the unreached state carries no actual dates',
+      [resolveGovernedProgress(act({ ...s20Acts[0], actual_start: '2026-09-02', actual_finish: '2026-09-09' }), idx, BDD).actualStart,
+        resolveGovernedProgress(act({ ...s20Acts[0], actual_start: '2026-09-02', actual_finish: '2026-09-09' }), idx, BDD).actualFinish],
+      [null, null]);
+
+    // --- H01-F: a future actual_start / actual_finish cannot contaminate the as-of-date state. ---
+    const futureActuals = [act({ ...s20Acts[0], percent_complete: 100, actual_start: '2026-09-20', actual_finish: '2026-09-25' })];
+    const withApprovedUpdate = [upd('HU-F', 'G1', '2026-09-10', 100)];
+    const f6F = f6With(withApprovedUpdate, [s20Txn('S20T1', 'G1', 50000)], futureActuals);
+    const f5F = f5With(withApprovedUpdate, futureActuals);
+    eq('S20-H01-F a future actual finish is not an as-of-date finish', g1(f5F).actualFinish, null);
+    eq('S20-H01-F a future actual start is not an as-of-date start', g1(f5F).actualStart, null);
+    eq('S20-H01-F the forecast finish is computed, not copied from the future actual',
+      g1(f5F).forecastFinish !== '2026-09-25', true);
+    eq('S20-H01-F EV still comes from the governed approved evidence', f6F.project.ev, 100000);
+    // The stored violation is still REPORTED: integrity audits the recorded rows, not the governed ones.
+    ok('S20-H01-F the stored future actual start is still reported as an integrity error',
+      f5F.integrity.some((f) => f.code === 'future_actual_start' && f.severity === 'error'));
+    ok('S20-H01-F the stored future actual finish is still reported as an integrity error',
+      f5F.integrity.some((f) => f.code === 'future_actual_finish' && f.severity === 'error'));
+    // A future actual finish must not silently complete an activity in the governed state either.
+    const onlyFutureFinish = act({ ...s20Acts[0], percent_complete: 0, actual_start: '2026-09-02', actual_finish: '2026-09-25' });
+    const governedF = resolveGovernedProgress(onlyFutureFinish, indexProgressHistory(withApprovedUpdate), BDD);
+    eq('S20-H01-F a future actual finish does not complete the governed state', governedF.actualFinish, null);
+    eq('S20-H01-F the in-period actual start survives the chronology guard', governedF.actualStart, '2026-09-02');
+
+    // --- one definition, shared with the historical phasing the S-Curve already used. ---
+    // A cutoff before the governed Data Date is the historical branch, which now delegates to the
+    // same shared rule instead of running its own loop.
+    eq('S20-H01 the S-Curve phasing and F5 resolve the same governing update',
+      phasePercentCompleteAsOf(s20Acts[0], both, '2026-09-12', '2026-09-13').percent, 60);
+    eq('S20-H01 the S-Curve phasing and the governed resolver agree at a historical cutoff',
+      phasePercentCompleteAsOf(s20Acts[0], both, '2026-09-18', '2026-09-20').percent,
+      latestApprovedUpdateOnOrBefore(indexProgressHistory(both), 'G1', '2026-09-18')?.percent_complete);
+    eq('S20-H01 the governed resolver ignores an update dated after the cutoff',
+      latestApprovedUpdateOnOrBefore(indexProgressHistory(both), 'G1', '2026-09-12')?.id, 'HU-A');
+    eq('S20-H01 an undated update is never evidence',
+      latestApprovedUpdateOnOrBefore(indexProgressHistory([upd('HU-X', 'G1', 'not-a-date', 50)]), 'G1', BDD), null);
+    // A governed project is structurally the recorded project, so downstream snapshots cannot churn.
+    ok('S20-H01 an already-governed activity is passed through by reference (no clone churn)',
+      applyGovernedProgress([s20Acts[1]], [upd('HU-A', 'G1', '2026-09-10', 60)], BDD)[0] === s20Acts[1]);
+  }
+
+  // =========================================================================
+  // S20-H02  Duplicate actual cost cannot move AC / CPI / EAC / VAC
+  // =========================================================================
+  {
+    const updates = [upd('HU-A', 'G1', '2026-09-10', 100)]; // G1 complete: EV = 100,000
+    const base1 = s20Txn('S20D1', 'G1', 50000);
+    const before = f6With(updates, [base1]);
+    ok('S20-H02 the fixture has a measurable CPI to protect', before.project.cpi !== null);
+    ok('S20-H02 the fixture has an EAC and a VAC to protect',
+      before.project.eac !== null && before.project.vac !== null);
+    eq('S20-H02 the fixture AC is the single approved row', before.project.ac, 50000);
+
+    // The duplicate: a DIFFERENT row id, the SAME business key.
+    const duplicate = s20Txn('S20D2', 'G1', 50000);
+    eq('S20-H02 the duplicate really is a different row id (not an id-deduplication)',
+      duplicate.id !== base1.id, true);
+    eq('S20-H02 the duplicate really shares the business key',
+      costTransactionBusinessKey(duplicate), costTransactionBusinessKey(base1));
+
+    const after = f6With(updates, [base1, duplicate]);
+    eq('S20-H02-A an exact duplicate leaves AC unchanged', after.project.ac, before.project.ac);
+    eq('S20-H02-B an exact duplicate leaves CPI unchanged', after.project.cpi, before.project.cpi);
+    eq('S20-H02-C an exact duplicate leaves EAC unchanged', after.project.eac, before.project.eac);
+    eq('S20-H02-D an exact duplicate leaves VAC unchanged', after.project.vac, before.project.vac);
+    eq('S20-H02 the duplicate is not counted in the transaction count', after.project.acCount, before.project.acCount);
+    eq('S20-H02 the duplicate does not reach the activity rollup either',
+      after.activities.find((a) => a.id === 'G1')?.ac, before.activities.find((a) => a.id === 'G1')?.ac);
+    // The warning is still raised — the requirement is that the MONEY does not move, not silence.
+    ok('S20-H02 the duplicate is still reported by integrity',
+      after.integrity.some((f) => f.code === 'duplicate_transaction' && f.refId === duplicate.id));
+    ok('S20-H02 the report states the duplicate was excluded from AC',
+      (after.integrity.find((f) => f.code === 'duplicate_transaction')?.evidence || [])
+        .some((e) => /excluded from AC/.test(e)));
+    // Order independence: the survivor is the earliest row by (date, id), not whichever came first.
+    const reversed = f6With(updates, [duplicate, base1]);
+    eq('S20-H02 the surviving row does not depend on array order', reversed.project.ac, before.project.ac);
+    eq('S20-H02 the shared helper keeps exactly one of the pair',
+      dedupeByBusinessKey([base1, duplicate]).unique.length, 1);
+    eq('S20-H02 the shared helper reports which row it dropped',
+      dedupeByBusinessKey([base1, duplicate]).duplicates[0].row.id, duplicate.id);
+
+    // H02-E: a genuinely distinct transaction is still included.
+    const distinct = s20Txn('S20D3', 'G1', 25000, { invoice_number: 'INV-S20-B' } as Partial<CostTransaction>);
+    eq('S20-H02-E a distinct transaction does NOT share the business key',
+      costTransactionBusinessKey(distinct) === costTransactionBusinessKey(base1), false);
+    const grown = f6With(updates, [base1, distinct]);
+    eq('S20-H02-E a genuinely distinct transaction increases AC normally', grown.project.ac, before.project.ac + 25000);
+    ok('S20-H02-E the added cost really changes CPI', grown.project.cpi !== before.project.cpi);
+    ok('S20-H02-E the added cost really changes EAC', grown.project.eac !== before.project.eac);
+    ok('S20-H02-E the added cost really changes VAC', grown.project.vac !== before.project.vac);
+    // A duplicate of a row that is NOT actual cost must not cancel the approved one.
+    const rejectedTwin = { ...base1, id: 'S20D4', status: 'rejected' } as CostTransaction;
+    eq('S20-H02 a rejected twin does not cancel its approved counterpart',
+      f6With(updates, [rejectedTwin, base1]).project.ac, before.project.ac);
+  }
+
+  // =========================================================================
+  // S20-M02  Orphan / foreign actual cost
+  // =========================================================================
+  {
+    const updates = [upd('HU-A', 'G1', '2026-09-10', 100)];
+    const base1 = s20Txn('S20M1', 'G1', 50000);
+    const before = f6With(updates, [base1]);
+
+    // --- M02-A: a transaction naming an activity that does not exist. ---
+    const orphan = s20Txn('S20M2', 'activity-that-does-not-exist', 75000);
+    const withOrphan = f6With(updates, [base1, orphan]);
+    eq('S20-M02-A an orphan transaction leaves AC unchanged', withOrphan.project.ac, before.project.ac);
+    eq('S20-M02-A an orphan transaction leaves EAC unchanged', withOrphan.project.eac, before.project.eac);
+    eq('S20-M02-A it does not reach the unassigned bucket either',
+      withOrphan.unassigned.ac, before.unassigned.ac);
+    ok('S20-M02-D the orphan is REPORTED, not silently consumed',
+      withOrphan.integrity.some((f) => f.code === 'invalid_activity_reference' && f.refId === orphan.id));
+    ok('S20-M02-D the report states the amount and the exclusion',
+      (withOrphan.integrity.find((f) => f.code === 'invalid_activity_reference')?.evidence || [])
+        .some((e) => /excluded from AC/.test(e))
+      && (withOrphan.integrity.find((f) => f.code === 'invalid_activity_reference')?.evidence || [])
+        .some((e) => e.includes('amount = 75000')));
+
+    // --- M02-B: a transaction naming an activity that belongs to ANOTHER project. ---
+    // The analysed activity set is this project's; the foreign activity is deliberately outside it.
+    const foreignAct = act({ id: 'FOREIGN-1', code: 'FOREIGN-1', project_id: 'p2', duration_days: 10, percent_complete: 100 });
+    const foreign = s20Txn('S20M3', 'FOREIGN-1', 125000);
+    const withForeign = f6With(updates, [base1, foreign]);
+    eq('S20-M02-B a foreign-project transaction leaves AC unchanged', withForeign.project.ac, before.project.ac);
+    eq('S20-M02-B a foreign-project transaction leaves CPI unchanged', withForeign.project.cpi, before.project.cpi);
+    eq('S20-M02-B a foreign-project transaction leaves EAC unchanged', withForeign.project.eac, before.project.eac);
+    eq('S20-M02-B it does not reach the unassigned bucket either',
+      withForeign.unassigned.ac, before.unassigned.ac);
+    ok('S20-M02-D the foreign transaction is reported too',
+      withForeign.integrity.some((f) => f.code === 'invalid_activity_reference' && f.refId === foreign.id));
+    // The shared predicate distinguishes the two failures once it can see the whole register.
+    const db: DemoDb = {
+      activities: [
+        { id: s20Acts[0].id, project_id: s20Acts[0].project_id },
+        { id: foreignAct.id, project_id: foreignAct.project_id },
+      ],
+    };
+    eq('S20-M02-B the shared predicate names the foreign-project failure',
+      controlRecordCrossesProjectBoundary('FOREIGN-1', 'p1', (id) => {
+        const row = (db['activities'] || []).find((a) => String(a.id) === id);
+        return row ? (row.project_id as string) : null;
+      }).reason, 'foreign_project');
+    eq('S20-M02-A the shared predicate names the missing-activity failure',
+      controlRecordCrossesProjectBoundary('nope', 'p1', () => null).reason, 'activity_not_found');
+
+    // --- M02-C: a valid same-project transaction is still accepted. ---
+    const valid = s20Txn('S20M4', 'G1', 25000, { invoice_number: 'INV-S20-C' } as Partial<CostTransaction>);
+    const foreign2 = s20Txn('S20M5', 'FOREIGN-1', 125000, { invoice_number: 'INV-S20-D' } as Partial<CostTransaction>);
+    const mixed = f6With(updates, [base1, valid, foreign2]);
+    eq('S20-M02-C a valid same-project transaction is accepted', mixed.project.ac, before.project.ac + 25000);
+    eq('S20-M02-C only the valid one is counted', mixed.project.acCount, before.project.acCount + 1);
+    // A project-level cost (no activity_id) is legal and unaffected by the boundary rule.
+    const projectLevel = s20Txn('S20M6', null, 10000, { invoice_number: 'INV-S20-E' } as Partial<CostTransaction>);
+    eq('S20-M02-C a project-level cost with no activity reference is still accepted',
+      f6With(updates, [base1, projectLevel]).project.ac, before.project.ac + 10000);
+    eq('S20-M02-C the boundary rule does not fire for a null activity reference',
+      controlRecordCrossesProjectBoundary(null, 'p1', () => null).crosses, false);
+
+    // --- the PERSISTENCE boundary: the demo store mirrors the live trigger. ---
+    const okSame = checkControlRecordProjectBoundary(db, 'cost_transactions', { id: 'new', project_id: 'p1', activity_id: 'G1' });
+    eq('S20-M02 the write boundary accepts a same-project activity', okSame.error, null);
+    const okNull = checkControlRecordProjectBoundary(db, 'cost_transactions', { id: 'new', project_id: 'p1', activity_id: null });
+    eq('S20-M02 the write boundary accepts a project-level cost', okNull.error, null);
+    const badOrphan = checkControlRecordProjectBoundary(db, 'cost_transactions', { id: 'new', project_id: 'p1', activity_id: 'ghost' });
+    ok('S20-M02-A the write boundary rejects a nonexistent activity', badOrphan.error !== null);
+    eq('S20-M02-A the rejection quotes the SQL exception verbatim',
+      badOrphan.error?.message, 'Control record crosses project boundary');
+    eq('S20-M02-A the rejection names the reason', badOrphan.error?.hint, 'trigger:validate_project_boundaries:activity_not_found');
+    const badForeign = checkControlRecordProjectBoundary(db, 'cost_transactions', { id: 'new', project_id: 'p1', activity_id: 'FOREIGN-1' });
+    ok('S20-M02-B the write boundary rejects another project activity', badForeign.error !== null);
+    eq('S20-M02-B the rejection names the reason', badForeign.error?.hint, 'trigger:validate_project_boundaries:foreign_project');
+    ok('S20-M02-B the rejection states which project the activity belongs to',
+      String(badForeign.error?.details).includes('p2') && String(badForeign.error?.details).includes('p1'));
+  }
+
+  // =========================================================================
+  // S20-M01  Data Date provenance
+  // =========================================================================
+  {
+    // M01-A: the project states its own Data Date -> explicitly governed, never a fallback.
+    const explicit = resolveDataDateProvenance({ data_date: '2026-08-01' });
+    eq('S20-M01-A an explicit data_date resolves to itself', explicit.dataDate, '2026-08-01');
+    eq('S20-M01-A an explicit data_date is EXPLICIT_GOVERNED_DATE', explicit.source, EXPLICIT_GOVERNED_DATE);
+    eq('S20-M01-A an explicit data_date is not a fallback', explicit.isFallback, false);
+    eq('S20-M01-A its origin is the project', explicit.origin, 'project');
+    eq('S20-M01-A the project value is reported verbatim', explicit.projectDataDate, '2026-08-01');
+
+    // M01-B: data_date is null -> the fallback is VISIBLY identified.
+    const nullDd = resolveDataDateProvenance({ data_date: null });
+    eq('S20-M01-B a null data_date resolves to the governed default', nullDd.dataDate, DEFAULT_DATA_DATE);
+    eq('S20-M01-B a null data_date is FALLBACK_DEFAULT_DATE', nullDd.source, FALLBACK_DEFAULT_DATE);
+    eq('S20-M01-B a null data_date is flagged as a fallback', nullDd.isFallback, true);
+    eq('S20-M01-B its origin is the default', nullDd.origin, 'default');
+    eq('S20-M01-B no project date is claimed', nullDd.projectDataDate, null);
+    ok('S20-M01-B the note says so in words', /[Ff]allback/.test(nullDd.note));
+
+    // M01-C: the data_date key is absent entirely -> same visible fallback.
+    const missingDd = resolveDataDateProvenance({});
+    eq('S20-M01-C a missing data_date resolves to the governed default', missingDd.dataDate, DEFAULT_DATA_DATE);
+    eq('S20-M01-C a missing data_date is FALLBACK_DEFAULT_DATE', missingDd.source, FALLBACK_DEFAULT_DATE);
+    eq('S20-M01-C a missing data_date is flagged as a fallback', missingDd.isFallback, true);
+    const noProject = resolveDataDateProvenance(null);
+    eq('S20-M01-C no project at all is the same visible fallback', noProject.source, FALLBACK_DEFAULT_DATE);
+    eq('S20-M01-C no project at all still resolves to the governed default', noProject.dataDate, DEFAULT_DATA_DATE);
+    // The two provenances are different values, so no consumer can conflate them.
+    ok('S20-M01 the two provenances are distinct markers',
+      EXPLICIT_GOVERNED_DATE !== FALLBACK_DEFAULT_DATE);
+    eq('S20-M01 isFallbackDataDate agrees with the resolution',
+      [isFallbackDataDate({ data_date: '2026-08-01' }), isFallbackDataDate({}), isFallbackDataDate(null)],
+      [false, true, true]);
+    // An explicit override is governance, not a fallback — but its origin still says "not the project".
+    const override = resolveDataDateProvenance({ data_date: '2026-08-01' }, '2026-09-01');
+    eq('S20-M01 an explicit override is governed, not a fallback', override.isFallback, false);
+    eq('S20-M01 an explicit override is EXPLICIT_GOVERNED_DATE', override.source, EXPLICIT_GOVERNED_DATE);
+    eq('S20-M01 an explicit override is labelled as an override', override.origin, 'override');
+    const overrideOnEmpty = resolveDataDateProvenance({}, '2026-09-01');
+    eq('S20-M01 an override rescues a project with no data_date', overrideOnEmpty.isFallback, false);
+    eq('S20-M01 the project date is still reported as absent',
+      overrideOnEmpty.projectDataDate, null);
+
+    // M01-D: every existing consumer keeps working — the value is bit-for-bit unchanged.
+    const matrix: Array<[DataDateBearer | null | undefined, string | null | undefined]> = [
+      [{ data_date: '2026-08-01' }, null],
+      [{ data_date: '2026-08-01' }, '2026-09-01'],
+      [{ data_date: null }, null],
+      [{ data_date: null }, '2026-09-01'],
+      [{}, null],
+      [{}, ''],
+      [null, null],
+      [undefined, null],
+    ];
+    for (const [bearer, ovr] of matrix) {
+      eq(`S20-M01-D resolveDataDate is unchanged for ${JSON.stringify(bearer)}/${String(ovr)}`,
+        resolveDataDate(bearer, ovr), ovr || bearer?.data_date || DEFAULT_DATA_DATE);
+      eq(`S20-M01-D the shim equals the provenance value for ${JSON.stringify(bearer)}/${String(ovr)}`,
+        resolveDataDate(bearer, ovr), resolveDataDateProvenance(bearer, ovr).dataDate);
+    }
+    // The S0 baseline assertions from the original harness still hold through the new implementation.
+    eq('S20-M01-D S0 override wins still holds', resolveDataDate({ data_date: '2026-08-01' }, '2026-09-01'), '2026-09-01');
+    eq('S20-M01-D S0 project DD still holds', resolveDataDate({ data_date: '2026-08-01' }), '2026-08-01');
+    eq('S20-M01-D S0 null project still holds', resolveDataDate(null), DEFAULT_DATA_DATE);
+    // The fallback is surfaced where the date is shown, not merely available.
+    const appSrc = readFileSync(resolvePath(s20Root, 'src/App.tsx'), 'utf8');
+    ok('S20-M01 the shell resolves the Data Date through the provenance helper',
+      /resolveDataDateProvenance\s*\(\s*project\s*\)/.test(appSrc));
+    ok('S20-M01 the shell renders a FALLBACK marker instead of presenting the stand-in as governed',
+      /dataDateResolution\.isFallback[\s\S]{0,400}FALLBACK/.test(appSrc)
+      && /dataDateResolution\.isFallback[\s\S]{0,400}افتراضي/.test(appSrc));
+  }
+
+  // =========================================================================
+  // S20-H04  NO DATA is not CPI = SPI = 1 with a realistic finish and 100% confidence
+  // =========================================================================
+  {
+    const START = '2026-07-01';
+    const END = '2027-03-31';
+    const emptyCanonical = selectCanonicalEvm(null);
+    eq('S20-H04 the fixture really is the no-data case', emptyCanonical.cpiStatus, 'empty_no_data');
+    eq('S20-H04 the fixture really has no measured SPI', emptyCanonical.spiStatus, 'empty_no_data');
+    eq('S20-H04 the canonical quote carries no CPI at all', emptyCanonical.cpi, null);
+    // The compatibility adapter DOES hand out a neutral 1.0 — that is the trap the fix closes.
+    const adapted = canonicalEvmToComprehensive(emptyCanonical);
+    eq('S20-H04 the non-nullable adapter still substitutes the neutral 1.0 (the trap)', adapted.cpi, 1);
+    eq('S20-H04 the adapter keeps the status authoritative so a consumer can tell', adapted.cpiStatus, 'empty_no_data');
+
+    // --- the pre-fix symptom, reproduced: feeding that 1.0 in produces healthy output. ---
+    const legacy = analyzeForecast(START, END, 0, 0, 0, adapted.spi, adapted.cpi, 0, 0, BDD, []);
+    eq('S20-H04 the pre-fix behaviour really reported 100% confidence from no data', legacy.confidence, 100);
+    ok('S20-H04 the pre-fix behaviour really produced a realistic finish from no data',
+      legacy.scenarios.realistic !== null);
+    eq('S20-H04 the pre-fix volatility was a perfect-looking 0', legacy.volatility, 0);
+
+    // --- H04-A/B: gated on the canonical statuses, no data yields no forecast and no confidence. ---
+    const gated = analyzeForecast(START, END, 0, 0, 0, adapted.spi, adapted.cpi, 0, 0, BDD, [],
+      { cpi: adapted.cpiStatus, spi: adapted.spiStatus });
+    eq('S20-H04-A no data produces NO realistic finish (N/A)', gated.scenarios.realistic, null);
+    eq('S20-H04-A no data produces no optimistic finish either', gated.scenarios.optimistic, null);
+    eq('S20-H04-A no data produces no pessimistic finish either', gated.scenarios.pessimistic, null);
+    eq('S20-H04-B no data reports NO confidence at all — never 100', gated.confidence, null);
+    eq('S20-H04 the forecast says it is not measured', gated.measured, false);
+    ok('S20-H04 the forecast states why it is N/A', /N\/A/.test(String(gated.note)));
+    eq('S20-H04 the statuses the forecast was gated on are published',
+      gated.indexStatus, { cpi: 'empty_no_data', spi: 'empty_no_data' });
+    // An ANOMALOUS index (value earned, denominator zero) is equally unforecastable.
+    const anomalous = analyzeForecast(START, END, 100000, 0, 0.5, 0, 0, 0, 0, BDD, [],
+      { cpi: 'anomalous_zero_denominator', spi: 'anomalous_zero_denominator' });
+    eq('S20-H04-A an anomalous index is also not a forecast', anomalous.scenarios.realistic, null);
+    eq('S20-H04-B an anomalous index is also not 100% confidence', anomalous.confidence, null);
+    eq('S20-H04 an anomalous cost index does not inflate EAC fourfold (BAC convention instead)',
+      anomalous.cost.realistic, 100000);
+    // One unmeasured index is enough to invalidate the finish forecast.
+    const halfMeasured = analyzeForecast(START, END, 100000, 50000, 0.5, 1, 1, 0, 0, BDD, [],
+      { cpi: 'valid', spi: 'empty_no_data' });
+    eq('S20-H04-A an unmeasured SPI alone stops the finish forecast', halfMeasured.scenarios.realistic, null);
+    eq('S20-H04-B an unmeasured SPI alone stops the confidence claim', halfMeasured.confidence, null);
+    eq('S20-H04 an unmeasured index is named in the published statuses',
+      halfMeasured.indexStatus.spi, 'empty_no_data');
+    eq('S20-H04 the shared finish-scenario helper applies the same gate',
+      forecastFinishScenarios(START, END, 0.5, 1, new Date(`${BDD}T00:00:00Z`), 'empty_no_data').realistic, null);
+    ok('S20-H04 a completed project still reports its planned finish (evidence, not extrapolation)',
+      forecastFinishScenarios(START, END, 1, 1, new Date(`${BDD}T00:00:00Z`), 'empty_no_data').realistic === END);
+
+    // --- H04-C: a REAL measured CPI = SPI = 1 forecasts exactly as before. ---
+    const measured = analyzeForecast(START, END, 100000, 50000, 0.5, 1, 1, 0, 0, BDD, [],
+      { cpi: 'valid', spi: 'valid' });
+    eq('S20-H04-C a measured SPI = 1 still produces a realistic finish',
+      measured.scenarios.realistic !== null, true);
+    eq('S20-H04-C a measured forecast is flagged as measured', measured.measured, true);
+    eq('S20-H04-C a measured forecast carries no N/A note', measured.note, null);
+    ok('S20-H04-C a measured CPI = SPI = 1 still reports a real confidence number',
+      typeof measured.confidence === 'number');
+    eq('S20-H04-C with perfect measured indices and no critical work the confidence is 100',
+      measured.confidence, 100);
+    eq('S20-H04-C the measured forecast is identical to the ungated call (no behaviour change)',
+      JSON.stringify(measured.scenarios),
+      JSON.stringify(analyzeForecast(START, END, 100000, 50000, 0.5, 1, 1, 0, 0, BDD, []).scenarios));
+    eq('S20-H04-C the measured cost forecast still divides by the measured CPI',
+      measured.cost.realistic, 50000 + 100000 * 0.5 / 1);
+    // Slippage is still penalised when the indices are measured.
+    const slipping = analyzeForecast(START, END, 100000, 50000, 0.5, 0.5, 0.5, 0, 0, BDD, [],
+      { cpi: 'valid', spi: 'valid' });
+    ok('S20-H04-C a measured 0.5 SPI still pushes the finish out',
+      (slipping.scenarios.realistic as string) > (measured.scenarios.realistic as string));
+    ok('S20-H04-C a measured 0.5 CPI still lowers the confidence',
+      (slipping.confidence as number) < (measured.confidence as number));
+    // No statuses supplied at all => previous behaviour, so no existing caller is disturbed.
+    const ungated = analyzeForecast(START, END, 100000, 50000, 0.5, 1, 1, 2, 1, BDD, []);
+    eq('S20-H04-C an ungated call keeps its number-valued confidence', typeof ungated.confidence, 'number');
+    eq('S20-H04-C an ungated call is still marked measured', ungated.measured, true);
+    eq('S20-H04-C an ungated call still subtracts critical and near-critical work',
+      ungated.confidence, 100 - 2 * 2 - 1);
+
+    // The Dashboard is the consumer that used to feed the synthetic values in.
+    const dashSrcB = readFileSync(resolvePath(s20Root, 'src/components/views/Dashboard.tsx'), 'utf8');
+    ok('S20-H04 the dashboard gates the forecast on the canonical index statuses',
+      /analyzeForecast\([\s\S]{0,900}\{\s*cpi:\s*evm\.cpiStatus,\s*spi:\s*evm\.spiStatus\s*\}/.test(dashSrcB));
+    ok('S20-H04 the dashboard still treats a null realistic finish as N/A, not as a date',
+      /if\s*\(!forecastFinish\)\s*return\s*null;/.test(dashSrcB));
+  }
 }
 
 // ---------------------------------------------------------------------------

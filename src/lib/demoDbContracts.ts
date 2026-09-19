@@ -256,6 +256,112 @@ export function reviewStateOf(
 }
 
 /* -------------------------------------------------------------------------
+ * P2A1-M02 — the cost-transaction PROJECT BOUNDARY.
+ *
+ * `cost_transactions.activity_id` is a nullable foreign key
+ * (`REFERENCES activities(id) ON DELETE SET NULL`), so the database accepts a row whose activity
+ * lives in ANOTHER project — and, in demo mode, a row whose activity does not exist at all, because
+ * the in-memory store enforces no referential integrity whatsoever. Either row is then summed into
+ * canonical AC by F6, which simply adds every approved in-period transaction it is handed.
+ *
+ * LIVE BEHAVIOUR BEING MIRRORED (20260907220000_add_planning_control_schema.sql)
+ * -----------------------------------------------------------------------------
+ *   CREATE TRIGGER validate_cost_project BEFORE INSERT OR UPDATE ON cost_transactions
+ *     FOR EACH ROW EXECUTE FUNCTION validate_project_boundaries();
+ *
+ *   -- inside validate_project_boundaries(), for 'progress_updates' / 'cost_transactions':
+ *   SELECT project_id INTO related_project FROM activities WHERE id = NEW.activity_id;
+ *   IF NEW.activity_id IS NOT NULL
+ *      AND (related_project IS NULL OR related_project <> NEW.project_id)
+ *   THEN RAISE EXCEPTION 'Control record crosses project boundary'; END IF;
+ *
+ * Two facts follow from that statement and are reproduced exactly:
+ *   - `activity_id IS NULL` is LEGAL (the cost is project-level, attributed by WBS/BOQ or not at
+ *     all), so only rows that actually name an activity are checked.
+ *   - `related_project IS NULL` (the activity does not exist) and `related_project <> project_id`
+ *     (the activity exists but belongs to another project) raise the SAME exception: from the
+ *     project's point of view both are "this transaction does not belong here".
+ *
+ * The predicate is a pure function of an activity -> owning-project lookup so that BOTH consumers of
+ * the rule can share one definition:
+ *   1. the demo store's write path (`src/lib/supabase.ts`), which mirrors the trigger by REJECTING
+ *      the write — exactly what `RAISE EXCEPTION` does;
+ *   2. F6 (`costControlEngine`), which QUARANTINES such a row out of canonical AC and reports it, so
+ *      a row that is already stored (seeded, imported, or written before this guard existed) can
+ *      never reach actual cost.
+ * ----------------------------------------------------------------------- */
+
+/** The result of evaluating the project boundary for one control record. */
+export type ProjectBoundaryVerdict =
+  | { crosses: false }
+  | { crosses: true; reason: 'activity_not_found' | 'foreign_project'; activityProjectId: string | null };
+
+/**
+ * Does naming this activity cross the record's project boundary?
+ *
+ * `lookupActivityProject` returns the owning `project_id` of an activity id, or null/undefined when
+ * no such activity exists — it is the only database access the rule needs, so the demo store can
+ * pass a whole-DB scan and F6 can pass its own project-scoped activity set.
+ */
+export function controlRecordCrossesProjectBoundary(
+  activityId: unknown,
+  projectId: unknown,
+  lookupActivityProject: (id: string) => string | null | undefined,
+): ProjectBoundaryVerdict {
+  // `NEW.activity_id IS NOT NULL` — a project-level cost carries no activity and is always legal.
+  if (activityId === null || activityId === undefined || activityId === '') return { crosses: false };
+  const id = String(activityId);
+  const relatedProject = lookupActivityProject(id);
+  if (relatedProject === null || relatedProject === undefined) {
+    return { crosses: true, reason: 'activity_not_found', activityProjectId: null };
+  }
+  if (String(relatedProject) !== String(projectId)) {
+    return { crosses: true, reason: 'foreign_project', activityProjectId: String(relatedProject) };
+  }
+  return { crosses: false };
+}
+
+/** A `cost_transactions` / `progress_updates` row as far as the boundary rule is concerned. */
+export interface ControlRecordProjectRef {
+  id?: unknown;
+  project_id?: unknown;
+  activity_id?: unknown;
+}
+
+/**
+ * The demo store's verdict for one control-record write, shaped like the PostgREST error the real
+ * database returns when the trigger fires.
+ *
+ * `message` quotes the SQL exception verbatim so a failure is diagnosable from the UI alone.
+ */
+export interface ProjectBoundaryCheck {
+  error: { message: string; details: string; hint: string } | null;
+}
+
+export function checkControlRecordProjectBoundary(
+  db: DemoDb,
+  tableName: 'cost_transactions',
+  row: ControlRecordProjectRef,
+): ProjectBoundaryCheck {
+  const activities = (db['activities'] || []) as Array<Record<string, unknown>>;
+  const verdict = controlRecordCrossesProjectBoundary(row.activity_id, row.project_id, (id) => {
+    const act = activities.find((a) => String(a.id) === id);
+    return act ? (act.project_id as string | null | undefined) : null;
+  });
+  if (!verdict.crosses) return { error: null };
+  const reason = verdict.reason === 'activity_not_found'
+    ? `No activities row with id "${String(row.activity_id)}".`
+    : `Activity "${String(row.activity_id)}" belongs to project "${verdict.activityProjectId}", not "${String(row.project_id)}".`;
+  return {
+    error: {
+      message: 'Control record crosses project boundary',
+      details: `${tableName} row "${String(row.id ?? '(new)')}" references an activity outside its own project. ${reason}`,
+      hint: `trigger:validate_project_boundaries:${verdict.reason}`,
+    },
+  };
+}
+
+/* -------------------------------------------------------------------------
  * REVIEW FINDING 2 (F9.4) — governed baseline evidence.
  *
  * `baseline_activities` has NO `project_id` column: it hangs off `project_baselines`, the revision

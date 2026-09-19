@@ -21,15 +21,125 @@ export interface DataDateBearer {
   data_date?: string | null;
 }
 
+/* ---------------------------------------------------------------------------
+ * P2A1-M01 — Data Date PROVENANCE.
+ *
+ * `resolveDataDate` used to return a bare string, so a project with no `data_date` of its own was
+ * indistinguishable from one whose governing body had explicitly set that exact date. Every consumer
+ * then reported the governed constant as if it were the project's own chronology — a fallback
+ * presented as governance. The resolution VALUE is unchanged (compatibility: the fallback is still
+ * required by callers that must have a date), but the PROVENANCE now travels with it.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The Data Date is the project's own governed status date (or an explicit caller override, which is
+ * equally an act of governance): the chronology is real.
+ */
+export const EXPLICIT_GOVERNED_DATE = 'EXPLICIT_GOVERNED_DATE' as const;
+/**
+ * The Data Date is the governed DEFAULT because the project states none. The chronology is a
+ * stand-in: it must be labelled as one wherever it is shown, and it must never be presented as an
+ * explicitly governed status date.
+ */
+export const FALLBACK_DEFAULT_DATE = 'FALLBACK_DEFAULT_DATE' as const;
+
+export type DataDateSource = typeof EXPLICIT_GOVERNED_DATE | typeof FALLBACK_DEFAULT_DATE;
+
+/** Which input actually supplied the resolved date. */
+export type DataDateOrigin = 'override' | 'project' | 'default';
+
+/** A resolved Data Date together with the provenance that makes it trustworthy — or not. */
+export interface DataDateResolution {
+  /** The resolved date. Identical to `resolveDataDate(...)`: no consumer's value changes. */
+  dataDate: string;
+  source: DataDateSource;
+  /** Convenience: `source === FALLBACK_DEFAULT_DATE`. */
+  isFallback: boolean;
+  origin: DataDateOrigin;
+  /** The project's own `data_date`, verbatim — null when it carries none. */
+  projectDataDate: string | null;
+  /** The explicit caller override in force, or null. */
+  overrideDataDate: string | null;
+  /** Short human-readable statement of the basis, so a UI can label the date without re-deriving. */
+  note: string;
+}
+
+/**
+ * Resolve the Data Date AND state where it came from.
+ *
+ * Resolution order is unchanged and still matches `calculateProjectEvmAtDataDate` in
+ * `src/lib/planningEngine.ts` (`overrideDataDate || project.data_date || DEFAULT_DATA_DATE`), so
+ * every consumer of this helper agrees with the canonical EVM / Earned Schedule results for the same
+ * project. Only the last step is new: reaching the governed constant is now recorded as
+ * `FALLBACK_DEFAULT_DATE` instead of being silently indistinguishable from governance.
+ *
+ * A caller-supplied `override` is `EXPLICIT_GOVERNED_DATE`: the caller is asserting an explicit
+ * status date, which is an act of governance — but `origin` still says it did not come from the
+ * project, so a consumer can tell the two apart without needing a third kind of date.
+ */
+export function resolveDataDateProvenance(
+  project: DataDateBearer | null | undefined,
+  override?: string | null,
+): DataDateResolution {
+  // Provenance only — the VALUE rules are untouched. A non-empty `data_date` is the project's own
+  // explicit statement (malformed or not; engines that need a parseable date already report N/A for
+  // one), and an empty / absent / null one is what falls back. Adding a stricter parse here would
+  // silently re-date projects that currently resolve fine, which is exactly the kind of quiet
+  // behaviour change this gap exists to prevent.
+  const projectRaw = project?.data_date;
+  const projectDataDate = typeof projectRaw === 'string' && projectRaw.trim() !== '' ? projectRaw : null;
+  const overrideDataDate = typeof override === 'string' && override.trim() !== '' ? override : null;
+
+  if (overrideDataDate) {
+    return {
+      dataDate: overrideDataDate,
+      source: EXPLICIT_GOVERNED_DATE,
+      isFallback: false,
+      origin: 'override',
+      projectDataDate,
+      overrideDataDate,
+      note: 'Explicit caller-supplied status date.',
+    };
+  }
+  if (projectDataDate) {
+    return {
+      dataDate: projectDataDate,
+      source: EXPLICIT_GOVERNED_DATE,
+      isFallback: false,
+      origin: 'project',
+      projectDataDate,
+      overrideDataDate: null,
+      note: "Explicitly governed by the project's own data_date.",
+    };
+  }
+  return {
+    dataDate: DEFAULT_DATA_DATE,
+    source: FALLBACK_DEFAULT_DATE,
+    isFallback: true,
+    origin: 'default',
+    projectDataDate: null,
+    overrideDataDate: null,
+    note: `Fallback: the project states no data_date, so the governed default ${DEFAULT_DATA_DATE} is standing in.`,
+  };
+}
+
 /**
  * Resolve the Data Date a screen must use.
  *
- * Resolution order matches `calculateProjectEvmAtDataDate` in `src/lib/planningEngine.ts`
- * (`overrideDataDate || project.data_date || DEFAULT_DATA_DATE`), so every consumer of this helper
- * agrees with the canonical EVM / Earned Schedule results for the same project.
+ * Unchanged in signature and value — this is the compatibility shim that keeps every existing caller
+ * working. Callers that must DISTINGUISH governed chronology from a stand-in use
+ * `resolveDataDateProvenance` (or `isFallbackDataDate`) instead.
  */
 export function resolveDataDate(project: DataDateBearer | null | undefined, override?: string | null): string {
-  return override || project?.data_date || DEFAULT_DATA_DATE;
+  return resolveDataDateProvenance(project, override).dataDate;
+}
+
+/** True when the resolved Data Date is a stand-in rather than an explicitly governed status date. */
+export function isFallbackDataDate(
+  project: DataDateBearer | null | undefined,
+  override?: string | null,
+): boolean {
+  return resolveDataDateProvenance(project, override).isFallback;
 }
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;

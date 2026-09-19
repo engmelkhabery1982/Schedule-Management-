@@ -727,25 +727,64 @@ export interface ForecastAnalysis {
     realistic: number;
     pessimistic: number;
   };
-  confidence: number;
+  /**
+   * P2A1-H04: null when the forecast is not computable because a governing performance index is not
+   * a MEASURED value. NO DATA is not 100% confidence: with no measured CPI/SPI there is no evidence
+   * to be confident about, so the figure is N/A rather than the `100` the synthetic `1.0` used to
+   * produce (volatility 0 ⇒ 100 − 0 − 0).
+   */
+  confidence: number | null;
   volatility: number;
+  /**
+   * P2A1-H04: true only when every governing index the caller supplied a status for is `valid`.
+   * `false` means the finish scenarios are N/A and the confidence is null — a consumer can therefore
+   * tell "no evidence" apart from "measured, perfectly on plan" without re-deriving the rule.
+   */
+  measured: boolean;
+  /** The statuses the forecast was gated on (null when the caller supplied none). */
+  indexStatus: { cpi: EvmRatioStatus | null; spi: EvmRatioStatus | null };
+  /** Why the forecast is N/A, so a screen can state it instead of showing a bare blank. */
+  note: string | null;
   riskExposure: {
     cost: number;
     days: number;
   };
 }
 
-// Phase A: `today` is required — the finish scenarios anchor on the governed Data Date passed by
-// the caller (Dashboard), never on the machine clock. There is no default on purpose.
+/** P2A1-H04: the statuses that decide whether a forecast is computable at all. */
+export interface ForecastIndexStatus {
+  cpi?: EvmRatioStatus | null;
+  spi?: EvmRatioStatus | null;
+}
+
+/**
+ * Phase A: `today` is required — the finish scenarios anchor on the governed Data Date passed by
+ * the caller (Dashboard), never on the machine clock. There is no default on purpose.
+ *
+ * Finish scenarios from the schedule performance index.
+ *
+ * P2A1-H04: `spiStatus` makes NO DATA distinguishable from perfect performance. The compatibility
+ * layer (`canonicalEvmToComprehensive`) substitutes `RATIO_EMPTY_STATE_VALUE` — a neutral `1.0` —
+ * where F6 reports no measurable SPI, and substituting it here produced a confident-looking
+ * "realistic finish" from nothing. When the caller says the index is not `valid`, every scenario is
+ * N/A instead: there is no performance evidence to extrapolate, so no finish date is computed.
+ * A genuinely measured SPI === 1 (status `valid`) is unaffected and forecasts exactly as before.
+ */
 export function forecastFinishScenarios(
   plannedStart: string | null,
   plannedFinish: string | null,
   actualProgress: number,
   spi: number,
   today: Date,
+  spiStatus?: EvmRatioStatus | null,
 ): ForecastScenarios {
   if (!plannedStart || !plannedFinish || actualProgress >= 1) {
     return { optimistic: plannedFinish, realistic: plannedFinish, pessimistic: plannedFinish };
+  }
+  // Unmeasured index => uncomputable forecast. `null` is the existing N/A convention for these
+  // fields (`ForecastScenarios` has always been `string | null`).
+  if (spiStatus != null && spiStatus !== 'valid') {
+    return { optimistic: null, realistic: null, pessimistic: null };
   }
 
   const start = new Date(`${plannedStart}T00:00:00Z`);
@@ -778,12 +817,14 @@ export function analyzeForecast(
   nearCriticalCount: number,
   dataDate: string,
   risks: Risk[] = [],
+  /**
+   * P2A1-H04: the canonical `cpiStatus` / `spiStatus` of the indices above. Optional — a caller that
+   * supplies none keeps the previous behaviour exactly. A caller that supplies them gets the
+   * no-data rule: an index that F6 did not MEASURE is never fed into a forecast as if it were the
+   * neutral `1.0` compatibility value, because 0/0 is not "on plan / on budget".
+   */
+  indexStatus?: ForecastIndexStatus | null,
 ): ForecastAnalysis {
-  const safeCpi = Math.max(0.25, cpi || 1);
-  const safeSpi = Math.max(0.25, spi || 1);
-  const volatility = Math.min(1, Math.abs(1 - safeSpi) * 0.6 + Math.abs(1 - safeCpi) * 0.4);
-  const confidence = Math.round(Math.max(0, Math.min(100, 100 - volatility * 70 - criticalCount * 2 - nearCriticalCount)));
-  const remaining = Math.max(0, 1 - Math.max(0, Math.min(1, actualProgress)));
   const openRisks = risks.filter((risk) => risk.status === 'open');
   const riskExposure = openRisks.reduce((exposure, risk) => ({
     cost: exposure.cost + bac * (Math.max(0, Math.min(5, Number(risk.probability || 0))) / 5)
@@ -791,15 +832,46 @@ export function analyzeForecast(
     days: exposure.days + (Math.max(0, Math.min(5, Number(risk.probability || 0))) / 5)
       * (Math.max(0, Math.min(5, Number(risk.impact || 0))) / 5) * 5,
   }), { cost: 0, days: 0 });
+  const remaining = Math.max(0, 1 - Math.max(0, Math.min(1, actualProgress)));
+
+  const cpiStatus = indexStatus && indexStatus.cpi != null ? indexStatus.cpi : null;
+  const spiStatus = indexStatus && indexStatus.spi != null ? indexStatus.spi : null;
+  const cpiMeasured = cpiStatus === null || cpiStatus === 'valid';
+  const spiMeasured = spiStatus === null || spiStatus === 'valid';
+  const measured = cpiMeasured && spiMeasured;
+
+  const safeCpi = Math.max(0.25, cpi || 1);
+  const safeSpi = Math.max(0.25, spi || 1);
+  // Volatility is a statement ABOUT measured performance, so it is 0 — not neutral — while an index
+  // is unmeasured; the authoritative "nothing to be confident about" signal is `confidence: null`.
+  const volatility = measured
+    ? Math.min(1, Math.abs(1 - safeSpi) * 0.6 + Math.abs(1 - safeCpi) * 0.4)
+    : 0;
+  const confidence = measured
+    ? Math.round(Math.max(0, Math.min(100, 100 - volatility * 70 - criticalCount * 2 - nearCriticalCount)))
+    : null;
+
   return {
-    scenarios: forecastFinishScenarios(plannedStart, plannedFinish, actualProgress, safeSpi, new Date(`${dataDate}T00:00:00Z`)),
+    scenarios: forecastFinishScenarios(
+      plannedStart, plannedFinish, actualProgress, safeSpi, new Date(`${dataDate}T00:00:00Z`), spiStatus,
+    ),
     cost: {
-      optimistic: actualCost + (bac * remaining) / Math.max(1, safeCpi * 1.15),
-      realistic: actualCost + (bac * remaining) / safeCpi,
-      pessimistic: actualCost + (bac * remaining) / Math.max(0.25, safeCpi * 0.8),
+      // P2A1-H04: with no measured cost index the EAC convention shared with `assessEvmRatios` and
+      // `budgetForecastEngine` applies — do not divide by a non-measured index, fall back to BAC.
+      // The synthetic `1.0` (and the anomaly's `0`, which inflated the forecast fourfold) are both
+      // excluded: neither is evidence of cost performance.
+      optimistic: cpiMeasured ? actualCost + (bac * remaining) / Math.max(1, safeCpi * 1.15) : bac,
+      realistic: cpiMeasured ? actualCost + (bac * remaining) / safeCpi : bac,
+      pessimistic: cpiMeasured ? actualCost + (bac * remaining) / Math.max(0.25, safeCpi * 0.8) : bac,
     },
     confidence,
     volatility,
+    measured,
+    indexStatus: { cpi: cpiStatus, spi: spiStatus },
+    note: measured
+      ? null
+      : 'Forecast is N/A: the canonical CPI/SPI are not measured values, so no performance evidence '
+        + 'exists to extrapolate a finish date or a confidence level.',
     riskExposure,
   };
 }

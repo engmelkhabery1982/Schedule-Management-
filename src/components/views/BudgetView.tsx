@@ -207,7 +207,18 @@ export default function BudgetView({ project }: BudgetViewProps) {
       vendor: transactionForm.vendor || null,
       invoice_number: transactionForm.invoice_number || null,
     });
-    if (error) return;
+    // P2A1-M02: a rejected write must never fail silently. The project boundary is enforced at the
+    // persistence layer (demo store mirrors the live `validate_cost_project` trigger), so an
+    // activity that does not exist, or that belongs to another project, comes back as an error here
+    // and is reported instead of looking like a save that quietly did nothing.
+    if (error) {
+      setNotice(error.message === 'Control record crosses project boundary'
+        ? (lang === 'ar'
+          ? 'تعذر التسجيل: النشاط المحدد غير موجود أو يتبع مشروعاً آخر.'
+          : 'Not saved: the selected activity does not exist or belongs to another project.')
+        : (lang === 'ar' ? `تعذر التسجيل: ${error.message}` : `Not saved: ${error.message}`));
+      return;
+    }
     setTransactionForm({ description: '', amount: 0, cost_type: 'direct', boq_item_id: '', activity_id: '', budget_line_id: '', vendor: '', invoice_number: '' });
     setTxnDate(governedDataDate);
     setNotice('');

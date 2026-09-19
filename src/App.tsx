@@ -1,7 +1,9 @@
 import { useState, useEffect } from 'react';
 import { supabase } from '@/lib/supabase';
 // GAP-010: the global Data Date controller falls back to the governed constant, never to a literal.
-import { DEFAULT_DATA_DATE } from '@/lib/projectControlsConstants';
+// P2A1-M01: the fallback is still needed, but it must be LABELLED — a stand-in date may never be
+// presented as if the project had explicitly governed it.
+import { resolveDataDateProvenance, FALLBACK_DEFAULT_DATE } from '@/lib/chronologyGuard';
 import { getInitialSeedData } from '@/lib/mockSeed';
 import { getLanguage, setLanguage, type Language } from '@/lib/i18n';
 import type { Project, ViewName } from '@/types';
@@ -35,6 +37,10 @@ function App() {
   const [project, setProject] = useState<Project | null>(null);
   const [loading, setLoading] = useState(true);
   const [lang, setLang] = useState<Language>(getLanguage());
+  // P2A1-M01: the Data Date and its provenance. The resolved VALUE is unchanged (a project with no
+  // `data_date` still gets the governed stand-in, because screens need a date), but the controller
+  // now knows — and shows — whether that date is the project's own governance or a fallback.
+  const dataDateResolution = resolveDataDateProvenance(project);
 
   useEffect(() => {
     loadLastProject();
@@ -118,14 +124,14 @@ function App() {
 
           <div className="flex items-center gap-2.5">
             {/* Unified Global Reactive Data Date Controller */}
-            <div className="flex items-center gap-1.5 bg-slate-100 hover:bg-slate-200/80 border border-slate-300 px-2.5 py-1 rounded-lg transition-colors shadow-2xs">
-              <Calendar size={13} className="text-amber-600 shrink-0" />
+            <div className={`flex items-center gap-1.5 bg-slate-100 hover:bg-slate-200/80 border px-2.5 py-1 rounded-lg transition-colors shadow-2xs ${dataDateResolution.isFallback ? 'border-amber-500' : 'border-slate-300'}`}>
+              <Calendar size={13} className={dataDateResolution.isFallback ? 'text-amber-500 shrink-0' : 'text-amber-600 shrink-0'} />
               <span className="text-[11px] font-bold text-slate-700 hidden sm:inline">
                 {lang === 'ar' ? 'تاريخ البيانات:' : 'Data Date:'}
               </span>
               <input
                 type="date"
-                value={project?.data_date || DEFAULT_DATA_DATE}
+                value={dataDateResolution.dataDate}
                 onChange={async (e) => {
                   const newDate = e.target.value;
                   if (!newDate || !project) return;
@@ -137,8 +143,21 @@ function App() {
                   }));
                 }}
                 className="text-[11px] font-mono font-bold text-amber-700 bg-white px-2 py-0.5 rounded border border-slate-300 focus:outline-none focus:ring-1 focus:ring-amber-500 cursor-pointer"
-                title={lang === 'ar' ? 'تعديل تاريخ قطع البيانات (Data Date Cutoff) ومزامنة كافة المؤشرات والجدول الزمني فورياً' : 'Modify Project Data Date Cutoff and live-sync schedule & EVM metrics'}
+                title={dataDateResolution.isFallback
+                  ? (lang === 'ar'
+                    ? `تحذير: هذا التاريخ افتراضي (${FALLBACK_DEFAULT_DATE}) لأن المشروع لا يحدد تاريخ بيانات خاصاً به. ${dataDateResolution.note}`
+                    : `Warning: this date is a FALLBACK (${FALLBACK_DEFAULT_DATE}) — the project states no data_date of its own. ${dataDateResolution.note}`)
+                  : (lang === 'ar' ? 'تعديل تاريخ قطع البيانات (Data Date Cutoff) ومزامنة كافة المؤشرات والجدول الزمني فورياً' : 'Modify Project Data Date Cutoff and live-sync schedule & EVM metrics')}
               />
+              {/* P2A1-M01: the stand-in is visible, so nobody can read it as governed chronology. */}
+              {dataDateResolution.isFallback && (
+                <span
+                  className="text-[9px] font-black uppercase tracking-wide text-amber-800 bg-amber-200 border border-amber-400 rounded px-1 py-px"
+                  title={dataDateResolution.note}
+                >
+                  {lang === 'ar' ? 'افتراضي' : 'FALLBACK'}
+                </span>
+              )}
             </div>
 
             {/* Direct Global Language Toggle */}

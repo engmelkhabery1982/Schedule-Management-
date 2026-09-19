@@ -11,6 +11,7 @@ import type {
 } from '@/types';
 import { analyzeCostControl } from '@/lib/costControlEngine';
 import { isIsoDate } from '@/lib/chronologyGuard';
+import { indexProgressHistory, latestApprovedUpdateOnOrBefore } from '@/lib/governedProgress';
 
 /**
  * F9.6 (Cross-Surface Control Reconciliation) — time-phased adapter over the CANONICAL cost engine.
@@ -131,14 +132,11 @@ export function phasePercentCompleteAsOf(
   if (!isIsoDate(cutoff) || cutoff >= governedDataDate) {
     return { percent: Number(activity.percent_complete) || 0, evidencePhased: false };
   }
-  let latest: ProgressUpdate | null = null;
-  for (const u of progressUpdates) {
-    if (u.activity_id !== activity.id) continue;
-    if (u.status !== 'approved') continue;
-    if (!isIsoDate(u.update_date)) continue; // rule 3: an undated record is not evidence
-    if (u.update_date > cutoff) continue; // rule 2: no future progress
-    if (latest === null || u.update_date > (latest.update_date as string)) latest = u;
-  }
+  // H01: rule 2 is the SHARED governed-progress rule (`src/lib/governedProgress.ts`), not a second
+  // copy of it, so the curve's historical buckets and the current Data Date read-out cannot drift.
+  const latest = latestApprovedUpdateOnOrBefore(
+    indexProgressHistory(progressUpdates), activity.id, cutoff,
+  );
   return { percent: latest ? Number(latest.percent_complete) || 0 : 0, evidencePhased: true };
 }
 

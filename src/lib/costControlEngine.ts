@@ -29,6 +29,8 @@
 
 import { countWorkingDays, getCalendar } from './calendarEngine';
 import { calendarDaysBetween, isAfterDataDate, isIsoDate } from './chronologyGuard';
+import { applyGovernedProgress } from './governedProgress';
+import { controlRecordCrossesProjectBoundary } from './demoDbContracts';
 import type { ScheduleControlReport } from './scheduleControlEngine';
 import type {
   Activity,
@@ -357,6 +359,69 @@ function minLevel(levels: CostConfidence[]): CostConfidence {
 }
 
 // ---------------------------------------------------------------------------
+// §0 — the actual-cost business key (H02: ONE duplicate rule, one population)
+// ---------------------------------------------------------------------------
+
+/**
+ * The business key that defines "the same cost transaction twice" (H02, P2A1-H02).
+ *
+ * Two rows carrying the same key are the SAME economic event recorded twice — same date, same
+ * amount, same activity / BOQ references, same vendor, same invoice number, same description. The
+ * database id is deliberately NOT part of the key: two distinct rows with distinct ids are exactly
+ * the duplicate this detects, and deduplicating by id would detect nothing at all.
+ *
+ * This is the single definition used by BOTH consumers of the rule:
+ *   - `checkCostIntegrity`, which reports the duplicate in the register; and
+ *   - the AC aggregation below, which must NOT count it twice.
+ * Before this module exported one key, the register flagged duplicates that AC went on to sum, so a
+ * duplicated invoice inflated AC (and therefore CPI, EAC and VAC) while the integrity panel merely
+ * warned about it.
+ */
+export function costTransactionBusinessKey(t: CostTransaction): string {
+  return JSON.stringify([
+    t.transaction_date, Number(t.amount), t.activity_id, t.boq_item_id,
+    t.vendor ?? null, t.invoice_number ?? null, t.description,
+  ]);
+}
+
+/** Deterministic register order: transaction date, then id — the order "first occurrence" means. */
+function byDateThenId(a: CostTransaction, b: CostTransaction): number {
+  if (a.transaction_date !== b.transaction_date) return a.transaction_date < b.transaction_date ? -1 : 1;
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
+export interface BusinessKeyDedupe<T> {
+  /** The rows that survive: the first occurrence of each business key, in input order. */
+  unique: T[];
+  /** Every row dropped as a repeat of an earlier one, paired with the row it repeats. */
+  duplicates: Array<{ row: T; first: T }>;
+}
+
+/**
+ * Collapse a set of rows onto their business keys — the same rule `checkCostIntegrity` reports.
+ *
+ * Deterministic and id-independent: input order must already be the governed register order
+ * (`byDateThenId`), so the surviving row is the earliest recorded occurrence and the result cannot
+ * depend on array shuffling.
+ */
+export function dedupeByBusinessKey<T extends CostTransaction>(rows: readonly T[]): BusinessKeyDedupe<T> {
+  const seen = new Map<string, T>();
+  const unique: T[] = [];
+  const duplicates: Array<{ row: T; first: T }> = [];
+  for (const row of rows) {
+    const key = costTransactionBusinessKey(row);
+    const first = seen.get(key);
+    if (first) {
+      duplicates.push({ row, first });
+      continue;
+    }
+    seen.set(key, row);
+    unique.push(row);
+  }
+  return { unique, duplicates };
+}
+
+// ---------------------------------------------------------------------------
 // §1 — cost data integrity
 // ---------------------------------------------------------------------------
 
@@ -367,27 +432,34 @@ function checkCostIntegrity(
   activityAc: Map<string, number>,
   activityBac: Map<string, number>,
   dataDate: string,
+  /**
+   * H02: the ids that the AC aggregation dropped as repeats of an earlier row. A duplicate that is
+   * inside the actual-cost population is reported as excluded, so the finding states the money
+   * consequence instead of only warning about register hygiene.
+   */
+  excludedDuplicateIds?: ReadonlySet<string>,
 ): CostIntegrityFinding[] {
   const out: CostIntegrityFinding[] = [];
-  const sortedTx = [...txns].sort((a, b) =>
-    a.transaction_date < b.transaction_date ? -1
-      : a.transaction_date > b.transaction_date ? 1
-        : a.id < b.id ? -1 : 1);
+  const sortedTx = [...txns].sort(byDateThenId);
 
-  // Duplicates: identical business key on distinct rows (NULL-safe equality).
+  // Duplicates: identical business key on distinct rows (NULL-safe equality). H02: the SAME key
+  // function the AC aggregation uses, so detection and aggregation can never disagree about what a
+  // duplicate is.
   const seen = new Map<string, CostTransaction>();
   for (const t of sortedTx) {
-    const key = JSON.stringify([
-      t.transaction_date, Number(t.amount), t.activity_id, t.boq_item_id,
-      t.vendor ?? null, t.invoice_number ?? null, t.description,
-    ]);
+    const key = costTransactionBusinessKey(t);
     const first = seen.get(key);
     if (first && first.id !== t.id) {
+      const excluded = excludedDuplicateIds ? excludedDuplicateIds.has(t.id) : false;
       out.push({
         severity: 'warning', code: 'duplicate_transaction', refKind: 'transaction',
         refId: t.id, refLabel: t.description,
-        message: `Transaction ${t.id} duplicates ${first.id} (same date, amount, refs and description).`,
-        evidence: [`transaction_date = ${t.transaction_date}`, `amount = ${t.amount}`, `matches ${first.id}`],
+        message: `Transaction ${t.id} duplicates ${first.id} (same date, amount, refs and description).`
+          + (excluded ? ' The repeat is excluded from AC: it is counted once.' : ''),
+        evidence: [
+          `transaction_date = ${t.transaction_date}`, `amount = ${t.amount}`, `matches ${first.id}`,
+          ...(excluded ? ['excluded from AC (counted once)'] : []),
+        ],
       });
     } else {
       seen.set(key, t);
@@ -516,11 +588,47 @@ export function analyzeCostControl(input: CostControlInput): CostControlReport {
   const manualEtc = finiteNum(input.manualEtc) !== null && (input.manualEtc as number) >= 0
     ? (input.manualEtc as number) : null;
   const ruler = getCalendar(calendarType);
-  const sortedActs = [...activities].sort(byCode);
+  // H01: earned value is a function of the GOVERNED as-of progress, not of the materialised
+  // `activities.percent_complete` column. `progress_updates` (approved, on/before the Data Date) is
+  // the source of truth — see `src/lib/governedProgress.ts`. Plan fields (dates, WBS, quantities)
+  // are inherited untouched, so a governed record yields the original activity object.
+  const governedActivities = applyGovernedProgress(activities, progressUpdates, dataDate);
+  const sortedActs = [...governedActivities].sort(byCode);
 
-  // --- AC transactions: approved and on/before the Data Date only. ---
-  const acTxns = costTransactions.filter((t) =>
-    t.status === 'approved' && isIsoDate(t.transaction_date) && !isAfterDataDate(t.transaction_date, dataDate));
+  // --- AC transactions: approved, on/before the Data Date, and counted exactly once (H02). ---
+  //
+  // The actual-cost population is (approved AND in-period AND non-duplicate). De-duplication runs
+  // INSIDE that population on purpose: a rejected or out-of-period row is not actual cost, so it
+  // cannot be the "first occurrence" that cancels an approved one — collapsing the whole register
+  // first would let a rejected row erase real spend. The business key is the same one
+  // `checkCostIntegrity` reports, so every row dropped here is also reported there.
+  // P2A1-M02 — the project boundary of an activity-bound transaction, evaluated with the SAME
+  // predicate the demo store enforces on write (`controlRecordCrossesProjectBoundary`, mirroring the
+  // live `validate_cost_project` trigger). A transaction that names an activity which does not exist,
+  // or which belongs to another project, is QUARANTINED: it never reaches AC, and it is reported as
+  // an integrity finding rather than being silently consumed.
+  //
+  // The analysed activity set IS this project's activities, so "not in the set" is exactly the SQL
+  // predicate's `related_project IS NULL OR related_project <> NEW.project_id`. Rows that carry no
+  // `activity_id` are project-level costs and are unaffected.
+  const analysedActivityProjectById = new Map<string, string>();
+  for (const a of governedActivities) analysedActivityProjectById.set(a.id, a.project_id ?? project.id);
+  const invalidActivityRefs: Array<{ txn: CostTransaction; reason: 'activity_not_found' | 'foreign_project' }> = [];
+  const inProjectCandidates = costTransactions
+    .filter((t) => t.status === 'approved' && isIsoDate(t.transaction_date) && !isAfterDataDate(t.transaction_date, dataDate))
+    .filter((t) => {
+      const verdict = controlRecordCrossesProjectBoundary(
+        t.activity_id, project.id, (id) => analysedActivityProjectById.get(id),
+      );
+      if (!verdict.crosses) return true;
+      invalidActivityRefs.push({ txn: t, reason: verdict.reason });
+      return false;
+    });
+
+  const acCandidates = [...inProjectCandidates].sort(byDateThenId);
+  const acDedupe = dedupeByBusinessKey(acCandidates);
+  const acTxns = acDedupe.unique;
+  const acExcludedDuplicateIds = new Set(acDedupe.duplicates.map((d) => d.row.id));
   const activityAc = new Map<string, number>();
   for (const t of acTxns) {
     if (!t.activity_id) continue;
@@ -589,7 +697,26 @@ export function analyzeCostControl(input: CostControlInput): CostControlReport {
     }
   }
 
-  const integrity = checkCostIntegrity(costTransactions, budgetLines, activities, activityAc, activityBac, dataDate);
+  const integrity: CostIntegrityFinding[] = checkCostIntegrity(
+    costTransactions, budgetLines, activities, activityAc, activityBac, dataDate, acExcludedDuplicateIds,
+  );
+  // P2A1-M02: the quarantined rows are reported, not swallowed — a transaction the project boundary
+  // rejects is an ERROR about the register, not a rounding difference, and its amount never enters
+  // AC, CPI, EAC or VAC.
+  for (const { txn, reason } of invalidActivityRefs) {
+    integrity.push({
+      severity: 'error', code: 'invalid_activity_reference', refKind: 'transaction',
+      refId: txn.id, refLabel: txn.description,
+      message: `Transaction ${txn.id} references activity ${String(txn.activity_id)}, which is not an activity of project ${project.id} (${reason === 'activity_not_found' ? 'no such activity' : 'it belongs to another project'}). It is excluded from AC.`,
+      evidence: [
+        `activity_id = ${String(txn.activity_id)}`,
+        `project_id = ${project.id}`,
+        `amount = ${txn.amount}`,
+        reason === 'activity_not_found' ? 'activity does not exist in this project' : 'activity belongs to another project',
+        'excluded from AC (project boundary)',
+      ],
+    });
+  }
   const errorCount = integrity.filter((f) => f.severity === 'error').length;
   const warnCount = integrity.filter((f) => f.severity === 'warning').length;
 

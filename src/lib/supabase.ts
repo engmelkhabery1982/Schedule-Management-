@@ -1,6 +1,8 @@
 import { createClient as createSupabaseClient } from '@supabase/supabase-js';
 import { getInitialSeedData } from './mockSeed';
-import { applyReviewCostTransaction, unimplementedRpcError } from './demoDbContracts';
+import {
+  applyReviewCostTransaction, checkControlRecordProjectBoundary, unimplementedRpcError,
+} from './demoDbContracts';
 
 const envUrl = import.meta.env?.VITE_SUPABASE_URL;
 const envAnonKey = import.meta.env?.VITE_SUPABASE_ANON_KEY;
@@ -168,6 +170,17 @@ class MockQueryBuilder<T = any> implements PromiseLike<{ data: any; error: any }
         created_at: item.created_at || new Date().toISOString(),
         ...item,
       }));
+      // P2A1-M02: mirror the live `validate_cost_project` trigger (`validate_project_boundaries()`).
+      // A cost transaction that names an activity which does not exist, or which belongs to another
+      // project, raises 'Control record crosses project boundary' BEFORE the row is written. Demo
+      // mode used to accept it silently, and canonical AC then summed it. One failing row fails the
+      // whole statement, exactly as the database would roll the statement back.
+      if (this.tableName === 'cost_transactions') {
+        for (const item of inserted) {
+          const { error } = checkControlRecordProjectBoundary(db, 'cost_transactions', item);
+          if (error) return { data: null, error };
+        }
+      }
       db[this.tableName] = [...table, ...inserted];
       saveDb(db);
       const res = Array.isArray(this.payload) ? inserted : inserted[0];
@@ -213,6 +226,14 @@ class MockQueryBuilder<T = any> implements PromiseLike<{ data: any; error: any }
         }
         return item;
       });
+      // P2A1-M02: the trigger is BEFORE INSERT OR UPDATE, so the NEW row (the merged result) is what
+      // the boundary is evaluated against — re-pointing a row at another project's activity fails.
+      if (this.tableName === 'cost_transactions') {
+        for (const item of updatedItems) {
+          const { error } = checkControlRecordProjectBoundary(db, 'cost_transactions', item);
+          if (error) return { data: null, error };
+        }
+      }
       db[this.tableName] = updatedTable;
       saveDb(db);
       return { data: updatedItems, error: null };

@@ -439,8 +439,14 @@ ${noticeForm.contractorName}`;
       nearCriticalActivities,
       governedDataDate,
       risks,
+      // P2A1-H04: gate the statistical forecast on the CANONICAL index statuses. `evm` is the
+      // non-nullable adapter, so where F6 reports "not measurable" it carries the neutral `1.0`
+      // compatibility value — feeding that in here used to produce a confident realistic finish and
+      // 100% confidence from no evidence at all. Passing the statuses makes NO DATA mean N/A, while
+      // a real measured CPI = SPI = 1 still forecasts exactly as before.
+      { cpi: evm.cpiStatus, spi: evm.spiStatus },
     );
-  }, [startDate, endDate, plannedBudget, actualCost, overallProgress, evm.spi, evm.cpi, criticalActivities, nearCriticalActivities, governedDataDate, risks]);
+  }, [startDate, endDate, plannedBudget, actualCost, overallProgress, evm.spi, evm.cpi, evm.cpiStatus, evm.spiStatus, criticalActivities, nearCriticalActivities, governedDataDate, risks]);
 
   // F9 (acceptance A): baseline variance is evaluated at the governed Data Date, never at the
   // machine clock — this count feeds behindBaselineCount and the control-health score.

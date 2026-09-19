@@ -23,6 +23,7 @@
 import { calculateCpm } from './cpmEngine';
 import { countWorkingDays, getCalendar } from './calendarEngine';
 import { calendarDaysBetween, isAfterDataDate, isIsoDate } from './chronologyGuard';
+import { applyGovernedProgress } from './governedProgress';
 import type {
   Activity,
   ActivityLink,
@@ -609,11 +610,19 @@ export function analyzeScheduleControl(input: ScheduleControlInput): ScheduleCon
   const previousSnapshot = input.previousSnapshot || null;
   const prevDD = previousSnapshot && isIsoDate(previousSnapshot.data_date) ? previousSnapshot.data_date : null;
 
+  // Integrity auditing runs on the RECORDED rows: a stored violation (future actual, bad date …)
+  // must still be reported even though governance now keeps it out of the numbers.
   const integrity = checkProgressIntegrity(activities, progressUpdates, dataDate);
 
+  // H01: the statused network is built from the GOVERNED as-of state, not from the materialised
+  // activity columns. `progress_updates` (approved, on/before the Data Date) is the source of truth;
+  // see `src/lib/governedProgress.ts` for the rule. Plan fields are inherited untouched, so this is
+  // the same array as `activities` whenever the record is already governed.
+  const governedActivities = applyGovernedProgress(activities, progressUpdates, dataDate);
+
   // The ONLY scheduling calculation in F5: canonical statused CPM with an explicit Data Date.
-  const cpm = activities.length > 0
-    ? calculateCpm(activities, links, { calendarType, dataDate, statusLogic })
+  const cpm = governedActivities.length > 0
+    ? calculateCpm(governedActivities, links, { calendarType, dataDate, statusLogic })
     : null;
   const results = cpm ? cpm.results : [];
   const linkResults = cpm ? cpm.linkResults : [];
@@ -627,9 +636,9 @@ export function analyzeScheduleControl(input: ScheduleControlInput): ScheduleCon
     drivingBySucc.set(l.successor_id, list);
   }
 
-  const codeById = new Map(activities.map((a) => [a.id, a.code]));
-  const actById = new Map(activities.map((a) => [a.id, a]));
-  const sorted = [...activities].sort(byCode);
+  const codeById = new Map(governedActivities.map((a) => [a.id, a.code]));
+  const actById = new Map(governedActivities.map((a) => [a.id, a]));
+  const sorted = [...governedActivities].sort(byCode);
 
   // --- statused activities + forecast finishes (§2 read-out) ---
   const statused: StatusedActivity[] = sorted.map((a) => {
@@ -726,7 +735,9 @@ export function analyzeScheduleControl(input: ScheduleControlInput): ScheduleCon
 
   let durNum = 0;
   let durDen = 0;
-  for (const a of activities) {
+  // H01: duration-weighted progress is earned from the GOVERNED as-of percent, so an approved-after
+  // -Data-Date or unapproved update cannot move the reported project percent either.
+  for (const a of governedActivities) {
     const d = Number(a.duration_days) || 0;
     if (d > 0) {
       durNum += d * (Number(a.percent_complete) || 0);
