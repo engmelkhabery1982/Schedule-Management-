@@ -87,7 +87,8 @@ import {
   CANONICAL_COST_AUTHORITY, SCENARIO_COST_AUTHORITY, CANONICAL_SCHEDULE_AUTHORITY, STATISTICAL_SCHEDULE_AUTHORITY,
 } from '@/lib/forecastSemantics';
 import {
-  applyReviewCostTransaction, unimplementedRpcError, reviewStateOf, selectGovernedBaselineActivities,
+  applyReviewCostTransaction, applyScheduleRecoveryScenario, unimplementedRpcError, reviewStateOf,
+  selectGovernedBaselineActivities,
   // S20 (Batch A / M02): the cost-transaction project boundary, mirrored from the live SQL trigger.
   checkControlRecordProjectBoundary, controlRecordCrossesProjectBoundary,
   type DemoDb,
@@ -4504,7 +4505,7 @@ console.log('--- S18 Pilot Closure (F9.5)');
   ok('S24 Apply builds writes from the evaluated selected scenario',
     applySource.includes('buildRecoveryScenarioPatches(activities, links, plan.evaluatedScenario)')
       && applySource.includes('plan.evaluatedScenario.activities, plan.evaluatedScenario.links'));
-  eq('S24 Apply runs canonical CPM exactly once after scenario persistence',
+  eq('S24 Apply runs canonical CPM exactly once for the atomic transaction payload',
     Array.from(applySource.matchAll(/calculateCpm\s*\(/g)).length, 1);
   ok('S24 Apply does not reconstruct schedule changes from synthetic savings',
     !applySource.includes('daysSaved') && !applySource.includes('plan.options.filter'));
@@ -4522,12 +4523,16 @@ console.log('--- S18 Pilot Closure (F9.5)');
   const changedPaths = new Set([
     ...execFileSync('git', ['diff', '--name-only'], { encoding: 'utf8' }).split('\n').filter(Boolean),
     ...execFileSync('git', ['diff', '--name-only', '--cached'], { encoding: 'utf8' }).split('\n').filter(Boolean),
+    ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
   ]);
   const allowedRecoveryPaths = new Set([
     'src/lib/recoveryOptimizerEngine.ts',
     'src/components/views/ScheduleRecoveryView.tsx',
     'src/types/index.ts',
     'scripts/validate-controls.ts',
+    'src/lib/demoDbContracts.ts',
+    'src/lib/supabase.ts',
+    'supabase/migrations/20260924120000_atomic_schedule_recovery_apply.sql',
   ]);
   const protectedControlPaths = [
     'src/lib/scheduleControlEngine.ts',
@@ -4544,6 +4549,192 @@ console.log('--- S18 Pilot Closure (F9.5)');
     [...changedPaths].every((path) => allowedRecoveryPaths.has(path)));
   ok('S24 F5/F6/F7, CPM/calendar, TIA and Resource Leveling files are unchanged',
     protectedControlPaths.every((path) => !changedPaths.has(path)));
+}
+
+// ---------------------------------------------------------------------------
+// S25 — Launch Batch 2A Apply atomicity.
+// ---------------------------------------------------------------------------
+{
+  console.log('--- S25 Launch Batch 2A atomic Apply transaction');
+  const atomicViewSrc = readFileSync(resolvePath(process.cwd(), 'src/components/views/ScheduleRecoveryView.tsx'), 'utf8');
+  const atomicSupabaseSrc = readFileSync(resolvePath(process.cwd(), 'src/lib/supabase.ts'), 'utf8');
+  const atomicDemoContractSrc = readFileSync(resolvePath(process.cwd(), 'src/lib/demoDbContracts.ts'), 'utf8');
+  const atomicMigrationSrc = readFileSync(
+    resolvePath(process.cwd(), 'supabase/migrations/20260924120000_atomic_schedule_recovery_apply.sql'),
+    'utf8',
+  );
+  const atomicMigrationCode = atomicMigrationSrc
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .split('\n')
+    .filter((line) => !/^\s*--/.test(line))
+    .join('\n');
+  const atomicApplyStart = atomicViewSrc.indexOf('async function handleApplyPlan()');
+  const atomicApplyEnd = atomicViewSrc.indexOf('\n  if (loading)', atomicApplyStart);
+  const atomicApplyBody = atomicApplyStart >= 0
+    ? atomicViewSrc.slice(atomicApplyStart, atomicApplyEnd < 0 ? undefined : atomicApplyEnd)
+    : '';
+
+  const atomicOptions = {
+    calendarType: '6_days' as const,
+    dataDate: '2026-09-13',
+    statusLogic: 'retained_logic' as const,
+  };
+  const atomicActivities = [
+    act({ id: 'ATOMIC-A', code: 'AA', duration_days: 10, early_start: '2026-09-13' }),
+    act({ id: 'ATOMIC-B', code: 'AB', duration_days: 5 }),
+  ];
+  const atomicLinks = [link('ATOMIC-LINK', 'ATOMIC-A', 'ATOMIC-B', 'FS', 0)];
+  const atomicCrashId = 'recovery-crashing-ATOMIC-A';
+  const atomicFastTrackId = 'recovery-fast-track-ATOMIC-LINK';
+  const atomicPlan = generateScheduleRecoveryPlan(atomicActivities, atomicLinks, {
+    targetFinishDate: '2026-09-20',
+    cpmOptions: atomicOptions,
+    selectedOptions: { [atomicCrashId]: true, [atomicFastTrackId]: true },
+    optionInputs: { [atomicCrashId]: { durationReductionDays: 2 } },
+  });
+  const atomicAssumptions = buildRecoveryScenarioPatches(
+    atomicActivities,
+    atomicLinks,
+    atomicPlan.evaluatedScenario,
+  );
+  const atomicCalculation = calculateCpm(
+    atomicPlan.evaluatedScenario.activities,
+    atomicPlan.evaluatedScenario.links,
+    atomicOptions,
+  );
+  const atomicCpmResults = atomicCalculation.results.map((result) => ({
+    activityId: result.activityId,
+    earlyStart: result.earlyStart,
+    earlyFinish: result.earlyFinish,
+    lateStart: result.lateStart,
+    lateFinish: result.lateFinish,
+    totalFloat: result.totalFloat,
+    freeFloat: result.freeFloat,
+    isCritical: result.isCritical,
+    activityDrag: result.activityDrag,
+  }));
+  const atomicRpcParams = {
+    p_project_id: 'p1',
+    p_activity_patches: atomicAssumptions.activities,
+    p_link_patches: atomicAssumptions.links,
+    p_cpm_results: atomicCpmResults,
+  };
+  function makeAtomicDemoState(): DemoDb {
+    return {
+      projects: [{ id: 'p1' }],
+      activities: atomicActivities.map((activity) => ({ ...activity })) as unknown as DemoDb['activities'],
+      activity_links: atomicLinks.map((scheduleLink) => ({ ...scheduleLink })) as unknown as DemoDb['activity_links'],
+    };
+  }
+  function cloneAtomicState(state: DemoDb): DemoDb {
+    return JSON.parse(JSON.stringify(state)) as DemoDb;
+  }
+
+  ok('S25 fixture evaluates both an activity assumption and an FS-to-SS link',
+    atomicPlan.evaluatedScenario.selectedOptionIds.includes(atomicCrashId)
+      && atomicPlan.evaluatedScenario.selectedOptionIds.includes(atomicFastTrackId)
+      && atomicAssumptions.activities.length === 1
+      && atomicAssumptions.links.length === 1
+      && atomicCalculation.cycle === null);
+
+  // Successful demo RPC publishes every evaluated assumption/link and every returned CPM row.
+  const successfulState = makeAtomicDemoState();
+  const successfulRpcResult = applyScheduleRecoveryScenario(successfulState, atomicRpcParams);
+  eq('S25 successful atomic demo RPC reports no error', successfulRpcResult.error, null);
+  for (const expected of atomicPlan.evaluatedScenario.activities) {
+    const persisted = successfulState.activities.find((activity) => activity.id === expected.id);
+    ok(`S25 success persists evaluated duration assumptions for ${expected.id}`,
+      Boolean(persisted)
+        && persisted?.duration_days === expected.duration_days
+        && persisted?.remaining_duration_days === expected.remaining_duration_days);
+  }
+  eq('S25 success persists the exact evaluated relationship set',
+    successfulState.activity_links.map((scheduleLink) => ({ id: scheduleLink.id, link_type: scheduleLink.link_type, lag_days: scheduleLink.lag_days })),
+    atomicPlan.evaluatedScenario.links.map((scheduleLink) => ({ id: scheduleLink.id, link_type: scheduleLink.link_type, lag_days: scheduleLink.lag_days })));
+  eq('S25 success saves every canonical CPM field for every project activity',
+    successfulState.activities.map((activity) => ({
+      id: activity.id,
+      early_start: activity.early_start,
+      early_finish: activity.early_finish,
+      late_start: activity.late_start,
+      late_finish: activity.late_finish,
+      total_float: activity.total_float,
+      free_float: activity.free_float,
+      is_critical: activity.is_critical,
+      activity_drag: activity.activity_drag,
+    })).sort((a, b) => a.id.localeCompare(b.id)),
+    atomicCpmResults.map((result) => ({
+      id: result.activityId,
+      early_start: result.earlyStart,
+      early_finish: result.earlyFinish,
+      late_start: result.lateStart,
+      late_finish: result.lateFinish,
+      total_float: result.totalFloat,
+      free_float: result.freeFloat,
+      is_critical: result.isCritical,
+      activity_drag: result.activityDrag,
+    })).sort((a, b) => a.id.localeCompare(b.id)));
+
+  // A malformed second CPM row fails after assumption/link and first-result staging in the real
+  // demo RPC contract. Since the helper publishes only on complete success, the source DB is intact.
+  const failureState = makeAtomicDemoState();
+  const beforeSimulatedFailure = JSON.stringify(failureState);
+  const failingCpmResults = atomicCpmResults.map((result, index) => index === 1
+    ? { ...result, activityDrag: 'not-a-number' }
+    : result);
+  const failedRpcResult = applyScheduleRecoveryScenario(failureState, {
+    ...atomicRpcParams,
+    p_cpm_results: failingCpmResults,
+  });
+  ok('S25 test injected a mid-CPM Apply failure after staged assumption/link and earlier CPM writes',
+    atomicCpmResults.length > 1 && failedRpcResult.error !== null);
+  eq('S25 simulated mid-Apply failure leaves all live activities and links unchanged',
+    JSON.stringify(failureState), beforeSimulatedFailure);
+
+  // The actual client path must be one RPC request, with SQL exceptions escaping so PostgreSQL
+  // aborts the statement transaction. No sequential PostgREST row-write path may remain.
+  eq('S25 Apply makes exactly one atomic recovery RPC call',
+    Array.from(atomicApplyBody.matchAll(/supabase\.rpc\s*\(/g)).length, 1);
+  ok('S25 Apply names the atomic transaction function and passes all scenario payload parts',
+    atomicApplyBody.includes("supabase.rpc('apply_schedule_recovery_scenario'")
+      && atomicApplyBody.includes('p_activity_patches: patches.activities')
+      && atomicApplyBody.includes('p_link_patches: patches.links')
+      && atomicApplyBody.includes('p_cpm_results: cpmResults'));
+  ok('S25 no sequential Supabase row updates remain in Apply',
+    !/supabase\.from\(['"][^'"]+['"]\)\.(?:update|insert|upsert|delete)\s*\(/.test(atomicApplyBody));
+  ok('S25 demo mode routes the same RPC to its staged atomic contract and saves only on success',
+    atomicSupabaseSrc.includes("fnName === 'apply_schedule_recovery_scenario'")
+      && atomicSupabaseSrc.includes('applyScheduleRecoveryScenario(db, params)')
+      && atomicSupabaseSrc.includes('if (!result.error) saveDb(db)')
+      && atomicDemoContractSrc.includes('const stagedActivities = liveActivities.map')
+      && atomicDemoContractSrc.includes("db['activities'] = stagedActivities"));
+  ok('S25 atomic RPC result is checked and the single Apply-time CPM is built from evaluated clones',
+    atomicApplyBody.includes('assertDbWriteOk(')
+      && atomicApplyBody.includes('plan.evaluatedScenario.activities, plan.evaluatedScenario.links')
+      && Array.from(atomicApplyBody.matchAll(/calculateCpm\s*\(/g)).length === 1);
+
+  ok('S25 migration creates one invoker RPC function for schedule recovery',
+    atomicMigrationCode.includes('ALTER TABLE public.activities ADD COLUMN IF NOT EXISTS activity_drag numeric(15,2)')
+      && atomicMigrationCode.includes('CREATE OR REPLACE FUNCTION public.apply_schedule_recovery_scenario(')
+      && atomicMigrationCode.includes('SECURITY INVOKER')
+      && atomicMigrationCode.includes('SET search_path = public, pg_temp'));
+  eq('S25 transaction function updates activity assumptions, links and CPM rows atomically',
+    [
+      (atomicMigrationCode.match(/UPDATE public\.activities/g) || []).length,
+      (atomicMigrationCode.match(/UPDATE public\.activity_links/g) || []).length,
+      (atomicMigrationCode.match(/GET DIAGNOSTICS v_rows = ROW_COUNT/g) || []).length,
+    ], [2, 1, 3]);
+  ok('S25 missing/failed row updates raise and are not swallowed inside the RPC',
+    atomicMigrationCode.includes('IF v_rows <> 1 THEN')
+      && atomicMigrationCode.includes('RAISE EXCEPTION')
+      && !/EXCEPTION\s+WHEN/i.test(atomicMigrationCode)
+      && !/\b(?:COMMIT|ROLLBACK)\b/i.test(atomicMigrationCode));
+  ok('S25 CPM payload must cover every project activity and duplicate row ids abort',
+    atomicMigrationCode.includes('CPM result must cover every project activity')
+      && atomicMigrationCode.includes('duplicate or missing activity ids'));
+  ok('S25 RPC privileges are explicit for app roles, not public',
+    atomicMigrationCode.includes('REVOKE ALL ON FUNCTION public.apply_schedule_recovery_scenario')
+      && atomicMigrationCode.includes('TO anon, authenticated'));
 }
 
 // ---------------------------------------------------------------------------

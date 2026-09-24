@@ -90,6 +90,14 @@ export interface ReviewCostTransactionParams {
   review_notes?: string | null;
 }
 
+/** Parameters of the one-statement recovery RPC mirrored by the demo store. */
+export interface AtomicScheduleRecoveryParams {
+  p_project_id?: unknown;
+  p_activity_patches?: unknown;
+  p_link_patches?: unknown;
+  p_cpm_results?: unknown;
+}
+
 /** `approval_level` is `NOT NULL DEFAULT 0` in the schema; a demo row may simply omit it. */
 function approvalLevelOf(row: { approval_level?: unknown } | null | undefined): number {
   const raw = Number(row?.approval_level ?? 0);
@@ -114,6 +122,140 @@ export function unimplementedRpcError(fnName: string): DemoRpcResult {
       hint: `rpc:${fnName}`,
     },
   };
+}
+
+/**
+ * Atomic local-store mirror of `apply_schedule_recovery_scenario`.
+ *
+ * All assumption patches, link patches, and canonical CPM result fields are applied to private row
+ * clones first. The live demo store is replaced only after the final CPM row validates, so any
+ * mid-Apply failure leaves its activities and links byte-for-byte unchanged just like the SQL RPC.
+ */
+export function applyScheduleRecoveryScenario(
+  db: DemoDb,
+  params: AtomicScheduleRecoveryParams,
+): DemoRpcResult {
+  const projectId = params?.p_project_id;
+  const activityPatches = params?.p_activity_patches;
+  const linkPatches = params?.p_link_patches;
+  const cpmResults = params?.p_cpm_results;
+  const fail = (message: string, hint: string): DemoRpcResult => ({
+    data: null,
+    error: { message, details: 'No part of this recovery Apply was committed.', hint },
+  });
+  const isRecord = (value: unknown): value is Record<string, unknown> =>
+    value !== null && typeof value === 'object' && !Array.isArray(value);
+  const uniqueStringIds = (rows: unknown[], field: string): boolean => {
+    const ids = rows.map((row) => isRecord(row) ? row[field] : null);
+    return ids.every((id) => typeof id === 'string' && id.length > 0) && new Set(ids).size === ids.length;
+  };
+  const isPositiveWholeNumber = (value: unknown): value is number =>
+    typeof value === 'number' && Number.isInteger(value) && value > 0;
+  const isFiniteNumber = (value: unknown): value is number =>
+    typeof value === 'number' && Number.isFinite(value);
+  const isDate = (value: unknown): value is string =>
+    typeof value === 'string'
+    && /^\d{4}-\d{2}-\d{2}$/.test(value)
+    && Number.isFinite(Date.parse(`${value}T00:00:00Z`));
+
+  if (typeof projectId !== 'string' || !projectId) return fail('Recovery Apply requires a project id', 'rpc:recovery:project_id');
+  if (!Array.isArray(activityPatches) || !Array.isArray(linkPatches) || !Array.isArray(cpmResults)) {
+    return fail('Recovery Apply payloads must be arrays', 'rpc:recovery:payload_shape');
+  }
+  if (!(db['projects'] || []).some((project) => String(project.id) === projectId)) {
+    return fail('Recovery Apply project does not exist', 'rpc:recovery:project_missing');
+  }
+  if (!uniqueStringIds(activityPatches, 'id')) return fail('Recovery Apply has duplicate or missing activity patch ids', 'rpc:recovery:activity_ids');
+  if (!uniqueStringIds(linkPatches, 'id')) return fail('Recovery Apply has duplicate or missing link patch ids', 'rpc:recovery:link_ids');
+
+  const liveActivities = db['activities'] || [];
+  const liveLinks = db['activity_links'] || [];
+  const projectActivityCount = liveActivities.filter((activity) => String(activity.project_id) === projectId).length;
+  if (cpmResults.length !== projectActivityCount || !uniqueStringIds(cpmResults, 'activityId')) {
+    return fail('Recovery Apply CPM result must uniquely cover every project activity', 'rpc:recovery:cpm_coverage');
+  }
+
+  // These clones are the in-memory transaction workspace. Nothing above or below mutates `db` until
+  // every recovery assumption, relationship and CPM field has passed validation.
+  const stagedActivities = liveActivities.map((activity) => ({ ...activity }));
+  const stagedLinks = liveLinks.map((link) => ({ ...link }));
+
+  for (const rawPatch of activityPatches) {
+    if (!isRecord(rawPatch) || typeof rawPatch.id !== 'string' || !isRecord(rawPatch.values)) {
+      return fail('Invalid recovery activity patch', 'rpc:recovery:activity_patch');
+    }
+    const values = rawPatch.values;
+    const keys = Object.keys(values);
+    if (keys.length === 0 || keys.some((key) => key !== 'duration_days' && key !== 'remaining_duration_days')) {
+      return fail('Recovery activity patch contains unsupported fields', 'rpc:recovery:activity_fields');
+    }
+    if ('duration_days' in values && !isPositiveWholeNumber(values.duration_days)) {
+      return fail('Recovery duration_days must be a positive whole number', 'rpc:recovery:duration');
+    }
+    if ('remaining_duration_days' in values && !isPositiveWholeNumber(values.remaining_duration_days)) {
+      return fail('Recovery remaining_duration_days must be a positive whole number', 'rpc:recovery:remaining_duration');
+    }
+    const index = stagedActivities.findIndex((activity) =>
+      String(activity.id) === rawPatch.id && String(activity.project_id) === projectId,
+    );
+    if (index < 0) return fail(`Recovery activity ${rawPatch.id} was not found in the project`, 'rpc:recovery:activity_missing');
+    stagedActivities[index] = { ...stagedActivities[index], ...values };
+  }
+
+  for (const rawPatch of linkPatches) {
+    if (!isRecord(rawPatch) || typeof rawPatch.id !== 'string' || !isRecord(rawPatch.values)) {
+      return fail('Invalid recovery link patch', 'rpc:recovery:link_patch');
+    }
+    const values = rawPatch.values;
+    if (Object.keys(values).length !== 1 || values.link_type !== 'SS') {
+      return fail('Recovery link patch must contain only the FS-to-SS relationship change', 'rpc:recovery:link_fields');
+    }
+    const index = stagedLinks.findIndex((link) =>
+      String(link.id) === rawPatch.id && String(link.project_id) === projectId,
+    );
+    if (index < 0) return fail(`Recovery link ${rawPatch.id} was not found in the project`, 'rpc:recovery:link_missing');
+    if (String(stagedLinks[index].link_type).toUpperCase() !== 'FS') {
+      return fail(`Recovery link ${rawPatch.id} is no longer an FS link`, 'rpc:recovery:link_not_fs');
+    }
+    stagedLinks[index] = { ...stagedLinks[index], ...values };
+  }
+
+  // Validate and stage results one row at a time. A malformed later result deliberately exercises
+  // the same rollback boundary as a database error after earlier activity/link/CPM writes.
+  for (const rawResult of cpmResults) {
+    if (
+      !isRecord(rawResult)
+      || typeof rawResult.activityId !== 'string'
+      || !isDate(rawResult.earlyStart)
+      || !isDate(rawResult.earlyFinish)
+      || !isDate(rawResult.lateStart)
+      || !isDate(rawResult.lateFinish)
+      || !isFiniteNumber(rawResult.totalFloat)
+      || !isFiniteNumber(rawResult.freeFloat)
+      || typeof rawResult.isCritical !== 'boolean'
+      || !isFiniteNumber(rawResult.activityDrag)
+    ) return fail('Invalid canonical CPM recovery result', 'rpc:recovery:cpm_result');
+
+    const index = stagedActivities.findIndex((activity) =>
+      String(activity.id) === rawResult.activityId && String(activity.project_id) === projectId,
+    );
+    if (index < 0) return fail(`CPM recovery result for activity ${rawResult.activityId} was not found`, 'rpc:recovery:cpm_activity_missing');
+    stagedActivities[index] = {
+      ...stagedActivities[index],
+      early_start: rawResult.earlyStart,
+      early_finish: rawResult.earlyFinish,
+      late_start: rawResult.lateStart,
+      late_finish: rawResult.lateFinish,
+      total_float: rawResult.totalFloat,
+      free_float: rawResult.freeFloat,
+      is_critical: rawResult.isCritical,
+      activity_drag: rawResult.activityDrag,
+    };
+  }
+
+  db['activities'] = stagedActivities;
+  db['activity_links'] = stagedLinks;
+  return { data: null, error: null };
 }
 
 /**

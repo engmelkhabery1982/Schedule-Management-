@@ -151,41 +151,33 @@ export default function ScheduleRecoveryView({ project }: ScheduleRecoveryViewPr
         throw new Error('لا توجد تغييرات قابلة للحفظ في السيناريو المُقيّم.');
       }
 
-      // Apply exactly the duration and relationship assumptions in the evaluated clone. Analysis
-      // itself is read-only; this handler is the only schedule-assumption write path on this view.
-      for (const patch of patches.activities) {
-        assertDbWriteOk(
-          await supabase.from('activities').update(patch.values).eq('id', patch.id).eq('project_id', project.id),
-          'حفظ افتراض مدة الاسترداد',
-        );
-      }
-      for (const patch of patches.links) {
-        assertDbWriteOk(
-          await supabase.from('activity_links').update(patch.values).eq('id', patch.id).eq('project_id', project.id),
-          'حفظ علاقة الاسترداد',
-        );
-      }
-
-      // One canonical Apply-time CPM run, using the exact scenario clones that were evaluated above.
+      // Calculate once from the exact evaluated clones, then send assumptions, relationships,
+      // and this complete CPM result through one PostgreSQL RPC transaction. Any failure raises
+      // from the function and rolls back every row touched by this Apply.
       const calculation = calculateCpm(plan.evaluatedScenario.activities, plan.evaluatedScenario.links, cpmOptions);
       if (calculation.cycle) {
         throw new Error(`تعذر حفظ نتائج CPM: رُصدت حلقة علاقات (${calculation.cycle.join(' ← ')}).`);
       }
-      for (const result of calculation.results) {
-        assertDbWriteOk(
-          await supabase.from('activities').update({
-            early_start: result.earlyStart,
-            early_finish: result.earlyFinish,
-            late_start: result.lateStart,
-            late_finish: result.lateFinish,
-            total_float: result.totalFloat,
-            free_float: result.freeFloat,
-            is_critical: result.isCritical,
-            activity_drag: result.activityDrag,
-          }).eq('id', result.activityId).eq('project_id', project.id),
-          'حفظ نتائج CPM للاسترداد',
-        );
-      }
+      const cpmResults = calculation.results.map((result) => ({
+        activityId: result.activityId,
+        earlyStart: result.earlyStart,
+        earlyFinish: result.earlyFinish,
+        lateStart: result.lateStart,
+        lateFinish: result.lateFinish,
+        totalFloat: result.totalFloat,
+        freeFloat: result.freeFloat,
+        isCritical: result.isCritical,
+        activityDrag: result.activityDrag,
+      }));
+      assertDbWriteOk(
+        await supabase.rpc('apply_schedule_recovery_scenario', {
+          p_project_id: project.id,
+          p_activity_patches: patches.activities,
+          p_link_patches: patches.links,
+          p_cpm_results: cpmResults,
+        }),
+        'تطبيق سيناريو الاسترداد وحفظ نتائج CPM ذرياً',
+      );
 
       if (!await loadData()) return;
       setSelectedOptionsMap({});

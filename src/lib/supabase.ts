@@ -1,7 +1,10 @@
 import { createClient as createSupabaseClient } from '@supabase/supabase-js';
 import { getInitialSeedData } from './mockSeed';
 import {
-  applyReviewCostTransaction, checkControlRecordProjectBoundary, unimplementedRpcError,
+  applyReviewCostTransaction,
+  applyScheduleRecoveryScenario,
+  checkControlRecordProjectBoundary,
+  unimplementedRpcError,
 } from './demoDbContracts';
 
 const envUrl = import.meta.env?.VITE_SUPABASE_URL;
@@ -343,6 +346,13 @@ const mockRpc = async (fnName: string, params: any) => {
   if (fnName === 'review_cost_transaction') {
     const result = applyReviewCostTransaction(db, params, new Date().toISOString());
     // Persist only a write that actually happened; a rejected contract must not touch the store.
+    if (!result.error) saveDb(db);
+    return result;
+  }
+  if (fnName === 'apply_schedule_recovery_scenario') {
+    const result = applyScheduleRecoveryScenario(db, params);
+    // The contract stages all rows privately and mutates the store only on full success; saveDb is
+    // therefore one local commit and an RPC error leaves LocalStorage untouched.
     if (!result.error) saveDb(db);
     return result;
   }
