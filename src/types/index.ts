@@ -204,6 +204,13 @@ export interface Resource {
   subcontractor?: string | null;
 }
 
+export interface ActivityResourceDemandPoint {
+  /** Zero-based offset within the activity's remaining CPM working days. */
+  workday_offset: number;
+  /** Verified resource units demanded on that working day (not an inferred average). */
+  units: number;
+}
+
 export interface ActivityResource {
   id: string;
   activity_id: string;
@@ -213,6 +220,11 @@ export interface ActivityResource {
   actual_quantity: number;
   /** Remaining units (P6 TASKRSRC.remain_qty). Null when the source carries none. */
   remaining_quantity?: number | null;
+  /**
+   * Verified resource demand by remaining activity working-day offset. Legacy/imported assignments
+   * leave this null until the source provides explicit phasing; never derive it from total quantity.
+   */
+  daily_demand_profile?: ActivityResourceDemandPoint[] | null;
   created_at: string;
   resource?: Resource;
 }
@@ -673,14 +685,15 @@ export interface DcmaAuditResult {
   criticalPathLengthDays: number;
 }
 
-// Resource Leveling & Histogram Types
+// Resource Leveling & Histogram Types. Unknown capacity/over-allocation stays null; it is never
+// represented by a fabricated zero/one-unit limit or a false "within capacity" result.
 export interface ResourceDailyUsage {
   date: string;
   resourceId: string;
   resourceName: string;
   units: number;
-  limit: number;
-  isOverallocated: boolean;
+  limit: number | null;
+  isOverallocated: boolean | null;
 }
 
 export interface ResourceSummaryItem {
@@ -688,11 +701,12 @@ export interface ResourceSummaryItem {
   name: string;
   type: string;
   unit: string;
-  maxAvailability: number;
-  peakAllocated: number;
-  avgAllocated: number;
-  isOverallocated: boolean;
-  overallocatedDaysCount: number;
+  maxAvailability: number | null;
+  peakAllocated: number | null;
+  avgAllocated: number | null;
+  isOverallocated: boolean | null;
+  overallocatedDaysCount: number | null;
+  dataStatus: 'measured' | 'insufficient_data' | 'no_remaining_assignment';
 }
 
 export interface ResourceHistogramData {
@@ -701,11 +715,12 @@ export interface ResourceHistogramData {
     dateLabel: string;
     startDate: string;
     endDate: string;
-    resourceUnits: Record<string, number>; // resourceId -> units
-    totalUnits: number;
-    isOverallocated: boolean;
+    resourceUnits: Record<string, number>; // resourceId -> units; resource units are not summed across pools.
+    isOverallocated: boolean | null;
   }[];
   resourceSummaries: ResourceSummaryItem[];
+  dataStatus: 'measured' | 'insufficient_data' | 'no_remaining_assignment';
+  dataIssues: string[];
 }
 
 // Procurement & Submittal Item

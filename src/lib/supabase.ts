@@ -3,6 +3,7 @@ import { getInitialSeedData } from './mockSeed';
 import {
   applyReviewCostTransaction,
   applyScheduleRecoveryScenario,
+  applyResourceLevelingScenario,
   checkControlRecordProjectBoundary,
   unimplementedRpcError,
 } from './demoDbContracts';
@@ -353,6 +354,12 @@ const mockRpc = async (fnName: string, params: any) => {
     const result = applyScheduleRecoveryScenario(db, params);
     // The contract stages all rows privately and mutates the store only on full success; saveDb is
     // therefore one local commit and an RPC error leaves LocalStorage untouched.
+    if (!result.error) saveDb(db);
+    return result;
+  }
+  if (fnName === 'apply_resource_leveling_scenario') {
+    const result = applyResourceLevelingScenario(db, params);
+    // All input snapshots and canonical CPM rows are validated before one local store replacement.
     if (!result.error) saveDb(db);
     return result;
   }

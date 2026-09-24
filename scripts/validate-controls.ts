@@ -50,11 +50,11 @@ import {
   TIAValidationError,
 } from '@/lib/tiaEngine';
 import { buildRecoveryScenarioPatches, generateScheduleRecoveryPlan } from '@/lib/recoveryOptimizerEngine';
-import { getCalendar, countWorkingDays, addWorkingDays } from '@/lib/calendarEngine';
+import { getCalendar, countWorkingDays, addWorkingDays, calculateLinkDate } from '@/lib/calendarEngine';
 import { calculateBaselineVariances } from '@/lib/trendEngine';
 import { generateScheduleAlerts } from '@/lib/alertEngine';
 import { calculateRecoveryPlan } from '@/lib/recoveryEngine';
-import { levelScheduleResources } from '@/lib/resourceLevelingEngine';
+import { generateResourceHistogram, levelScheduleResources } from '@/lib/resourceLevelingEngine';
 import { parseXerContent } from '@/lib/xerImporter';
 import { generateBoqPlan, emptyBoqOverrides } from '@/lib/boqPlanningEngine';
 import {
@@ -93,7 +93,7 @@ import {
   CANONICAL_COST_AUTHORITY, SCENARIO_COST_AUTHORITY, CANONICAL_SCHEDULE_AUTHORITY, STATISTICAL_SCHEDULE_AUTHORITY,
 } from '@/lib/forecastSemantics';
 import {
-  applyReviewCostTransaction, applyScheduleRecoveryScenario, unimplementedRpcError, reviewStateOf,
+  applyReviewCostTransaction, applyScheduleRecoveryScenario, applyResourceLevelingScenario, unimplementedRpcError, reviewStateOf,
   selectGovernedBaselineActivities,
   // S20 (Batch A / M02): the cost-transaction project boundary, mirrored from the live SQL trigger.
   checkControlRecordProjectBoundary, controlRecordCrossesProjectBoundary,
@@ -524,9 +524,16 @@ console.log('--- S2 machine-clock independence (acceptance A)');
 
   const res = { id: 'R1', project_id: 'p1', name: 'Crew', type: 'labor', unit: 'crew', unit_rate: 100, availability: 1, created_at: '2026-01-01T00:00:00Z' } as Resource;
   const asg = { id: 'AS1', activity_id: 'N1', resource_id: 'R1', project_id: 'p1', planned_quantity: 5, actual_quantity: 0, created_at: '2026-01-01T00:00:00Z' } as ActivityResource;
-  const levelNow = JSON.stringify(levelScheduleResources(undated, [res], [asg], '6_days'));
+  const levelInput = {
+    activities: undated,
+    links: undatedLinks,
+    resources: [res],
+    assignments: [asg],
+    cpmOptions: { calendarType: '6_days' as const, dataDate: DEFAULT_DATA_DATE },
+  };
+  const levelNow = JSON.stringify(levelScheduleResources(levelInput));
   let levelShifted = '';
-  withShiftedClock(400, () => { levelShifted = JSON.stringify(levelScheduleResources(undated, [res], [asg], '6_days')); });
+  withShiftedClock(400, () => { levelShifted = JSON.stringify(levelScheduleResources(levelInput)); });
   eq('S2 leveling (dateless) identical under shift', levelShifted, levelNow);
 
   const pipelineNow = JSON.stringify(runPipeline(FULL));
@@ -626,23 +633,36 @@ console.log('--- S4 BOQ planning');
 console.log('--- S5 resource leveling');
 // ===========================================================================
 {
-  const res = { id: 'R1', project_id: 'p1', name: 'Formwork crew', type: 'labor', unit: 'crew', unit_rate: 500, availability: 2, created_at: '2026-01-01T00:00:00Z' } as Resource;
-  const crit = act({ id: 'C1', code: 'C1', early_start: '2026-08-27', early_finish: '2026-09-06', duration_days: 8, is_critical: true, total_float: 0 });
-  const loose = act({ id: 'F1', code: 'F1', early_start: '2026-08-27', early_finish: '2026-09-03', duration_days: 5, is_critical: false, total_float: 8 });
-  const asgCrit = { id: 'AC1', activity_id: 'C1', resource_id: 'R1', project_id: 'p1', planned_quantity: 4, actual_quantity: 0, created_at: '2026-01-01T00:00:00Z' } as ActivityResource;
-  const asgLoose = { id: 'AF1', activity_id: 'F1', resource_id: 'R1', project_id: 'p1', planned_quantity: 4, actual_quantity: 0, created_at: '2026-01-01T00:00:00Z' } as ActivityResource;
-  const result = levelScheduleResources([crit, loose], [res], [asgCrit, asgLoose], '6_days');
-  ok('S5 only the non-critical activity is a shift candidate', result.leveledActivities.every((c) => c.activityId !== 'C1'));
-  const shift = result.leveledActivities.find((c) => c.activityId === 'F1');
-  if (shift) {
-    ok('S5 shift bounded by float and the 5-day cap', shift.shiftDays > 0 && shift.shiftDays <= Math.min(8, 5));
-    ok('S5 shifted dates are ISO', isIsoDate(shift.earlyStart) && isIsoDate(shift.earlyFinish));
-  }
-  ok('S5 counters finite', Number.isFinite(result.overallocationsResolved) && Number.isFinite(result.remainingOverallocations) && Number.isFinite(result.projectExtendedDays));
-  const again = levelScheduleResources([crit, loose], [res], [asgCrit, asgLoose], '6_days');
+  const res = { id: 'R1', project_id: 'p1', name: 'Formwork crew', type: 'labor', unit: 'crew', unit_rate: 500, availability: 1, created_at: '2026-01-01T00:00:00Z' } as Resource;
+  const tasks = [
+    act({ id: 'L1', code: 'L1', duration_days: 3, percent_complete: 0 }),
+    act({ id: 'L2', code: 'L2', duration_days: 3, percent_complete: 0 }),
+  ];
+  const assignments = tasks.map((task, index) => ({
+    id: `LA${index + 1}`, activity_id: task.id, resource_id: 'R1', project_id: 'p1',
+    planned_quantity: 3, actual_quantity: 0,
+    daily_demand_profile: Array.from({ length: 3 }, (_, workday_offset) => ({ workday_offset, units: 1 })),
+    created_at: '2026-01-01T00:00:00Z',
+  } as ActivityResource));
+  const input = {
+    activities: tasks,
+    links: [],
+    resources: [res],
+    assignments,
+    cpmOptions: { calendarType: '6_days' as const, dataDate: DD },
+    projectControls: { calendar_type: '6_days' as const, data_date: DD, status_logic: 'retained_logic' as const },
+  };
+  const before = JSON.stringify(input);
+  const result = levelScheduleResources(input);
+  ok('S5 analysis returns an explicitly approvable conflict-free scenario', result.status === 'ready' && result.unresolvedConflicts.length === 0);
+  ok('S5 the resource conflict is removed only in the in-memory preview', (result.conflictsBefore?.length || 0) > 0 && result.conflictsAfter?.length === 0 && result.manuallyShiftedActivityIds.length > 0);
+  ok('S5 source activities, links, resources and assignments remain unchanged', JSON.stringify(input) === before);
+  ok('S5 canonical CPM finish is exposed for the evaluated scenario', result.leveledProjectFinish === result.scenarioCpm?.projectEarlyFinish);
+  const again = levelScheduleResources(input);
   eq('S5 leveling determinism', JSON.stringify(again), JSON.stringify(result));
   noNonFinite('S5 leveling scan', result);
-  const emptyLevel = levelScheduleResources([], [], [], '6_days');
+  const emptyLevel = levelScheduleResources({ activities: [], links: [], resources: [], assignments: [] });
+  ok('S5 empty leveler explicitly reports insufficient data', emptyLevel.status === 'insufficient_data');
   noNonFinite('S5 leveling empty scan', emptyLevel);
 }
 
@@ -4544,19 +4564,25 @@ console.log('--- S18 Pilot Closure (F9.5)');
     'src/lib/tiaEngine.ts',
     'src/components/views/TimeImpactAnalysisView.tsx',
   ]);
-  const s24ChangedPaths = [...changedPaths].filter((path) => !batch2bTiaPaths.has(path));
+  const batch2cResourcePaths = new Set([
+    'src/lib/resourceLevelingEngine.ts',
+    'src/components/views/ResourceHistogramView.tsx',
+    'src/lib/demoDbContracts.ts',
+    'src/lib/supabase.ts',
+    'supabase/migrations/20260924130000_atomic_resource_leveling_apply.sql',
+  ]);
+  const s24ChangedPaths = [...changedPaths].filter((path) => !batch2bTiaPaths.has(path) && !batch2cResourcePaths.has(path));
   const protectedControlPaths = [
     'src/lib/scheduleControlEngine.ts',
     'src/lib/costControlEngine.ts',
     'src/lib/integratedDecisionEngine.ts',
     'src/lib/cpmEngine.ts',
     'src/lib/calendarEngine.ts',
-    'src/lib/resourceLevelingEngine.ts',
     'src/lib/boqResourceLeveling.ts',
   ];
   ok('S24 changes stay within the recovery engine/view, required validation and shared types',
     s24ChangedPaths.every((path) => allowedRecoveryPaths.has(path)));
-  ok('S24 F5/F6/F7, CPM/calendar and Resource Leveling files are unchanged',
+  ok('S24 F5/F6/F7, CPM/calendar and BOQ control files are unchanged',
     protectedControlPaths.every((path) => !changedPaths.has(path)));
 }
 
@@ -5355,8 +5381,16 @@ console.log('--- S18 Pilot Closure (F9.5)');
     'src/types/index.ts',
     'scripts/validate-controls.ts',
   ]);
+  const batch2cTiaExclusions = new Set([
+    'src/lib/resourceLevelingEngine.ts',
+    'src/components/views/ResourceHistogramView.tsx',
+    'src/lib/demoDbContracts.ts',
+    'src/lib/supabase.ts',
+    'supabase/migrations/20260924130000_atomic_resource_leveling_apply.sql',
+  ]);
+  const s26ChangedPaths = [...batch2bChangedPaths].filter((path) => !batch2cTiaExclusions.has(path));
   ok('S26 changed files stay within TIA engine/view, directly required types, and regression harness',
-    [...batch2bChangedPaths].every((path) => allowedBatch2bPaths.has(path)));
+    s26ChangedPaths.every((path) => allowedBatch2bPaths.has(path)));
   const protectedBatch2bPaths = [
     'src/lib/scheduleControlEngine.ts', 'src/lib/costControlEngine.ts', 'src/lib/integratedDecisionEngine.ts',
     'src/lib/cpmEngine.ts', 'src/lib/calendarEngine.ts', 'src/lib/resourceLevelingEngine.ts',
@@ -5364,7 +5398,357 @@ console.log('--- S18 Pilot Closure (F9.5)');
     'src/components/views/ExecutiveReportView.tsx', 'src/lib/mockSeed.ts',
   ];
   ok('S26 F5/F6/F7, CPM/calendar, recovery, dashboard/report, and seed files remain untouched',
-    protectedBatch2bPaths.every((path) => !batch2bChangedPaths.has(path)));
+    protectedBatch2bPaths.every((path) => !s26ChangedPaths.includes(path)));
+}
+
+// ---------------------------------------------------------------------------
+// S27 — Launch Batch 2C resource-leveling analysis, exact Apply, and scope.
+// ---------------------------------------------------------------------------
+{
+  console.log('--- S27 Launch Batch 2C Resource Leveling Deepening');
+  const levelingEngineSource = readFileSync(resolvePath(process.cwd(), 'src/lib/resourceLevelingEngine.ts'), 'utf8');
+  const levelingViewSource = readFileSync(resolvePath(process.cwd(), 'src/components/views/ResourceHistogramView.tsx'), 'utf8');
+  const levelingDemoContractSource = readFileSync(resolvePath(process.cwd(), 'src/lib/demoDbContracts.ts'), 'utf8');
+  const levelingSupabaseSource = readFileSync(resolvePath(process.cwd(), 'src/lib/supabase.ts'), 'utf8');
+  const levelingMigrationSource = readFileSync(resolvePath(process.cwd(), 'supabase/migrations/20260924130000_atomic_resource_leveling_apply.sql'), 'utf8');
+  const levelingDate = DD;
+  const levelingOptions = { calendarType: '6_days' as const, dataDate: levelingDate, statusLogic: 'retained_logic' as const };
+  const levelingControls = { calendar_type: '6_days' as const, data_date: levelingDate, status_logic: 'retained_logic' as const };
+  const resource = (id: string, availability: number) => ({
+    id, project_id: 'p1', name: `Crew ${id}`, type: 'labor', unit: 'crew', unit_rate: 100,
+    availability, created_at: '2026-01-01T00:00:00Z',
+  } as Resource);
+  const assigned = (
+    id: string,
+    activityId: string,
+    resourceId: string,
+    planned: number,
+    actual = 0,
+    remaining?: number | null,
+    dailyDemandProfile?: ActivityResource['daily_demand_profile'],
+  ) => ({
+    id, activity_id: activityId, resource_id: resourceId, project_id: 'p1',
+    planned_quantity: planned, actual_quantity: actual, remaining_quantity: remaining,
+    daily_demand_profile: dailyDemandProfile,
+    created_at: '2026-01-01T00:00:00Z',
+  } as ActivityResource);
+  const twoTasks = [
+    act({ id: 'LV-A', code: 'LV-A', duration_days: 3, percent_complete: 0 }),
+    act({ id: 'LV-B', code: 'LV-B', duration_days: 3, percent_complete: 0 }),
+  ];
+  const threeDayDemand = Array.from({ length: 3 }, (_, workday_offset) => ({ workday_offset, units: 1 }));
+  const twoAssignments = [
+    assigned('LV-AA', 'LV-A', 'LV-R', 3, 0, null, threeDayDemand),
+    assigned('LV-AB', 'LV-B', 'LV-R', 3, 0, null, threeDayDemand),
+  ];
+  const levelingInput = {
+    activities: twoTasks,
+    links: [],
+    resources: [resource('LV-R', 1)],
+    assignments: twoAssignments,
+    cpmOptions: levelingOptions,
+    projectControls: levelingControls,
+  };
+
+  // Analysis immutability, measured quantity/capacity basis, and the histogram's N/A semantics.
+  const originalInput = JSON.stringify(levelingInput);
+  const preview = levelScheduleResources(levelingInput);
+  eq('S27 analysis does not mutate live activities/links/resources/assignments', JSON.stringify(levelingInput), originalInput);
+  eq('S27 analysis is read-only and returns an in-memory activity scenario', preview.status, 'ready');
+  ok('S27 measured capacity and planned-quantity basis expose baseline conflicts',
+    (preview.conflictsBefore?.length || 0) === 3 && preview.conflictsBefore?.[0].demand === 2 && preview.conflictsBefore?.[0].capacity === 1);
+  eq('S27 conflict-free leveled preview has no unresolved conflicts', preview.conflictsAfter?.length, 0);
+  ok('S27 preview requires explicit Apply and delays the canonical project finish when work is serialized',
+    preview.manuallyShiftedActivityIds.length > 0 && (preview.finishVarianceWorkingDays || 0) > 0);
+  eq('S27 scenario finish is the canonical CPM finish, not a date-shift estimate',
+    preview.leveledProjectFinish, preview.scenarioCpm?.projectEarlyFinish || null);
+  const doubledCapacity = levelScheduleResources({
+    ...levelingInput,
+    resources: [resource('LV-R', 2)],
+  });
+  eq('S27 verified capacity increase changes the measured conflict result', doubledCapacity.status, 'no_conflicts');
+  const changedTotalsOnly = levelScheduleResources({
+    ...levelingInput,
+    assignments: twoAssignments.map((assignment) => ({ ...assignment, planned_quantity: 999 })),
+  });
+  eq('S27 aggregate planned quantity is never converted into a different daily demand profile',
+    changedTotalsOnly.conflictsBefore?.map((conflict) => conflict.demand),
+    preview.conflictsBefore?.map((conflict) => conflict.demand));
+  const histogram = generateResourceHistogram(levelingInput);
+  const histogramResource = histogram.resourceSummaries.find((item) => item.id === 'LV-R');
+  eq('S27 histogram uses recorded resource availability', histogramResource?.maxAvailability, 1);
+  eq('S27 histogram daily peak uses assignment quantity divided by CPM duration', histogramResource?.peakAllocated, 2);
+  eq('S27 histogram never aggregates incomparable resource pools into one unit total',
+    'totalUnits' in (histogram.timeBuckets[0] || {}), false);
+
+  const missingCapacity = levelScheduleResources({
+    ...levelingInput,
+    resources: [resource('LV-R', 0)],
+  });
+  eq('S27 zero/missing availability is N/A, not a fabricated capacity', missingCapacity.status, 'insufficient_data');
+  eq('S27 missing capacity does not calculate fabricated conflicts', missingCapacity.conflictsBefore, null);
+  eq('S27 missing capacity proposes no writes', missingCapacity.manuallyShiftedActivityIds.length, 0);
+  const unphasedAssignments = twoAssignments.map((assignment) => ({ ...assignment, daily_demand_profile: null }));
+  const unphasedScenario = levelScheduleResources({ ...levelingInput, assignments: unphasedAssignments });
+  eq('S27 total assignment quantities without a verified time profile are Insufficient data', unphasedScenario.status, 'insufficient_data');
+  eq('S27 unphased totals never become invented before-conflict counts', unphasedScenario.conflictsBefore, null);
+  ok('S27 unphased assignment evidence explains why daily demand is N/A',
+    unphasedScenario.dataIssues.some((issue) => issue.includes('time-phased daily demand profile')));
+  const unphasedHistogram = generateResourceHistogram({ ...levelingInput, assignments: unphasedAssignments });
+  eq('S27 unphased histogram peak remains N/A instead of a flat allocation estimate',
+    unphasedHistogram.resourceSummaries.find((item) => item.id === 'LV-R')?.peakAllocated, null);
+
+  // Completed work is historical; an in-progress assignment is fixed at the Data Date, and only
+  // the future unstarted activity can move to resolve its resource conflict.
+  const statusedActivities = [
+    act({ id: 'LV-DONE', code: 'LV-DONE', duration_days: 2, actual_start: '2026-09-08', actual_finish: levelingDate, percent_complete: 100, actual_quantity: 2 }),
+    act({ id: 'LV-RUN', code: 'LV-RUN', duration_days: 4, remaining_duration_days: 2, actual_start: '2026-09-10', percent_complete: 50, actual_quantity: 2 }),
+    act({ id: 'LV-FUTURE', code: 'LV-FUTURE', duration_days: 2, percent_complete: 0 }),
+  ];
+  const statusedInput = {
+    activities: statusedActivities,
+    links: [],
+    resources: [resource('LV-R', 1)],
+    assignments: [
+      assigned('LV-AD', 'LV-DONE', 'LV-R', 2, 2, 0),
+      assigned('LV-AR', 'LV-RUN', 'LV-R', 4, 2, 2, [{ workday_offset: 0, units: 1 }, { workday_offset: 1, units: 1 }]),
+      assigned('LV-AF', 'LV-FUTURE', 'LV-R', 2, 0, null, [{ workday_offset: 0, units: 1 }, { workday_offset: 1, units: 1 }]),
+    ],
+    cpmOptions: levelingOptions,
+    projectControls: levelingControls,
+  };
+  const statusedScenario = levelScheduleResources(statusedInput);
+  eq('S27 completed/actual work can be leveled around without moving the completed activity', statusedScenario.status, 'ready');
+  ok('S27 actual-start/progress work remains fixed while a future activity is shifted',
+    !statusedScenario.manuallyShiftedActivityIds.includes('LV-RUN')
+      && !statusedScenario.manuallyShiftedActivityIds.includes('LV-DONE')
+      && statusedScenario.manuallyShiftedActivityIds.includes('LV-FUTURE'));
+  const unchangedStarted = statusedScenario.scenarioActivities.find((item) => item.id === 'LV-RUN');
+  const unchangedDone = statusedScenario.scenarioActivities.find((item) => item.id === 'LV-DONE');
+  eq('S27 actual start and progress evidence remain unchanged',
+    [unchangedStarted?.actual_start, unchangedStarted?.percent_complete, unchangedStarted?.actual_quantity],
+    ['2026-09-10', 50, 2]);
+  eq('S27 completed actual dates remain unchanged',
+    [unchangedDone?.actual_start, unchangedDone?.actual_finish, unchangedDone?.percent_complete],
+    ['2026-09-08', levelingDate, 100]);
+
+  // P6 calendar + relationship regression: CPM must honor a non-working exception and retain FS
+  // logic when a non-critical predecessor is pushed by leveling.
+  const p6Calendar = {
+    id: 'LV-CAL', project_id: 'p1', p6_clndr_id: 'CAL-LV', name: 'Sun-Tue with holiday',
+    clndr_type: 'P6', is_default: false, hours_per_day: 8, hours_per_week: 24, base_p6_clndr_id: null,
+    workweek_json: { day_hours: { '1': 8, '2': 8, '3': 8 } },
+    exceptions_json: ['2026-09-14'], pattern_status: 'parsed', created_at: '2026-01-01T00:00:00Z',
+  } as any;
+  const calendarActivities = [
+    act({ id: 'LV-PRED', code: 'LV-PRED', duration_days: 2, calendar_id: 'LV-CAL' }),
+    act({ id: 'LV-SUCC', code: 'LV-SUCC', duration_days: 2, calendar_id: 'LV-CAL' }),
+    act({ id: 'LV-LONG', code: 'LV-LONG', duration_days: 5, calendar_id: 'LV-CAL' }),
+  ];
+  const calendarLinks = [link('LV-PS', 'LV-PRED', 'LV-SUCC')];
+  const calendarInput = {
+    activities: calendarActivities,
+    links: calendarLinks,
+    resources: [resource('LV-R', 1)],
+    assignments: [
+      assigned('LV-AP', 'LV-PRED', 'LV-R', 2, 0, null, [{ workday_offset: 0, units: 1 }, { workday_offset: 1, units: 1 }]),
+      assigned('LV-AL', 'LV-LONG', 'LV-R', 5, 0, null, Array.from({ length: 5 }, (_, workday_offset) => ({ workday_offset, units: 1 }))),
+    ],
+    cpmOptions: { ...levelingOptions, calendars: [p6Calendar] },
+    projectControls: levelingControls,
+  };
+  const calendarScenario = levelScheduleResources(calendarInput);
+  eq('S27 P6-calendar-constrained scenario remains feasible after canonical CPM', calendarScenario.status, 'ready');
+  eq('S27 resource leveling leaves activity relationships intact', JSON.stringify(calendarScenario.sourceSnapshot.links), JSON.stringify(calendarLinks));
+  const calendarResults = new Map((calendarScenario.scenarioCpm?.results || []).map((item) => [item.activityId, item]));
+  const predecessorResult = calendarResults.get('LV-PRED');
+  const successorResult = calendarResults.get('LV-SUCC');
+  const p6Workday = (date: string) => {
+    const day = new Date(`${date}T00:00:00Z`).getUTCDay();
+    return [0, 1, 2].includes(day) && date !== '2026-09-14';
+  };
+  ok('S27 every scenario start/finish honors the assigned P6 workweek and exception',
+    (calendarScenario.scenarioCpm?.results || []).every((item) => p6Workday(item.earlyStart) && p6Workday(item.earlyFinish)));
+  ok('S27 successor remains after its FS predecessor under P6 calendar rules',
+    Boolean(predecessorResult && successorResult && successorResult.earlyStart > predecessorResult.earlyFinish));
+  if (predecessorResult && successorResult) {
+    const p6ExecutionCalendar = { type: '6_days' as const, workDays: [0, 1, 2], holidays: ['2026-09-14'], hoursPerDay: 8 };
+    const canonicalRequiredStart = calculateLinkDate(
+      predecessorResult.earlyStart,
+      predecessorResult.earlyFinish,
+      successorResult.remainingDuration,
+      'FS',
+      0,
+      p6ExecutionCalendar,
+      p6ExecutionCalendar,
+    );
+    eq('S27 relationship date is satisfied by leveled canonical CPM', successorResult.earlyStart, canonicalRequiredStart);
+  }
+  eq('S27 actual finish delay is surfaced as a signed working-day variance',
+    calendarScenario.finishVarianceWorkingDays,
+    calendarScenario.currentProjectFinish && calendarScenario.leveledProjectFinish
+      ? countWorkingDays(calendarScenario.currentProjectFinish, calendarScenario.leveledProjectFinish, getCalendar('6_days')) - 1
+      : null);
+  const missingP6Calendar = levelScheduleResources({
+    ...calendarInput,
+    cpmOptions: { ...levelingOptions, calendars: [] },
+  });
+  eq('S27 a referenced but unavailable P6 calendar reports N/A rather than silently leveling on fallback',
+    missingP6Calendar.status, 'insufficient_data');
+
+  const fixedOverloadInput = {
+    activities: [act({ id: 'LV-FIXED', code: 'LV-FIXED', duration_days: 4, remaining_duration_days: 2, actual_start: '2026-09-10', percent_complete: 50 })],
+    links: [],
+    resources: [resource('LV-R', 1)],
+    assignments: [assigned('LV-AFIX', 'LV-FIXED', 'LV-R', 4, 0, 4, [{ workday_offset: 0, units: 2 }, { workday_offset: 1, units: 2 }])],
+    cpmOptions: levelingOptions,
+    projectControls: levelingControls,
+  };
+  const unresolved = levelScheduleResources(fixedOverloadInput);
+  eq('S27 immovable overload is explicitly not a full leveling success', unresolved.status, 'no_feasible_scenario');
+  ok('S27 unresolved conflicts remain visible and block Apply', unresolved.unresolvedConflicts.length > 0 && unresolved.manuallyShiftedActivityIds.length === 0 && unresolved.leveledProjectFinish === null);
+
+  // Demo mode Apply mirrors the atomic SQL contract. The successful Apply saves only the evaluated
+  // CPM fields; a late missing target and a stale evidence set both leave every row untouched.
+  const demoDbSeed: DemoDb = {
+    projects: [{ id: 'p1', data_date: levelingDate, calendar_type: '6_days', status_logic: 'retained_logic' }],
+    activities: levelingInput.activities.map((item) => ({ ...item })),
+    activity_links: levelingInput.links.map((item) => ({ ...item })),
+    resources: levelingInput.resources.map((item) => ({ ...item })),
+    activity_resources: levelingInput.assignments.map((item) => ({ ...item })),
+    calendars: [],
+  };
+  const makeRpcParams = (value: typeof preview) => ({
+    p_project_id: 'p1',
+    p_expected_activities: value.sourceSnapshot.activities,
+    p_expected_links: value.sourceSnapshot.links,
+    p_expected_resources: value.sourceSnapshot.resources,
+    p_expected_assignments: value.sourceSnapshot.assignments,
+    p_expected_calendars: value.sourceSnapshot.calendars,
+    p_expected_controls: value.sourceSnapshot.controls,
+    p_activity_patches: value.manuallyShiftedActivityIds.map((activityId) => ({
+      activity_id: activityId,
+      early_start: value.scenarioActivities.find((item) => item.id === activityId)?.early_start,
+    })),
+    p_cpm_results: (value.scenarioCpm?.results || []).map((item) => ({
+      activity_id: item.activityId,
+      early_start: item.earlyStart,
+      early_finish: item.earlyFinish,
+      late_start: item.lateStart,
+      late_finish: item.lateFinish,
+      total_float: item.totalFloat,
+      free_float: item.freeFloat,
+      is_critical: item.isCritical,
+      activity_drag: item.activityDrag,
+    })),
+  });
+  const successfulApply = applyResourceLevelingScenario(demoDbSeed, makeRpcParams(preview));
+  eq('S27 Apply commits only after the evaluated scenario payload passes validation', successfulApply.error, null);
+  const appliedById = new Map(demoDbSeed.activities.map((item) => [String(item.id), item]));
+  ok('S27 Apply saves the exact evaluated CPM dates, float, criticality and drag',
+    (preview.scenarioCpm?.results || []).every((result) => {
+      const saved = appliedById.get(result.activityId);
+      return saved?.early_start === result.earlyStart
+        && saved?.early_finish === result.earlyFinish
+        && saved?.late_start === result.lateStart
+        && saved?.late_finish === result.lateFinish
+        && saved?.total_float === result.totalFloat
+        && saved?.free_float === result.freeFloat
+        && saved?.is_critical === result.isCritical
+        && saved?.activity_drag === result.activityDrag;
+    }));
+  eq('S27 Apply does not change actual-progress evidence',
+    demoDbSeed.activities.map((item) => [item.id, item.actual_start, item.actual_finish, item.percent_complete, item.actual_quantity]),
+    levelingInput.activities.map((item) => [item.id, item.actual_start, item.actual_finish, item.percent_complete, item.actual_quantity]));
+
+  const rollbackDb: DemoDb = JSON.parse(JSON.stringify({
+    ...demoDbSeed,
+    activities: levelingInput.activities.map((item) => ({ ...item })),
+  }));
+  const rollbackBefore = JSON.stringify(rollbackDb);
+  const badCpmParams = makeRpcParams(preview);
+  badCpmParams.p_cpm_results = (badCpmParams.p_cpm_results as Array<Record<string, unknown>>).map((item, index, all) =>
+    index === all.length - 1 ? { ...item, activity_id: 'NOT-IN-PROJECT' } : item,
+  );
+  const failedApply = applyResourceLevelingScenario(rollbackDb, badCpmParams);
+  ok('S27 injected late Apply failure is returned as an error', Boolean(failedApply.error));
+  eq('S27 rollback leaves all activities and evidence untouched after a staged-row failure', JSON.stringify(rollbackDb), rollbackBefore);
+
+  const staleDb: DemoDb = JSON.parse(JSON.stringify({
+    ...demoDbSeed,
+    activities: levelingInput.activities.map((item) => ({ ...item })),
+    resources: [{ ...levelingInput.resources[0], availability: 99 }],
+  }));
+  const staleBefore = JSON.stringify(staleDb);
+  const staleApply = applyResourceLevelingScenario(staleDb, makeRpcParams(preview));
+  ok('S27 Apply rejects changed capacity/assignment evidence', Boolean(staleApply.error));
+  eq('S27 stale-input rejection performs no partial write', JSON.stringify(staleDb), staleBefore);
+
+  // UI and storage boundary: analysis is read-only and there is exactly one atomic Apply RPC, never
+  // an activity-by-activity update loop. The local demo branch mirrors the same all-or-nothing write.
+  ok('S27 resource-leveling engine has no Supabase/database write path', !/supabase\.from\(|supabase\.rpc\(/.test(levelingEngineSource));
+  ok('S27 the view loads activities, links, resources, assignments, and project calendars',
+    ['activities', 'activity_links', 'resources', 'activity_resources', 'calendars']
+      .every((table) => levelingViewSource.includes(`from('${table}')`))
+      && levelingViewSource.includes('dataDate: project?.data_date || DEFAULT_DATA_DATE')
+      && levelingViewSource.includes('statusLogic: project?.status_logic ||'));
+  ok('S27 the view has no direct/sequential activity UPDATE path',
+    !/supabase\.from\(['\"]activities['\"]\)\.update\s*\(/.test(levelingViewSource));
+  eq('S27 view calls one dedicated RPC for the explicit Apply action',
+    Array.from(levelingViewSource.matchAll(/supabase\.rpc\(['"]apply_resource_leveling_scenario['"]/g)).length, 1);
+  ok('S27 Apply is gated on a ready, fully conflict-free evaluated scenario',
+    levelingViewSource.includes("scenario?.status === 'ready'")
+      && levelingViewSource.includes('scenario.unresolvedConflicts.length === 0')
+      && levelingViewSource.includes('window.confirm'));
+  ok('S27 demo RPC dispatcher saves only a successful one-shot local contract',
+    levelingSupabaseSource.includes("fnName === 'apply_resource_leveling_scenario'")
+      && /applyResourceLevelingScenario\(db, params\)[\s\S]{0,200}if \(!result\.error\) saveDb\(db\)/.test(levelingSupabaseSource));
+  const demoApplyStart = levelingDemoContractSource.indexOf('export function applyResourceLevelingScenario');
+  const demoApplyEnd = levelingDemoContractSource.indexOf('Faithful demo-store implementation of the `review_cost_transaction`', demoApplyStart);
+  const demoApplySource = demoApplyStart >= 0 ? levelingDemoContractSource.slice(demoApplyStart, demoApplyEnd) : '';
+  ok('S27 demo contract stages CPM rows and replaces the local activity store once',
+    demoApplySource.includes('export function applyResourceLevelingScenario')
+      && demoApplySource.split("db['activities'] = stagedActivities").length - 1 === 1);
+  ok('S27 SQL RPC validates stale inputs, stages one transaction, and persists canonical CPM fields',
+    levelingMigrationSource.includes('CREATE OR REPLACE FUNCTION public.apply_resource_leveling_scenario')
+      && levelingMigrationSource.includes('p_expected_assignments')
+      && levelingMigrationSource.includes('RAISE EXCEPTION')
+      && levelingMigrationSource.includes('SET early_start =')
+      && levelingMigrationSource.includes('activity_drag ='));
+  ok('S27 SQL RPC never writes actual/progress fields',
+    !/SET[^;]*(?:actual_start|actual_finish|actual_quantity|percent_complete)\s*=/.test(levelingMigrationSource));
+  ok('S27 leveler requires verified day-phased assignment demand and never derives a flat profile from totals',
+    levelingEngineSource.includes('daily_demand_profile')
+      && levelingEngineSource.includes('No profile is inferred.')
+      && !levelingEngineSource.includes('uniform average demand'));
+
+  const changedPaths = new Set([
+    ...execFileSync('git', ['diff', '--name-only'], { encoding: 'utf8' }).split('\n').filter(Boolean),
+    ...execFileSync('git', ['diff', '--name-only', '--cached'], { encoding: 'utf8' }).split('\n').filter(Boolean),
+    ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
+  ]);
+  const allowedBatch2cPaths = new Set([
+    'src/lib/resourceLevelingEngine.ts',
+    'src/components/views/ResourceHistogramView.tsx',
+    'src/types/index.ts',
+    'scripts/validate-controls.ts',
+    'src/lib/demoDbContracts.ts',
+    'src/lib/supabase.ts',
+    'supabase/migrations/20260924130000_atomic_resource_leveling_apply.sql',
+  ]);
+  ok('S27 changes stay within Batch 2C resource-leveling, required types/tests, and atomic Apply support',
+    [...changedPaths].every((path) => allowedBatch2cPaths.has(path)));
+  const protectedUnchanged = [
+    'src/lib/scheduleControlEngine.ts', 'src/lib/costControlEngine.ts', 'src/lib/integratedDecisionEngine.ts',
+    'src/lib/cpmEngine.ts', 'src/lib/calendarEngine.ts', 'src/lib/boqResourceLeveling.ts',
+    'src/lib/recoveryOptimizerEngine.ts', 'src/components/views/ScheduleRecoveryView.tsx',
+    'src/lib/tiaEngine.ts', 'src/components/views/TimeImpactAnalysisView.tsx',
+    'src/components/views/ScheduleView.tsx', 'src/components/views/DashboardView.tsx',
+    'src/components/views/ExecutiveReportView.tsx', 'src/lib/mockSeed.ts',
+    'supabase/migrations/20260924120000_atomic_schedule_recovery_apply.sql',
+  ];
+  ok('S27 Recovery/TIA/F5/F6/F7/CPM/calendar/BOQ/dashboard/report/seed remain unchanged',
+    protectedUnchanged.every((path) => !changedPaths.has(path)));
 }
 
 // ---------------------------------------------------------------------------

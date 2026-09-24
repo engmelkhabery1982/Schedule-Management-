@@ -98,6 +98,19 @@ export interface AtomicScheduleRecoveryParams {
   p_cpm_results?: unknown;
 }
 
+/** Parameters of the stale-input-guarded resource-leveling transaction. */
+export interface AtomicResourceLevelingParams {
+  p_project_id?: unknown;
+  p_expected_activities?: unknown;
+  p_expected_links?: unknown;
+  p_expected_resources?: unknown;
+  p_expected_assignments?: unknown;
+  p_expected_calendars?: unknown;
+  p_expected_controls?: unknown;
+  p_activity_patches?: unknown;
+  p_cpm_results?: unknown;
+}
+
 /** `approval_level` is `NOT NULL DEFAULT 0` in the schema; a demo row may simply omit it. */
 function approvalLevelOf(row: { approval_level?: unknown } | null | undefined): number {
   const raw = Number(row?.approval_level ?? 0);
@@ -255,6 +268,155 @@ export function applyScheduleRecoveryScenario(
 
   db['activities'] = stagedActivities;
   db['activity_links'] = stagedLinks;
+  return { data: null, error: null };
+}
+
+/**
+ * Atomic demo-store mirror of `apply_resource_leveling_scenario`.
+ *
+ * The input snapshots are compared before staging any writes, then all activity changes are applied
+ * to private clones. A failed/stale request leaves the live store untouched, matching the single
+ * PostgreSQL transaction used by the production RPC.
+ */
+export function applyResourceLevelingScenario(
+  db: DemoDb,
+  params: AtomicResourceLevelingParams,
+): DemoRpcResult {
+  const projectId = params?.p_project_id;
+  const expectedActivities = params?.p_expected_activities;
+  const expectedLinks = params?.p_expected_links;
+  const expectedResources = params?.p_expected_resources;
+  const expectedAssignments = params?.p_expected_assignments;
+  const expectedCalendars = params?.p_expected_calendars;
+  const expectedControls = params?.p_expected_controls;
+  const patches = params?.p_activity_patches;
+  const cpmResults = params?.p_cpm_results;
+  const fail = (message: string, hint: string): DemoRpcResult => ({
+    data: null,
+    error: { message, details: 'No part of this resource-leveling Apply was committed.', hint },
+  });
+  const isRecord = (value: unknown): value is Record<string, unknown> =>
+    value !== null && typeof value === 'object' && !Array.isArray(value);
+  const isDate = (value: unknown): value is string =>
+    typeof value === 'string'
+    && /^\d{4}-\d{2}-\d{2}$/.test(value)
+    && Number.isFinite(Date.parse(`${value}T00:00:00Z`));
+  const isFiniteNumber = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
+  const uniqueIds = (rows: unknown[], field: string): boolean => {
+    const ids = rows.map((row) => isRecord(row) ? row[field] : null);
+    return ids.every((id) => typeof id === 'string' && id.length > 0) && new Set(ids).size === ids.length;
+  };
+  const stable = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(stable);
+    if (!isRecord(value)) return value;
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stable(value[key])]));
+  };
+  const rowSet = (rows: unknown[]): string => JSON.stringify(
+    rows.map((row) => stable(row)).sort((a, b) => {
+      const aId = isRecord(a) ? String(a.id ?? '') : '';
+      const bId = isRecord(b) ? String(b.id ?? '') : '';
+      return aId.localeCompare(bId);
+    }),
+  );
+
+  if (typeof projectId !== 'string' || !projectId) return fail('Resource-leveling Apply requires a project id', 'rpc:resource_leveling:project_id');
+  const payloadArrays = [expectedActivities, expectedLinks, expectedResources, expectedAssignments, expectedCalendars, patches, cpmResults];
+  if (!payloadArrays.every(Array.isArray) || !isRecord(expectedControls)) {
+    return fail('Resource-leveling Apply payloads have an invalid shape', 'rpc:resource_leveling:payload_shape');
+  }
+  const project = (db['projects'] || []).find((row) => String(row.id) === projectId);
+  if (!project) return fail('Resource-leveling Apply project does not exist', 'rpc:resource_leveling:project_missing');
+
+  const tableSnapshots: Array<[string, unknown[]]> = [
+    ['activities', expectedActivities as unknown[]],
+    ['activity_links', expectedLinks as unknown[]],
+    ['resources', expectedResources as unknown[]],
+    ['activity_resources', expectedAssignments as unknown[]],
+    ['calendars', expectedCalendars as unknown[]],
+  ];
+  for (const [table, expected] of tableSnapshots) {
+    const actual = (db[table] || []).filter((row) => String(row.project_id) === projectId);
+    if (rowSet(actual) !== rowSet(expected)) {
+      return fail(`Resource-leveling inputs changed in ${table}; analyze again before Apply`, `rpc:resource_leveling:stale:${table}`);
+    }
+    if (expected.some((row) => !isRecord(row) || String(row.project_id) !== projectId)) {
+      return fail(`Resource-leveling snapshot crosses project boundary in ${table}`, `rpc:resource_leveling:project_scope:${table}`);
+    }
+  }
+  const actualControls = {
+    calendar_type: project.calendar_type ?? null,
+    data_date: project.data_date ?? null,
+    status_logic: project.status_logic ?? null,
+  };
+  if (JSON.stringify(stable(actualControls)) !== JSON.stringify(stable(expectedControls))) {
+    return fail('Project schedule controls changed; analyze again before Apply', 'rpc:resource_leveling:stale:controls');
+  }
+
+  const liveActivities = db['activities'] || [];
+  const projectActivities = liveActivities.filter((row) => String(row.project_id) === projectId);
+  if (!uniqueIds(patches as unknown[], 'activity_id') || (patches as unknown[]).length === 0) {
+    return fail('Resource-leveling Apply requires unique shifted activity ids', 'rpc:resource_leveling:patch_ids');
+  }
+  if ((cpmResults as unknown[]).length !== projectActivities.length || !uniqueIds(cpmResults as unknown[], 'activity_id')) {
+    return fail('Canonical CPM result must uniquely cover every project activity', 'rpc:resource_leveling:cpm_coverage');
+  }
+  const cpmByActivity = new Map<string, Record<string, unknown>>();
+  for (const rawResult of cpmResults as unknown[]) {
+    if (
+      !isRecord(rawResult)
+      || typeof rawResult.activity_id !== 'string'
+      || !isDate(rawResult.early_start)
+      || !isDate(rawResult.early_finish)
+      || !isDate(rawResult.late_start)
+      || !isDate(rawResult.late_finish)
+      || !isFiniteNumber(rawResult.total_float)
+      || !isFiniteNumber(rawResult.free_float)
+      || typeof rawResult.is_critical !== 'boolean'
+      || !isFiniteNumber(rawResult.activity_drag)
+    ) return fail('Invalid canonical CPM result in resource-leveling payload', 'rpc:resource_leveling:cpm_result');
+    cpmByActivity.set(rawResult.activity_id, rawResult);
+  }
+
+  for (const rawPatch of patches as unknown[]) {
+    if (!isRecord(rawPatch) || typeof rawPatch.activity_id !== 'string' || !isDate(rawPatch.early_start)) {
+      return fail('Invalid resource-leveling activity patch', 'rpc:resource_leveling:activity_patch');
+    }
+    const activity = projectActivities.find((row) => String(row.id) === rawPatch.activity_id);
+    const cpm = cpmByActivity.get(rawPatch.activity_id);
+    if (!activity || !cpm) return fail(`Shifted activity ${rawPatch.activity_id} is not in the evaluated project CPM`, 'rpc:resource_leveling:activity_missing');
+    if (cpm.early_start !== rawPatch.early_start) return fail(`Shifted activity ${rawPatch.activity_id} does not match the evaluated CPM result`, 'rpc:resource_leveling:patch_cpm_mismatch');
+    const assignmentHasActual = (db['activity_resources'] || []).some((assignment) =>
+      String(assignment.project_id) === projectId
+        && String(assignment.activity_id) === rawPatch.activity_id
+        && Number(assignment.actual_quantity || 0) > 0,
+    );
+    if (
+      activity.actual_start !== null && activity.actual_start !== undefined
+      || activity.actual_finish !== null && activity.actual_finish !== undefined
+      || Number(activity.percent_complete || 0) > 0
+      || Number(activity.actual_quantity || 0) > 0
+      || assignmentHasActual
+    ) return fail(`Activity ${rawPatch.activity_id} contains actual/completed work and cannot be shifted`, 'rpc:resource_leveling:actual_work');
+  }
+
+  // All validation is complete. Stage every canonical CPM row privately and publish once.
+  const stagedActivities = liveActivities.map((row) => ({ ...row }));
+  for (const rawResult of cpmResults as Array<Record<string, unknown>>) {
+    const index = stagedActivities.findIndex((row) => String(row.id) === String(rawResult.activity_id) && String(row.project_id) === projectId);
+    if (index < 0) return fail(`CPM result activity ${String(rawResult.activity_id)} disappeared before commit`, 'rpc:resource_leveling:cpm_activity_missing');
+    stagedActivities[index] = {
+      ...stagedActivities[index],
+      early_start: rawResult.early_start,
+      early_finish: rawResult.early_finish,
+      late_start: rawResult.late_start,
+      late_finish: rawResult.late_finish,
+      total_float: rawResult.total_float,
+      free_float: rawResult.free_float,
+      is_critical: rawResult.is_critical,
+      activity_drag: rawResult.activity_drag,
+    };
+  }
+  db['activities'] = stagedActivities;
   return { data: null, error: null };
 }
 
