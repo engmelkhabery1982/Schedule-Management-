@@ -2,11 +2,11 @@ import { useState, useMemo, useEffect } from 'react';
 import { supabase } from '@/lib/supabase';
 import { getLanguage, type Language } from '@/lib/i18n';
 import { resolveContractBaseline } from '@/lib/budgetForecastEngine';
-import type { Project, PaymentCertificate, VariationOrder, SubcontractPackage } from '@/types';
+import type { Project, PaymentCertificate, SubcontractPackage } from '@/types';
+import ScopeChangeRegister from './ScopeChangeRegister';
 import { DEFAULT_DATA_DATE } from '@/lib/projectControlsConstants';
 import { loadSubcontractPackages } from '@/lib/subcontractEngine';
 import {
-  assessCommercialChronology,
   getContractRetentionPercent,
   reconcilePaymentCertificate,
   reconcileSubcontractorCertificate,
@@ -16,16 +16,10 @@ import {
 import {
   Receipt,
   FileCheck2,
-  DollarSign,
-  Plus,
   Printer,
-  CheckCircle2,
-  Clock,
   AlertCircle,
   FileText,
   Building,
-  TrendingUp,
-  Percent,
 } from 'lucide-react';
 
 interface PaymentCertificatesViewProps {
@@ -75,7 +69,6 @@ export default function PaymentCertificatesView({ project }: PaymentCertificates
   const [activeTab, setActiveTab] = useState<'ipcs' | 'subcontractors' | 'vos'>('ipcs');
   const [selectedIpcId, setSelectedIpcId] = useState<string>('IPC-03');
   const [selectedSubIpcId, setSelectedSubIpcId] = useState<string>('SUB-IPC-01');
-  const [showAddVoModal, setShowAddVoModal] = useState(false);
   const [showAddSubIpcModal, setShowAddSubIpcModal] = useState(false);
 
   // Subcontractor IPCs.
@@ -598,74 +591,6 @@ export default function PaymentCertificatesView({ project }: PaymentCertificates
     },
   ]);
 
-  // Variation Orders Log.
-  // Chronology (GAP-021): only VO-001 is an approved actual, and its approval date sits on or before
-  // the governed Data Date. VO-002 and VO-003 are live claims, so they carry no approval date and no
-  // approved amount, and they never enter the approved-variation totals.
-  const [variationOrders, setVariationOrders] = useState<VariationOrder[]>([
-    {
-      id: 'VO-01',
-      voNumber: 'VO-001',
-      title: 'تعديل مسارات كابلات الجهد المتوسط ومحطة المحولات',
-      description: 'نقل موقع غرفة المحولات لتفادي تقاطع شبكة الصرف الرئيسية وفق تعليمات شركة الكهرباء.',
-      reason: 'authority_requirement',
-      claimedCostSar: 145000,
-      approvedCostSar: 128000,
-      claimedTimeDays: 14,
-      approvedTimeDays: 10,
-      status: 'approved',
-      submissionDate: '2026-08-05',
-      approvalDate: '2026-08-20',
-      impactedActivityCode: 'ACT-008',
-    },
-    {
-      id: 'VO-02',
-      voNumber: 'VO-002',
-      title: 'ترقية نظام الواجهات الزجاجية إلى زجاج عاكس ثلاثي الطبقات',
-      description: 'تحسين كفاءة الطاقة وتخفيض الحمل الحراري للمبنى حسب متطلبات كود البناء السعودي الأخضر.',
-      reason: 'client_request',
-      claimedCostSar: 280000,
-      // Under review: no approved amount or duration exists yet, so nothing is invented here.
-      approvedCostSar: 0,
-      claimedTimeDays: 20,
-      approvedTimeDays: 0,
-      status: 'pending_review',
-      submissionDate: '2026-09-05',
-      impactedActivityCode: 'ACT-010',
-    },
-    {
-      id: 'VO-03',
-      voNumber: 'VO-003',
-      title: 'إضافة نظام إطفاء بالغاز النظيف FM200 لغرف السيرفرات',
-      description: 'تجهيز غرف تكنولوجيا المعلومات بنظام إطفاء متطور لم يكن مشمولاً بالمخططات الأولية.',
-      reason: 'design_change',
-      claimedCostSar: 95000,
-      approvedCostSar: 0,
-      claimedTimeDays: 7,
-      approvedTimeDays: 0,
-      status: 'negotiation',
-      submissionDate: '2026-09-11',
-      impactedActivityCode: 'ACT-011',
-    },
-  ]);
-
-  // Form state for creating a new VO
-  const [newVoForm, setNewVoForm] = useState({
-    voNumber: `VO-00${variationOrders.length + 1}`,
-    title: '',
-    description: '',
-    reason: 'client_request' as const,
-    claimedCostSar: 85000,
-    // A new claim starts unapproved: no approved amount or date is pre-filled (GAP-021).
-    approvedCostSar: 0,
-    claimedTimeDays: 12,
-    approvedTimeDays: 0,
-    status: 'pending_review' as VariationOrder['status'],
-    submissionDate: project?.data_date || DEFAULT_DATA_DATE,
-    approvalDate: '',
-    impactedActivityCode: 'ACT-005',
-  });
-
   const selectedIpc = useMemo(() => {
     return certificates.find((c) => c.id === selectedIpcId) || certificates[certificates.length - 1];
   }, [certificates, selectedIpcId]);
@@ -744,17 +669,6 @@ export default function PaymentCertificatesView({ project }: PaymentCertificates
   const totalSubRetentionWithheld = subIpcReconciliations
     .filter((rec) => rec.chronology.countsAsActual)
     .reduce((sum, rec) => sum + rec.deductions.retention, 0);
-
-  /** A variation order counts as approved money only when its approval happened by the Data Date. */
-  const approvedVariationOrders = variationOrders.filter((vo) =>
-    assessCommercialChronology({ recordDate: vo.approvalDate || null, status: vo.status, dataDate }).countsAsActual,
-  );
-  const pendingVariationOrders = variationOrders.filter(
-    (vo) => !approvedVariationOrders.includes(vo) && vo.status !== 'rejected',
-  );
-  const totalVoApprovedCost = approvedVariationOrders.reduce((sum, v) => sum + v.approvedCostSar, 0);
-  const totalVoApprovedTimeDays = approvedVariationOrders.reduce((sum, v) => sum + v.approvedTimeDays, 0);
-  const totalVoClaimedPendingCost = pendingVariationOrders.reduce((sum, v) => sum + v.claimedCostSar, 0);
 
   /** A reconciliation with the optional contractual-retention fields of a subcontractor certificate. */
   type CertificateRec = CertificateReconciliation & {
@@ -982,87 +896,13 @@ export default function PaymentCertificatesView({ project }: PaymentCertificates
     );
   };
 
-  // GAP-043: governed contract baseline precedence — `project.contract_value`, then a legitimate
-  // budget / BOQ total when the consumer has loaded one, then "not available". The former
-  // The former `|| <hardcoded SAR figure>` branch invented a contract that then fed the revised
-  // contract value and every certification percentage. This view loads no budget or BOQ records, so
-  // the precedence legitimately ends at N/A rather than at another arbitrary numeric fallback.
+  // Contract value is shown as recorded, without adding VO exposure or claiming an approved revision.
   const contractBaseline = resolveContractBaseline({ project });
-  const baseContractValue = contractBaseline.value;
-  const revisedContractValue = baseContractValue + totalVoApprovedCost;
   const contractValueLabel = contractBaseline.isAvailable
-    ? `${baseContractValue.toLocaleString()} SAR`
+    ? `${contractBaseline.value.toLocaleString()} SAR`
     : lang === 'ar'
       ? 'غير متوفر (N/A) — لا توجد قيمة عقد مسجلة'
       : 'Not available (N/A) — no recorded contract value';
-  const revisedContractValueLabel = contractBaseline.isAvailable
-    ? `${revisedContractValue.toLocaleString()} SAR`
-    : lang === 'ar'
-      ? `غير متوفر (N/A) — أوامر التغيير المعتمدة ${totalVoApprovedCost.toLocaleString()} SAR`
-      : `Not available (N/A) — approved VOs ${totalVoApprovedCost.toLocaleString()} SAR`;
-
-  // Toggle VO Status dynamically (Approved vs Pending vs Rejected)
-  const handleToggleVoStatus = (voId: string) => {
-    setVariationOrders((prev) =>
-      prev.map((vo) => {
-        if (vo.id === voId) {
-          const nextStatus = vo.status === 'approved' ? 'pending_review' : vo.status === 'pending_review' ? 'rejected' : 'approved';
-          // Approving a variation order approves what was claimed: the screen does not invent a
-          // negotiated discount (the former 90% cost / 80% time haircut was a fabricated commercial
-          // rule). A real negotiation is recorded by editing the claimed/approved amounts.
-          const approvedCost = nextStatus === 'approved' ? vo.claimedCostSar : 0;
-          const approvedTime = nextStatus === 'approved' ? vo.claimedTimeDays : 0;
-          // Dated at the governed Data Date, never at an arbitrary wall-clock day that could land
-          // after the cutoff and turn a pending claim into a future-dated actual (GAP-021).
-          const approvalDate = nextStatus === 'approved' ? vo.approvalDate || dataDate : undefined;
-          return {
-            ...vo,
-            status: nextStatus,
-            approvedCostSar: approvedCost,
-            approvedTimeDays: approvedTime,
-            approvalDate,
-          };
-        }
-        return vo;
-      })
-    );
-  };
-
-  const handleAddNewVo = () => {
-    if (!newVoForm.title) return;
-    const newVo: VariationOrder = {
-      id: `VO-0${variationOrders.length + 1}`,
-      voNumber: newVoForm.voNumber,
-      title: newVoForm.title,
-      description: newVoForm.description,
-      reason: newVoForm.reason,
-      claimedCostSar: Number(newVoForm.claimedCostSar) || 0,
-      approvedCostSar: Number(newVoForm.approvedCostSar) || 0,
-      claimedTimeDays: Number(newVoForm.claimedTimeDays) || 0,
-      approvedTimeDays: Number(newVoForm.approvedTimeDays) || 0,
-      status: newVoForm.status,
-      submissionDate: newVoForm.submissionDate || dataDate,
-      approvalDate: newVoForm.status === 'approved' ? newVoForm.approvalDate || undefined : undefined,
-      impactedActivityCode: newVoForm.impactedActivityCode,
-    };
-
-    setVariationOrders([...variationOrders, newVo]);
-    setShowAddVoModal(false);
-    setNewVoForm({
-      voNumber: `VO-00${variationOrders.length + 2}`,
-      title: '',
-      description: '',
-      reason: 'client_request',
-      claimedCostSar: 85000,
-      approvedCostSar: 0,
-      claimedTimeDays: 12,
-      approvedTimeDays: 0,
-      status: 'pending_review',
-      submissionDate: project?.data_date || DEFAULT_DATA_DATE,
-      approvalDate: '',
-      impactedActivityCode: 'ACT-005',
-    });
-  };
 
   return (
     <div className="space-y-5 select-none">
@@ -1077,9 +917,11 @@ export default function PaymentCertificatesView({ project }: PaymentCertificates
             <span className="px-2 py-0.5 rounded text-[10px] font-black bg-slate-900 text-amber-400">
               Contract Billing & EVM
             </span>
-            <span className="px-2 py-0.5 rounded text-[10px] font-black bg-indigo-50 text-indigo-900 border border-indigo-200">
-              {lang === 'ar' ? `تاريخ البيانات: ${dataDate}` : `Data Date: ${dataDate}`}
-            </span>
+            {activeTab !== 'vos' && (
+              <span className="px-2 py-0.5 rounded text-[10px] font-black bg-indigo-50 text-indigo-900 border border-indigo-200">
+                {lang === 'ar' ? `تاريخ البيانات: ${dataDate}` : `Data Date: ${dataDate}`}
+              </span>
+            )}
           </div>
           <p className="text-xs text-slate-500 mt-1">
             {lang === 'ar'
@@ -1122,48 +964,35 @@ export default function PaymentCertificatesView({ project }: PaymentCertificates
         </div>
       </div>
 
-      {/* KPI Metric Cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
-        <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
-          <span className="text-[11px] text-slate-400 block mb-1">{lang === 'ar' ? 'قيمة العقد الأصلية (Base Contract)' : 'Base Contract Value'}</span>
-          <div className={`text-lg font-black ${contractBaseline.isAvailable ? 'text-slate-900' : 'text-slate-400'} text-xs leading-6`}>{contractValueLabel}</div>
+      {activeTab !== 'vos' && (
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+          <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+            <span className="mb-1 block text-[11px] text-slate-400">{lang === 'ar' ? 'قيمة العقد المسجلة (دون أوامر التغيير)' : 'Recorded contract value (VOs excluded)'}</span>
+            <div className={`text-xs font-black leading-6 ${contractBaseline.isAvailable ? 'text-slate-900' : 'text-slate-400'}`}>{contractValueLabel}</div>
+          </div>
+          <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+            <span className="mb-1 block text-[11px] text-slate-400">{lang === 'ar' ? 'المعتمد فعلياً حتى تاريخ البيانات' : 'Certified actual to Data Date'}</span>
+            <div className="text-lg font-black text-slate-900">{totalCertifiedGross.toLocaleString()} SAR</div>
+            <span className="text-[10px] font-bold text-slate-500">
+              {lang === 'ar'
+                ? `${ipcSummary.certifiedCount} مستخلص فعلي · ${ipcSummary.excludedCount} معلق/مخطط (متوقع +${ipcSummary.forecastCurrentTotal.toLocaleString()} SAR)`
+                : `${ipcSummary.certifiedCount} actual · ${ipcSummary.excludedCount} pending/forecast (+${ipcSummary.forecastCurrentTotal.toLocaleString()} SAR)`}
+            </span>
+          </div>
+          <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+            <span className="mb-1 block text-[11px] text-slate-400">{lang === 'ar' ? 'محتجز الضمان الفعلي (حسب العقود)' : 'Retention withheld (contractual)'}</span>
+            <div className="text-lg font-black text-amber-700">{totalRetentionWithheld.toLocaleString()} SAR</div>
+            <span className="text-[10px] font-bold text-amber-700">{lang === 'ar' ? 'مستخلصات المقاول الرئيسي الفعلية' : 'Main-contractor actual certificates'}</span>
+          </div>
+          <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+            <span className="mb-1 block text-[11px] text-slate-400">{lang === 'ar' ? 'محتجز مقاولي الباطن الفعلي' : 'Subcontractor retention withheld'}</span>
+            <div className="text-lg font-black text-amber-700">{totalSubRetentionWithheld.toLocaleString()} SAR</div>
+            <span className="text-[10px] font-bold text-slate-500">{lang === 'ar' ? `${subIpcSummary.certifiedCount} مستخلص فعلي` : `${subIpcSummary.certifiedCount} certified IPC(s)`}</span>
+          </div>
         </div>
-        <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
-          <span className="text-[11px] text-slate-400 block mb-1">{lang === 'ar' ? 'قيمة العقد المعدلة (Revised BAC)' : 'Revised Contract (BAC)'}</span>
-          <div className={`text-lg font-black ${contractBaseline.isAvailable ? 'text-emerald-700' : 'text-slate-400'} text-xs leading-6`}>{revisedContractValueLabel}</div>
-          <span className="text-[10px] text-emerald-600 font-bold">+{totalVoApprovedCost.toLocaleString()} SAR VOs</span>
-        </div>
-        <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
-          <span className="text-[11px] text-slate-400 block mb-1">{lang === 'ar' ? 'إجمالي التمديد الزمني المعتمد' : 'Approved Time Extension'}</span>
-          <div className="text-lg font-black text-blue-700">+{totalVoApprovedTimeDays} {lang === 'ar' ? 'يوم عمل' : 'days'}</div>
-          <span className="text-[10px] text-blue-600 font-bold">{lang === 'ar' ? 'مربوط بشبكة CPM و TIA' : 'Linked to CPM & TIA'}</span>
-        </div>
-        <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
-          <span className="text-[11px] text-slate-400 block mb-1">
-            {lang === 'ar' ? 'المعتمد فعلياً حتى تاريخ البيانات' : 'Certified actual to Data Date'}
-          </span>
-          <div className="text-lg font-black text-slate-900">{totalCertifiedGross.toLocaleString()} SAR</div>
-          <span className="text-[10px] text-slate-500 font-bold">
-            {lang === 'ar'
-              ? `${ipcSummary.certifiedCount} مستخلص فعلي · ${ipcSummary.excludedCount} معلق/مخطط (متوقع +${ipcSummary.forecastCurrentTotal.toLocaleString()} SAR)`
-              : `${ipcSummary.certifiedCount} actual · ${ipcSummary.excludedCount} pending/forecast (+${ipcSummary.forecastCurrentTotal.toLocaleString()} SAR)`}
-          </span>
-        </div>
-        <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
-          <span className="text-[11px] text-slate-400 block mb-1">
-            {lang === 'ar' ? 'محتجز الضمان الفعلي (حسب العقود)' : 'Retention withheld (contractual)'}
-          </span>
-          {/* Summed from the certificates that count as actual — not a flat percentage of the total. */}
-          <div className="text-lg font-black text-amber-700">{totalRetentionWithheld.toLocaleString()} SAR</div>
-          <span className="text-[10px] text-amber-700 font-bold">
-            {lang === 'ar'
-              ? `مستخلصات الباطن: ${totalSubRetentionWithheld.toLocaleString()} SAR · مطالبات تغييرية معلقة: ${totalVoClaimedPendingCost.toLocaleString()} SAR`
-              : `Subcontractor IPCs: ${totalSubRetentionWithheld.toLocaleString()} SAR · pending VO claims: ${totalVoClaimedPendingCost.toLocaleString()} SAR`}
-          </span>
-        </div>
-      </div>
+      )}
 
-      {(ipcSummary.mismatchedCount > 0 || ipcSummary.contradictionsCount > 0 || subIpcSummary.mismatchedCount > 0 || subIpcSummary.contradictionsCount > 0) && (
+      {activeTab !== 'vos' && (ipcSummary.mismatchedCount > 0 || ipcSummary.contradictionsCount > 0 || subIpcSummary.mismatchedCount > 0 || subIpcSummary.contradictionsCount > 0) && (
         <div className="p-3 rounded-xl border border-rose-300 bg-rose-50 text-[11px] font-bold text-rose-900 flex flex-wrap items-center gap-3">
           <span className="flex items-center gap-1.5">
             <AlertCircle size={14} className="text-rose-600" />
@@ -1560,269 +1389,7 @@ export default function PaymentCertificatesView({ project }: PaymentCertificates
         </div>
       )}
 
-      {/* TAB 3: Variation Orders Log */}
-      {activeTab === 'vos' && (
-        <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden space-y-4 p-5">
-          <div className="flex flex-wrap items-center justify-between gap-4 border-b pb-3">
-            <div>
-              <div className="flex items-center gap-2">
-                <FileText size={16} className="text-amber-600" />
-                <h3 className="text-sm font-bold text-slate-900">
-                  {lang === 'ar' ? 'سجل الأوامر التغييرية والمطالبات المالية (Variation Orders Log)' : 'Variation Orders Log'}
-                </h3>
-                <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-300">
-                  {lang === 'ar' ? 'مربوط آلياً بالجداول والميزانية و TIA' : 'Linked to Schedule, Cost & TIA'}
-                </span>
-              </div>
-              <p className="text-xs text-slate-500 mt-0.5">
-                {lang === 'ar'
-                  ? 'رصد ومتابعة التغييرات الهندسية والتعاقدية وأثرها المالي (زيادة ميزانية العقد) والزمني (تمديد مسار CPM) على المشروع.'
-                  : 'Track engineering change requests, approved cost, and schedule duration impact linked to CPM and Budget.'}
-              </p>
-            </div>
-
-            <button
-              onClick={() => setShowAddVoModal(true)}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold transition-all shadow-sm cursor-pointer"
-            >
-              <Plus size={14} />
-              <span>{lang === 'ar' ? 'تسجيل أمر تغييري جديد' : 'New Variation Order'}</span>
-            </button>
-          </div>
-
-          {/* Direct Linkage Infographic Bar */}
-          <div className="p-3.5 bg-blue-50/80 border border-blue-200 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs text-blue-950">
-            <div className="flex items-center gap-2">
-              <span className="w-2 h-2 rounded-full bg-blue-600 animate-ping" />
-              <span className="font-bold">
-                {lang === 'ar' ? 'التكامل التلقائي للأوامر التغييرية:' : 'Variation Order Bidirectional Linkage:'}
-              </span>
-            </div>
-            <div className="flex flex-wrap items-center gap-3 font-mono text-[11px]">
-              <span className="bg-white px-2 py-0.5 rounded border border-blue-200">
-                📊 {lang === 'ar' ? 'الميزانية المعدلة (BAC):' : 'Revised BAC:'} {revisedContractValueLabel}
-              </span>
-              <span className="bg-white px-2 py-0.5 rounded border border-blue-200">
-                ⏱ {lang === 'ar' ? 'التمديد الزمني:' : 'Total EOT:'} +{totalVoApprovedTimeDays} {lang === 'ar' ? 'يوم' : 'days'}
-              </span>
-              <span className="bg-white px-2 py-0.5 rounded border border-blue-200">
-                🔗 {lang === 'ar' ? 'شبكة CPM:' : 'CPM Network:'} {lang === 'ar' ? 'محدثة تلقائياً' : 'Auto-synced'}
-              </span>
-              {/* Chronology (GAP-021): only approvals dated on or before the Data Date are counted;
-                  live claims are shown separately and stay out of the revised contract value. */}
-              <span className="bg-white px-2 py-0.5 rounded border border-emerald-300 text-emerald-900">
-                📅 {lang === 'ar' ? `معتمد حتى ${dataDate}:` : `Approved by ${dataDate}:`} {approvedVariationOrders.length} ·{' '}
-                {totalVoApprovedCost.toLocaleString()} SAR
-              </span>
-              <span className="bg-white px-2 py-0.5 rounded border border-amber-300 text-amber-900">
-                ⏳ {lang === 'ar' ? 'مطالبات معلقة (خارج الإجمالي):' : 'Pending claims (excluded):'}{' '}
-                {pendingVariationOrders.length} · {totalVoClaimedPendingCost.toLocaleString()} SAR
-              </span>
-            </div>
-          </div>
-
-          <div className="overflow-x-auto">
-            <table className="w-full text-xs">
-              <thead className="bg-slate-50 text-slate-700 border-b font-bold">
-                <tr>
-                  <th className="p-3 text-right">{lang === 'ar' ? 'رقم الأمر' : 'VO No.'}</th>
-                  <th className="p-3 text-right">{lang === 'ar' ? 'عنوان وبيان التغيير' : 'Title & Description'}</th>
-                  <th className="p-3 text-right">{lang === 'ar' ? 'النشاط المربوط في CPM' : 'Linked Activity'}</th>
-                  <th className="p-3 text-center">{lang === 'ar' ? 'تاريخ التقديم' : 'Submission Date'}</th>
-                  <th className="p-3 text-center">{lang === 'ar' ? 'تاريخ الاعتماد / السريان' : 'Approval / Impact Date'}</th>
-                  <th className="p-3 text-center">{lang === 'ar' ? 'الأثر المالي (المعتمد)' : 'Approved Cost'}</th>
-                  <th className="p-3 text-center">{lang === 'ar' ? 'الأثر الزمني (EOT)' : 'Time Impact'}</th>
-                  <th className="p-3 text-center">{lang === 'ar' ? 'الحالة والاعتماد' : 'Status'}</th>
-                  <th className="p-3 text-center">{lang === 'ar' ? 'إجراء' : 'Action'}</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100">
-                {variationOrders.map((vo) => (
-                  <tr key={vo.id} className="hover:bg-slate-50 transition-colors">
-                    <td className="p-3 font-mono font-bold text-amber-800">{vo.voNumber}</td>
-                    <td className="p-3 max-w-sm">
-                      <div className="font-bold text-slate-800">{vo.title}</div>
-                      <div className="text-[11px] text-slate-500 line-clamp-1 mt-0.5">{vo.description}</div>
-                    </td>
-                    <td className="p-3">
-                      <span className="font-mono font-bold text-blue-700 bg-blue-50 px-2 py-0.5 rounded border border-blue-200 text-[11px]">
-                        {vo.impactedActivityCode || 'ACT-03'}
-                      </span>
-                    </td>
-                    <td className="p-3 text-center font-mono text-slate-600 whitespace-nowrap">
-                      <span className="px-2 py-0.5 rounded bg-slate-100 font-semibold text-[11px]">
-                        {/* A missing submission date is shown as missing: no date is invented. */}
-                        {vo.submissionDate || (lang === 'ar' ? 'غير مُقدّم (N/A)' : 'Not submitted (N/A)')}
-                      </span>
-                    </td>
-                    <td className="p-3 text-center font-mono whitespace-nowrap">
-                      {vo.status === 'approved' && vo.approvalDate ? (
-                        <span className="px-2 py-0.5 rounded bg-emerald-50 text-emerald-800 border border-emerald-200 font-bold text-[11px]">
-                          ✓ {vo.approvalDate}
-                        </span>
-                      ) : (
-                        <span className="text-slate-400 text-[10px]">
-                          {lang === 'ar' ? 'بانتظار الاعتماد' : 'Pending Approval'}
-                        </span>
-                      )}
-                    </td>
-                    <td className="p-3 text-center font-mono">
-                      <div className="font-bold text-emerald-700">{vo.approvedCostSar.toLocaleString()} SAR</div>
-                      <div className="text-[10px] text-slate-400">({vo.claimedCostSar.toLocaleString()} SAR)</div>
-                    </td>
-                    <td className="p-3 text-center font-mono font-bold text-blue-700">
-                      +{vo.approvedTimeDays} {lang === 'ar' ? 'يوم' : 'd'}
-                    </td>
-                    <td className="p-3 text-center">
-                      <span
-                        className={`px-2.5 py-1 rounded-full text-[10px] font-bold ${
-                          vo.status === 'approved'
-                            ? 'bg-emerald-100 text-emerald-800'
-                            : vo.status === 'pending_review'
-                            ? 'bg-amber-100 text-amber-800'
-                            : 'bg-rose-100 text-rose-800'
-                        }`}
-                      >
-                        {vo.status === 'approved' ? 'معتمد (Approved)' : vo.status === 'pending_review' ? 'قيد المراجعة' : 'مرفوض'}
-                      </span>
-                    </td>
-                    <td className="p-3 text-center">
-                      <button
-                        onClick={() => handleToggleVoStatus(vo.id)}
-                        className="px-2.5 py-1 rounded bg-slate-100 hover:bg-slate-200 text-slate-800 font-bold text-[10px] cursor-pointer"
-                        title={lang === 'ar' ? 'تبديل حالة الاعتماد وإعادة حساب الأثر المالي والزمني' : 'Toggle status'}
-                      >
-                        {lang === 'ar' ? 'تغيير الحالة ↺' : 'Toggle ↺'}
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
-
-      {/* Add VO Modal */}
-      {showAddVoModal && (
-        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
-          <div className="bg-white rounded-xl max-w-lg w-full p-6 space-y-4 shadow-xl text-xs">
-            <h3 className="text-base font-bold text-slate-900 border-b pb-2">
-              {lang === 'ar' ? 'تسجيل أمر تغييري وربطه بالجدول والميزانية' : 'Register New Variation Order'}
-            </h3>
-
-            <div className="space-y-3">
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-slate-600 font-bold mb-1">{lang === 'ar' ? 'رقم الأمر التغييري' : 'VO Number'}</label>
-                  <input
-                    type="text"
-                    value={newVoForm.voNumber}
-                    onChange={(e) => setNewVoForm({ ...newVoForm, voNumber: e.target.value })}
-                    className="w-full p-2 border rounded-lg font-mono font-bold"
-                  />
-                </div>
-                <div>
-                  <label className="block text-slate-600 font-bold mb-1">{lang === 'ar' ? 'النشاط المرتبط في الجدول (CPM Activity)' : 'Linked Activity'}</label>
-                  <select
-                    value={newVoForm.impactedActivityCode}
-                    onChange={(e) => setNewVoForm({ ...newVoForm, impactedActivityCode: e.target.value })}
-                    className="w-full p-2 border rounded-lg bg-white font-mono font-bold"
-                  >
-                    <option value="ACT-01">ACT-01 - أعمال الحفريات وتجهيز الموقع</option>
-                    <option value="ACT-02">ACT-02 - لبشة الأساسات الخرسانية</option>
-                    <option value="ACT-03">ACT-03 - أعمدة وجدران القص للدور الأرضي</option>
-                    <option value="ACT-04">ACT-04 - سقف الدور الأرضي</option>
-                    <option value="ACT-05">ACT-05 - أعمدة الدور الأول</option>
-                    <option value="ACT-06">ACT-06 - سقف الدور الأول</option>
-                    <option value="ACT-10">ACT-10 - الواجهات الزجاجية والكلادينج</option>
-                    <option value="ACT-11">ACT-11 - وحدات التكييف وشبكات MEP</option>
-                  </select>
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-slate-600 font-bold mb-1">{lang === 'ar' ? 'عنوان وبيان أمر التغيير' : 'Title & Description'}</label>
-                <input
-                  type="text"
-                  placeholder="مثال: إضافة أعمال إنشائية إضافية أو تعديل تصاميم"
-                  value={newVoForm.title}
-                  onChange={(e) => setNewVoForm({ ...newVoForm, title: e.target.value })}
-                  className="w-full p-2 border rounded-lg font-semibold"
-                />
-              </div>
-
-              <div>
-                <label className="block text-slate-600 font-bold mb-1">{lang === 'ar' ? 'تفاصيل التغيير الفني والتعاقدي' : 'Details'}</label>
-                <textarea
-                  rows={2}
-                  value={newVoForm.description}
-                  onChange={(e) => setNewVoForm({ ...newVoForm, description: e.target.value })}
-                  className="w-full p-2 border rounded-lg text-xs"
-                  placeholder="بيان المبررات الهندسية والمراسلات المرجعية..."
-                />
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-slate-600 font-bold mb-1">{lang === 'ar' ? 'تاريخ التقديم (Submission Date)' : 'Submission Date'}</label>
-                  <input
-                    type="date"
-                    value={newVoForm.submissionDate}
-                    onChange={(e) => setNewVoForm({ ...newVoForm, submissionDate: e.target.value })}
-                    className="w-full p-2 border rounded-lg font-mono"
-                  />
-                </div>
-                <div>
-                  <label className="block text-slate-600 font-bold mb-1">{lang === 'ar' ? 'تاريخ الاعتماد / سريان الأثر' : 'Approval / Effective Date'}</label>
-                  <input
-                    type="date"
-                    value={newVoForm.approvalDate}
-                    onChange={(e) => setNewVoForm({ ...newVoForm, approvalDate: e.target.value })}
-                    className="w-full p-2 border rounded-lg font-mono text-emerald-800 font-bold"
-                  />
-                </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-slate-600 font-bold mb-1">{lang === 'ar' ? 'الأثر المالي المعتمد (SAR)' : 'Approved Cost (SAR)'}</label>
-                  <input
-                    type="number"
-                    value={newVoForm.approvedCostSar}
-                    onChange={(e) => setNewVoForm({ ...newVoForm, approvedCostSar: Number(e.target.value) })}
-                    className="w-full p-2 border rounded-lg font-mono font-bold text-emerald-700"
-                  />
-                </div>
-                <div>
-                  <label className="block text-slate-600 font-bold mb-1">{lang === 'ar' ? 'التمديد الزمني المعتمد (أيام)' : 'Approved Time (Days)'}</label>
-                  <input
-                    type="number"
-                    value={newVoForm.approvedTimeDays}
-                    onChange={(e) => setNewVoForm({ ...newVoForm, approvedTimeDays: Number(e.target.value) })}
-                    className="w-full p-2 border rounded-lg font-mono font-bold text-blue-700"
-                  />
-                </div>
-              </div>
-            </div>
-
-            <div className="flex justify-end gap-2 pt-3 border-t">
-              <button
-                onClick={() => setShowAddVoModal(false)}
-                className="px-4 py-2 border rounded-lg text-slate-600 font-bold cursor-pointer"
-              >
-                {lang === 'ar' ? 'إلغاء' : 'Cancel'}
-              </button>
-              <button
-                onClick={handleAddNewVo}
-                className="px-4 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-lg shadow-sm cursor-pointer"
-              >
-                {lang === 'ar' ? 'حفظ وربط مع الجدول والميزانية' : 'Save & Link to CPM/Budget'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      {activeTab === 'vos' && <ScopeChangeRegister project={project} />}
     </div>
   );
 }

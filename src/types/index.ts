@@ -389,9 +389,14 @@ export interface ProjectBaseline {
   name?: string;
   /** SQL `status text NOT NULL DEFAULT 'draft'` with a CHECK constraint. */
   status: BaselineStatus;
-  /** SQL `approved_at timestamptz`, nullable — stamped when the baseline is approved. */
+  /** Existing schedule-baseline approval timestamp; scope approvals use the same header. */
   approved_at?: string | null;
-  /** SQL `is_active boolean NOT NULL DEFAULT true`. */
+  /** SQL `baseline_kind`: schedule, scope-only, or integrated schedule/scope snapshot. */
+  baseline_kind?: 'schedule' | 'scope' | 'integrated';
+  /** Explicit approval evidence stored on the same immutable baseline revision. */
+  approved_by?: string | null;
+  approval_reference?: string | null;
+  /** SQL `is_active boolean NOT NULL DEFAULT true` remains the schedule-baseline selector. */
   is_active: boolean;
   /** SQL `created_at timestamptz DEFAULT now()`. */
   created_at: string;
@@ -1263,20 +1268,115 @@ export interface PaymentCertificate {
   items: PaymentCertificateItem[];
 }
 
+export type VariationOrderStatus = 'draft' | 'submitted' | 'under_review' | 'approved' | 'rejected' | 'withdrawn';
+export type VariationOrderCause = 'client_request' | 'design_change' | 'site_condition' | 'authority_requirement' | 'other';
+
+/** Persisted scope-change header. Approved/rejected/withdrawn rows are terminal and read-only. */
 export interface VariationOrder {
   id: string;
-  voNumber: string; // e.g. "VO-001"
+  project_id: string;
+  vo_number: string;
   title: string;
   description: string;
-  reason: 'client_request' | 'design_change' | 'site_condition' | 'authority_requirement';
-  claimedCostSar: number;
-  approvedCostSar: number;
-  claimedTimeDays: number;
-  approvedTimeDays: number;
-  status: 'pending_review' | 'approved' | 'rejected' | 'negotiation';
-  submissionDate: string;
-  approvalDate?: string;
-  impactedActivityCode?: string;
+  cause: VariationOrderCause;
+  source: string;
+  source_reference: string | null;
+  status: VariationOrderStatus;
+  requested_date: string;
+  requested_by: string;
+  submitted_at: string | null;
+  approval_date: string | null;
+  approved_by: string | null;
+  approval_reference: string | null;
+  approval_evidence_reference: string | null;
+  rejection_date: string | null;
+  rejected_by: string | null;
+  rejection_reference: string | null;
+  rejection_reason: string | null;
+  withdrawn_date: string | null;
+  withdrawn_by: string | null;
+  withdrawal_reason: string | null;
+  /** Recorded only as VO evidence; this batch does not feed CPM, TIA or EOT calculations. */
+  schedule_impact_days: number | null;
+  schedule_impact_reference: string | null;
+  notes: string | null;
+  /** Corrective revisions create a new VO linked to the terminal historical row. */
+  revision_of_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Item-level change, preserving `null` (unquantified) separately from explicit zero. */
+export interface VariationOrderBoqImpact {
+  id: string;
+  project_id: string;
+  variation_order_id: string;
+  boq_item_id: string;
+  quantity_impact: number | null;
+  value_impact: number | null;
+  notes: string | null;
+}
+
+export interface VariationOrderWbsLink {
+  id: string;
+  project_id: string;
+  variation_order_id: string;
+  wbs_node_id: string;
+}
+
+export interface VariationOrderActivityLink {
+  id: string;
+  project_id: string;
+  variation_order_id: string;
+  activity_id: string;
+}
+
+export interface VariationOrderEvent {
+  id: string;
+  project_id: string;
+  variation_order_id: string;
+  event_type: string;
+  from_status: VariationOrderStatus | null;
+  to_status: VariationOrderStatus;
+  actor: string;
+  changed_at: string;
+  reference: string | null;
+  evidence_reference: string | null;
+  notes: string | null;
+  details?: Record<string, unknown>;
+}
+
+/** Immutable BOQ line snapshot attached to a `project_baselines` revision. */
+export interface BaselineBoqItem {
+  id: string;
+  project_id: string;
+  baseline_id: string;
+  source_boq_item_id: string | null;
+  item_code: string;
+  description: string;
+  unit: string | null;
+  original_quantity: number | null;
+  original_unit_price: number | null;
+  original_value: number | null;
+  category: string | null;
+  section: string | null;
+  sort_order: number;
+}
+
+/** Immutable WBS scope snapshot attached to the same `project_baselines` revision. */
+export interface BaselineWbsNode {
+  id: string;
+  project_id: string;
+  baseline_id: string;
+  source_wbs_node_id: string | null;
+  source_parent_id: string | null;
+  parent_code: string | null;
+  node_code: string;
+  node_name: string;
+  level: number;
+  sort_order: number;
+  boq_item_id: string | null;
+  boq_code: string | null;
 }
 
 // Subcontractor Package & Subcontract BOQ Assignment Types

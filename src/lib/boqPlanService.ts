@@ -14,8 +14,8 @@
 // planned_cost: every generated assignment contributes NULL to the cost sum, and the
 // trigger preserves the stored cost when the whole sum is NULL (either insert order).
 //
-// Baseline: persist NEVER creates one. approveBoqBaseline() is the only path, and it
-// refuses unless the plan validation reports zero critical findings.
+// Baseline: persist NEVER creates one. Integrated BOQ-plan and scope-only approvals use the
+// atomic evidence-gated `project_baselines` RPC; imported plans are refused on critical findings.
 // =====================================================================================
 
 import type { BoqPlan } from "./boqPlanningEngine";
@@ -27,6 +27,7 @@ export interface BoqDbClient {
       eq(col: string, val: string): Promise<{ data: unknown; error: { message: string } | null }>;
     };
   };
+  rpc(name: string, params: Record<string, unknown>): Promise<{ data: unknown; error: { message: string } | null }>;
 }
 
 export interface BoqPersistPlan {
@@ -72,6 +73,12 @@ function uuid(): string {
     const r = (Math.random() * 16) | 0;
     return (c === "x" ? r : (r & 0x3) | 0x8).toString(16);
   });
+}
+
+function isValidDateOnly(value: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
 }
 
 export interface BoqProjectInput {
@@ -312,19 +319,86 @@ export interface BoqBaselineEligibility {
   criticalCount: number;
 }
 
+export interface ScopeBaselineApprovalEvidence {
+  approvedBy: string;
+  approvalReference: string;
+  approvedAt: string;
+}
+
+interface ScopeBaselineRpcResult {
+  baseline_id?: string;
+  version?: number;
+  activity_count?: number;
+}
+
+async function approveScopeBaselineRevision(
+  client: BoqDbClient,
+  projectId: string,
+  evidence: ScopeBaselineApprovalEvidence,
+  name: string,
+  activities: Array<Record<string, unknown>>,
+  expectedVersion?: number,
+): Promise<BoqBaselineResult> {
+  if (!projectId || !evidence.approvedBy.trim() || !evidence.approvalReference.trim()
+      || !isValidDateOnly(evidence.approvedAt)) {
+    return {
+      ok: false,
+      error: 'Scope baseline approval requires a project, approver, valid approval date and evidence reference.',
+      baselineId: null,
+      version: null,
+      activityCount: 0,
+    };
+  }
+  try {
+    const { data, error } = await client.rpc('approve_project_scope_baseline', {
+      p_project_id: projectId,
+      p_name: name,
+      p_approval_reference: evidence.approvalReference.trim(),
+      p_approved_by: evidence.approvedBy.trim(),
+      p_approved_at: `${evidence.approvedAt}T00:00:00.000Z`,
+      p_activity_rows: activities,
+      p_expected_version: expectedVersion ?? null,
+    });
+    if (error) throw new Error(`approve_project_scope_baseline: ${error.message}`);
+    const result = (data && typeof data === 'object' ? data : {}) as ScopeBaselineRpcResult;
+    if (!result.baseline_id || typeof result.version !== 'number') {
+      throw new Error('approve_project_scope_baseline returned no baseline revision');
+    }
+    return {
+      ok: true,
+      error: null,
+      baselineId: result.baseline_id,
+      version: result.version,
+      activityCount: typeof result.activity_count === 'number' ? result.activity_count : activities.length,
+    };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message, baselineId: null, version: null, activityCount: 0 };
+  }
+}
+
+/** Create an approved scope-only revision through the existing `project_baselines` authority. */
+export async function approveScopeBaseline(
+  client: BoqDbClient,
+  projectId: string,
+  evidence: ScopeBaselineApprovalEvidence,
+  name = 'Approved Scope Baseline',
+): Promise<BoqBaselineResult> {
+  return approveScopeBaselineRevision(client, projectId, evidence, name, []);
+}
+
 export async function approveBoqBaseline(
   client: BoqDbClient,
   projectId: string,
   activities: Array<{ activity_id: string; planned_start: string | null; planned_finish: string | null; duration_days: number; planned_cost: number; total_float_days?: number | null }>,
   // F5: optional per-activity total float captured at approval for float-change analysis.
   eligibility: BoqBaselineEligibility,
+  evidence: ScopeBaselineApprovalEvidence,
   version = 1,
-  name = "Initial Baseline"
+  name = 'Initial Baseline',
 ): Promise<BoqBaselineResult> {
-  // F2.1 defense in depth: the service refuses on its own authority, before any
-  // INSERT, so no caller (present UI or future) can baseline an invalid plan.
+  // F2.1 defense in depth: the service refuses on its own authority before the atomic RPC.
   if (!eligibility || eligibility.canApproveBaseline !== true) {
-    const criticals = eligibility && typeof eligibility.criticalCount === "number" ? eligibility.criticalCount : "unknown";
+    const criticals = eligibility && typeof eligibility.criticalCount === 'number' ? eligibility.criticalCount : 'unknown';
     return {
       ok: false,
       error: `Baseline approval refused: plan is not eligible (critical failures: ${criticals}). Resolve critical validation findings first.`,
@@ -333,30 +407,16 @@ export async function approveBoqBaseline(
       activityCount: 0,
     };
   }
-  try {
-    const header = {
-      id: uuid(), project_id: projectId, version, name,
-      status: "approved", approved_at: new Date().toISOString(), is_active: true,
-    };
-    const { error: hErr } = await client.from("project_baselines").insert(header);
-    if (hErr) throw new Error(`project_baselines: ${hErr.message}`);
-    const rows = activities.map((a) => ({
-      id: uuid(),
-      baseline_id: header.id,
-      activity_id: a.activity_id,
-      early_start: a.planned_start,
-      early_finish: a.planned_finish,
-      duration_days: a.duration_days,
-      planned_cost: a.planned_cost,
-      // F5 additive: baseline float capture; absent (legacy callers) persists as NULL.
-      total_float: typeof a.total_float_days === 'number' && Number.isFinite(a.total_float_days) ? a.total_float_days : null,
-    }));
-    if (rows.length > 0) {
-      const { error: rErr } = await client.from("baseline_activities").insert(rows);
-      if (rErr) throw new Error(`baseline_activities: ${rErr.message}`);
-    }
-    return { ok: true, error: null, baselineId: header.id as string, version, activityCount: rows.length };
-  } catch (e) {
-    return { ok: false, error: (e as Error).message, baselineId: null, version: null, activityCount: 0 };
-  }
+  const rows = activities.map((activity) => ({
+    activity_id: activity.activity_id,
+    early_start: activity.planned_start,
+    early_finish: activity.planned_finish,
+    duration_days: activity.duration_days,
+    planned_cost: activity.planned_cost,
+    // F5 additive: preserve a missing float as NULL, not zero.
+    total_float: typeof activity.total_float_days === 'number' && Number.isFinite(activity.total_float_days)
+      ? activity.total_float_days
+      : null,
+  }));
+  return approveScopeBaselineRevision(client, projectId, evidence, name, rows, version);
 }

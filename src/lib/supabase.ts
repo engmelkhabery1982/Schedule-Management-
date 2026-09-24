@@ -7,6 +7,11 @@ import {
   checkControlRecordProjectBoundary,
   unimplementedRpcError,
 } from './demoDbContracts';
+import {
+  applyApproveProjectScopeBaseline,
+  applySaveVariationOrderDraft,
+  applyTransitionVariationOrder,
+} from './scopeChangeDbContracts';
 
 const envUrl = import.meta.env?.VITE_SUPABASE_URL;
 const envAnonKey = import.meta.env?.VITE_SUPABASE_ANON_KEY;
@@ -360,6 +365,21 @@ const mockRpc = async (fnName: string, params: any) => {
   if (fnName === 'apply_resource_leveling_scenario') {
     const result = applyResourceLevelingScenario(db, params);
     // All input snapshots and canonical CPM rows are validated before one local store replacement.
+    if (!result.error) saveDb(db);
+    return result;
+  }
+  if (fnName === 'approve_project_scope_baseline') {
+    const result = applyApproveProjectScopeBaseline(db, params);
+    if (!result.error) saveDb(db);
+    return result;
+  }
+  if (fnName === 'save_variation_order_draft') {
+    const result = applySaveVariationOrderDraft(db, params);
+    if (!result.error) saveDb(db);
+    return result;
+  }
+  if (fnName === 'transition_variation_order') {
+    const result = applyTransitionVariationOrder(db, params);
     if (!result.error) saveDb(db);
     return result;
   }

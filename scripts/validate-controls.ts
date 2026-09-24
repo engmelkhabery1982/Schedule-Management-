@@ -20,6 +20,8 @@
  *   S13 determinism of the full pipeline            (acceptance J)
  *   S17 Controlled Pilot defects                    (F9.4: EVM reconciliation, cost-approval
  *                                                    persistence, F5 baseline/delay, critical count)
+ *   S28 Launch Batch 3A                              (immutable BOQ/WBS scope baseline, VO lifecycle,
+ *                                                    null-vs-zero impacts, traceability, evidence and file boundary)
  *
  * Expectations are either independently hand-computed (refWdDelta replicates the documented
  * inclusive working-day convention on purpose) or exact quotes of the source engine's output —
@@ -124,16 +126,37 @@ import {
   summarizeSimulationControlKpis,
 } from '@/lib/complexScenarioSimulator';
 import type {
-  Activity, ActivityBoqAllocation, ActivityLink, ActivityResource, BaselineActivity, BoqItem, BudgetLine,
+  Activity, ActivityBoqAllocation, ActivityLink, ActivityResource, BaselineActivity, BaselineBoqItem, BoqItem, BudgetLine,
   ComplexScenarioModel, ComplexScenarioResult, CostControlSnapshot, CostTransaction, DelayClaimEvent, ParsedBoqRow,
-  Project, ProgressUpdate, Resource, ScenarioSensitivityTornado, ScheduleUpdateSnapshot, WbsNode,
+  Project, ProgressUpdate, Resource, ScenarioSensitivityTornado, ScheduleUpdateSnapshot, VariationOrder, VariationOrderBoqImpact, WbsNode,
 } from '@/types';
+import { calculateScopeSummary, getScopeItemMetrics, sumKnownImpacts, sumOriginalScopeValue } from '@/lib/scopeChangeEngine';
+import {
+  applyApproveProjectScopeBaseline,
+  applySaveVariationOrderDraft,
+  applyTransitionVariationOrder,
+} from '@/lib/scopeChangeDbContracts';
 
 // ---------------------------------------------------------------------------
 // Assertion helpers
 // ---------------------------------------------------------------------------
 let failures = 0;
 let checks = 0;
+
+// Batch 3A owns only the existing baseline/VO governance paths below. Later-closed batch tests
+// subtract these paths from their global diff sets, while S28 checks this exact boundary.
+const BATCH3A_GOVERNANCE_PATHS = new Set([
+  'src/components/views/ImportView.tsx',
+  'src/components/views/PaymentCertificatesView.tsx',
+  'src/components/views/ScopeChangeRegister.tsx',
+  'src/lib/boqPlanService.ts',
+  'src/lib/scopeChangeEngine.ts',
+  'src/lib/scopeChangeDbContracts.ts',
+  'src/lib/supabase.ts',
+  'src/types/index.ts',
+  'scripts/validate-controls.ts',
+  'supabase/migrations/20260924140000_scope_baseline_change_governance.sql',
+]);
 function eq(name: string, actual: unknown, expected: unknown): void {
   checks += 1;
   const a = JSON.stringify(actual);
@@ -4571,7 +4594,8 @@ console.log('--- S18 Pilot Closure (F9.5)');
     'src/lib/supabase.ts',
     'supabase/migrations/20260924130000_atomic_resource_leveling_apply.sql',
   ]);
-  const s24ChangedPaths = [...changedPaths].filter((path) => !batch2bTiaPaths.has(path) && !batch2cResourcePaths.has(path));
+  const s24ChangedPaths = [...changedPaths].filter((path) =>
+    !batch2bTiaPaths.has(path) && !batch2cResourcePaths.has(path) && !BATCH3A_GOVERNANCE_PATHS.has(path));
   const protectedControlPaths = [
     'src/lib/scheduleControlEngine.ts',
     'src/lib/costControlEngine.ts',
@@ -5388,7 +5412,8 @@ console.log('--- S18 Pilot Closure (F9.5)');
     'src/lib/supabase.ts',
     'supabase/migrations/20260924130000_atomic_resource_leveling_apply.sql',
   ]);
-  const s26ChangedPaths = [...batch2bChangedPaths].filter((path) => !batch2cTiaExclusions.has(path));
+  const s26ChangedPaths = [...batch2bChangedPaths].filter((path) =>
+    !batch2cTiaExclusions.has(path) && !BATCH3A_GOVERNANCE_PATHS.has(path));
   ok('S26 changed files stay within TIA engine/view, directly required types, and regression harness',
     s26ChangedPaths.every((path) => allowedBatch2bPaths.has(path)));
   const protectedBatch2bPaths = [
@@ -5736,8 +5761,9 @@ console.log('--- S18 Pilot Closure (F9.5)');
     'src/lib/supabase.ts',
     'supabase/migrations/20260924130000_atomic_resource_leveling_apply.sql',
   ]);
+  const s27ChangedPaths = [...changedPaths].filter((path) => !BATCH3A_GOVERNANCE_PATHS.has(path));
   ok('S27 changes stay within Batch 2C resource-leveling, required types/tests, and atomic Apply support',
-    [...changedPaths].every((path) => allowedBatch2cPaths.has(path)));
+    s27ChangedPaths.every((path) => allowedBatch2cPaths.has(path)));
   const protectedUnchanged = [
     'src/lib/scheduleControlEngine.ts', 'src/lib/costControlEngine.ts', 'src/lib/integratedDecisionEngine.ts',
     'src/lib/cpmEngine.ts', 'src/lib/calendarEngine.ts', 'src/lib/boqResourceLeveling.ts',
@@ -5749,6 +5775,334 @@ console.log('--- S18 Pilot Closure (F9.5)');
   ];
   ok('S27 Recovery/TIA/F5/F6/F7/CPM/calendar/BOQ/dashboard/report/seed remain unchanged',
     protectedUnchanged.every((path) => !changedPaths.has(path)));
+}
+
+// ---------------------------------------------------------------------------
+// S28 — Launch Batch 3A: immutable scope baseline + governed variation orders.
+// ---------------------------------------------------------------------------
+{
+  console.log('--- S28 Launch Batch 3A scope baseline + change governance');
+  const scopeMigration = readFileSync(resolvePath(process.cwd(), 'supabase/migrations/20260924140000_scope_baseline_change_governance.sql'), 'utf8');
+  const scopeRegister = readFileSync(resolvePath(process.cwd(), 'src/components/views/ScopeChangeRegister.tsx'), 'utf8');
+  const paymentView = readFileSync(resolvePath(process.cwd(), 'src/components/views/PaymentCertificatesView.tsx'), 'utf8');
+  const boqBaselineService = readFileSync(resolvePath(process.cwd(), 'src/lib/boqPlanService.ts'), 'utf8');
+  const scopeNow = '2026-09-24T12:00:00.000Z';
+  const scopeProjectId = 'scope-project-1';
+  const scopeDb: DemoDb = {
+    projects: [{ id: scopeProjectId }],
+    boq_items: [
+      { id: 'scope-boq-1', project_id: scopeProjectId, code: 'B-001', description: 'Concrete', unit: 'm3', quantity: 10, unit_price: 5, total_price: 50, category: 'Civil', section: 'A', sort_order: 1 },
+      { id: 'scope-boq-2', project_id: scopeProjectId, code: 'B-002', description: 'Steel', unit: 't', quantity: 4, unit_price: 20, total_price: 80, category: 'Civil', section: 'A', sort_order: 2 },
+    ],
+    wbs_nodes: [
+      { id: 'scope-wbs-1', project_id: scopeProjectId, parent_id: null, code: 'W-01', name: 'Substructure', level: 1, sort_order: 1, boq_item_id: 'scope-boq-1' },
+      { id: 'scope-wbs-2', project_id: scopeProjectId, parent_id: 'scope-wbs-1', code: 'W-01.01', name: 'Concrete works', level: 2, sort_order: 2, boq_item_id: 'scope-boq-1' },
+    ],
+    activities: [
+      { id: 'scope-act-1', project_id: scopeProjectId, code: 'A-01', name: 'Pour concrete' },
+      { id: 'scope-act-2', project_id: scopeProjectId, code: 'A-02', name: 'Install steel' },
+    ],
+    activity_boq_allocations: [
+      { id: 'alloc-1', project_id: scopeProjectId, activity_id: 'scope-act-1', boq_item_id: 'scope-boq-1', quantity_share: 10, cost_share: 50, allocation_basis: 'BOQ' },
+    ],
+    project_baselines: [],
+    baseline_activities: [],
+  };
+  const originalBoqRows = JSON.stringify(scopeDb.boq_items);
+  const missingBaselineEvidence = applyApproveProjectScopeBaseline(scopeDb, {
+    p_project_id: scopeProjectId,
+    p_name: 'Initial Scope Baseline',
+    p_approval_reference: '',
+    p_approved_by: 'Client PM',
+    p_approved_at: '2026-09-10T00:00:00.000Z',
+    p_activity_rows: [],
+    p_expected_version: 1,
+  }, scopeNow);
+  ok('S28 baseline approval refuses missing evidence before writing', Boolean(missingBaselineEvidence.error));
+  eq('S28 failed baseline approval leaves contracted BOQ rows byte-for-byte unchanged', JSON.stringify(scopeDb.boq_items), originalBoqRows);
+  const invalidBaselineDate = applyApproveProjectScopeBaseline(scopeDb, {
+    p_project_id: scopeProjectId,
+    p_name: 'Invalid Date Baseline',
+    p_approval_reference: 'BASE-APP-INVALID-DATE',
+    p_approved_by: 'Client PM',
+    p_approved_at: '2026-02-31T00:00:00.000Z',
+    p_activity_rows: [],
+    p_expected_version: 1,
+  }, scopeNow);
+  ok('S28 baseline approval rejects a normalized-but-invalid calendar date', Boolean(invalidBaselineDate.error));
+  eq('S28 invalid baseline date leaves baseline history unchanged', (scopeDb.project_baselines || []).length, 0);
+
+  const baselineResult = applyApproveProjectScopeBaseline(scopeDb, {
+    p_project_id: scopeProjectId,
+    p_name: 'Initial Scope Baseline',
+    p_approval_reference: 'BASE-APP-001',
+    p_approved_by: 'Client PM',
+    p_approved_at: '2026-09-10T00:00:00.000Z',
+    p_activity_rows: [],
+    p_expected_version: 1,
+  }, scopeNow);
+  eq('S28 approved scope snapshot succeeds with dated approver/reference', baselineResult.error, null);
+  const baselineId1 = String((baselineResult.data as { baseline_id?: string } | null)?.baseline_id || '');
+  eq('S28 scope baseline uses project_baselines v1 without making it an F5 schedule baseline',
+    [(scopeDb.project_baselines || [])[0]?.version, (scopeDb.project_baselines || [])[0]?.status, (scopeDb.project_baselines || [])[0]?.baseline_kind, (scopeDb.project_baselines || [])[0]?.is_active],
+    [1, 'approved', 'scope', false]);
+  eq('S28 BOQ snapshot captures source quantity/value exactly once',
+    (scopeDb.baseline_boq_items || []).map((row) => [row.original_quantity, row.original_value]),
+    [[10, 50], [4, 80]]);
+  eq('S28 WBS scope is snapshotted against that same baseline header',
+    (scopeDb.baseline_wbs_nodes || []).map((row) => row.baseline_id),
+    [baselineId1, baselineId1]);
+  eq('S28 scope baseline approval does not write to the original BOQ source', JSON.stringify(scopeDb.boq_items), originalBoqRows);
+  eq('S28 original contract value uses the stored BOQ value basis',
+    sumOriginalScopeValue((scopeDb.baseline_boq_items || []) as unknown as BaselineBoqItem[]), 130);
+
+  const saveScopeDraft = (
+    voNumber: string,
+    boqLines: Array<Record<string, unknown>>,
+    revisionOfId: string | null = null,
+    wbsIds = ['scope-wbs-1', 'scope-wbs-2'],
+    activityIds = ['scope-act-1', 'scope-act-2'],
+  ) => applySaveVariationOrderDraft(scopeDb, {
+    p_project_id: scopeProjectId,
+    p_variation_order_id: null,
+    p_header: {
+      vo_number: voNumber,
+      title: `${voNumber} controlled change`,
+      description: 'Scope governance regression fixture',
+      cause: 'client_request',
+      source: 'Client instruction',
+      source_reference: 'SRC-001',
+      requested_date: '2026-09-11',
+      requested_by: 'Requester',
+      schedule_impact_days: null,
+      schedule_impact_reference: null,
+      notes: null,
+      revision_of_id: revisionOfId,
+    },
+    p_boq_impacts: boqLines,
+    p_wbs_ids: wbsIds,
+    p_activity_ids: activityIds,
+    p_actor: 'Requester',
+  }, scopeNow);
+  const transitionScopeVo = (
+    id: string,
+    expected: string,
+    next: string,
+    extras: Record<string, unknown> = {},
+  ) => applyTransitionVariationOrder(scopeDb, {
+    p_variation_order_id: id,
+    p_expected_status: expected,
+    p_next_status: next,
+    p_actor: 'Scope approver',
+    ...extras,
+  }, scopeNow);
+  const readScopeOrders = () => (scopeDb.variation_orders || []) as unknown as VariationOrder[];
+  const readScopeImpacts = () => (scopeDb.variation_order_boq_impacts || []) as unknown as VariationOrderBoqImpact[];
+  const readScopeBaselines = () => (scopeDb.baseline_boq_items || []) as unknown as BaselineBoqItem[];
+  const summarizeScope = () => calculateScopeSummary(readScopeBaselines(), readScopeOrders(), readScopeImpacts());
+
+  const vo1Draft = saveScopeDraft('VO-001', [
+    { boq_item_id: 'scope-boq-1', quantity_impact: 2, value_impact: 10, notes: 'Measured addition' },
+    { boq_item_id: 'scope-boq-2', quantity_impact: 0, value_impact: 0, notes: 'Explicit no-cost adjustment' },
+  ]);
+  eq('S28 VO draft save does not mutate source BOQ rows', JSON.stringify(scopeDb.boq_items), originalBoqRows);
+  const vo1Id = String(vo1Draft.data || '');
+  eq('S28 VO can trace multiple BOQ items', (scopeDb.variation_order_boq_impacts || []).filter((row) => row.variation_order_id === vo1Id).length, 2);
+  eq('S28 VO can trace multiple WBS nodes', (scopeDb.variation_order_wbs_links || []).filter((row) => row.variation_order_id === vo1Id).length, 2);
+  eq('S28 VO can trace multiple activities', (scopeDb.variation_order_activity_links || []).filter((row) => row.variation_order_id === vo1Id).length, 2);
+  const vo1CreateEvent = (scopeDb.variation_order_events || []).find((event) => event.variation_order_id === vo1Id);
+  ok('S28 audit event captures the draft header and linked-impact before/after details',
+    Boolean(vo1CreateEvent?.details && (vo1CreateEvent.details as Record<string, unknown>).after_boq_impacts));
+  eq('S28 draft changes remain pending exposure and do not revise approved scope',
+    summarizeScope(),
+    { originalContractValue: 130, approvedChangesValue: 0, revisedApprovedScopeValue: 130, pendingExposureValue: 10 });
+  const vo1Rows = readScopeOrders();
+  const firstScopeBaselineItems = readScopeBaselines();
+  const b2Snapshot = firstScopeBaselineItems.find((item) => item.source_boq_item_id === 'scope-boq-2');
+  ok('S28 explicit-zero quantity/value remain zero, not N/A',
+    sumKnownImpacts([0]) === 0
+      && getScopeItemMetrics(b2Snapshot!, vo1Rows, readScopeImpacts()).approvedQuantityImpact === 0
+      && getScopeItemMetrics(b2Snapshot!, vo1Rows, readScopeImpacts()).approvedValueImpact === 0);
+  eq('S28 any missing impact remains N/A, not zero', sumKnownImpacts([null]), null);
+
+  eq('S28 submitted transition is recorded', transitionScopeVo(vo1Id, 'draft', 'submitted').error, null);
+  eq('S28 under-review transition is recorded', transitionScopeVo(vo1Id, 'submitted', 'under_review').error, null);
+  eq('S28 pending/under-review still does not change revised approved scope', summarizeScope().revisedApprovedScopeValue, 130);
+  const vo1BeforeFailedApproval = JSON.stringify(scopeDb.variation_orders);
+  const missingVoEvidence = transitionScopeVo(vo1Id, 'under_review', 'approved', {
+    p_effective_date: '2026-09-15',
+    p_reference: 'APPROVAL-VO-001',
+    p_evidence_reference: '',
+  });
+  ok('S28 approval transition rejects missing evidence', Boolean(missingVoEvidence.error));
+  eq('S28 failed approval leaves VO state unchanged', JSON.stringify(scopeDb.variation_orders), vo1BeforeFailedApproval);
+  const invalidVoDate = transitionScopeVo(vo1Id, 'under_review', 'approved', {
+    p_effective_date: '2026-02-31',
+    p_reference: 'APPROVAL-VO-001',
+    p_evidence_reference: 'client-letter://APP-001',
+  });
+  ok('S28 VO approval rejects an invalid calendar date even when evidence exists', Boolean(invalidVoDate.error));
+  eq('S28 invalid-date approval leaves VO state unchanged', JSON.stringify(scopeDb.variation_orders), vo1BeforeFailedApproval);
+  eq('S28 explicit evidence allows approval', transitionScopeVo(vo1Id, 'under_review', 'approved', {
+    p_effective_date: '2026-09-15',
+    p_reference: 'APPROVAL-VO-001',
+    p_evidence_reference: 'client-letter://APP-001',
+  }).error, null);
+  eq('S28 revised approved scope is derived as original + approved impacts', summarizeScope().revisedApprovedScopeValue, 140);
+  eq('S28 approval does not rewrite original BOQ source quantities/values', JSON.stringify(scopeDb.boq_items), originalBoqRows);
+  const approvedB1 = readScopeBaselines().find((item) => item.source_boq_item_id === 'scope-boq-1')!;
+  const approvedItemMetrics = getScopeItemMetrics(approvedB1, readScopeOrders(), readScopeImpacts());
+  eq('S28 approved quantity impact is applied only to the revised item quantity',
+    [approvedItemMetrics.approvedQuantityImpact, approvedItemMetrics.revisedQuantity], [2, 12]);
+
+  const vo2Draft = saveScopeDraft('VO-002', [
+    { boq_item_id: 'scope-boq-1', quantity_impact: null, value_impact: null, notes: 'Unquantified pending request' },
+  ]);
+  const vo2Id = String(vo2Draft.data || '');
+  eq('S28 null pending item impact is N/A exposure, not numeric zero', summarizeScope().pendingExposureValue, null);
+  eq('S28 VO-002 submits with traceability', transitionScopeVo(vo2Id, 'draft', 'submitted').error, null);
+  eq('S28 rejection is a terminal, dated lifecycle outcome', transitionScopeVo(vo2Id, 'submitted', 'rejected', {
+    p_effective_date: '2026-09-17',
+    p_reference: 'REJECT-002',
+    p_notes: 'Not approved in this instruction',
+  }).error, null);
+  eq('S28 rejected VO is removed from pending exposure and approved scope remains unchanged',
+    [summarizeScope().pendingExposureValue, summarizeScope().revisedApprovedScopeValue], [0, 140]);
+
+  const vo3Draft = saveScopeDraft('VO-003', [
+    { boq_item_id: 'scope-boq-2', quantity_impact: null, value_impact: null, notes: 'Unquantified approved instruction' },
+  ]);
+  const vo3Id = String(vo3Draft.data || '');
+  transitionScopeVo(vo3Id, 'draft', 'submitted');
+  transitionScopeVo(vo3Id, 'submitted', 'under_review');
+  eq('S28 an approved but unquantified item impact makes revised scope N/A',
+    transitionScopeVo(vo3Id, 'under_review', 'approved', {
+      p_effective_date: '2026-09-18', p_reference: 'APPROVAL-VO-003', p_evidence_reference: 'client-letter://APP-003',
+    }).error,
+    null);
+  eq('S28 approved missing impact is not converted to zero in the derived contract scope',
+    [summarizeScope().approvedChangesValue, summarizeScope().revisedApprovedScopeValue], [null, null]);
+
+  const vo4Draft = saveScopeDraft('VO-004', [
+    { boq_item_id: 'scope-boq-1', quantity_impact: 1, value_impact: 20, notes: 'Withdrawn before review' },
+  ]);
+  const vo4Id = String(vo4Draft.data || '');
+  eq('S28 withdrawn draft is terminal and excluded from pending exposure', transitionScopeVo(vo4Id, 'draft', 'withdrawn', {
+    p_effective_date: '2026-09-19', p_notes: 'Superseded by a later instruction',
+  }).error, null);
+  eq('S28 withdrawn and rejected rows do not enter pending or approved exposure', summarizeScope().pendingExposureValue, 0);
+
+  const approvedStateBeforeMutation = JSON.stringify(scopeDb.variation_orders);
+  const eventsBeforeMutation = JSON.stringify(scopeDb.variation_order_events);
+  const approvedToggleAttempt = transitionScopeVo(vo1Id, 'approved', 'withdrawn', {
+    p_effective_date: '2026-09-20', p_notes: 'attempt to rewrite approved history',
+  });
+  ok('S28 terminal approved history cannot be toggled or rewritten', Boolean(approvedToggleAttempt.error));
+  eq('S28 failed terminal mutation appends no audit event', JSON.stringify(scopeDb.variation_order_events), eventsBeforeMutation);
+  const approvedEditAttempt = applySaveVariationOrderDraft(scopeDb, {
+    p_project_id: scopeProjectId,
+    p_variation_order_id: vo1Id,
+    p_header: {
+      vo_number: 'VO-001', title: 'Silently edited approved VO', cause: 'client_request',
+      requested_date: '2026-09-11', requested_by: 'Requester', schedule_impact_days: null,
+    },
+    p_boq_impacts: [], p_wbs_ids: [], p_activity_ids: [], p_actor: 'Requester',
+  }, scopeNow);
+  ok('S28 save-draft path refuses edits to an approved VO', Boolean(approvedEditAttempt.error));
+  eq('S28 approved row and its approval history remain unchanged', JSON.stringify(scopeDb.variation_orders), approvedStateBeforeMutation);
+
+  const revisionDraft = saveScopeDraft('VO-005', [], vo1Id, [], []);
+  ok('S28 correction path creates a new VO linked to terminal approved history',
+    !revisionDraft.error && readScopeOrders().some((order) => order.vo_number === 'VO-005' && order.revision_of_id === vo1Id));
+  const b1SnapshotForMissing = readScopeBaselines().find((item) => item.source_boq_item_id === 'scope-boq-1')!;
+  eq('S28 a pending VO without BOQ impact lines keeps per-item exposure N/A, not zero',
+    getScopeItemMetrics(b1SnapshotForMissing, readScopeOrders(), readScopeImpacts()).pendingValueExposure, null);
+
+  const revisionDb = JSON.parse(JSON.stringify(scopeDb)) as DemoDb;
+  (revisionDb.boq_items || [])[0].quantity = 999;
+  (revisionDb.boq_items || [])[0].total_price = 9999;
+  const sourceBeforeRevision = JSON.stringify(revisionDb.boq_items);
+  const secondBaseline = applyApproveProjectScopeBaseline(revisionDb, {
+    p_project_id: scopeProjectId,
+    p_name: 'Scope Baseline Revision 2',
+    p_approval_reference: 'BASE-APP-002',
+    p_approved_by: 'Client PM',
+    p_approved_at: '2026-09-20T00:00:00.000Z',
+    p_activity_rows: [],
+    p_expected_version: 2,
+  }, scopeNow);
+  eq('S28 baseline correction/reapproval creates a new retained revision',
+    [(revisionDb.project_baselines || []).length, (revisionDb.project_baselines || []).map((row) => row.version), secondBaseline.error],
+    [2, [1, 2], null]);
+  eq('S28 the first approved scope snapshot is retained after pointer advances',
+    (revisionDb.baseline_boq_items || []).filter((row) => row.baseline_id === baselineId1).map((row) => row.original_value), [50, 80]);
+  eq('S28 later scope revisions cannot reset the original quantity/value basis from altered source BOQ',
+    (revisionDb.baseline_boq_items || []).filter((row) => row.baseline_id !== baselineId1).map((row) => [row.original_quantity, row.original_value]),
+    [[10, 50], [4, 80]]);
+  eq('S28 later baseline approval does not itself modify the current BOQ source', JSON.stringify(revisionDb.boq_items), sourceBeforeRevision);
+  eq('S28 earlier VO operations still left the initial source BOQ unchanged', JSON.stringify(scopeDb.boq_items), originalBoqRows);
+
+  ok('S28 SQL extends the existing baseline header and stores BOQ/WBS revision snapshots',
+    scopeMigration.includes('ALTER TABLE project_baselines')
+      && scopeMigration.includes('CREATE TABLE IF NOT EXISTS baseline_boq_items')
+      && scopeMigration.includes('CREATE TABLE IF NOT EXISTS baseline_wbs_nodes')
+      && scopeMigration.includes('project_scope_baseline_current'));
+  ok('S28 SQL VO register includes lifecycle dates, unique number, evidence and all trace links',
+    scopeMigration.includes('idx_variation_orders_project_number_ci')
+      && scopeMigration.includes('approval_evidence_reference')
+      && scopeMigration.includes('rejection_date')
+      && scopeMigration.includes('variation_order_boq_impacts')
+      && scopeMigration.includes('variation_order_wbs_links')
+      && scopeMigration.includes('variation_order_activity_links'));
+  ok('S28 SQL blocks approved-history edits/deletes and makes audit events append-only',
+    scopeMigration.includes('Terminal variation order history is immutable')
+      && scopeMigration.includes('details jsonb NOT NULL DEFAULT')
+      && scopeMigration.includes('Variation order audit history is append-only')
+      && scopeMigration.includes('Approved scope baseline snapshots are immutable'));
+  ok('S28 baseline and VO writes use explicit atomic RPC contracts',
+    scopeMigration.includes('FUNCTION approve_project_scope_baseline')
+      && scopeMigration.includes('FUNCTION save_variation_order_draft')
+      && scopeMigration.includes('FUNCTION transition_variation_order')
+      && scopeMigration.includes('REVOKE INSERT, UPDATE, DELETE ON project_baselines, baseline_activities')
+      && boqBaselineService.includes("rpc('approve_project_scope_baseline'"));
+  ok('S28 existing Payment Certificates VO tab uses the governed register and has no unsafe toggle',
+    paymentView.includes('<ScopeChangeRegister project={project} />')
+      && !paymentView.includes('Toggle ↺')
+      && !paymentView.includes('setVariationOrders'));
+  ok('S28 register reuses existing activity↔BOQ allocation traceability without copying value shares',
+    scopeRegister.includes("from('activity_boq_allocations')")
+      && scopeRegister.includes('activityById.get(allocation.activity_id)?.code')
+      && !scopeRegister.includes('cost_share *')
+      && !scopeRegister.includes('quantity_share *'));
+  ok('S28 scope calculations preserve null and derive revised scope only from approved impacts',
+    scopeRegister.includes('calculateScopeSummary(baselineItems, orders, boqImpacts)')
+      && scopeRegister.includes('getScopeItemMetrics(item, orders, boqImpacts)')
+      && !scopeRegister.includes('approvedCostSar'));
+
+  const s28ChangedPaths = new Set([
+    ...execFileSync('git', ['diff', '--name-only'], { encoding: 'utf8' }).split('\n').filter(Boolean),
+    ...execFileSync('git', ['diff', '--name-only', '--cached'], { encoding: 'utf8' }).split('\n').filter(Boolean),
+    ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
+  ]);
+  ok('S28 changed files stay inside the requested Batch 3A governance boundary',
+    [...s28ChangedPaths].every((path) => BATCH3A_GOVERNANCE_PATHS.has(path)));
+  const protectedBatch3aFiles = [
+    'src/lib/scheduleControlEngine.ts', 'src/lib/costControlEngine.ts', 'src/lib/integratedDecisionEngine.ts',
+    'src/lib/canonicalEvm.ts', 'src/lib/sCurveEngine.ts', 'src/lib/sCurveTimePhasing.ts',
+    'src/lib/governedProgress.ts', 'src/components/views/BudgetView.tsx', 'src/components/views/ProgressView.tsx',
+    'src/components/views/FinancialControlsView.tsx',
+    'src/lib/cpmEngine.ts', 'src/lib/calendarEngine.ts', 'src/lib/recoveryEngine.ts',
+    'src/lib/recoveryOptimizerEngine.ts', 'src/components/views/ScheduleRecoveryView.tsx',
+    'src/lib/tiaEngine.ts', 'src/components/views/TimeImpactAnalysisView.tsx',
+    'src/lib/resourceLevelingEngine.ts', 'src/components/views/ResourceHistogramView.tsx',
+    'src/lib/boqResourceLeveling.ts', 'src/components/views/ScheduleView.tsx',
+    'src/components/views/DashboardView.tsx', 'src/components/views/ExecutiveReportView.tsx',
+    'src/lib/mockSeed.ts',
+    'supabase/migrations/20260924120000_atomic_schedule_recovery_apply.sql',
+    'supabase/migrations/20260924130000_atomic_resource_leveling_apply.sql',
+  ];
+  ok('S28 protected F5/F6/F7, CPM/calendar, Recovery, TIA/EOT, Resource Leveling and seed files are unchanged',
+    protectedBatch3aFiles.every((path) => !s28ChangedPaths.has(path)));
 }
 
 // ---------------------------------------------------------------------------

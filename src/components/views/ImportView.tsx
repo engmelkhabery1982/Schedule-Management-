@@ -83,6 +83,7 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
   const [boqDone, setBoqDone] = useState<{ persist: BoqPersistPlan; canApprove: boolean; criticalCount: number } | null>(null);
   const [doneSource, setDoneSource] = useState<'xer' | 'boq' | null>(null);
   const [boqBaseline, setBoqBaseline] = useState<{ ok: boolean; version: number | null; error: string | null } | null>(null);
+  const [baselineApprovalEvidence, setBaselineApprovalEvidence] = useState({ approvedBy: '', approvalReference: '', approvedAt: '' });
 
   // XER state
   const [xerFile, setXerFile] = useState<File | null>(null);
@@ -158,6 +159,7 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
       setBoqTab('class');
       setBoqDone(null);
       setBoqBaseline(null);
+      setBaselineApprovalEvidence({ approvedBy: '', approvalReference: '', approvedAt: '' });
       setDoneSource(null);
       setParseProgress(`تم تحليل ${rows.length} بند بنجاح`);
     } catch {
@@ -324,7 +326,15 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
         costByAct.set(String(r.activity_id), Number(r.planned_cost) || 0);
       }
       for (const a of acts) a.planned_cost = costByAct.get(a.activity_id) || 0;
-      const res = await approveBoqBaseline(supabase, boqDone.persist.projectId, acts, { canApproveBaseline: boqDone.canApprove, criticalCount: boqDone.criticalCount }, 1, 'Initial Baseline');
+      const res = await approveBoqBaseline(
+        supabase,
+        boqDone.persist.projectId,
+        acts,
+        { canApproveBaseline: boqDone.canApprove, criticalCount: boqDone.criticalCount },
+        baselineApprovalEvidence,
+        1,
+        'Initial Baseline',
+      );
       if (!res.ok) {
         setBoqBaseline({ ok: false, version: null, error: res.error });
         return;
@@ -378,9 +388,29 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
               <span className="font-bold text-red-600 text-sm"> / {r.unallocatedTotal.toLocaleString()}</span>
             </div>
           </div>
+          {!boqBaseline?.ok && (
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4 p-4 bg-amber-50 border border-amber-200 rounded-xl text-xs">
+              <div className="md:col-span-3">
+                <p className="font-bold text-amber-900">مرجع اعتماد خط أساس النطاق (مطلوب لحفظ سجل تعاقدي قابل للتدقيق)</p>
+                <p className="text-amber-800 mt-1">سيُحفظ BOQ وWBS الأصليان مع هذا الإصدار؛ الاعتماد لا يعدّل كميات أو قيم بنود BOQ.</p>
+              </div>
+              <label className="space-y-1 text-slate-700 font-semibold">
+                <span>المعتمد / Approved by</span>
+                <input value={baselineApprovalEvidence.approvedBy} onChange={(event) => setBaselineApprovalEvidence({ ...baselineApprovalEvidence, approvedBy: event.target.value })} className="w-full rounded-lg border border-slate-300 bg-white p-2" required />
+              </label>
+              <label className="space-y-1 text-slate-700 font-semibold">
+                <span>مرجع خطاب الاعتماد / Approval evidence reference</span>
+                <input value={baselineApprovalEvidence.approvalReference} onChange={(event) => setBaselineApprovalEvidence({ ...baselineApprovalEvidence, approvalReference: event.target.value })} className="w-full rounded-lg border border-slate-300 bg-white p-2" placeholder="خطاب / محضر / أمر اعتماد" required />
+              </label>
+              <label className="space-y-1 text-slate-700 font-semibold">
+                <span>تاريخ الاعتماد / Approval date</span>
+                <input type="date" value={baselineApprovalEvidence.approvedAt} onChange={(event) => setBaselineApprovalEvidence({ ...baselineApprovalEvidence, approvedAt: event.target.value })} className="w-full rounded-lg border border-slate-300 bg-white p-2 font-mono" required />
+              </label>
+            </div>
+          )}
           {boqBaseline && (
             <div className={`text-sm font-semibold mb-4 p-3 rounded-lg ${boqBaseline.ok ? 'bg-emerald-50 text-emerald-700' : 'bg-red-50 text-red-700'}`}>
-              {boqBaseline.ok ? `تم اعتماد خط الأساس v${boqBaseline.version}` : `تعذر الاعتماد: ${boqBaseline.error}`}
+              {boqBaseline.ok ? `تم اعتماد خط أساس النطاق والجدول v${boqBaseline.version}` : `تعذر الاعتماد: ${boqBaseline.error}`}
             </div>
           )}
           {error && (
@@ -393,8 +423,8 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
             {!boqBaseline?.ok && (
               <button
                 onClick={handleApproveBoqBaseline}
-                disabled={!boqDone.canApprove}
-                title={boqDone.canApprove ? 'اعتماد خط الأساس v1' : 'توجد ملاحظات حرجة تمنع الاعتماد — راجع تبويب التحقق'}
+                disabled={!boqDone.canApprove || !baselineApprovalEvidence.approvedBy.trim() || !baselineApprovalEvidence.approvalReference.trim() || !baselineApprovalEvidence.approvedAt}
+                title={!boqDone.canApprove ? 'توجد ملاحظات حرجة تمنع الاعتماد — راجع تبويب التحقق' : 'اعتماد خط أساس النطاق والجدول v1'}
                 className="inline-flex items-center gap-2 bg-amber-500 text-slate-900 px-6 py-3 rounded-lg font-semibold hover:bg-amber-600 transition-colors disabled:opacity-50"
               >
                 <ShieldCheck size={18} />
