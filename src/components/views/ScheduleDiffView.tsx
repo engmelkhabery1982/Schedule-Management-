@@ -1,235 +1,139 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { supabase } from '@/lib/supabase';
 import type {
   Project,
   Activity,
   BaselineActivity,
-  ProjectBaseline,
   ScheduleDiffResult,
   ActivityDiffItem,
 } from '@/types';
 import { getLanguage, translations, type Language } from '@/lib/i18n';
-import {
-  GitCompare,
-  Search,
-  Camera,
-  Calendar,
-  Clock,
-  Zap,
-} from 'lucide-react';
+import { GitCompare, Search } from 'lucide-react';
 
 interface ScheduleDiffViewProps {
   project: Project | null;
 }
 
-interface ScheduleRevision {
+interface ComparisonActivity {
   id: string;
+  code: string;
   name: string;
-  createdAt: string;
-  activitiesSnapshot: {
-    id: string;
-    code: string;
-    name: string;
-    duration_days: number;
-    start_date: string | null;
-    end_date: string | null;
-    total_float?: number;
-    is_critical: boolean;
-    percent_complete: number;
-  }[];
+  duration_days: number;
+  start_date: string | null;
+  end_date: string | null;
+  total_float: number | null;
+  is_critical: boolean | null;
+  percent_complete: number | null;
 }
 
 export default function ScheduleDiffView({ project }: ScheduleDiffViewProps) {
   const [activities, setActivities] = useState<Activity[]>([]);
-  const [baselines, setBaselines] = useState<ProjectBaseline[]>([]);
   const [baselineActivities, setBaselineActivities] = useState<BaselineActivity[]>([]);
-  const [revisions, setRevisions] = useState<ScheduleRevision[]>([]);
-  const [selectedRevAId, setSelectedRevAId] = useState<string>('baseline_rev0');
-  const [selectedRevBId, setSelectedRevBId] = useState<string>('live_schedule');
   const [loading, setLoading] = useState(true);
   const [filterMode, setFilterMode] = useState<'all' | 'modified_only' | 'slippage_only' | 'critical_only'>('all');
   const [searchQuery, setSearchQuery] = useState('');
-  const [message, setMessage] = useState('');
-  const [isSnapshotting, setIsSnapshotting] = useState(false);
   const [lang, setLang] = useState<Language>(getLanguage());
+  const [loadedProjectId, setLoadedProjectId] = useState<string | null>(null);
+  const loadRequestId = useRef(0);
 
   useEffect(() => {
-    if (project) loadData();
-    else setLoading(false);
-
-    const handleLangChange = (e: any) => {
-      setLang(e.detail?.lang || getLanguage());
-    };
-    window.addEventListener('app-language-changed', handleLangChange);
-    return () => window.removeEventListener('app-language-changed', handleLangChange);
-  }, [project]);
-
-  async function loadData() {
-    if (!project) return;
-    setLoading(true);
-    const [actRes, baseRes, baseActRes] = await Promise.all([
-      supabase.from('activities').select('*').eq('project_id', project.id).order('sort_order'),
-      supabase.from('project_baselines').select('*').eq('project_id', project.id),
-      supabase.from('baseline_activities').select('*'),
-    ]);
-
-    const acts = actRes.data || [];
-    setActivities(acts);
-    setBaselines((baseRes.data || []) as ProjectBaseline[]);
-    setBaselineActivities((baseActRes.data || []) as BaselineActivity[]);
-
-    // Load custom revisions from localStorage
-    const revStorageKey = `schedule_diff_revisions_${project.id}`;
-    const storedRevs: ScheduleRevision[] = JSON.parse(localStorage.getItem(revStorageKey) || '[]');
-
-    if (storedRevs.length === 0 && acts.length > 0) {
-      const initialRevs: ScheduleRevision[] = [
-        {
-          id: 'rev_oct_2026',
-          name: 'Rev 01 - تحديث شهر أكتوبر 2026 (Cut-off M1)',
-          createdAt: '2026-10-31',
-          activitiesSnapshot: acts.map((a: Activity, idx: number) => ({
-            id: a.id,
-            code: a.code,
-            name: a.name,
-            duration_days: a.duration_days,
-            start_date: a.early_start,
-            end_date: a.early_finish,
-            total_float: idx < 3 ? 0 : 5,
-            is_critical: idx < 3,
-            percent_complete: idx === 0 ? 100 : idx === 1 ? 80 : 0,
-          })),
-        },
-        {
-          id: 'rev_nov_2026',
-          name: 'Rev 02 - تحديث شهر نوفمبر 2026 (Cut-off M2)',
-          createdAt: '2026-11-30',
-          activitiesSnapshot: acts.map((a: Activity, idx: number) => ({
-            id: a.id,
-            code: a.code,
-            name: a.name,
-            duration_days: idx === 2 ? a.duration_days + 4 : a.duration_days,
-            start_date: a.early_start,
-            end_date: idx === 2 && a.early_finish ? new Date(new Date(a.early_finish).getTime() + 4 * 86400000).toISOString().split('T')[0] : a.early_finish,
-            total_float: idx === 2 ? 0 : a.total_float || 0,
-            is_critical: a.is_critical,
-            percent_complete: idx < 2 ? 100 : idx === 2 ? 40 : 0,
-          })),
-        },
-      ];
-      localStorage.setItem(revStorageKey, JSON.stringify(initialRevs));
-      setRevisions(initialRevs);
+    if (project) {
+      void loadData(project);
     } else {
-      setRevisions(storedRevs);
+      loadRequestId.current += 1;
+      setActivities([]);
+      setBaselineActivities([]);
+      setLoadedProjectId(null);
+      setLoading(false);
     }
 
+    const handleLangChange = (e: Event) => {
+      const nextLang = (e as CustomEvent<{ lang?: Language }>).detail?.lang;
+      setLang(nextLang || getLanguage());
+    };
+    window.addEventListener('app-language-changed', handleLangChange);
+    return () => {
+      loadRequestId.current += 1;
+      window.removeEventListener('app-language-changed', handleLangChange);
+    };
+  }, [project]);
+
+  async function loadData(projectToLoad: Project | null = project) {
+    if (!projectToLoad) return;
+    const requestId = ++loadRequestId.current;
+    setLoading(true);
+    setActivities([]);
+    setBaselineActivities([]);
+    setLoadedProjectId(null);
+
+    const [actRes, baselineRes] = await Promise.all([
+      supabase.from('activities').select('*').eq('project_id', projectToLoad.id).order('sort_order'),
+      // Match ScheduleView's governed baseline query: rows are scoped through the current project's
+      // ACTIVE + APPROVED project_baselines header. baseline_activities has no project_id of its own.
+      supabase.from('baseline_activities').select('*, project_baselines!inner(project_id, is_active, status)').eq('project_baselines.project_id', projectToLoad.id).eq('project_baselines.is_active', true).eq('project_baselines.status', 'approved'),
+    ]);
+
+    // Ignore out-of-order responses after a project change or a newer reload.
+    if (requestId !== loadRequestId.current) return;
+    setActivities((actRes.data || []) as Activity[]);
+    setBaselineActivities((baselineRes.data || []) as BaselineActivity[]);
+    setLoadedProjectId(projectToLoad.id);
     setLoading(false);
   }
 
   const t = translations[lang];
+  const hasApprovedBaseline = baselineActivities.length > 0;
 
-  function handleCreateSnapshot() {
-    if (!project || activities.length === 0) return;
-    setIsSnapshotting(true);
-    const defaultName = lang === 'ar'
-      ? `Rev 0${revisions.length + 1} - لقطة بتاريخ ${new Date().toISOString().split('T')[0]}`
-      : `Rev 0${revisions.length + 1} - Snapshot ${new Date().toISOString().split('T')[0]}`;
-    const snapName = prompt(lang === 'ar' ? 'أدخل اسم أو وصف النسخة المحفوظة:' : 'Enter revision snapshot title:', defaultName);
-    if (!snapName) {
-      setIsSnapshotting(false);
-      return;
-    }
+  const diffResult: ScheduleDiffResult | null = useMemo(() => {
+    if (!hasApprovedBaseline) return null;
 
-    const newRev: ScheduleRevision = {
-      id: `rev_${Date.now()}`,
-      name: snapName,
-      createdAt: new Date().toISOString().split('T')[0],
-      activitiesSnapshot: activities.map((a) => ({
-        id: a.id,
-        code: a.code,
-        name: a.name,
-        duration_days: a.duration_days,
-        start_date: a.early_start,
-        end_date: a.early_finish,
-        total_float: a.total_float,
-        is_critical: a.is_critical,
-        percent_complete: a.percent_complete,
-      })),
-    };
+    const liveById = new Map(activities.map((activity) => [activity.id, activity]));
+    const baselineRows: ComparisonActivity[] = baselineActivities.map((baseline) => {
+      const liveActivity = liveById.get(baseline.activity_id);
+      const baselineFloat = typeof baseline.total_float === 'number' ? baseline.total_float : null;
+      return {
+        id: baseline.activity_id,
+        // The baseline row stores no code/name. Use the corresponding real activity when it still
+        // exists; for a deleted activity, show its real activity_id rather than inventing a label.
+        code: liveActivity?.code || baseline.activity_id,
+        name: liveActivity?.name || baseline.activity_id,
+        duration_days: baseline.duration_days,
+        start_date: baseline.early_start || null,
+        end_date: baseline.early_finish || null,
+        total_float: baselineFloat,
+        // Baseline criticality can only be derived where the approved baseline stored total float.
+        is_critical: baselineFloat === null ? null : baselineFloat <= 0,
+        // Approved baseline activities do not store a progress percentage.
+        percent_complete: null,
+      };
+    });
+    const liveRows: ComparisonActivity[] = activities.map((activity) => ({
+      id: activity.id,
+      code: activity.code,
+      name: activity.name,
+      duration_days: activity.duration_days,
+      start_date: activity.early_start || null,
+      end_date: activity.early_finish || null,
+      total_float: typeof activity.total_float === 'number' ? activity.total_float : null,
+      is_critical: typeof activity.is_critical === 'boolean' ? activity.is_critical : null,
+      percent_complete: typeof activity.percent_complete === 'number' ? activity.percent_complete : null,
+    }));
 
-    const updated = [newRev, ...revisions];
-    setRevisions(updated);
-    localStorage.setItem(`schedule_diff_revisions_${project.id}`, JSON.stringify(updated));
-    setSelectedRevBId(newRev.id);
-    setMessage(lang === 'ar' ? `تم حفظ لقطة الجدول الزمني (${snapName}) وتفعيلها في المقارنة.` : `Snapshot (${snapName}) saved and activated in comparison.`);
-    setIsSnapshotting(false);
-  }
-
-  const getRevisionActivities = (revId: string) => {
-    if (revId === 'live_schedule') {
-      return activities.map((a) => ({
-        id: a.id,
-        code: a.code,
-        name: a.name,
-        duration_days: a.duration_days,
-        start_date: a.early_start,
-        end_date: a.early_finish,
-        total_float: a.total_float || 0,
-        is_critical: a.is_critical,
-        percent_complete: a.percent_complete,
-      }));
-    }
-    if (revId === 'baseline_rev0') {
-      return activities.map((a) => {
-        const base = baselineActivities.find((b) => b.activity_id === a.id);
-        return {
-          id: a.id,
-          code: a.code,
-          name: a.name,
-          duration_days: base ? base.duration_days : a.duration_days,
-          start_date: base ? base.early_start : a.early_start,
-          end_date: base ? base.early_finish : a.early_finish,
-          total_float: 0,
-          is_critical: a.is_critical,
-          percent_complete: 0,
-        };
-      });
-    }
-    const foundRev = revisions.find((r) => r.id === revId);
-    if (foundRev) return foundRev.activitiesSnapshot;
-    return [];
-  };
-
-  const diffResult: ScheduleDiffResult = useMemo(() => {
-    const listA = getRevisionActivities(selectedRevAId);
-    const listB = getRevisionActivities(selectedRevBId);
-
-    const nameA = selectedRevAId === 'baseline_rev0'
-      ? (lang === 'ar' ? 'خط الأساس المعتمد (Baseline Rev 0)' : 'Approved Baseline (Rev 0)')
-      : selectedRevAId === 'live_schedule'
-      ? (lang === 'ar' ? 'الجدول الحالي المحدث' : 'Live CPM Schedule')
-      : revisions.find((r) => r.id === selectedRevAId)?.name || selectedRevAId;
-
-    const nameB = selectedRevBId === 'live_schedule'
-      ? (lang === 'ar' ? 'الجدول الحالي المحدث (Live CPM Schedule)' : 'Live CPM Schedule')
-      : selectedRevBId === 'baseline_rev0'
-      ? (lang === 'ar' ? 'خط الأساس المعتمد (Baseline Rev 0)' : 'Approved Baseline (Rev 0)')
-      : revisions.find((r) => r.id === selectedRevBId)?.name || selectedRevBId;
-
-    const mapA = new Map(listA.map((a) => [a.code, a]));
-    const mapB = new Map(listB.map((a) => [a.code, a]));
+    const baselineName = lang === 'ar' ? 'خط الأساس المعتمد' : 'Approved Baseline';
+    const currentScheduleName = lang === 'ar' ? 'الجدول الحي' : 'Live Schedule';
+    const mapA = new Map(baselineRows.map((activity) => [activity.id, activity]));
+    const mapB = new Map(liveRows.map((activity) => [activity.id, activity]));
 
     let addedCount = 0;
     let deletedCount = 0;
     let modifiedCount = 0;
-    let criticalityShiftCount = 0;
+    let measuredCriticalityShiftCount = 0;
     const diffItems: ActivityDiffItem[] = [];
+    const allActivityIds = Array.from(new Set([...Array.from(mapA.keys()), ...Array.from(mapB.keys())]));
 
-    const allCodes = Array.from(new Set([...Array.from(mapA.keys()), ...Array.from(mapB.keys())]));
-
-    allCodes.forEach((code) => {
-      const actA = mapA.get(code);
-      const actB = mapB.get(code);
+    allActivityIds.forEach((activityId) => {
+      const actA = mapA.get(activityId);
+      const actB = mapB.get(activityId);
 
       if (!actA && actB) {
         addedCount++;
@@ -240,20 +144,20 @@ export default function ScheduleDiffView({ project }: ScheduleDiffViewProps) {
           diffType: 'added',
           startBaseline: null,
           startCurrent: actB.start_date,
-          startVarianceDays: 0,
+          startVarianceDays: null,
           finishBaseline: null,
           finishCurrent: actB.end_date,
-          finishVarianceDays: 0,
-          durationBaseline: 0,
+          finishVarianceDays: null,
+          durationBaseline: null,
           durationCurrent: actB.duration_days,
-          durationVarianceDays: actB.duration_days,
-          totalFloatBaseline: 0,
-          totalFloatCurrent: actB.total_float || 0,
-          totalFloatVarianceDays: 0,
-          criticalityBaseline: false,
+          durationVarianceDays: null,
+          totalFloatBaseline: null,
+          totalFloatCurrent: actB.total_float,
+          totalFloatVarianceDays: null,
+          criticalityBaseline: null,
           criticalityCurrent: actB.is_critical,
-          criticalityShift: actB.is_critical ? 'became_critical' : 'unchanged',
-          percentBaseline: 0,
+          criticalityShift: 'unknown',
+          percentBaseline: null,
           percentCurrent: actB.percent_complete,
         });
       } else if (actA && !actB) {
@@ -265,36 +169,44 @@ export default function ScheduleDiffView({ project }: ScheduleDiffViewProps) {
           diffType: 'deleted',
           startBaseline: actA.start_date,
           startCurrent: null,
-          startVarianceDays: 0,
+          startVarianceDays: null,
           finishBaseline: actA.end_date,
           finishCurrent: null,
-          finishVarianceDays: 0,
+          finishVarianceDays: null,
           durationBaseline: actA.duration_days,
-          durationCurrent: 0,
-          durationVarianceDays: -actA.duration_days,
-          totalFloatBaseline: actA.total_float || 0,
-          totalFloatCurrent: 0,
-          totalFloatVarianceDays: 0,
+          durationCurrent: null,
+          durationVarianceDays: null,
+          totalFloatBaseline: actA.total_float,
+          totalFloatCurrent: null,
+          totalFloatVarianceDays: null,
           criticalityBaseline: actA.is_critical,
-          criticalityCurrent: false,
-          criticalityShift: actA.is_critical ? 'became_non_critical' : 'unchanged',
+          criticalityCurrent: null,
+          criticalityShift: 'unknown',
           percentBaseline: actA.percent_complete,
-          percentCurrent: 0,
+          percentCurrent: null,
         });
       } else if (actA && actB) {
         const startVar = actA.start_date && actB.start_date
           ? Math.round((new Date(actB.start_date).getTime() - new Date(actA.start_date).getTime()) / 86400000)
-          : 0;
+          : null;
         const finishVar = actA.end_date && actB.end_date
           ? Math.round((new Date(actB.end_date).getTime() - new Date(actA.end_date).getTime()) / 86400000)
-          : 0;
-        const durVar = actB.duration_days - actA.duration_days;
-        const floatVar = (actB.total_float || 0) - (actA.total_float || 0);
+          : null;
+        const durationVar = actB.duration_days - actA.duration_days;
+        const floatVar = actA.total_float !== null && actB.total_float !== null
+          ? actB.total_float - actA.total_float
+          : null;
+        const isCritChanged = actA.is_critical !== null
+          && actB.is_critical !== null
+          && actA.is_critical !== actB.is_critical;
+        if (isCritChanged) measuredCriticalityShiftCount++;
 
-        const isCritChanged = actA.is_critical !== actB.is_critical;
-        if (isCritChanged) criticalityShiftCount++;
-
-        const isModified = startVar !== 0 || finishVar !== 0 || durVar !== 0 || isCritChanged || actA.percent_complete !== actB.percent_complete;
+        // Baseline activities carry no progress percentage, so progress is not treated as a
+        // baseline variance or allowed to inflate the modified-activity count.
+        const isModified = (startVar !== null && startVar !== 0)
+          || (finishVar !== null && finishVar !== 0)
+          || durationVar !== 0
+          || isCritChanged;
         if (isModified) modifiedCount++;
 
         diffItems.push({
@@ -310,49 +222,75 @@ export default function ScheduleDiffView({ project }: ScheduleDiffViewProps) {
           finishVarianceDays: finishVar,
           durationBaseline: actA.duration_days,
           durationCurrent: actB.duration_days,
-          durationVarianceDays: durVar,
-          totalFloatBaseline: actA.total_float || 0,
-          totalFloatCurrent: actB.total_float || 0,
+          durationVarianceDays: durationVar,
+          totalFloatBaseline: actA.total_float,
+          totalFloatCurrent: actB.total_float,
           totalFloatVarianceDays: floatVar,
           criticalityBaseline: actA.is_critical,
           criticalityCurrent: actB.is_critical,
-          criticalityShift: !actA.is_critical && actB.is_critical ? 'became_critical' : actA.is_critical && !actB.is_critical ? 'became_non_critical' : 'unchanged',
+          criticalityShift: actA.is_critical === null || actB.is_critical === null
+            ? 'unknown'
+            : !actA.is_critical && actB.is_critical
+            ? 'became_critical'
+            : actA.is_critical && !actB.is_critical
+            ? 'became_non_critical'
+            : 'unchanged',
           percentBaseline: actA.percent_complete,
           percentCurrent: actB.percent_complete,
         });
       }
     });
 
-    const maxFinishA = listA.reduce((max, a) => !a.end_date ? max : !max || a.end_date > max ? a.end_date : max, null as string | null);
-    const maxFinishB = listB.reduce((max, a) => !a.end_date ? max : !max || a.end_date > max ? a.end_date : max, null as string | null);
+    const maxFinishA = baselineRows.reduce(
+      (max, activity) => !activity.end_date ? max : !max || activity.end_date > max ? activity.end_date : max,
+      null as string | null,
+    );
+    const maxFinishB = liveRows.reduce(
+      (max, activity) => !activity.end_date ? max : !max || activity.end_date > max ? activity.end_date : max,
+      null as string | null,
+    );
     const projectFinishVarianceDays = maxFinishA && maxFinishB
       ? Math.round((new Date(maxFinishB).getTime() - new Date(maxFinishA).getTime()) / 86400000)
-      : 0;
+      : null;
 
-    const summary = projectFinishVarianceDays === 0
-      ? (lang === 'ar' ? `تاريخ إنجاز المشروع في (${nameB}) متطابق تماماً مع (${nameA}).` : `Project completion in (${nameB}) is identical to (${nameA}).`)
+    const summary = projectFinishVarianceDays === null
+      ? (lang === 'ar'
+        ? 'غير متاح (N/A): لا تتوفر تواريخ إنجاز من خط الأساس المعتمد والجدول الحي معاً.'
+        : 'N/A — finish dates are not available in both the approved baseline and live schedule.')
+      : projectFinishVarianceDays === 0
+      ? (lang === 'ar'
+        ? `تاريخ إنجاز المشروع في (${currentScheduleName}) متطابق مع (${baselineName}).`
+        : `Project completion in (${currentScheduleName}) matches (${baselineName}).`)
       : projectFinishVarianceDays > 0
-      ? (lang === 'ar' ? `يوجد تأخير كلي قدره +${projectFinishVarianceDays} يوماً في موعد إنهاء المشروع في (${nameB}) مقارنة بـ (${nameA}).` : `Total project slippage of +${projectFinishVarianceDays} days detected in (${nameB}) compared to (${nameA}).`)
-      : (lang === 'ar' ? `المشروع متقدم بمقدار ${Math.abs(projectFinishVarianceDays)} يوماً في (${nameB}) مقارنة بـ (${nameA}).` : `Project is ahead by ${Math.abs(projectFinishVarianceDays)} days in (${nameB}) compared to (${nameA}).`);
+      ? (lang === 'ar'
+        ? `يوجد تأخير كلي قدره +${projectFinishVarianceDays} يوماً في موعد إنهاء المشروع في (${currentScheduleName}) مقارنة بـ (${baselineName}).`
+        : `Total project slippage of +${projectFinishVarianceDays} days in (${currentScheduleName}) compared to (${baselineName}).`)
+      : (lang === 'ar'
+        ? `المشروع متقدم بمقدار ${Math.abs(projectFinishVarianceDays)} يوماً في (${currentScheduleName}) مقارنة بـ (${baselineName}).`
+        : `Project is ahead by ${Math.abs(projectFinishVarianceDays)} days in (${currentScheduleName}) compared to (${baselineName}).`);
+
+    const hasCompleteBaselineCriticality = baselineRows.length > 0
+      && baselineRows.every((activity) => activity.is_critical !== null);
 
     return {
-      baselineName: nameA,
-      currentScheduleName: nameB,
-      totalActivitiesCount: allCodes.length,
+      baselineName,
+      currentScheduleName,
+      totalActivitiesCount: allActivityIds.length,
       addedCount,
       deletedCount,
       modifiedCount,
-      criticalityShiftCount,
+      criticalityShiftCount: hasCompleteBaselineCriticality ? measuredCriticalityShiftCount : null,
       projectFinishVarianceDays,
       activities: diffItems,
       summary,
     };
-  }, [activities, baselineActivities, revisions, selectedRevAId, selectedRevBId, lang]);
+  }, [activities, baselineActivities, hasApprovedBaseline, lang]);
 
   const filteredItems = useMemo(() => {
+    if (!diffResult) return [];
     return diffResult.activities.filter((item) => {
       if (filterMode === 'modified_only' && item.diffType !== 'modified' && item.diffType !== 'added') return false;
-      if (filterMode === 'slippage_only' && item.finishVarianceDays <= 0) return false;
+      if (filterMode === 'slippage_only' && (item.finishVarianceDays === null || item.finishVarianceDays <= 0)) return false;
       if (filterMode === 'critical_only' && !item.criticalityCurrent) return false;
       if (searchQuery) {
         const q = searchQuery.toLowerCase();
@@ -362,13 +300,22 @@ export default function ScheduleDiffView({ project }: ScheduleDiffViewProps) {
     });
   }, [diffResult, filterMode, searchQuery]);
 
-  if (loading) {
+  if (loading || (project ? loadedProjectId !== project.id : loadedProjectId !== null)) {
     return (
       <div className="flex items-center justify-center min-h-[400px]">
         <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-amber-500"></div>
       </div>
     );
   }
+
+  const comparisonUnavailable = !project || !diffResult;
+  const finishVarianceClass = diffResult?.projectFinishVarianceDays == null
+    ? 'text-slate-400'
+    : diffResult.projectFinishVarianceDays > 0
+    ? 'text-rose-600'
+    : diffResult.projectFinishVarianceDays < 0
+    ? 'text-emerald-600'
+    : 'text-slate-600';
 
   return (
     <div className="space-y-6">
@@ -381,217 +328,194 @@ export default function ScheduleDiffView({ project }: ScheduleDiffViewProps) {
               {t.diff_title}
             </h1>
             <span className="px-2 py-0.5 rounded text-[10px] font-black bg-slate-900 text-amber-400">
-              Revision Matrix
+              {lang === 'ar' ? 'خط الأساس المعتمد ↔ الجدول الحي' : 'Approved Baseline ↔ Live Schedule'}
             </span>
           </div>
-          <p className="text-xs text-slate-500 mt-1">
-            {t.diff_subtitle}
+          <p className="text-xs text-slate-500 mt-1">{t.diff_subtitle}</p>
+        </div>
+      </div>
+
+      {comparisonUnavailable ? (
+        <div role="status" className="bg-white p-8 rounded-xl border border-slate-200 shadow-sm text-center">
+          <GitCompare size={32} className="mx-auto text-slate-300 mb-3" />
+          <div className="text-2xl font-black text-slate-500 mb-2">N/A</div>
+          <p className="text-sm font-bold text-slate-700">
+            {!project
+              ? (lang === 'ar' ? 'اختر مشروعاً لعرض مقارنة الجدول.' : 'Select a project to compare schedules.')
+              : (lang === 'ar'
+                ? 'لا توجد صفوف لخط أساس نشط ومعتمد لهذا المشروع. المقارنة غير متاحة حتى يتوفر خط أساس حقيقي معتمد.'
+                : 'No active, approved baseline rows are available for this project. Comparison is N/A until a real approved baseline is available.')}
           </p>
         </div>
+      ) : (
+        <>
+          {/* Fixed comparison: approved baseline versus the project's current live schedule. */}
+          <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="p-3 bg-slate-50 rounded-xl border border-slate-200 space-y-1.5">
+              <span className="block text-xs font-bold text-slate-700">{t.rev_a_label}</span>
+              <div className="text-sm font-black text-slate-900">{lang === 'ar' ? 'خط الأساس المعتمد' : 'Approved Baseline'}</div>
+            </div>
+            <div className="p-3 bg-amber-50/60 rounded-xl border border-amber-200 space-y-1.5">
+              <span className="block text-xs font-bold text-amber-950">{t.rev_b_label}</span>
+              <div className="text-sm font-black text-amber-950">{lang === 'ar' ? 'الجدول الحي' : 'Live Schedule'}</div>
+            </div>
+          </div>
 
-        {/* Action Button to Take Snapshot */}
-        <button
-          onClick={handleCreateSnapshot}
-          disabled={isSnapshotting}
-          className="flex items-center gap-1.5 bg-slate-900 hover:bg-slate-800 text-amber-400 px-4 py-2 rounded-xl text-xs font-bold transition-all shadow-sm cursor-pointer"
-        >
-          <Camera size={15} />
-          {t.save_snapshot}
-        </button>
-      </div>
+          {/* Variance KPI Cards */}
+          <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
+            <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
+              <span className="text-xs text-slate-500 font-bold">{t.project_slip_var}</span>
+              <div className={`text-2xl font-black mt-1 ${finishVarianceClass}`}>
+                {diffResult.projectFinishVarianceDays === null
+                  ? 'N/A'
+                  : `${diffResult.projectFinishVarianceDays > 0 ? '+' : ''}${diffResult.projectFinishVarianceDays} ${lang === 'ar' ? 'يوم' : 'Days'}`}
+              </div>
+              <span className="text-[10px] text-slate-400">{lang === 'ar' ? 'خط الأساس المعتمد مقابل الجدول الحي' : 'Approved Baseline vs Live Schedule'}</span>
+            </div>
 
-      {message && (
-        <div className="p-3.5 bg-blue-50 border border-blue-200 text-blue-900 rounded-xl text-xs font-bold flex items-center justify-between shadow-sm animate-fadeIn">
-          <span>{message}</span>
-          <button onClick={() => setMessage('')} className="text-blue-500 hover:text-blue-700 font-bold text-base">×</button>
-        </div>
+            <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
+              <span className="text-xs text-slate-500 font-bold">{t.modified_activities}</span>
+              <div className="text-2xl font-black text-slate-900 mt-1">{diffResult.modifiedCount}</div>
+              <span className="text-[10px] text-slate-400">{lang === 'ar' ? `من أصل ${diffResult.totalActivitiesCount} نشاط` : `out of ${diffResult.totalActivitiesCount}`}</span>
+            </div>
+
+            <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
+              <span className="text-xs text-slate-500 font-bold">{t.critical_shifts}</span>
+              <div className="text-2xl font-black text-amber-600 mt-1">{diffResult.criticalityShiftCount ?? 'N/A'}</div>
+              <span className="text-[10px] text-slate-400">{lang === 'ar' ? 'غير متاح عند غياب الهامش المسجل في الأساس' : 'N/A when baseline float evidence is not recorded'}</span>
+            </div>
+
+            <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
+              <span className="text-xs text-slate-500 font-bold">{t.added_activities}</span>
+              <div className="text-2xl font-black text-emerald-600 mt-1">+{diffResult.addedCount}</div>
+              <span className="text-[10px] text-slate-400">{lang === 'ar' ? 'أنشطة جديدة في الجدول الحالي' : 'New activities in the live schedule'}</span>
+            </div>
+          </div>
+
+          {/* Summary Banner */}
+          <div className="p-4 bg-gradient-to-r from-amber-500/10 via-amber-500/5 to-transparent border-r-4 border-amber-500 rounded-xl bg-white shadow-sm flex items-center justify-between">
+            <span className="font-bold text-slate-900 text-xs">{diffResult.summary}</span>
+          </div>
+
+          {/* Filter and Search Bar */}
+          <div className="flex flex-wrap items-center justify-between gap-3 bg-slate-50 p-3 rounded-xl border border-slate-200 text-xs">
+            <div className="flex items-center gap-2">
+              <div className="relative">
+                <Search size={14} className="absolute right-3 top-2.5 text-slate-400" />
+                <input
+                  type="text"
+                  placeholder={lang === 'ar' ? 'بحث في الأنشطة المعدلة...' : 'Search activities...'}
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  className="pr-8 pl-3 py-1.5 border border-slate-300 rounded-lg bg-white text-xs w-60 outline-none focus:border-amber-500 font-medium"
+                />
+              </div>
+
+              <div className="flex items-center gap-1 bg-white border border-slate-200 rounded-lg p-0.5">
+                <button
+                  onClick={() => setFilterMode('all')}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${filterMode === 'all' ? 'bg-amber-500 text-slate-950 shadow-sm' : 'text-slate-600 hover:text-slate-900'}`}
+                >
+                  {t.filter_all} ({diffResult.activities.length})
+                </button>
+                <button
+                  onClick={() => setFilterMode('modified_only')}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${filterMode === 'modified_only' ? 'bg-amber-500 text-slate-950 shadow-sm' : 'text-slate-600 hover:text-slate-900'}`}
+                >
+                  {t.filter_modified} ({diffResult.modifiedCount})
+                </button>
+                <button
+                  onClick={() => setFilterMode('slippage_only')}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${filterMode === 'slippage_only' ? 'bg-amber-500 text-slate-950 shadow-sm' : 'text-slate-600 hover:text-slate-900'}`}
+                >
+                  {t.filter_slippage}
+                </button>
+                <button
+                  onClick={() => setFilterMode('critical_only')}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${filterMode === 'critical_only' ? 'bg-amber-500 text-slate-950 shadow-sm' : 'text-slate-600 hover:text-slate-900'}`}
+                >
+                  {t.filter_critical}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {/* Approved Baseline vs Live Schedule Table */}
+          <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead className="bg-slate-50 text-slate-700 border-b border-slate-200 font-bold">
+                  <tr>
+                    <th className="p-3 text-right">{t.activity_code}</th>
+                    <th className="p-3 text-right">{t.activity_name}</th>
+                    <th className="p-3 text-right">{lang === 'ar' ? 'البداية (الأساس)' : 'Start (Baseline)'}</th>
+                    <th className="p-3 text-right">{lang === 'ar' ? 'البداية (الحي)' : 'Start (Live)'}</th>
+                    <th className="p-3 text-right">{lang === 'ar' ? 'النهاية (الأساس)' : 'Finish (Baseline)'}</th>
+                    <th className="p-3 text-right">{lang === 'ar' ? 'النهاية (الحي)' : 'Finish (Live)'}</th>
+                    <th className="p-3 text-right">{lang === 'ar' ? 'انحراف النهاية' : 'Finish Var'}</th>
+                    <th className="p-3 text-right">{lang === 'ar' ? 'المدة (الأساس)' : 'Dur (Baseline)'}</th>
+                    <th className="p-3 text-right">{lang === 'ar' ? 'المدة (الحي)' : 'Dur (Live)'}</th>
+                    <th className="p-3 text-center">{t.critical}</th>
+                    <th className="p-3 text-center">{lang === 'ar' ? 'حالة التغيير' : 'Diff Status'}</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 font-medium">
+                  {filteredItems.map((item) => (
+                    <tr key={item.activityId} className="hover:bg-slate-50 transition-colors">
+                      <td className="p-3 font-mono font-bold text-slate-700">{item.code}</td>
+                      <td className="p-3 font-bold text-slate-800 max-w-xs truncate">{item.name}</td>
+                      <td className="p-3 font-mono text-slate-500">{item.startBaseline || 'N/A'}</td>
+                      <td className="p-3 font-mono text-slate-900 font-bold">{item.startCurrent || 'N/A'}</td>
+                      <td className="p-3 font-mono text-slate-500">{item.finishBaseline || 'N/A'}</td>
+                      <td className="p-3 font-mono text-slate-900 font-bold">{item.finishCurrent || 'N/A'}</td>
+                      <td className="p-3 font-mono font-black">
+                        {item.finishVarianceDays === null ? (
+                          <span className="text-slate-400">N/A</span>
+                        ) : item.finishVarianceDays > 0 ? (
+                          <span className="text-rose-600">+{item.finishVarianceDays} {lang === 'ar' ? 'يوم' : 'd'}</span>
+                        ) : item.finishVarianceDays < 0 ? (
+                          <span className="text-emerald-600">{item.finishVarianceDays} {lang === 'ar' ? 'يوم' : 'd'}</span>
+                        ) : (
+                          <span className="text-slate-400">0 {lang === 'ar' ? 'يوم' : 'd'}</span>
+                        )}
+                      </td>
+                      <td className="p-3 text-slate-500">{item.durationBaseline === null ? 'N/A' : `${item.durationBaseline} ${lang === 'ar' ? 'يوم' : 'd'}`}</td>
+                      <td className="p-3 font-bold text-slate-900">{item.durationCurrent === null ? 'N/A' : `${item.durationCurrent} ${lang === 'ar' ? 'يوم' : 'd'}`}</td>
+                      <td className="p-3 text-center">
+                        {item.criticalityCurrent === null ? (
+                          <span className="text-slate-400">N/A</span>
+                        ) : item.criticalityCurrent ? (
+                          <span className="px-2 py-0.5 rounded text-[10px] bg-rose-100 text-rose-700 font-bold">{t.critical}</span>
+                        ) : (
+                          <span className="text-slate-300">-</span>
+                        )}
+                      </td>
+                      <td className="p-3 text-center">
+                        {item.diffType === 'added' ? (
+                          <span className="px-2 py-0.5 rounded-full text-[10px] bg-emerald-100 text-emerald-800 font-bold">{lang === 'ar' ? 'مضاف' : 'Added'}</span>
+                        ) : item.diffType === 'deleted' ? (
+                          <span className="px-2 py-0.5 rounded-full text-[10px] bg-rose-100 text-rose-800 font-bold">{lang === 'ar' ? 'محذوف' : 'Deleted'}</span>
+                        ) : item.diffType === 'modified' ? (
+                          <span className="px-2 py-0.5 rounded-full text-[10px] bg-blue-100 text-blue-800 font-bold">{lang === 'ar' ? 'معدل' : 'Modified'}</span>
+                        ) : (
+                          <span className="text-slate-400 text-[10px]">{lang === 'ar' ? 'مطابق' : 'Unchanged'}</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                  {filteredItems.length === 0 && (
+                    <tr>
+                      <td colSpan={11} className="p-8 text-center text-sm text-slate-400">
+                        {lang === 'ar' ? 'لا توجد أنشطة تطابق عوامل التصفية.' : 'No activities match the selected filters.'}
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </>
       )}
-
-      {/* Revisions Selectors Toolbar */}
-      <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm grid grid-cols-1 md:grid-cols-2 gap-4">
-        {/* Version A */}
-        <div className="p-3 bg-slate-50 rounded-xl border border-slate-200 space-y-1.5">
-          <label className="block text-xs font-bold text-slate-700">
-            {t.rev_a_label}
-          </label>
-          <select
-            value={selectedRevAId}
-            onChange={(e) => setSelectedRevAId(e.target.value)}
-            className="w-full p-2 bg-white border border-slate-300 rounded-lg text-xs font-bold text-slate-900 outline-none focus:ring-2 focus:ring-amber-500 cursor-pointer"
-          >
-            <option value="baseline_rev0">{lang === 'ar' ? 'خط الأساس الأصلي المعتمد (Baseline Rev 0)' : 'Approved Baseline (Rev 0)'}</option>
-            {revisions.map((rev) => (
-              <option key={rev.id} value={rev.id}>{rev.name} ({rev.createdAt})</option>
-            ))}
-            <option value="live_schedule">{lang === 'ar' ? 'الجدول الزمني الحي (Live Schedule)' : 'Live Schedule'}</option>
-          </select>
-        </div>
-
-        {/* Version B */}
-        <div className="p-3 bg-amber-50/60 rounded-xl border border-amber-200 space-y-1.5">
-          <label className="block text-xs font-bold text-amber-950">
-            {t.rev_b_label}
-          </label>
-          <select
-            value={selectedRevBId}
-            onChange={(e) => setSelectedRevBId(e.target.value)}
-            className="w-full p-2 bg-white border border-amber-300 rounded-lg text-xs font-black text-amber-950 outline-none focus:ring-2 focus:ring-amber-500 cursor-pointer"
-          >
-            <option value="live_schedule">{lang === 'ar' ? 'الجدول الزمني الحي المحدث (Live CPM Schedule)' : 'Live CPM Schedule'}</option>
-            {revisions.map((rev) => (
-              <option key={rev.id} value={rev.id}>{rev.name} ({rev.createdAt})</option>
-            ))}
-            <option value="baseline_rev0">{lang === 'ar' ? 'خط الأساس الأصلي المعتمد (Baseline Rev 0)' : 'Approved Baseline (Rev 0)'}</option>
-          </select>
-        </div>
-      </div>
-
-      {/* Variance KPI Cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
-        <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
-          <span className="text-xs text-slate-500 font-bold">{t.project_slip_var}</span>
-          <div className={`text-2xl font-black mt-1 ${diffResult.projectFinishVarianceDays > 0 ? 'text-rose-600' : 'text-emerald-600'}`}>
-            {diffResult.projectFinishVarianceDays > 0 ? `+${diffResult.projectFinishVarianceDays}` : diffResult.projectFinishVarianceDays} {lang === 'ar' ? 'يوم' : 'Days'}
-          </div>
-          <span className="text-[10px] text-slate-400">{lang === 'ar' ? 'مقارنة بين النسختين' : 'Between selected revisions'}</span>
-        </div>
-
-        <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
-          <span className="text-xs text-slate-500 font-bold">{t.modified_activities}</span>
-          <div className="text-2xl font-black text-slate-900 mt-1">{diffResult.modifiedCount}</div>
-          <span className="text-[10px] text-slate-400">{lang === 'ar' ? `من أصل ${diffResult.totalActivitiesCount} نشاط` : `out of ${diffResult.totalActivitiesCount}`}</span>
-        </div>
-
-        <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
-          <span className="text-xs text-slate-500 font-bold">{t.critical_shifts}</span>
-          <div className="text-2xl font-black text-amber-600 mt-1">{diffResult.criticalityShiftCount}</div>
-          <span className="text-[10px] text-slate-400">{lang === 'ar' ? 'أنشطة تحولت لحرجة' : 'Critical switches'}</span>
-        </div>
-
-        <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
-          <span className="text-xs text-slate-500 font-bold">{t.added_activities}</span>
-          <div className="text-2xl font-black text-emerald-600 mt-1">+{diffResult.addedCount}</div>
-          <span className="text-[10px] text-slate-400">{lang === 'ar' ? 'غير موجودة بالنسخة الأولى' : 'New tasks in Rev B'}</span>
-        </div>
-      </div>
-
-      {/* Summary Banner */}
-      <div className="p-4 bg-gradient-to-r from-amber-500/10 via-amber-500/5 to-transparent border-r-4 border-amber-500 rounded-xl bg-white shadow-sm flex items-center justify-between">
-        <span className="font-bold text-slate-900 text-xs">{diffResult.summary}</span>
-      </div>
-
-      {/* Filter and Search Bar */}
-      <div className="flex flex-wrap items-center justify-between gap-3 bg-slate-50 p-3 rounded-xl border border-slate-200 text-xs">
-        <div className="flex items-center gap-2">
-          <div className="relative">
-            <Search size={14} className="absolute right-3 top-2.5 text-slate-400" />
-            <input
-              type="text"
-              placeholder={lang === 'ar' ? 'بحث في الأنشطة المعدلة...' : 'Search activities...'}
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              className="pr-8 pl-3 py-1.5 border border-slate-300 rounded-lg bg-white text-xs w-60 outline-none focus:border-amber-500 font-medium"
-            />
-          </div>
-
-          <div className="flex items-center gap-1 bg-white border border-slate-200 rounded-lg p-0.5">
-            <button
-              onClick={() => setFilterMode('all')}
-              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
-                filterMode === 'all' ? 'bg-amber-500 text-slate-950 shadow-sm' : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              {t.filter_all} ({diffResult.activities.length})
-            </button>
-            <button
-              onClick={() => setFilterMode('modified_only')}
-              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
-                filterMode === 'modified_only' ? 'bg-amber-500 text-slate-950 shadow-sm' : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              {t.filter_modified} ({diffResult.modifiedCount})
-            </button>
-            <button
-              onClick={() => setFilterMode('slippage_only')}
-              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
-                filterMode === 'slippage_only' ? 'bg-amber-500 text-slate-950 shadow-sm' : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              {t.filter_slippage}
-            </button>
-            <button
-              onClick={() => setFilterMode('critical_only')}
-              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
-                filterMode === 'critical_only' ? 'bg-amber-500 text-slate-950 shadow-sm' : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              {t.filter_critical}
-            </button>
-          </div>
-        </div>
-      </div>
-
-      {/* Comparison Grid Table */}
-      <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full text-xs">
-            <thead className="bg-slate-50 text-slate-700 border-b border-slate-200 font-bold">
-              <tr>
-                <th className="p-3 text-right">{t.activity_code}</th>
-                <th className="p-3 text-right">{t.activity_name}</th>
-                <th className="p-3 text-right">{lang === 'ar' ? 'بداية النسخة (A)' : 'Start (Rev A)'}</th>
-                <th className="p-3 text-right">{lang === 'ar' ? 'بداية النسخة (B)' : 'Start (Rev B)'}</th>
-                <th className="p-3 text-right">{lang === 'ar' ? 'نهاية النسخة (A)' : 'Finish (Rev A)'}</th>
-                <th className="p-3 text-right">{lang === 'ar' ? 'نهاية النسخة (B)' : 'Finish (Rev B)'}</th>
-                <th className="p-3 text-right">{lang === 'ar' ? 'انحراف النهاية (FV)' : 'Finish Var (FV)'}</th>
-                <th className="p-3 text-right">{lang === 'ar' ? 'مدة (A)' : 'Dur (A)'}</th>
-                <th className="p-3 text-right">{lang === 'ar' ? 'مدة (B)' : 'Dur (B)'}</th>
-                <th className="p-3 text-center">{t.critical}</th>
-                <th className="p-3 text-center">{lang === 'ar' ? 'حالة التغيير' : 'Diff Status'}</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-100 font-medium">
-              {filteredItems.map((item) => (
-                <tr key={item.activityId} className="hover:bg-slate-50 transition-colors">
-                  <td className="p-3 font-mono font-bold text-slate-700">{item.code}</td>
-                  <td className="p-3 font-bold text-slate-800 max-w-xs truncate">{item.name}</td>
-                  <td className="p-3 font-mono text-slate-500">{item.startBaseline || '-'}</td>
-                  <td className="p-3 font-mono text-slate-900 font-bold">{item.startCurrent || '-'}</td>
-                  <td className="p-3 font-mono text-slate-500">{item.finishBaseline || '-'}</td>
-                  <td className="p-3 font-mono text-slate-900 font-bold">{item.finishCurrent || '-'}</td>
-                  <td className="p-3 font-mono font-black">
-                    {item.finishVarianceDays > 0 ? (
-                      <span className="text-rose-600">+{item.finishVarianceDays} {lang === 'ar' ? 'يوم' : 'd'}</span>
-                    ) : item.finishVarianceDays < 0 ? (
-                      <span className="text-emerald-600">{item.finishVarianceDays} {lang === 'ar' ? 'يوم' : 'd'}</span>
-                    ) : (
-                      <span className="text-slate-400">0 {lang === 'ar' ? 'يوم' : 'd'}</span>
-                    )}
-                  </td>
-                  <td className="p-3 text-slate-500">{item.durationBaseline} {lang === 'ar' ? 'يوم' : 'd'}</td>
-                  <td className="p-3 font-bold text-slate-900">{item.durationCurrent} {lang === 'ar' ? 'يوم' : 'd'}</td>
-                  <td className="p-3 text-center">
-                    {item.criticalityCurrent ? (
-                      <span className="px-2 py-0.5 rounded text-[10px] bg-rose-100 text-rose-700 font-bold">{t.critical}</span>
-                    ) : (
-                      <span className="text-slate-300">-</span>
-                    )}
-                  </td>
-                  <td className="p-3 text-center">
-                    {item.diffType === 'added' ? (
-                      <span className="px-2 py-0.5 rounded-full text-[10px] bg-emerald-100 text-emerald-800 font-bold">{lang === 'ar' ? 'مضاف' : 'Added'}</span>
-                    ) : item.diffType === 'modified' ? (
-                      <span className="px-2 py-0.5 rounded-full text-[10px] bg-blue-100 text-blue-800 font-bold">{lang === 'ar' ? 'معدل' : 'Modified'}</span>
-                    ) : (
-                      <span className="text-slate-400 text-[10px]">{lang === 'ar' ? 'مطابق' : 'Unchanged'}</span>
-                    )}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
     </div>
   );
 }

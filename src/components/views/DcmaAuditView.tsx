@@ -1,6 +1,6 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { supabase } from '@/lib/supabase';
-import type { Project, Activity, ActivityLink, BaselineActivity, ActivityResource, DcmaAuditResult, ProgressUpdate } from '@/types';
+import type { Project, Activity, ActivityLink, BaselineActivity, ActivityResource, DcmaAuditResult, DcmaAutoFixType, ProgressUpdate } from '@/types';
 import { runDcma14PointAudit, autoFixDcmaIssues } from '@/lib/scheduleQualityEngine';
 // F9.4 (Controlled Pilot defect 4): the float profile's critical bucket must use the same canonical
 // criticality as F5, the dashboard and the Executive Report — not the cached `is_critical` column.
@@ -13,14 +13,12 @@ import {
   AlertTriangle,
   CheckCircle2,
   XCircle,
-  Clock,
   Sparkles,
   Award,
   ChevronDown,
   ChevronUp,
   RefreshCw,
   Wrench,
-  Check,
 } from 'lucide-react';
 
 interface DcmaAuditViewProps {
@@ -39,35 +37,58 @@ export default function DcmaAuditView({ project }: DcmaAuditViewProps) {
   const [message, setMessage] = useState('');
   const [isFixing, setIsFixing] = useState(false);
   const [lang, setLang] = useState<Language>(getLanguage());
+  const [loadedProjectId, setLoadedProjectId] = useState<string | null>(null);
+  const loadRequestId = useRef(0);
 
   useEffect(() => {
-    if (project) loadData();
-    else setLoading(false);
+    if (project) {
+      void loadData(project);
+    } else {
+      loadRequestId.current += 1;
+      setActivities([]);
+      setLinks([]);
+      setBaselineActivities([]);
+      setAssignments([]);
+      setProgressUpdates([]);
+      setLoadedProjectId(null);
+      setLoading(false);
+    }
 
-    const handleLangChange = (e: any) => {
-      setLang(e.detail?.lang || getLanguage());
+    const handleLangChange = (e: Event) => {
+      const nextLang = (e as CustomEvent<{ lang?: Language }>).detail?.lang;
+      setLang(nextLang || getLanguage());
     };
     window.addEventListener('app-language-changed', handleLangChange);
-    return () => window.removeEventListener('app-language-changed', handleLangChange);
+    return () => {
+      loadRequestId.current += 1;
+      window.removeEventListener('app-language-changed', handleLangChange);
+    };
   }, [project]);
 
-  async function loadData() {
-    if (!project) return;
+  async function loadData(projectToLoad: Project | null = project) {
+    if (!projectToLoad) return;
+    const requestId = ++loadRequestId.current;
     setLoading(true);
+    setLoadedProjectId(null);
     const [actRes, linkRes, baselineRes, assignRes, progRes] = await Promise.all([
-      supabase.from('activities').select('*').eq('project_id', project.id).order('sort_order'),
-      supabase.from('activity_links').select('*').eq('project_id', project.id),
-      supabase.from('baseline_activities').select('*'),
-      supabase.from('activity_resources').select('*').eq('project_id', project.id),
+      supabase.from('activities').select('*').eq('project_id', projectToLoad.id).order('sort_order'),
+      supabase.from('activity_links').select('*').eq('project_id', projectToLoad.id),
+      // baseline_activities has no project_id; scope it through this project's active approved header,
+      // matching the governed baseline query used by ScheduleView.
+      supabase.from('baseline_activities').select('*, project_baselines!inner(project_id, is_active, status)').eq('project_baselines.project_id', projectToLoad.id).eq('project_baselines.is_active', true).eq('project_baselines.status', 'approved'),
+      supabase.from('activity_resources').select('*').eq('project_id', projectToLoad.id),
       // P2A1-H01: the governed progress history, so the canonical criticality below is computed on
       // the same statused activities F5 uses rather than on the materialised column.
-      supabase.from('progress_updates').select('*').eq('project_id', project.id),
+      supabase.from('progress_updates').select('*').eq('project_id', projectToLoad.id),
     ]);
+    // Discard stale responses so a previous project's records cannot replace the current project's view.
+    if (requestId !== loadRequestId.current) return;
     setActivities(actRes.data || []);
     setLinks((linkRes.data || []) as ActivityLink[]);
     setBaselineActivities((baselineRes.data || []) as BaselineActivity[]);
     setAssignments((assignRes.data || []) as ActivityResource[]);
     setProgressUpdates((progRes.data || []) as ProgressUpdate[]);
+    setLoadedProjectId(projectToLoad.id);
     setLoading(false);
   }
 
@@ -123,7 +144,7 @@ export default function DcmaAuditView({ project }: DcmaAuditViewProps) {
     );
   }, [activities, links, baselineActivities, assignments, dcmaDataDate, project?.calendar_type, project?.status_logic]);
 
-  async function handleAutoFix(fixType: any = 'all') {
+  async function handleAutoFix(fixType: DcmaAutoFixType = 'all') {
     if (!project) return;
     setIsFixing(true);
     try {
@@ -143,16 +164,18 @@ export default function DcmaAuditView({ project }: DcmaAuditViewProps) {
       setMessage(result.message);
       // Also reload from database to ensure 100% persistence verification
       await loadData();
-    } catch (err: any) {
-      setMessage(`خطأ أثناء المعالجة: ${err?.message || 'خطأ غير معروف'}`);
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : 'خطأ غير معروف';
+      setMessage(`خطأ أثناء المعالجة: ${errorMessage}`);
     } finally {
       setIsFixing(false);
     }
   }
 
   const t = translations[lang];
+  const hasActivities = activities.length > 0;
 
-  if (loading) {
+  if (loading || (project ? loadedProjectId !== project.id : loadedProjectId !== null)) {
     return (
       <div className="flex items-center justify-center min-h-[400px]">
         <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-amber-600"></div>
@@ -241,11 +264,13 @@ export default function DcmaAuditView({ project }: DcmaAuditViewProps) {
               <Award size={18} className="text-amber-400" />
             </div>
             <div className="text-4xl font-black tracking-tight text-white mb-1">
-              {audit.score}
-              <span className="text-lg font-normal text-slate-400">/100</span>
+              {hasActivities ? audit.score : 'N/A'}
+              {hasActivities && <span className="text-lg font-normal text-slate-400">/100</span>}
             </div>
             <p className="text-xs text-amber-300 font-bold">
-              {audit.score >= 90
+              {!hasActivities
+                ? (lang === 'ar' ? 'غير متاح (N/A) — لا توجد أنشطة لفحصها.' : 'N/A — no activities are available to audit.')
+                : audit.score >= 90
                 ? (lang === 'ar' ? '⭐ ممتاز (مطابق للمواصفات العالمية)' : '⭐ Excellent (Industry Compliant)')
                 : audit.score >= 75
                 ? (lang === 'ar' ? '⚠️ مقبول مع مقترحات تحسين' : '⚠️ Acceptable with warnings')
@@ -254,26 +279,26 @@ export default function DcmaAuditView({ project }: DcmaAuditViewProps) {
           </div>
 
           <div className="mt-4 pt-3 border-t border-slate-700/60 text-[11px] text-slate-300">
-            {audit.summary}
+            {hasActivities ? audit.summary : (lang === 'ar' ? 'لا توجد بيانات جدول لتقييم الجودة.' : 'No schedule data is available for a quality assessment.')}
           </div>
         </div>
 
         {/* Breakdown Stats */}
         <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex flex-col justify-center items-center text-center">
           <CheckCircle2 size={28} className="text-emerald-500 mb-1" />
-          <div className="text-2xl font-black text-slate-800">{audit.totalPassed} / 14</div>
+          <div className="text-2xl font-black text-slate-800">{hasActivities ? `${audit.totalPassed} / 14` : 'N/A'}</div>
           <span className="text-xs text-slate-500 font-bold mt-0.5">{lang === 'ar' ? 'معايير ناجحة تماماً' : 'Passed Points'}</span>
         </div>
 
         <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex flex-col justify-center items-center text-center">
           <AlertTriangle size={28} className="text-amber-500 mb-1" />
-          <div className="text-2xl font-black text-amber-700">{audit.totalWarnings} / 14</div>
+          <div className="text-2xl font-black text-amber-700">{hasActivities ? `${audit.totalWarnings} / 14` : 'N/A'}</div>
           <span className="text-xs text-slate-500 font-bold mt-0.5">{lang === 'ar' ? 'معايير بتنبيهات تحسين' : 'Warning Points'}</span>
         </div>
 
         <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex flex-col justify-center items-center text-center">
           <XCircle size={28} className="text-rose-500 mb-1" />
-          <div className="text-2xl font-black text-rose-700">{audit.totalFailed} / 14</div>
+          <div className="text-2xl font-black text-rose-700">{hasActivities ? `${audit.totalFailed} / 14` : 'N/A'}</div>
           <span className="text-xs text-slate-500 font-bold mt-0.5">{lang === 'ar' ? 'معايير مخالفة' : 'Failed Points'}</span>
         </div>
       </div>
@@ -307,11 +332,13 @@ export default function DcmaAuditView({ project }: DcmaAuditViewProps) {
               <span className="font-mono text-[10px] bg-slate-200 px-1.5 py-0.5 rounded font-bold">Target ≥ 2.0</span>
             </div>
             <div className="text-2xl font-black text-slate-900 font-mono">
-              {activities.length > 0 ? (links.length / activities.length).toFixed(2) : '0.00'}
+              {hasActivities ? (links.length / activities.length).toFixed(2) : 'N/A'}
             </div>
             <p className="text-[10px] text-slate-500">
-              {lang === 'ar'
-                ? `إجمالي ${links.length} علاقة على ${activities.length} نشاط (معدل ممتاز ومتزن للشبكة)`
+              {!hasActivities
+                ? (lang === 'ar' ? 'غير متاح (N/A) — لا توجد أنشطة لحساب الكثافة.' : 'N/A — no activities are available for the density ratio.')
+                : lang === 'ar'
+                ? `إجمالي ${links.length} علاقة على ${activities.length} نشاط.`
                 : `${links.length} links across ${activities.length} activities.`}
             </p>
           </div>
@@ -322,30 +349,30 @@ export default function DcmaAuditView({ project }: DcmaAuditViewProps) {
             <div className="grid grid-cols-3 gap-1 text-center font-mono text-[10px]">
               <div className="bg-rose-50 border border-rose-200 p-1 rounded">
                 <span className="text-rose-700 font-bold block">حرج (0d)</span>
-                <span className="font-black text-rose-950">{floatProfile.critical}</span>
+                <span className="font-black text-rose-950">{hasActivities ? floatProfile.critical : 'N/A'}</span>
               </div>
               <div className="bg-amber-50 border border-amber-200 p-1 rounded">
                 <span className="text-amber-700 font-bold block">1-14d</span>
-                <span className="font-black text-amber-950">{floatProfile.near}</span>
+                <span className="font-black text-amber-950">{hasActivities ? floatProfile.near : 'N/A'}</span>
               </div>
               <div className="bg-emerald-50 border border-emerald-200 p-1 rounded">
                 <span className="text-emerald-700 font-bold block">&gt; 14d</span>
-                <span className="font-black text-emerald-950">{floatProfile.loose}</span>
+                <span className="font-black text-emerald-950">{hasActivities ? floatProfile.loose : 'N/A'}</span>
               </div>
             </div>
           </div>
 
-          {/* 3. Concurrency Index */}
+          {/* 3. Concurrency Index — no governed concurrency calculation is available in this view. */}
           <div className="p-3.5 bg-slate-50 rounded-xl border border-slate-200 space-y-2">
             <div className="flex items-center justify-between">
               <span className="text-slate-600 font-bold">{lang === 'ar' ? 'مؤشر التزامن (Concurrency)' : 'Concurrency Index'}</span>
-              <span className="font-mono text-[10px] bg-emerald-100 text-emerald-800 px-1.5 py-0.5 rounded font-bold">Optimal</span>
+              <span className="font-mono text-[10px] bg-slate-200 text-slate-600 px-1.5 py-0.5 rounded font-bold">N/A</span>
             </div>
-            <div className="text-2xl font-black text-slate-900 font-mono">
-              3.4 <span className="text-xs text-slate-500 font-normal">أنشطة متزامنة/أسبوع</span>
-            </div>
+            <div className="text-2xl font-black text-slate-500 font-mono">N/A</div>
             <p className="text-[10px] text-slate-500">
-              {lang === 'ar' ? 'توزيع متوازن للأعمال لتفادي ازدحام الموارد بموقع العمل' : 'Balanced resource peak concurrency'}
+              {lang === 'ar'
+                ? 'غير متاح (N/A) — لا يوجد ناتج تزامن تشغيلي محسوب من بيانات المشروع.'
+                : 'N/A — no operational concurrency result is calculated from project data.'}
             </p>
           </div>
         </div>
@@ -449,6 +476,13 @@ export default function DcmaAuditView({ project }: DcmaAuditViewProps) {
               </div>
             );
           })}
+          {audit.points.length === 0 && (
+            <div role="status" className="p-8 text-center text-sm text-slate-500">
+              {lang === 'ar'
+                ? 'غير متاح (N/A) — لا توجد أنشطة مسجلة لتقييم معايير DCMA.'
+                : 'N/A — no recorded activities are available for DCMA evaluation.'}
+            </div>
+          )}
         </div>
       </div>
     </div>

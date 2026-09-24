@@ -843,21 +843,21 @@ export interface ActivityDiffItem {
   diffType: 'added' | 'deleted' | 'modified' | 'unchanged';
   startBaseline: string | null;
   startCurrent: string | null;
-  startVarianceDays: number;
+  startVarianceDays: number | null;
   finishBaseline: string | null;
   finishCurrent: string | null;
-  finishVarianceDays: number;
-  durationBaseline: number;
-  durationCurrent: number;
-  durationVarianceDays: number;
-  totalFloatBaseline: number;
-  totalFloatCurrent: number;
-  totalFloatVarianceDays: number;
-  criticalityBaseline: boolean;
-  criticalityCurrent: boolean;
-  criticalityShift: 'became_critical' | 'became_non_critical' | 'unchanged';
-  percentBaseline: number;
-  percentCurrent: number;
+  finishVarianceDays: number | null;
+  durationBaseline: number | null;
+  durationCurrent: number | null;
+  durationVarianceDays: number | null;
+  totalFloatBaseline: number | null;
+  totalFloatCurrent: number | null;
+  totalFloatVarianceDays: number | null;
+  criticalityBaseline: boolean | null;
+  criticalityCurrent: boolean | null;
+  criticalityShift: 'became_critical' | 'became_non_critical' | 'unchanged' | 'unknown';
+  percentBaseline: number | null;
+  percentCurrent: number | null;
 }
 
 export interface ScheduleDiffResult {
@@ -867,8 +867,8 @@ export interface ScheduleDiffResult {
   addedCount: number;
   deletedCount: number;
   modifiedCount: number;
-  criticalityShiftCount: number;
-  projectFinishVarianceDays: number;
+  criticalityShiftCount: number | null;
+  projectFinishVarianceDays: number | null;
   activities: ActivityDiffItem[];
   summary: string;
 }

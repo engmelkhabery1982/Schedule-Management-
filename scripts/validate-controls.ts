@@ -1651,7 +1651,67 @@ console.log('--- S17 Controlled Pilot defects (F9.4)');
     && q.includes(".eq('project_baselines.is_active', true)")
     && q.includes(".eq('project_baselines.status', 'approved')");
   const isProjectScoped = (q: string): boolean =>
-    q.includes(".eq('project_baselines.project_id', project.id)");
+    q.includes(".eq('project_baselines.project_id', project.id)")
+    || q.includes(".eq('project_baselines.project_id', projectToLoad.id)");
+
+  // ---------------------------------------------------------------------
+  // S23  Launch Batch 1 — schedule integrity regressions
+  // ---------------------------------------------------------------------
+  console.log('--- S23 Launch Batch 1 schedule integrity');
+  const scheduleDiffSrc = readSrc('src/components/views/ScheduleDiffView.tsx');
+  const dcmaSrc = readSrc('src/components/views/DcmaAuditView.tsx');
+  const scheduleDiffBaselineQuery = queryFor(scheduleDiffSrc, 'baseline_activities') ?? '';
+  const dcmaBaselineQuery = queryFor(dcmaSrc, 'baseline_activities') ?? '';
+  const scheduleViewBaselineQuery = queryFor(readSrc('src/components/views/ScheduleView.tsx'), 'baseline_activities') ?? '';
+  const governedBaselineQueryMarkers = [
+    "select('*, project_baselines!inner(project_id, is_active, status)')",
+    ".eq('project_baselines.is_active', true)",
+    ".eq('project_baselines.status', 'approved')",
+  ];
+  for (const [name, query] of [
+    ['ScheduleDiffView', scheduleDiffBaselineQuery],
+    ['DcmaAuditView', dcmaBaselineQuery],
+  ] as const) {
+    ok(`S23 ${name} loads baseline activity rows`, query.length > 0);
+    ok(`S23 ${name} uses the active + approved governed join`, isRevisionGoverned(query));
+    ok(`S23 ${name} scopes the joined baseline to project.id`, isProjectScoped(query));
+    ok(`S23 ${name} matches ScheduleView's governed query shape`,
+      governedBaselineQueryMarkers.every((marker) => query.includes(marker))
+        && governedBaselineQueryMarkers.every((marker) => scheduleViewBaselineQuery.includes(marker)));
+    ok(`S23 ${name} has no bare unscoped baseline select`,
+      !/supabase\.from\('baseline_activities'\)\.select\('\*'\)\s*[,;)]/.test(query));
+  }
+
+  ok('S23 ScheduleDiff contains no fabricated Oct/Nov revisions or localStorage snapshots',
+    !/rev_oct_2026|rev_nov_2026|schedule_diff_revisions_|ScheduleRevision|activitiesSnapshot|localStorage|handleCreateSnapshot/.test(scheduleDiffSrc));
+  ok('S23 ScheduleDiff exposes no revision selector or snapshot action',
+    !/<select\b|selectedRev|Revision Matrix|Save Schedule Snapshot/.test(scheduleDiffSrc));
+  ok('S23 ScheduleDiff uses only real baseline rows and has an N/A path when none exist',
+    /const hasApprovedBaseline = baselineActivities\.length > 0/.test(scheduleDiffSrc)
+      && /if \(!hasApprovedBaseline\) return null/.test(scheduleDiffSrc)
+      && /baselineActivities\.map\(/.test(scheduleDiffSrc)
+      && /Comparison is N\/A/.test(scheduleDiffSrc));
+  ok('S23 project-scoped baseline responses cannot overwrite or display stale project data',
+    [scheduleDiffSrc, dcmaSrc].every((src) =>
+      /if \(requestId !== loadRequestId\.current\) return;[\s\S]{0,240}setBaselineActivities/.test(src)
+        && /loadedProjectId !== project\.id/.test(src)));
+  ok('S23 ScheduleDiff compares actual approved baseline fields without live-value fallback',
+    /duration_days: baseline\.duration_days/.test(scheduleDiffSrc)
+      && /start_date: baseline\.early_start \|\| null/.test(scheduleDiffSrc)
+      && /end_date: baseline\.early_finish \|\| null/.test(scheduleDiffSrc)
+      && !/baseline\.(?:duration_days|early_start|early_finish)\s*\?\?\s*liveActivity\./.test(scheduleDiffSrc));
+  ok('S23 ScheduleDiff does not compare live progress with an unstored baseline percentage',
+    !/actA\.percent_complete\s*!==\s*actB\.percent_complete/.test(scheduleDiffSrc));
+
+  ok('S23 DCMA concurrency is N/A, not the fabricated 3.4 / Optimal result',
+    dcmaSrc.includes('Concurrency Index') && dcmaSrc.includes('N/A')
+      && !dcmaSrc.includes('3.4') && !dcmaSrc.includes('Optimal'));
+  ok('S23 DCMA empty schedules display N/A instead of a 100/100 result',
+    /const hasActivities = activities\.length > 0/.test(dcmaSrc)
+      && /hasActivities \? audit\.score : 'N\/A'/.test(dcmaSrc)
+      && /audit\.points\.length === 0/.test(dcmaSrc));
+  ok('S23 DCMA audit and auto-fix still use the existing engine entry points',
+    /runDcma14PointAudit\(/.test(dcmaSrc) && /autoFixDcmaIssues\(/.test(dcmaSrc));
 
   // --- Finding 1: PortfolioView table -> destructured slot binding. ---
   const pfSrc = readSrc('src/components/views/PortfolioView.tsx');
@@ -1692,6 +1752,8 @@ console.log('--- S17 Controlled Pilot defects (F9.4)');
     'src/components/views/Dashboard.tsx',
     'src/components/views/ProgressView.tsx',
     'src/components/views/ScheduleView.tsx',
+    'src/components/views/ScheduleDiffView.tsx',
+    'src/components/views/DcmaAuditView.tsx',
     'src/components/views/ExecutiveReportView.tsx',
   ];
   for (const rel of GOVERNED_VIEWS) {
