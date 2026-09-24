@@ -808,30 +808,55 @@ export interface DelayClaimEvent {
 }
 
 // Schedule Recovery & Crashing Optimizer Types
+export type RecoveryStrategy = 'crashing' | 'fast_tracking' | 'crew_doubling';
+
 export interface RecoveryOption {
   id: string;
   activityId: string;
   activityCode: string;
   activityName: string;
-  strategy: 'crashing' | 'fast_tracking' | 'overtime' | 'crew_doubling';
+  strategy: RecoveryStrategy;
   strategyAr: string;
-  daysSaved: number;
-  additionalCost: number;
-  costPerDay: number;
-  feasibilityScore: number; // 0-100%
-  description: string;
+  affectedActivityIds: string[];
+  affectedLinkIds: string[];
+  linkId: string | null;
+  fromLinkType: string | null;
+  toLinkType: string | null;
+  /** User-entered reduction assumption, bounded by the CPM remaining duration. */
+  durationReductionDays: number | null;
+  maxDurationReductionDays: number | null;
+  /** Explicit user-entered incremental premium/cost; null means no cost evidence. */
+  additionalCost: number | null;
   selected: boolean;
+  isApplicable: boolean;
+  /** Actual duration reduction used when this option is included in the evaluated scenario. */
+  appliedDurationReductionDays: number | null;
+  description: string;
+}
+
+export interface RecoveryEvaluatedScenario {
+  /** In-memory clones containing only the selected, evaluated duration / relationship changes. */
+  activities: Activity[];
+  links: ActivityLink[];
+  selectedOptionIds: string[];
 }
 
 export interface RecoveryPlanResult {
-  targetFinishDate: string;
-  currentFinishDate: string;
-  requiredCompressionDays: number;
-  totalDaysRecovered: number;
-  totalRecoveryCost: number;
-  newProjectFinishDate: string;
+  targetFinishDate: string | null;
+  currentFinishDate: string | null;
+  requiredCompressionDays: number | null;
+  /** CPM-derived working-day difference between current and scenario finish dates. */
+  recoveredWorkingDays: number | null;
+  /** Sum of explicit option costs, or null if any applied option has no cost input. */
+  incrementalCostSar: number | null;
+  /** Read directly from the scenario CPM result; never back-calculated from option inputs. */
+  scenarioFinishDate: string | null;
+  remainingGapDays: number | null;
   options: RecoveryOption[];
-  feasibilityRating: 'high' | 'moderate' | 'difficult';
+  recoveryStatus: 'not_measured' | 'no_actions_selected' | 'no_improvement' | 'improved' | 'improved_with_gap' | 'target_achieved';
+  currentCycle: string[] | null;
+  scenarioCycle: string[] | null;
+  evaluatedScenario: RecoveryEvaluatedScenario;
   summary: string;
 }
 

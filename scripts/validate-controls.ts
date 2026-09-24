@@ -31,6 +31,7 @@
 // the shipped source instead — which is also the stronger check, because it tests the code the user
 // actually runs rather than a copy of it.
 import { readFileSync, existsSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { dirname, resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DEFAULT_DATA_DATE, governedDefaultToday } from '@/lib/projectControlsConstants';
@@ -42,6 +43,7 @@ import {
   type DataDateBearer,
 } from '@/lib/chronologyGuard';
 import { calculateCpm } from '@/lib/cpmEngine';
+import { buildRecoveryScenarioPatches, generateScheduleRecoveryPlan } from '@/lib/recoveryOptimizerEngine';
 import { getCalendar, countWorkingDays, addWorkingDays } from '@/lib/calendarEngine';
 import { calculateBaselineVariances } from '@/lib/trendEngine';
 import { generateScheduleAlerts } from '@/lib/alertEngine';
@@ -4335,6 +4337,214 @@ console.log('--- S18 Pilot Closure (F9.5)');
   }
 }
 
+
+// ---------------------------------------------------------------------------
+// S24 — Launch Batch 2A: CPM-evaluated recovery scenarios and Apply-only persistence.
+// ---------------------------------------------------------------------------
+{
+  console.log('--- S24 Launch Batch 2A schedule recovery scenarios');
+  const recoveryRoot = (() => {
+    const cwd = process.cwd();
+    if (existsSync(resolvePath(cwd, 'package.json'))) return cwd;
+    let dir = dirname(fileURLToPath(import.meta.url));
+    for (let i = 0; i < 8; i += 1) {
+      if (existsSync(resolvePath(dir, 'package.json'))) return dir;
+      dir = dirname(dir);
+    }
+    return cwd;
+  })();
+  const recoveryRead = (rel: string): string => readFileSync(resolvePath(recoveryRoot, rel), 'utf8');
+  const recoveryCode = (rel: string): string => recoveryRead(rel)
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .split('\n')
+    .filter((line) => !/^\s*\/\//.test(line))
+    .join('\n');
+  const recoveryEngineSrc = recoveryCode('src/lib/recoveryOptimizerEngine.ts');
+  const recoveryViewSrc = recoveryCode('src/components/views/ScheduleRecoveryView.tsx');
+  const recoveryCpmOptions = {
+    calendarType: '6_days' as const,
+    dataDate: '2026-09-13',
+    statusLogic: 'retained_logic' as const,
+  };
+
+  // A linked critical path: a user-entered three-day reduction must be applied to a clone and the
+  // actual finish / recovery must quote canonical CPM, not a sum of option metadata.
+  const recoveryChainActs = [
+    act({ id: 'REC-A', code: 'RA', duration_days: 10, early_start: '2026-09-13' }),
+    act({ id: 'REC-B', code: 'RB', duration_days: 5 }),
+  ];
+  const recoveryChainLinks = [link('REC-LAB', 'REC-A', 'REC-B')];
+  const recoveryInputSnapshot = JSON.stringify({ activities: recoveryChainActs, links: recoveryChainLinks });
+  const crashOptionId = 'recovery-crashing-REC-A';
+  const crashPlan = generateScheduleRecoveryPlan(recoveryChainActs, recoveryChainLinks, {
+    targetFinishDate: '2026-09-20',
+    cpmOptions: recoveryCpmOptions,
+    selectedOptions: { [crashOptionId]: true },
+    optionInputs: { [crashOptionId]: { durationReductionDays: 3 } },
+  });
+  const independentScenarioCpm = calculateCpm(
+    crashPlan.evaluatedScenario.activities,
+    crashPlan.evaluatedScenario.links,
+    recoveryCpmOptions,
+  );
+  eq('S24 recovery scenario finish is exactly its canonical CPM finish',
+    crashPlan.scenarioFinishDate, independentScenarioCpm.projectEarlyFinish);
+  eq('S24 recovered days are the independent project-calendar finish-date delta',
+    crashPlan.recoveredWorkingDays,
+    crashPlan.scenarioFinishDate && crashPlan.currentFinishDate
+      ? refWdDelta(crashPlan.scenarioFinishDate, crashPlan.currentFinishDate)
+      : null);
+  eq('S24 the evaluated scenario records the selected crashing option only',
+    crashPlan.evaluatedScenario.selectedOptionIds, [crashOptionId]);
+  ok('S24 scenario analysis leaves the source schedule objects untouched',
+    JSON.stringify({ activities: recoveryChainActs, links: recoveryChainLinks }) === recoveryInputSnapshot);
+  ok('S24 the remaining target gap is measured from scenario CPM finish to target',
+    crashPlan.remainingGapDays !== null
+      && crashPlan.scenarioFinishDate !== null
+      && crashPlan.targetFinishDate !== null
+      && crashPlan.remainingGapDays === (crashPlan.scenarioFinishDate > crashPlan.targetFinishDate
+        ? refWdDelta(crashPlan.targetFinishDate, crashPlan.scenarioFinishDate)
+        : 0));
+  ok('S24 recovery options do not carry fabricated daysSaved fields',
+    crashPlan.options.every((option) => !Object.prototype.hasOwnProperty.call(option, 'daysSaved')));
+
+  // Incremental cost is N/A when no real premium/cost input is supplied and uses the explicit
+  // entered value when provided; no synthetic per-day rate is inferred.
+  eq('S24 missing incremental-cost evidence produces N/A/null', crashPlan.incrementalCostSar, null);
+  eq('S24 selected option has no fabricated additional cost',
+    crashPlan.options.find((option) => option.id === crashOptionId)?.additionalCost, null);
+  const pricedCrashPlan = generateScheduleRecoveryPlan(recoveryChainActs, recoveryChainLinks, {
+    targetFinishDate: '2026-09-20',
+    cpmOptions: recoveryCpmOptions,
+    selectedOptions: { [crashOptionId]: true },
+    optionInputs: { [crashOptionId]: { durationReductionDays: 3, incrementalCostSar: 12345.67 } },
+  });
+  eq('S24 cost uses only the explicit incremental premium supplied by the user', pricedCrashPlan.incrementalCostSar, 12345.67);
+
+  // Started activities change only their CPM-consumed remaining-duration assumption, not the
+  // original duration or percent-complete evidence.
+  const inProgressActivity = act({
+    id: 'REC-IP', code: 'IP', duration_days: 10, early_start: '2026-09-13',
+    actual_start: '2026-09-13', percent_complete: 30,
+  });
+  const inProgressOptionId = 'recovery-crashing-REC-IP';
+  const inProgressPlan = generateScheduleRecoveryPlan([inProgressActivity], [], {
+    targetFinishDate: '2026-09-20', cpmOptions: recoveryCpmOptions,
+    selectedOptions: { [inProgressOptionId]: true },
+    optionInputs: { [inProgressOptionId]: { durationReductionDays: 2 } },
+  });
+  const evaluatedInProgress = inProgressPlan.evaluatedScenario.activities[0];
+  eq('S24 started-work recovery preserves original duration', evaluatedInProgress.duration_days, 10);
+  eq('S24 started-work recovery changes only the remaining duration assumption', evaluatedInProgress.remaining_duration_days, 5);
+  eq('S24 started-work recovery preserves progress evidence', evaluatedInProgress.percent_complete, 30);
+
+  // Fast tracking is an actual FS -> SS relationship change in the scenario clone. The CPM finish
+  // moves because of that link change while both activity durations and the recorded lag stay put.
+  const fastActs = [
+    act({ id: 'REC-FA', code: 'FA', duration_days: 10, early_start: '2026-09-13' }),
+    act({ id: 'REC-FB', code: 'FB', duration_days: 5 }),
+  ];
+  const fastLinks = [link('REC-FS-LINK', 'REC-FA', 'REC-FB', 'FS', 0)];
+  const fastOptionId = 'recovery-fast-track-REC-FS-LINK';
+  const fastPlan = generateScheduleRecoveryPlan(fastActs, fastLinks, {
+    targetFinishDate: '2026-09-20', cpmOptions: recoveryCpmOptions,
+    selectedOptions: { [fastOptionId]: true },
+  });
+  eq('S24 fast tracking changes the evaluated relationship to SS',
+    fastPlan.evaluatedScenario.links[0]?.link_type, 'SS');
+  eq('S24 fast tracking preserves the existing relationship lag',
+    fastPlan.evaluatedScenario.links[0]?.lag_days, fastLinks[0].lag_days);
+  eq('S24 fast tracking changes no activity durations',
+    fastPlan.evaluatedScenario.activities.map((activity) => activity.duration_days),
+    fastActs.map((activity) => activity.duration_days));
+  ok('S24 relationship-based fast tracking is evaluated by CPM and improves the finish',
+    fastPlan.scenarioFinishDate !== null
+      && fastPlan.currentFinishDate !== null
+      && fastPlan.scenarioFinishDate < fastPlan.currentFinishDate
+      && fastPlan.recoveredWorkingDays !== null
+      && fastPlan.recoveredWorkingDays > 0);
+  const fastTrackPatches = buildRecoveryScenarioPatches(fastActs, fastLinks, fastPlan.evaluatedScenario);
+  eq('S24 Apply patch for fast tracking persists only the evaluated relationship change',
+    fastTrackPatches, { activities: [], links: [{ id: 'REC-FS-LINK', values: { link_type: 'SS' } }] });
+
+  // Equal-duration parallel paths prove that selecting an action is not itself proof of recovery.
+  const parallelActs = [
+    act({ id: 'REC-P1', code: 'P1', duration_days: 10, early_start: '2026-09-13' }),
+    act({ id: 'REC-P2', code: 'P2', duration_days: 10, early_start: '2026-09-13' }),
+  ];
+  const parallelOptionId = 'recovery-crashing-REC-P1';
+  const noImprovementPlan = generateScheduleRecoveryPlan(parallelActs, [], {
+    targetFinishDate: '2026-09-15', cpmOptions: recoveryCpmOptions,
+    selectedOptions: { [parallelOptionId]: true },
+    optionInputs: { [parallelOptionId]: { durationReductionDays: 2 } },
+  });
+  eq('S24 a non-finish-improving selected option recovers zero actual days', noImprovementPlan.recoveredWorkingDays, 0);
+  eq('S24 a no-improvement scenario is explicitly not successful', noImprovementPlan.recoveryStatus, 'no_improvement');
+  ok('S24 a no-improvement scenario is never described as achieved', !noImprovementPlan.summary.includes('حقق السيناريو'));
+
+  // The patch builder is given the evaluated selected scenario (not a reduction sum); only the
+  // chosen activity assumption may persist. Fast-tracking above separately covers selected links.
+  const scenarioPatches = buildRecoveryScenarioPatches(parallelActs, [], noImprovementPlan.evaluatedScenario);
+  eq('S24 Apply patches contain only the selected/evaluated activity assumption',
+    scenarioPatches, { activities: [{ id: 'REC-P1', values: { duration_days: 8 } }], links: [] });
+  const emptyScenarioPatches = buildRecoveryScenarioPatches(parallelActs, [], {
+    activities: parallelActs.map((activity) => ({ ...activity, duration_days: 1 })),
+    links: [], selectedOptionIds: [],
+  });
+  eq('S24 Apply persists nothing when no option was selected', emptyScenarioPatches, { activities: [], links: [] });
+
+  // UI/source contracts bind the pure analysis path, explicit Apply boundary and unchanged scope.
+  const applyStart = recoveryViewSrc.indexOf('async function handleApplyPlan()');
+  const applyEnd = recoveryViewSrc.indexOf('\n  if (loading)', applyStart);
+  const preApplySource = applyStart >= 0 ? recoveryViewSrc.slice(0, applyStart) : recoveryViewSrc;
+  const applySource = applyStart >= 0 ? recoveryViewSrc.slice(applyStart, applyEnd < 0 ? undefined : applyEnd) : '';
+  const writePattern = /supabase\.from\(['"][^'"]+['"]\)\.(?:insert|update|upsert|delete)\s*\(/g;
+  ok('S24 analysis engine is pure and has no persistence path', !/supabase\.from\(/.test(recoveryEngineSrc));
+  ok('S24 view analysis/loading contains no database writes', !writePattern.test(preApplySource));
+  ok('S24 Apply builds writes from the evaluated selected scenario',
+    applySource.includes('buildRecoveryScenarioPatches(activities, links, plan.evaluatedScenario)')
+      && applySource.includes('plan.evaluatedScenario.activities, plan.evaluatedScenario.links'));
+  eq('S24 Apply runs canonical CPM exactly once after scenario persistence',
+    Array.from(applySource.matchAll(/calculateCpm\s*\(/g)).length, 1);
+  ok('S24 Apply does not reconstruct schedule changes from synthetic savings',
+    !applySource.includes('daysSaved') && !applySource.includes('plan.options.filter'));
+  ok('S24 scenario finish, recovered days, cost N/A and target gap are visibly bound in the view',
+    recoveryViewSrc.includes('plan.scenarioFinishDate')
+      && recoveryViewSrc.includes('plan.recoveredWorkingDays')
+      && recoveryViewSrc.includes('plan.incrementalCostSar')
+      && recoveryViewSrc.includes('plan.remainingGapDays')
+      && recoveryViewSrc.includes("'N/A'"));
+  ok('S24 no fabricated fixed recovery rates remain in recovery source',
+    !/\b(?:1800|2400|500)\b/.test(recoveryEngineSrc)
+      && !/\bcostPerDay\b/.test(`${recoveryEngineSrc}\n${recoveryViewSrc}`)
+      && !/(?:SAR|ريال)\s*\/\s*(?:day|يوم)/i.test(`${recoveryEngineSrc}\n${recoveryViewSrc}`));
+
+  const changedPaths = new Set([
+    ...execFileSync('git', ['diff', '--name-only'], { encoding: 'utf8' }).split('\n').filter(Boolean),
+    ...execFileSync('git', ['diff', '--name-only', '--cached'], { encoding: 'utf8' }).split('\n').filter(Boolean),
+  ]);
+  const allowedRecoveryPaths = new Set([
+    'src/lib/recoveryOptimizerEngine.ts',
+    'src/components/views/ScheduleRecoveryView.tsx',
+    'src/types/index.ts',
+    'scripts/validate-controls.ts',
+  ]);
+  const protectedControlPaths = [
+    'src/lib/scheduleControlEngine.ts',
+    'src/lib/costControlEngine.ts',
+    'src/lib/integratedDecisionEngine.ts',
+    'src/lib/cpmEngine.ts',
+    'src/lib/calendarEngine.ts',
+    'src/lib/tiaEngine.ts',
+    'src/components/views/TimeImpactAnalysisView.tsx',
+    'src/lib/resourceLevelingEngine.ts',
+    'src/lib/boqResourceLeveling.ts',
+  ];
+  ok('S24 changes stay within the recovery engine/view, required validation and shared types',
+    [...changedPaths].every((path) => allowedRecoveryPaths.has(path)));
+  ok('S24 F5/F6/F7, CPM/calendar, TIA and Resource Leveling files are unchanged',
+    protectedControlPaths.every((path) => !changedPaths.has(path)));
+}
 
 // ---------------------------------------------------------------------------
 // S22 — Batch C (P2A1): NO STATIC CONTROL CLAIMS / NO FAKE AUDIT PASS /
