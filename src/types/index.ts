@@ -781,6 +781,10 @@ export interface FragnetItem {
   predecessor_id: string;
   successor_id: string;
   impact_date: string;
+  /** Existing schedule relationship replaced by the in-memory fragnet insertion. */
+  insertion_link_id?: string;
+  insertion_link_type?: string;
+  insertion_lag_days?: number;
 }
 
 export interface DelayClaimEvent {
@@ -799,12 +803,17 @@ export interface DelayClaimEvent {
   pre_impact_project_finish: string;
   post_impact_project_finish: string;
   critical_delay_days: number;
-  eot_days_claimed: number;
-  daily_indirect_cost_rate: number;
-  compensation_claimed_sar: number;
+  /** Null until an EOT determination is supported by a recorded entitlement decision. */
+  eot_days_claimed: number | null;
+  /** Null unless an explicit user/contract rate was supplied. */
+  daily_indirect_cost_rate: number | null;
+  /** Null until both an approved EOT basis and a rate/cost basis are recorded. */
+  compensation_claimed_sar: number | null;
   status: 'draft' | 'submitted_to_consultant' | 'under_determination' | 'approved_eot' | 'rejected';
   contractual_reference: string;
   created_at: string;
+  /** Identifies the canonical single-fragnet CPM calculation used by this record. */
+  analysis_method?: string;
 }
 
 // Schedule Recovery & Crashing Optimizer Types

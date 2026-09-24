@@ -1,38 +1,39 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { supabase } from '@/lib/supabase';
 import { getLanguage, type Language } from '@/lib/i18n';
 import type {
-  Project,
   Activity,
   ActivityLink,
   DelayClaimEvent,
   DelayEventType,
   DelayResponsibility,
+  P6Calendar,
+  Project,
 } from '@/types';
-import { performTimeImpactAnalysis } from '@/lib/tiaEngine';
-// GAP-038 / GAP-010: the governed Data Date decides what a delay event may claim to be. A new
-// analysis never silently starts after it, and an event that does is a forward-looking scenario
-// rather than an occurred delay.
 import { isAfterDataDate, resolveDataDate } from '@/lib/chronologyGuard';
 import {
-  Scale,
-  Plus,
-  Calendar,
+  assessConcurrencyEvidence,
+  performTimeImpactAnalysis,
+  recommendEot,
+  TIA_ANALYSIS_METHOD,
+  type TIAAnalysisResult,
+  type TIAConcurrencyAssessment,
+  type TIAEotRecommendation,
+} from '@/lib/tiaEngine';
+import type { CpmOptions } from '@/lib/cpmEngine';
+import {
   AlertOctagon,
-  CheckCircle2,
-  FileText,
-  Clock,
   ArrowRight,
-  DollarSign,
-  Gavel,
-  ShieldAlert,
+  CheckCircle2,
   ChevronDown,
   ChevronUp,
-  Layers,
-  Sparkles,
+  Clock,
+  DollarSign,
+  FileText,
   GitPullRequest,
-  SlidersHorizontal,
-  Table,
+  Layers,
+  Plus,
+  Scale,
 } from 'lucide-react';
 
 interface TimeImpactAnalysisViewProps {
@@ -40,694 +41,615 @@ interface TimeImpactAnalysisViewProps {
 }
 
 type TabType = 'claims' | 'windows' | 'concurrency' | 'float_governance';
+type FormEventType = DelayEventType | '';
+type FormResponsibility = DelayResponsibility | '';
+
+interface TIAFormState {
+  claimNumber: string;
+  title: string;
+  description: string;
+  eventType: FormEventType;
+  responsibility: FormResponsibility;
+  insertionLinkId: string;
+  delayDurationDays: string;
+  impactStartDate: string;
+  dailyIndirectCostRate: string;
+  contractualClause: string;
+}
+
+const INITIAL_FORM: TIAFormState = {
+  claimNumber: '',
+  title: '',
+  description: '',
+  eventType: '',
+  responsibility: '',
+  insertionLinkId: '',
+  delayDurationDays: '',
+  impactStartDate: '',
+  dailyIndirectCostRate: '',
+  contractualClause: '',
+};
+
+const EVENT_TYPE_LABELS: Record<DelayEventType, { en: string; ar: string }> = {
+  client_delay: { en: 'Client delay', ar: 'تأخير العميل' },
+  consultant_review_delay: { en: 'Consultant review delay', ar: 'تأخير مراجعة الاستشاري' },
+  differing_site_conditions: { en: 'Differing site conditions', ar: 'ظروف موقع مختلفة' },
+  variation_order: { en: 'Variation order', ar: 'أمر تغييري' },
+  force_majeure: { en: 'Force majeure', ar: 'قوة قاهرة' },
+  contractor_delay: { en: 'Contractor delay', ar: 'تأخير المقاول' },
+};
+
+function displayDate(value: string | null | undefined): string {
+  return value || 'N/A';
+}
+
+function displayNumber(value: number | null | undefined, suffix = ''): string {
+  return value === null || value === undefined || !Number.isFinite(value)
+    ? 'N/A'
+    : `${value.toLocaleString()}${suffix}`;
+}
+
+function enrichStoredClaim(
+  claim: DelayClaimEvent,
+  recordedClaims: DelayClaimEvent[],
+  dataDate: string,
+): TIAAnalysisResult {
+  const concurrencyAssessment = assessConcurrencyEvidence(claim, recordedClaims, dataDate);
+  const hasVerifiedCpmMethod = claim.analysis_method === TIA_ANALYSIS_METHOD;
+  const eotRecommendation = claim.status === 'approved_eot' || hasVerifiedCpmMethod
+    ? recommendEot(claim, concurrencyAssessment)
+    : {
+        status: 'unproven' as const,
+        days: null,
+        note: 'Unproven / N/A — this stored record has no verified single-fragnet CPM measurement or approved EOT determination.',
+      };
+  return {
+    ...claim,
+    scenarioActivities: [],
+    scenarioLinks: [],
+    concurrencyAssessment,
+    eotRecommendation,
+    assumptions: hasVerifiedCpmMethod
+      ? [
+          'Stored delay event record; the in-memory scenario network is not persisted.',
+          concurrencyAssessment.note,
+          typeof claim.daily_indirect_cost_rate !== 'number'
+            ? 'No user/contract daily rate is recorded.'
+            : `Recorded daily rate: ${claim.daily_indirect_cost_rate}.`,
+        ]
+      : [
+          'Stored record has no verified single-fragnet analysis-method marker; its CPM impact and event window are not treated as measured evidence.',
+          'No source schedule scenario network is available in this stored record.',
+        ],
+  };
+}
 
 export default function TimeImpactAnalysisView({ project }: TimeImpactAnalysisViewProps) {
   const [activeTab, setActiveTab] = useState<TabType>('claims');
-  const [claims, setClaims] = useState<DelayClaimEvent[]>([]);
+  const [claims, setClaims] = useState<TIAAnalysisResult[]>([]);
   const [activities, setActivities] = useState<Activity[]>([]);
   const [links, setLinks] = useState<ActivityLink[]>([]);
+  const [calendars, setCalendars] = useState<P6Calendar[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadNotice, setLoadNotice] = useState('');
+  const [analysisError, setAnalysisError] = useState('');
   const [showAddModal, setShowAddModal] = useState(false);
   const [expandedClaimId, setExpandedClaimId] = useState<string | null>(null);
-  /** Ids of claims this screen generated itself as a demonstration (no record behind them). */
-  const [sampleClaimIds, setSampleClaimIds] = useState<string[]>([]);
   const [lang, setLang] = useState<Language>(getLanguage());
-
-  const [form, setForm] = useState<{
-    claimNumber: string;
-    title: string;
-    description: string;
-    eventType: DelayEventType;
-    responsibility: DelayResponsibility;
-    affectedActivityId: string;
-    delayDurationDays: number;
-    impactStartDate: string;
-    dailyIndirectCostRate: number;
-    contractualClause: string;
-  }>({
-    claimNumber: 'EOT-001',
-    title: 'تأخر اعتماد المخططات التنفيذية وتعديل مسارات التكييف',
-    description: 'تأخر مراجعة واعتماد Shop Drawings للجسور الحاملة ومسارات دكت التكييف لمدة 14 يوماً عن المدة التعاقدية.',
-    eventType: 'consultant_review_delay',
-    responsibility: 'excusable_compensable',
-    affectedActivityId: '',
-    delayDurationDays: 14,
-    // GAP-038: the default impact date is the governed Data Date of the active project
-    // (`project.data_date` or DEFAULT_DATA_DATE), never a hardcoded future month. A claimant who
-    // means a future event has to move the date deliberately, and the modal says what that means.
-    impactStartDate: resolveDataDate(project),
-    dailyIndirectCostRate: 4800,
-    contractualClause: 'عقد فيديك الأحمر - المادة 8.4 (تمديد مدة الإنجاز) والمادة 20.1 (مطالبات المقاول)',
-  });
+  const [form, setForm] = useState<TIAFormState>(INITIAL_FORM);
 
   const governedDataDate = useMemo(() => resolveDataDate(project), [project]);
+  const cpmOptions = useMemo<CpmOptions>(() => ({
+    calendarType: project?.calendar_type || '6_days',
+    dataDate: governedDataDate,
+    statusLogic: project?.status_logic || 'retained_logic',
+    calendars,
+  }), [project?.calendar_type, project?.status_logic, governedDataDate, calendars]);
 
-  // Re-anchor the impact date whenever another project becomes active, so a date carried over from a
-  // previous project can never be inherited silently.
   useEffect(() => {
-    setForm((prev) => ({ ...prev, impactStartDate: governedDataDate }));
-  }, [governedDataDate]);
+    if (project) {
+      void loadData();
+    } else {
+      setActivities([]);
+      setLinks([]);
+      setCalendars([]);
+      setClaims([]);
+      setLoading(false);
+    }
 
-  useEffect(() => {
-    if (project) loadData();
-    else setLoading(false);
-
-    const handleLangChange = (e: any) => {
-      setLang(e.detail?.lang || getLanguage());
+    const handleLangChange = (event: Event) => {
+      const detail = (event as CustomEvent<{ lang?: Language }>).detail;
+      setLang(detail?.lang || getLanguage());
     };
     window.addEventListener('app-language-changed', handleLangChange);
     return () => window.removeEventListener('app-language-changed', handleLangChange);
+    // loadData intentionally snapshots the active project for each project change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project]);
 
   async function loadData() {
     if (!project) return;
     setLoading(true);
-    const [actRes, linkRes, claimRes] = await Promise.all([
+    setLoadNotice('');
+    const [activityResult, linkResult, calendarResult, claimResult] = await Promise.all([
       supabase.from('activities').select('*').eq('project_id', project.id).order('sort_order'),
       supabase.from('activity_links').select('*').eq('project_id', project.id),
+      supabase.from('calendars').select('*').eq('project_id', project.id),
       supabase.from('delay_claims').select('*').eq('project_id', project.id).order('created_at', { ascending: false }),
     ]);
 
-    const acts = actRes.data || [];
-    setActivities(acts);
-    setLinks((linkRes.data || []) as ActivityLink[]);
-
-    const activeCrit = acts.find((a: Activity) => a.is_critical && a.percent_complete < 100) || acts[4] || acts[0];
-    if (activeCrit && !form.affectedActivityId) {
-      setForm((prev) => ({ ...prev, affectedActivityId: activeCrit.id }));
+    const sourceError = activityResult.error || linkResult.error || calendarResult.error;
+    if (sourceError) {
+      setActivities([]);
+      setLinks([]);
+      setCalendars([]);
+      setClaims([]);
+      setLoadNotice(`Unable to load the project schedule: ${sourceError.message}`);
+      setLoading(false);
+      return;
     }
 
-    // Default Seed Claim
-    const fetchedClaims = (claimRes.data || []) as DelayClaimEvent[];
-    if (fetchedClaims.length === 0 && acts.length > 0 && activeCrit) {
-      // The demonstration claim is dated AT the governed Data Date and is labelled as a sample: the
-      // engine returns it with status 'draft', so it can never be read as an occurred, approved delay.
-      const defaultClaim = performTimeImpactAnalysis({
-        projectId: project.id,
-        claimNumber: 'EOT-001',
-        title: '[عيّنة توضيحية] تأخر تسليم تصريح أعمال صب الخرسانة وتعديل مسارات الخدمات',
-        description: 'تأخر إصدار تصاريح الحفر وصب الخرسانة الجاهزة بسبب تعديل مسار كابلات الكهرباء التابعة لبلدية الرياض.',
-        eventType: 'client_delay',
-        responsibility: 'excusable_compensable',
-        affectedActivityId: activeCrit.id,
-        delayDurationDays: 14,
-        impactStartDate: governedDataDate,
-        dailyIndirectCostRate: 4800,
-        contractualClause: 'عقد فيديك الأحمر - المادة 8.4 (أ) والمادة 1.9 (تأخر الرسومات والتعليمات)',
-        activities: acts,
-        links: (linkRes.data || []) as ActivityLink[],
-        calendarType: project.calendar_type || '6_days',
-      });
-      setClaims([defaultClaim]);
-      setExpandedClaimId(defaultClaim.id);
-      setSampleClaimIds([defaultClaim.id]);
-    } else {
-      setClaims(fetchedClaims);
-      if (fetchedClaims.length > 0) setExpandedClaimId(fetchedClaims[0].id);
-    }
+    const loadedActivities = (activityResult.data || []) as Activity[];
+    const loadedLinks = (linkResult.data || []) as ActivityLink[];
+    const loadedCalendars = (calendarResult.data || []) as P6Calendar[];
+    const loadedClaims = claimResult.error ? [] : ((claimResult.data || []) as DelayClaimEvent[]);
 
+    setActivities(loadedActivities);
+    setLinks(loadedLinks);
+    setCalendars(loadedCalendars);
+    setClaims(loadedClaims.map((claim) => enrichStoredClaim(claim, loadedClaims, governedDataDate)));
+    setExpandedClaimId(loadedClaims[0]?.id || null);
+
+    if (claimResult.error) {
+      setLoadNotice('No delay-claim records could be loaded. New TIA scenarios remain in this session only.');
+    }
     setLoading(false);
   }
 
-  function handleCreateClaim() {
-    if (!project || !form.title || !form.affectedActivityId) return;
+  const selectableLinks = useMemo(() => {
+    const activityIds = new Set(activities.map((activity) => activity.id));
+    return links.filter((link) => activityIds.has(link.predecessor_id) && activityIds.has(link.successor_id));
+  }, [activities, links]);
 
-    const newClaim = performTimeImpactAnalysis({
-      projectId: project.id,
-      claimNumber: form.claimNumber,
-      title: form.title,
-      description: form.description,
-      eventType: form.eventType,
-      responsibility: form.responsibility,
-      affectedActivityId: form.affectedActivityId,
-      delayDurationDays: Number(form.delayDurationDays) || 1,
-      impactStartDate: form.impactStartDate,
-      dailyIndirectCostRate: Number(form.dailyIndirectCostRate) || 4800,
-      contractualClause: form.contractualClause,
-      activities,
-      links,
-      calendarType: project.calendar_type || '6_days',
-    });
-
-    setClaims([newClaim, ...claims]);
-    setExpandedClaimId(newClaim.id);
-    setShowAddModal(false);
+  function activityName(activityId: string): string {
+    const activity = activities.find((item) => item.id === activityId);
+    return activity ? `${activity.code} — ${activity.name}` : activityId;
   }
 
-  // --- Time Windows Analysis Calculation (AACE RP 29R-03) ---
-  const timeWindows = useMemo(() => {
-    return [
-      {
-        id: 'W1',
-        nameAr: 'النافذة 1: مرحلة التأسيس وتجهيز الموقع',
-        nameEn: 'Window 1: Substructure & Site Prep',
-        period: '2026-09-01 → 2026-10-31',
-        plannedProgress: 100,
-        actualProgress: 100,
-        criticalPathInWindow: 'الحفر والإحلال وأساسات اللبشة',
-        windowSlippage: 0,
-        floatConsumed: 0,
-        ownerDelay: 0,
-        contractorDelay: 0,
-        netEotDays: 0,
-        status: 'completed',
-      },
-      {
-        id: 'W2',
-        nameAr: 'النافذة 2: أعمال الهيكل الخرساني والأعمدة',
-        nameEn: 'Window 2: Superstructure Concrete',
-        period: '2026-11-01 → 2026-12-31',
-        plannedProgress: 75,
-        actualProgress: 60,
-        criticalPathInWindow: 'أعمدة وسقف الدور الأرضي والأول',
-        windowSlippage: 14,
-        floatConsumed: 8,
-        ownerDelay: 14,
-        contractorDelay: 3,
-        netEotDays: 14,
-        status: 'active',
-      },
-      {
-        id: 'W3',
-        nameAr: 'النافذة 3: التشطيبات المعمارية ومسارات MEP',
-        nameEn: 'Window 3: Architectural & MEP Rough-in',
-        period: '2027-01-01 → 2027-03-31',
-        plannedProgress: 0,
-        actualProgress: 0,
-        criticalPathInWindow: 'تمديدات التكييف والإنذار وأعمال اللياسة',
-        windowSlippage: 0,
-        floatConsumed: 0,
-        ownerDelay: 0,
-        contractorDelay: 0,
-        netEotDays: 0,
-        status: 'future',
-      },
-      {
-        id: 'W4',
-        nameAr: 'النافذة 4: الاختبارات والتشغيل والتسليم النهائي',
-        nameEn: 'Window 4: Testing, Commissioning & Handover',
-        period: '2027-04-01 → 2027-05-31',
-        plannedProgress: 0,
-        actualProgress: 0,
-        criticalPathInWindow: 'الفحص الميكانيكي واعتماد الدفاع المدني',
-        windowSlippage: 0,
-        floatConsumed: 0,
-        ownerDelay: 0,
-        contractorDelay: 0,
-        netEotDays: 0,
-        status: 'future',
-      },
-    ];
-  }, []);
+  function linkDescription(link: ActivityLink): string {
+    return `${activityName(link.predecessor_id)} → ${activityName(link.successor_id)} (${link.link_type}, lag ${link.lag_days}d)`;
+  }
 
-  // --- Concurrent Delays Detector Matrix ---
-  const concurrencyMatrix = useMemo(() => {
-    return [
-      {
-        id: 'CONC-01',
-        period: '2026-11-10 → 2026-11-24 (14 يوماً)',
-        employerEvent: 'تأخر تسليم تصاريح الصب واعتماد مسارات التكييف',
-        contractorEvent: 'تأخر توريد حديد التسليح الإضافي لعدم توفر سيولة',
-        isConcurrent: true,
-        sclRuleAr: 'وفق بروتوكول SCL: تمنح تمديد وقت (EOT) دون تعويض مالي لفترة التزامن.',
-        sclRuleEn: 'Under SCL Protocol: EOT is awarded, but prolongation costs are non-compensable during concurrent period.',
-        eotEntitlement: '14 يوماً EOT معتمد',
-        costEntitlement: 'تعويض مالي مستحق بنسبة 60% بعد فك التزامن',
-      },
-      {
-        id: 'CONC-02',
-        period: '2026-10-05 → 2026-10-12 (7 أيام)',
-        employerEvent: 'تعديل مخططات العزل المائي من قبل الاستشاري',
-        contractorEvent: 'لا يوجد تأخير من المقاول (مسار المالك فقط)',
-        isConcurrent: false,
-        sclRuleAr: 'تأخير حصري للمالك: استحقاق كامل لتمديد الوقت والتكاليف غير المباشرة.',
-        sclRuleEn: 'Pure Employer Delay: Full entitlement to EOT and prolongation cost reimbursement.',
-        eotEntitlement: '7 أيام EOT كاملة',
-        costEntitlement: 'تعويض مالي كامل (33,600 SAR)',
-      },
-    ];
-  }, []);
-
-  // --- Float Ownership & Erosion Table ---
-  const floatGovernanceList = useMemo(() => {
-    return activities.map((act) => {
-      const origFloat = Number(act.total_float || 0);
-      const isCrit = act.is_critical;
-      const consumedFloat = Math.max(0, 15 - origFloat);
-      let ownershipStatusAr = 'متاح للمشروع (Project Float)';
-      let ownershipStatusEn = 'Available for Project';
-
-      if (isCrit) {
-        ownershipStatusAr = 'مسار حرج - لا يوجد هامش (Zero Float)';
-        ownershipStatusEn = 'Critical - Zero Float';
-      } else if (origFloat < 5) {
-        ownershipStatusAr = 'هامش شبه مستهلك (Near Critical)';
-        ownershipStatusEn = 'Near Critical Float';
-      }
-
-      return {
-        id: act.id,
-        code: act.code,
-        name: act.name,
-        totalFloat: origFloat,
-        consumedFloat,
-        isCritical: isCrit,
-        ownershipStatusAr,
-        ownershipStatusEn,
-      };
-    });
-  }, [activities]);
-
-  const getResponsibilityBadge = (resp: DelayResponsibility) => {
-    switch (resp) {
-      case 'excusable_compensable':
-        return (
-          <span className="px-2.5 py-1 rounded-full text-[11px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-300 flex items-center gap-1">
-            <CheckCircle2 size={12} />
-            {lang === 'ar' ? 'تأخير مبرر مع تعويض مالي (Time + Cost)' : 'Excusable Compensable (Time + Cost)'}
-          </span>
-        );
-      case 'excusable_non_compensable':
-        return (
-          <span className="px-2.5 py-1 rounded-full text-[11px] font-bold bg-amber-100 text-amber-800 border border-amber-300 flex items-center gap-1">
-            <Clock size={12} />
-            {lang === 'ar' ? 'تأخير مبرر (تمديد وقت فقط - Time Only)' : 'Excusable Non-Compensable (Time Only)'}
-          </span>
-        );
-      default:
-        return (
-          <span className="px-2.5 py-1 rounded-full text-[11px] font-bold bg-red-100 text-red-800 border border-red-300 flex items-center gap-1">
-            <AlertOctagon size={12} />
-            {lang === 'ar' ? 'تأخير غير مبرر (مسؤولية المقاول - Penalties)' : 'Non-Excusable (Contractor Risk)'}
-          </span>
-        );
+  function handleCreateClaim() {
+    setAnalysisError('');
+    if (!project) return;
+    if (!form.eventType || !form.responsibility) {
+      setAnalysisError('Select an event type and record the responsibility classification.');
+      return;
     }
-  };
+
+    const parsedRate = form.dailyIndirectCostRate.trim() === '' ? null : Number(form.dailyIndirectCostRate);
+    try {
+      const result = performTimeImpactAnalysis({
+        projectId: project.id,
+        claimNumber: form.claimNumber,
+        title: form.title,
+        description: form.description,
+        eventType: form.eventType,
+        responsibility: form.responsibility,
+        insertionLinkId: form.insertionLinkId,
+        delayDurationDays: Number(form.delayDurationDays),
+        impactStartDate: form.impactStartDate,
+        dailyIndirectCostRate: parsedRate,
+        contractualClause: form.contractualClause,
+        activities,
+        links,
+        cpmOptions,
+        recordedClaims: claims,
+      });
+
+      // This is a local analysis record only; neither the source schedule nor its links are saved.
+      setClaims((previous) => [result, ...previous]);
+      setExpandedClaimId(result.id);
+      setForm(INITIAL_FORM);
+      setShowAddModal(false);
+      setActiveTab('claims');
+    } catch (error) {
+      setAnalysisError(error instanceof Error ? error.message : 'TIA analysis could not be completed.');
+    }
+  }
+
+  const floatGovernanceList = useMemo(() => activities.map((activity) => {
+    const totalFloat = Number(activity.total_float || 0);
+    const isCritical = activity.is_critical;
+    let ownershipStatusEn = 'Available for Project';
+    let ownershipStatusAr = 'متاح للمشروع';
+
+    if (isCritical) {
+      ownershipStatusEn = 'Critical — zero float';
+      ownershipStatusAr = 'مسار حرج — هامش صفري';
+    } else if (totalFloat < 5) {
+      ownershipStatusEn = 'Near-critical float';
+      ownershipStatusAr = 'هامش قريب من الحرج';
+    }
+
+    return {
+      id: activity.id,
+      code: activity.code,
+      name: activity.name,
+      totalFloat,
+      isCritical,
+      ownershipStatusEn,
+      ownershipStatusAr,
+    };
+  }), [activities]);
+
+  function responsibilityBadge(responsibility: DelayResponsibility) {
+    if (responsibility === 'excusable_compensable') {
+      return (
+        <span className="inline-flex items-center gap-1 rounded-full border border-emerald-300 bg-emerald-50 px-2.5 py-1 text-[11px] font-bold text-emerald-800">
+          <CheckCircle2 size={12} />
+          {lang === 'ar' ? 'تصنيف مسجل: مبرر مع تعويض' : 'Recorded: excusable / compensable'}
+        </span>
+      );
+    }
+    if (responsibility === 'excusable_non_compensable') {
+      return (
+        <span className="inline-flex items-center gap-1 rounded-full border border-amber-300 bg-amber-50 px-2.5 py-1 text-[11px] font-bold text-amber-800">
+          <Clock size={12} />
+          {lang === 'ar' ? 'تصنيف مسجل: مبرر دون تعويض' : 'Recorded: excusable / non-compensable'}
+        </span>
+      );
+    }
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full border border-red-300 bg-red-50 px-2.5 py-1 text-[11px] font-bold text-red-800">
+        <AlertOctagon size={12} />
+        {lang === 'ar' ? 'تصنيف مسجل: غير مبرر' : 'Recorded: non-excusable'}
+      </span>
+    );
+  }
+
+  function concurrencyFor(claim: TIAAnalysisResult): TIAConcurrencyAssessment {
+    return claim.concurrencyAssessment || assessConcurrencyEvidence(claim, claims, governedDataDate);
+  }
+
+  function eotFor(claim: TIAAnalysisResult): TIAEotRecommendation {
+    return claim.eotRecommendation || recommendEot(claim, concurrencyFor(claim));
+  }
+
+  function recommendationLabel(recommendation: TIAEotRecommendation): string {
+    if (recommendation.status === 'approved') return `${recommendation.days ?? 'N/A'} ${lang === 'ar' ? 'يوم معتمد مسجل' : 'approved days recorded'}`;
+    if (recommendation.status === 'not_recommended' && recommendation.days === 0) return lang === 'ar' ? '0 يوم — لم يقس CPM حركة في نهاية المشروع' : '0 days — CPM measured no finish movement';
+    if (recommendation.status === 'not_recommended') return lang === 'ar' ? 'غير موصى به وفق التصنيف المسجل' : 'Not recommended under recorded classification';
+    return 'Unproven / N/A';
+  }
+
+  function approvedCost(claim: TIAAnalysisResult): number | null {
+    return claim.status === 'approved_eot' &&
+      !isAfterDataDate(claim.start_date, governedDataDate) &&
+      typeof claim.compensation_claimed_sar === 'number' &&
+      Number.isFinite(claim.compensation_claimed_sar)
+      ? claim.compensation_claimed_sar
+      : null;
+  }
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center min-h-[400px]">
-        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
+      <div className="flex min-h-[400px] items-center justify-center">
+        <div className="h-8 w-8 animate-spin rounded-full border-b-2 border-blue-600" />
       </div>
     );
   }
 
-  // Chronology (GAP-010 / GAP-038): a delay event only counts as an OCCURRED delay when it starts on
-  // or before the Data Date, and only an approved determination is an entitlement. Everything else
-  // stays visible as a claim or as a future scenario, but never enters the approved totals.
-  const occurredClaims = claims.filter((c) => !isAfterDataDate(c.start_date, governedDataDate));
-  const futureScenarioClaims = claims.filter((c) => isAfterDataDate(c.start_date, governedDataDate));
-  const approvedClaims = occurredClaims.filter((c) => c.status === 'approved_eot');
-  const approvedEotDays = approvedClaims.reduce((sum, c) => sum + c.eot_days_claimed, 0);
-  const approvedCompensationSar = approvedClaims.reduce((sum, c) => sum + c.compensation_claimed_sar, 0);
-  const pendingEotDays = occurredClaims.reduce((sum, c) => sum + c.eot_days_claimed, 0) - approvedEotDays;
-  const totalEotDays = claims.reduce((sum, c) => sum + c.eot_days_claimed, 0);
-  const totalFinancialClaim = claims.reduce((sum, c) => sum + c.compensation_claimed_sar, 0);
+  const occurredClaims = claims.filter((claim) => !isAfterDataDate(claim.start_date, governedDataDate));
+  const approvedClaims = occurredClaims.filter((claim) => claim.status === 'approved_eot');
+  const claimsWithApprovedEot = approvedClaims.filter((claim) => typeof claim.eot_days_claimed === 'number' && Number.isFinite(claim.eot_days_claimed));
+  const claimsWithApprovedCost = approvedClaims.filter((claim) => typeof claim.compensation_claimed_sar === 'number' && Number.isFinite(claim.compensation_claimed_sar));
+  const approvedEotDays = claimsWithApprovedEot.reduce((sum, claim) => sum + (claim.eot_days_claimed ?? 0), 0);
+  const approvedCompensation = claimsWithApprovedCost.reduce((sum, claim) => sum + (claim.compensation_claimed_sar ?? 0), 0);
+  const futureClaims = claims.filter((claim) => isAfterDataDate(claim.start_date, governedDataDate));
+  const unprovenClaims = claims.filter((claim) => claim.status !== 'approved_eot' && claim.status !== 'rejected');
 
   return (
     <div className="space-y-6">
-      {/* Header */}
-      <div className="flex flex-wrap items-center justify-between gap-4 bg-white p-5 rounded-xl border border-slate-200 shadow-sm">
+      <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
         <div>
-          <h1 className="text-xl font-bold text-slate-800 flex items-center gap-2">
+          <h1 className="flex items-center gap-2 text-xl font-bold text-slate-800">
             <Scale className="text-blue-600" size={24} />
-            {lang === 'ar' ? 'تحليل الأثر الزمني ومطالبات تمديد الوقت (Time Impact Analysis - TIA)' : 'Time Impact Analysis & Delay Claims (TIA)'}
+            {lang === 'ar' ? 'تحليل الأثر الزمني ومطالبات تمديد الوقت (TIA)' : 'Time Impact Analysis & EOT Evidence'}
           </h1>
-          <p className="text-xs text-slate-500 mt-1">
+          <p className="mt-1 max-w-3xl text-xs text-slate-500">
             {lang === 'ar'
-              ? 'محاكاة إدخال شبكات التأخير (Fragnets) في مسار CPM، تحليل النوافذ الزمنية، وإثبات الأحقية وفق بروتوكول SCL وعقود فيديك.'
-              : 'Simulate delay fragnets in CPM, perform time window forensic analysis, and verify EOT entitlement under SCL Protocol.'}
+              ? 'تحليل للقراءة فقط: خط أساس CPM للحالة القائمة، وإدخال Fragnet واحد على علاقة يحددها المستخدم. لا يتغير الجدول الأصلي.'
+              : 'Read-only analysis: statused CPM baseline, then one user-defined fragnet insertion. The source schedule is not changed.'}
           </p>
         </div>
-
         <button
-          onClick={() => setShowAddModal(true)}
-          className="flex items-center gap-1.5 bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg text-xs font-semibold shadow-md shadow-blue-500/20 transition-all cursor-pointer"
+          onClick={() => { setAnalysisError(''); setShowAddModal(true); }}
+          disabled={selectableLinks.length === 0}
+          className="flex cursor-pointer items-center gap-1.5 rounded-lg bg-blue-600 px-4 py-2 text-xs font-semibold text-white shadow-md transition-all hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
         >
           <Plus size={15} />
-          {lang === 'ar' ? 'إدخال حدث تأخير وتحليل الأثر (New Fragnet)' : 'New Delay Fragnet Analysis'}
+          {lang === 'ar' ? 'تحليل Fragnet جديد' : 'New Fragnet Analysis'}
         </button>
       </div>
 
-      {/* Navigation Tabs for Advanced Forensic Features */}
-      <div className="flex items-center gap-2 border-b border-slate-200 pb-2">
-        <button
-          onClick={() => setActiveTab('claims')}
-          className={`flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-bold transition-all cursor-pointer ${
-            activeTab === 'claims'
-              ? 'bg-slate-900 text-amber-400 shadow-sm'
-              : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'
-          }`}
-        >
-          <FileText size={14} />
-          <span>{lang === 'ar' ? 'مطالبات Fragnets و EOT' : 'Fragnet Claims & EOT'}</span>
-        </button>
+      {loadNotice && (
+        <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">{loadNotice}</div>
+      )}
 
-        <button
-          onClick={() => setActiveTab('windows')}
-          className={`flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-bold transition-all cursor-pointer ${
-            activeTab === 'windows'
-              ? 'bg-slate-900 text-amber-400 shadow-sm'
-              : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'
-          }`}
-        >
-          <Layers size={14} />
-          <span>{lang === 'ar' ? 'تحليل النوافذ الزمنية (Time Windows Analysis)' : 'Time Windows Analysis'}</span>
-        </button>
-
-        <button
-          onClick={() => setActiveTab('concurrency')}
-          className={`flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-bold transition-all cursor-pointer ${
-            activeTab === 'concurrency'
-              ? 'bg-slate-900 text-amber-400 shadow-sm'
-              : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'
-          }`}
-        >
-          <GitPullRequest size={14} />
-          <span>{lang === 'ar' ? 'تحليل التزامن (Concurrent Delays)' : 'Concurrent Delays'}</span>
-        </button>
-
-        <button
-          onClick={() => setActiveTab('float_governance')}
-          className={`flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-bold transition-all cursor-pointer ${
-            activeTab === 'float_governance'
-              ? 'bg-slate-900 text-amber-400 shadow-sm'
-              : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'
-          }`}
-        >
-          <Clock size={14} />
-          <span>{lang === 'ar' ? 'حوكمة استهلاك الهوامش (Float Ownership)' : 'Float Ownership'}</span>
-        </button>
+      <div className="flex flex-wrap items-center gap-2 border-b border-slate-200 pb-2">
+        {([
+          ['claims', FileText, lang === 'ar' ? 'تحليل الأحداث و EOT' : 'Events & EOT'],
+          ['windows', Layers, lang === 'ar' ? 'النوافذ الزمنية' : 'Time Windows'],
+          ['concurrency', GitPullRequest, lang === 'ar' ? 'أدلة التزامن' : 'Concurrency Evidence'],
+          ['float_governance', Clock, lang === 'ar' ? 'حوكمة الهوامش' : 'Float Ownership'],
+        ] as const).map(([tab, Icon, label]) => (
+          <button
+            key={tab}
+            onClick={() => setActiveTab(tab)}
+            className={`flex cursor-pointer items-center gap-2 rounded-lg px-4 py-2 text-xs font-bold transition-all ${activeTab === tab ? 'bg-slate-900 text-amber-400 shadow-sm' : 'border border-slate-200 bg-white text-slate-600 hover:bg-slate-50'}`}
+          >
+            <Icon size={14} />
+            <span>{label}</span>
+          </button>
+        ))}
       </div>
 
-      {/* Summary KPI Cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-        <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex items-center gap-3">
-          <div className="w-12 h-12 rounded-xl bg-blue-50 text-blue-600 flex items-center justify-center font-bold">
-            <Gavel size={24} />
-          </div>
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+        <div className="flex items-center gap-3 rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+          <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-blue-50 text-blue-600"><FileText size={23} /></div>
           <div>
             <div className="text-2xl font-bold text-slate-800">{claims.length}</div>
-            <span className="text-xs text-slate-500">{lang === 'ar' ? 'إجمالي مطالبات التأخير المسجلة' : 'Registered Delay Claims'}</span>
-            {(futureScenarioClaims.length > 0 || sampleClaimIds.length > 0) && (
-              <span className="text-[10px] text-slate-400 font-semibold block">
-                {lang === 'ar'
-                  ? `منها ${futureScenarioClaims.length} سيناريو مستقبلي و ${sampleClaimIds.length} عيّنة توضيحية`
-                  : `${futureScenarioClaims.length} future scenario(s), ${sampleClaimIds.length} demo sample(s)`}
-              </span>
-            )}
+            <span className="text-xs text-slate-500">{lang === 'ar' ? 'سجلات أحداث التأخير المتاحة' : 'Available delay-event records'}</span>
+            <span className="block text-[10px] font-semibold text-slate-400">{futureClaims.length} {lang === 'ar' ? 'سيناريو مستقبلي بعد تاريخ الحالة' : 'future scenario(s) after the data date'}</span>
           </div>
         </div>
-
-        <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex items-center gap-3">
-          <div className="w-12 h-12 rounded-xl bg-amber-50 text-amber-600 flex items-center justify-center font-bold">
-            <Clock size={24} />
-          </div>
+        <div className="flex items-center gap-3 rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+          <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-amber-50 text-amber-600"><Clock size={23} /></div>
           <div>
-            <div className="text-2xl font-bold text-amber-700">+{approvedEotDays} {lang === 'ar' ? 'يوم' : 'days'}</div>
-            <span className="text-xs text-slate-500">{lang === 'ar' ? 'تمديد الوقت المعتمد حتى تاريخ خط الحالة (Approved EOT)' : `Approved EOT up to the Data Date (${governedDataDate})`}</span>
-            <span className="text-[10px] text-slate-400 font-semibold block">
-              {lang === 'ar'
-                ? `مطالبات غير معتمدة بعد: +${pendingEotDays} يوم · إجمالي المُطالب به: +${totalEotDays} يوم`
-                : `Not yet determined: +${pendingEotDays} d · total claimed: +${totalEotDays} d`}
-            </span>
+            <div className="text-2xl font-bold text-amber-700">
+              {claimsWithApprovedEot.length ? `+${approvedEotDays}` : 'N/A'} {lang === 'ar' && claimsWithApprovedEot.length ? 'يوم' : claimsWithApprovedEot.length ? 'days' : ''}
+            </div>
+            <span className="text-xs text-slate-500">{lang === 'ar' ? 'أيام EOT المعتمدة والمسجلة' : 'Recorded approved EOT days'}</span>
+            <span className="block text-[10px] font-semibold text-slate-400">{unprovenClaims.length} {lang === 'ar' ? 'بانتظار إثبات/تحديد الأحقية' : 'claim(s) remain unproven or undetermined'}</span>
           </div>
         </div>
-
-        <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex items-center gap-3">
-          <div className="w-12 h-12 rounded-xl bg-emerald-50 text-emerald-600 flex items-center justify-center font-bold">
-            <DollarSign size={24} />
-          </div>
+        <div className="flex items-center gap-3 rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+          <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-emerald-50 text-emerald-600"><DollarSign size={23} /></div>
           <div>
-            <div className="text-2xl font-bold text-emerald-700">{approvedCompensationSar.toLocaleString()} SAR</div>
-            <span className="text-xs text-slate-500">{lang === 'ar' ? 'تعويضات الإطالة المعتمدة (وقعت قبل خط الحالة)' : 'Approved prolongation compensation (occurred by the Data Date)'}</span>
-            <span className="text-[10px] text-slate-400 font-semibold block">
-              {lang === 'ar' ? `إجمالي المُطالب به: ${totalFinancialClaim.toLocaleString()} SAR` : `Total claimed: ${totalFinancialClaim.toLocaleString()} SAR`}
-            </span>
+            <div className="text-2xl font-bold text-emerald-700">
+              {claimsWithApprovedCost.length ? `${approvedCompensation.toLocaleString()} SAR` : 'N/A'}
+            </div>
+            <span className="text-xs text-slate-500">{lang === 'ar' ? 'تكاليف إطالة معتمدة ومسجلة' : 'Recorded approved prolongation cost'}</span>
+            <span className="block text-[10px] font-semibold text-slate-400">{lang === 'ar' ? 'لا يُفترض أي معدل يومي' : 'No daily rate is assumed'}</span>
           </div>
         </div>
       </div>
 
-      {/* TAB 1: Claims & Fragnets List */}
       {activeTab === 'claims' && (
         <div className="space-y-4">
+          {claims.length === 0 && (
+            <div className="rounded-xl border border-dashed border-slate-300 bg-white p-8 text-center text-sm text-slate-500">
+              {lang === 'ar' ? 'لا توجد أحداث تأخير مسجلة. أدخل حدثاً وعلاقة Fragnet صريحة لبدء التحليل.' : 'No delay events are recorded. Enter an event and an explicit fragnet relationship to begin.'}
+            </div>
+          )}
           {claims.map((claim) => {
             const isExpanded = expandedClaimId === claim.id;
-            const affectedAct = activities.find((a) => a.id === claim.affected_activity_id);
+            const concurrency = concurrencyFor(claim);
+            const recommendation = eotFor(claim);
+            const fragnet = claim.fragnets[0];
+            const claimCost = approvedCost(claim);
+            const hasVerifiedCpmMethod = claim.analysis_method === TIA_ANALYSIS_METHOD;
+            const rateIsVerifiable = hasVerifiedCpmMethod;
 
             return (
-              <div
-                key={claim.id}
-                className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden transition-all"
-              >
-                {/* Claim Card Header */}
-                <div
+              <article key={claim.id} className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
+                <button
+                  type="button"
                   onClick={() => setExpandedClaimId(isExpanded ? null : claim.id)}
-                  className="p-5 flex flex-wrap items-center justify-between gap-4 cursor-pointer hover:bg-slate-50/70"
+                  className="flex w-full cursor-pointer flex-wrap items-center justify-between gap-4 p-5 text-left hover:bg-slate-50/70"
                 >
-                  <div className="space-y-1">
-                    <div className="flex items-center gap-3">
-                      <span className="font-mono text-xs font-black px-2.5 py-0.5 rounded bg-slate-900 text-white">
-                        {claim.claim_number}
-                      </span>
+                  <div className="min-w-0 space-y-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="rounded bg-slate-900 px-2.5 py-0.5 font-mono text-xs font-black text-white">{claim.claim_number}</span>
                       <h3 className="text-sm font-bold text-slate-900">{claim.title}</h3>
-                      {sampleClaimIds.includes(claim.id) && (
-                        <span className="text-[9.5px] font-black px-2 py-0.5 rounded bg-amber-100 text-amber-900 border border-amber-300 whitespace-nowrap">
-                          {lang === 'ar' ? 'عيّنة توضيحية (DEMO) — لا يوجد سجل تعاقدي خلفها' : 'DEMO sample — no contractual record behind it'}
-                        </span>
-                      )}
+                      <span className="rounded border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-bold uppercase text-slate-600">{claim.status.replace(/_/g, ' ')}</span>
                       {isAfterDataDate(claim.start_date, governedDataDate) && (
-                        <span className="text-[9.5px] font-black px-2 py-0.5 rounded bg-slate-200 text-slate-700 border border-slate-300 whitespace-nowrap">
-                          {lang === 'ar'
-                            ? `سيناريو مستقبلي بعد خط الحالة (${governedDataDate}) — ليس تأخيراً واقعاً`
-                            : `Future scenario after the Data Date (${governedDataDate}) — not an occurred delay`}
+                        <span className="rounded border border-amber-300 bg-amber-50 px-2 py-0.5 text-[10px] font-bold text-amber-900">
+                          {lang === 'ar' ? 'سيناريو مستقبلي — ليس تأخيراً واقعاً' : 'Future scenario — not an occurred delay'}
                         </span>
                       )}
                     </div>
-                    <p className="text-xs text-slate-500 max-w-2xl line-clamp-1">{claim.description}</p>
+                    <p className="line-clamp-1 max-w-3xl text-xs text-slate-500">{claim.description}</p>
                   </div>
-
                   <div className="flex items-center gap-4">
-                    {getResponsibilityBadge(claim.responsibility)}
-
-                    <div className="text-left font-mono">
-                      <div className="text-[10px] text-slate-400">{lang === 'ar' ? 'أثر المسار الحرج' : 'Critical Impact'}</div>
-                      <div className="text-xs font-bold text-red-600">+{claim.critical_delay_days} {lang === 'ar' ? 'يوم' : 'd'}</div>
+                    {responsibilityBadge(claim.responsibility)}
+                    <div className="text-right font-mono">
+                      <div className="text-[10px] text-slate-400">{lang === 'ar' ? 'تأخير حرج مقاس' : 'Measured critical delay'}</div>
+                      <div className="text-xs font-bold text-red-700">{hasVerifiedCpmMethod ? displayNumber(claim.critical_delay_days, lang === 'ar' ? ' يوم' : ' d') : 'N/A'}</div>
                     </div>
-
                     {isExpanded ? <ChevronUp size={18} className="text-slate-400" /> : <ChevronDown size={18} className="text-slate-400" />}
                   </div>
-                </div>
+                </button>
 
-                {/* Expanded Detailed Analysis Dossier */}
                 {isExpanded && (
-                  <div className="p-5 border-t border-slate-100 bg-slate-50/50 space-y-5 text-xs">
-                    {/* CPM Comparison Grid */}
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                      <div className="p-3.5 bg-white rounded-xl border border-slate-200 shadow-sm">
-                        <span className="text-slate-400 block text-[11px] mb-1">{lang === 'ar' ? 'نهاية المشروع قبل الحدث (Pre-Impact)' : 'Pre-Impact Finish Date'}</span>
-                        <span className="text-sm font-mono font-bold text-slate-800">{claim.pre_impact_project_finish}</span>
-                      </div>
-
-                      <div className="p-3.5 bg-white rounded-xl border border-slate-200 shadow-sm">
-                        <span className="text-slate-400 block text-[11px] mb-1">{lang === 'ar' ? 'نهاية المشروع بعد الحدث (Post-Impact)' : 'Post-Impact Finish Date'}</span>
-                        <span className="text-sm font-mono font-bold text-red-700">{claim.post_impact_project_finish}</span>
-                      </div>
-
-                      <div className="p-3.5 bg-white rounded-xl border border-slate-200 shadow-sm">
-                        <span className="text-slate-400 block text-[11px] mb-1">{lang === 'ar' ? 'التعويض المالي المطالب به' : 'Compensation Claimed'}</span>
-                        <span className="text-sm font-bold text-emerald-700">
-                          {claim.compensation_claimed_sar.toLocaleString()} SAR ({claim.daily_indirect_cost_rate} SAR/{lang === 'ar' ? 'يوم' : 'd'})
-                        </span>
-                      </div>
+                  <div className="space-y-5 border-t border-slate-100 bg-slate-50/50 p-5 text-xs">
+                    <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+                      <Metric label={lang === 'ar' ? 'نهاية المشروع غير المتأثرة' : 'Unimpacted project finish'} value={hasVerifiedCpmMethod ? displayDate(claim.pre_impact_project_finish) : 'N/A'} />
+                      <Metric label={lang === 'ar' ? 'نهاية المشروع بعد إدخال Fragnet' : 'Impacted project finish'} value={hasVerifiedCpmMethod ? displayDate(claim.post_impact_project_finish) : 'N/A'} />
+                      <Metric label={lang === 'ar' ? 'فرق نهاية المشروع المقاس بواسطة CPM' : 'CPM-measured finish delta'} value={hasVerifiedCpmMethod ? displayNumber(claim.critical_delay_days, lang === 'ar' ? ' يوم عمل' : ' working days') : 'N/A'} emphasis />
                     </div>
 
-                    {/* Fragnet Logic Diagram */}
-                    <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
-                      <h4 className="font-bold text-slate-800 mb-2 flex items-center gap-1.5 text-xs">
-                        <Clock size={14} className="text-blue-600" />
-                        <span>{lang === 'ar' ? 'تسلسل شبكة التأخير الفرعية (Fragnet CPM Linkage)' : 'Sub-network Delay Fragnet CPM Logic'}</span>
+                    <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                      <EvidenceCard title={lang === 'ar' ? 'المسؤولية المسجلة' : 'Recorded responsibility'}>
+                        {responsibilityBadge(claim.responsibility)}
+                      </EvidenceCard>
+                      <EvidenceCard title={lang === 'ar' ? 'التزامن — دليل / حالة' : 'Concurrency — evidence / status'}>
+                        <div className="font-bold text-slate-800">{concurrency.status === 'potential_overlap' ? (lang === 'ar' ? 'تداخل محتمل مسجل' : 'Potential recorded overlap') : 'N/A'}</div>
+                        <p className="mt-1 text-slate-600">{concurrency.note}</p>
+                        {concurrency.evidence.map((evidence) => (
+                          <div key={`${evidence.claimId}-${evidence.overlapStart}`} className="mt-2 rounded border border-slate-200 bg-white p-2 text-slate-700">
+                            <span className="font-mono font-bold">{evidence.claimNumber}</span> · {evidence.overlapStart} → {evidence.overlapEnd} · {lang === 'ar' ? 'أثر CPM المقاس للحدث المقارن:' : 'other event measured CPM impact:'} {evidence.measuredCriticalDelayDays}d
+                          </div>
+                        ))}
+                      </EvidenceCard>
+                      <EvidenceCard title={lang === 'ar' ? 'توصية تمديد الوقت' : 'EOT recommendation'}>
+                        <div className={`font-bold ${recommendation.status === 'approved' ? 'text-emerald-800' : recommendation.status === 'not_recommended' ? 'text-slate-700' : 'text-amber-800'}`}>
+                          {recommendationLabel(recommendation)}
+                        </div>
+                        <p className="mt-1 text-slate-600">{recommendation.note}</p>
+                      </EvidenceCard>
+                      <EvidenceCard title={lang === 'ar' ? 'تكلفة الإطالة' : 'Prolongation cost'}>
+                        <div className="font-bold text-emerald-800">{claimCost === null ? 'N/A' : `${claimCost.toLocaleString()} SAR`}</div>
+                        <p className="mt-1 text-slate-600">
+                          {claim.status === 'approved_eot' && claimCost !== null
+                            ? (lang === 'ar' ? 'قيمة التكلفة من السجل المعتمد.' : 'Value taken from the approved record.')
+                            : (lang === 'ar' ? 'N/A — لا يوجد أساس EOT معتمد ومعدل/دليل تكلفة قابل للتحقق.' : 'N/A — no approved EOT basis plus verifiable rate/cost evidence.')}
+                        </p>
+                        <p className="mt-1 text-slate-600">
+                          {lang === 'ar' ? 'المعدل اليومي المسجل:' : 'Recorded daily rate:'} {' '}
+                          {rateIsVerifiable && typeof claim.daily_indirect_cost_rate === 'number' && Number.isFinite(claim.daily_indirect_cost_rate)
+                            ? `${claim.daily_indirect_cost_rate.toLocaleString()} SAR/day`
+                            : 'N/A'}
+                        </p>
+                      </EvidenceCard>
+                    </div>
+
+                    <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+                      <h4 className="mb-2 flex items-center gap-1.5 text-xs font-bold text-slate-800">
+                        <ArrowRight size={14} className="text-blue-600" />
+                        {lang === 'ar' ? 'نقطة إدراج Fragnet والعلاقات' : 'Fragnet insertion point and relationships'}
                       </h4>
-
-                      <div className="flex flex-wrap items-center gap-2 text-xs py-2">
-                        <div className="p-2 bg-slate-100 rounded border border-slate-300 font-mono">
-                          {affectedAct ? `[${affectedAct.code}] ${affectedAct.name}` : 'النشاط المتأثر'}
+                      {fragnet && hasVerifiedCpmMethod ? (
+                        <div className="flex flex-wrap items-center gap-2 text-xs">
+                          <div className="rounded border border-slate-300 bg-slate-100 p-2 font-mono">{activityName(fragnet.predecessor_id)}</div>
+                          <ArrowRight size={15} className="text-slate-400" />
+                          <div className="rounded border border-red-300 bg-red-50 p-2 font-mono font-bold text-red-800">{fragnet.name} · {fragnet.duration_days}d</div>
+                          <ArrowRight size={15} className="text-slate-400" />
+                          <div className="rounded border border-blue-300 bg-blue-50 p-2 font-mono text-blue-800">{activityName(fragnet.successor_id)}</div>
+                          <span className="basis-full text-[11px] text-slate-500">
+                            {lang === 'ar' ? 'العلاقة المستبدلة:' : 'Replaced relationship:'} {fragnet.insertion_link_id || 'N/A'} · {fragnet.insertion_link_type || 'N/A'} · {fragnet.insertion_lag_days ?? 'N/A'}d lag
+                          </span>
                         </div>
-                        <ArrowRight size={16} className="text-slate-400 rotate-180" />
-                        <div className="p-2 bg-red-50 border border-red-300 rounded text-red-800 font-bold font-mono">
-                          {claim.fragnets[0]?.name || `[Fragnet] حدث التأخير (${claim.delay_duration_days} يوم)`}
-                        </div>
-                        <ArrowRight size={16} className="text-slate-400 rotate-180" />
-                        <div className="p-2 bg-blue-50 border border-blue-300 rounded text-blue-800 font-mono">
-                          {lang === 'ar' ? 'الأنشطة اللاحقة وشبكة المسار الحرج الممتدة' : 'Successor CPM Activities & Critical Extension'}
-                        </div>
-                      </div>
+                      ) : <p className="text-slate-500">N/A</p>}
+                      <p className="mt-2 text-[11px] text-slate-500">
+                        {lang === 'ar'
+                          ? 'أُضيف Fragnet واحد في نسخة تحليلية داخل الذاكرة؛ لم تُمدد مدة نشاط أصلي ولم يُحفظ أي تغيير في الجدول.'
+                          : 'One fragnet was added to an in-memory analysis copy; no source activity was extended and no schedule change was saved.'}
+                      </p>
                     </div>
 
-                    {/* Contractual Clause Reference */}
-                    <div className="p-3 bg-blue-50/80 border border-blue-200 rounded-lg text-blue-900">
-                      <span className="font-bold block mb-1">{lang === 'ar' ? 'السند القانوني والتعاقدي للمطالبة:' : 'Contractual Legal Basis:'}</span>
-                      <span>{claim.contractual_reference}</span>
+                    <div className="rounded-xl border border-slate-200 bg-white p-4">
+                      <h4 className="mb-2 font-bold text-slate-800">{lang === 'ar' ? 'الأدلة والافتراضات' : 'Evidence and assumptions'}</h4>
+                      <ul className="list-disc space-y-1 pl-5 text-slate-600">
+                        {(claim.assumptions.length ? claim.assumptions : ['No analysis assumptions were stored.']).map((assumption, index) => <li key={`${index}-${assumption}`}>{assumption}</li>)}
+                      </ul>
+                      <div className="mt-3 border-t border-slate-100 pt-3 text-slate-600">
+                        <span className="font-bold">{lang === 'ar' ? 'مرجع تعاقدي أدخله المستخدم:' : 'User-entered contractual reference:'}</span>{' '}
+                        {hasVerifiedCpmMethod ? claim.contractual_reference || 'N/A' : 'N/A'}
+                      </div>
+                      <div className="mt-1 text-slate-500">
+                        {lang === 'ar' ? 'نوع الحدث:' : 'Event type:'} {EVENT_TYPE_LABELS[claim.event_type]?.[lang === 'ar' ? 'ar' : 'en'] || claim.event_type} · {hasVerifiedCpmMethod ? `${claim.start_date} → ${claim.end_date} · ${claim.delay_duration_days}d` : 'N/A'}
+                      </div>
                     </div>
                   </div>
                 )}
-              </div>
+              </article>
             );
           })}
         </div>
       )}
 
-      {/* TAB 2: Time Windows Analysis (AACE RP 29R-03) */}
       {activeTab === 'windows' && (
-        <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden space-y-4 p-5">
-          <div>
-            <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
-              <Layers size={16} className="text-blue-600" />
-              {lang === 'ar' ? 'تحليل النوافذ الزمنية الجنائي (Forensic Time Windows Analysis - AACE RP 29R-03)' : 'Forensic Time Windows Analysis (AACE RP 29R-03)'}
-            </h3>
-            <p className="text-xs text-slate-500 mt-1">
-              {lang === 'ar'
-                ? 'تقسيم عمر المشروع إلى نوافذ زمنية دورية لتحديد متى وأين نشأ التأخير الحرج، وتوثيق استهلاك الهوامش عبر كل فترة.'
-                : 'Segment project lifecycle into periodic analysis windows to quantify critical slippage and float consumption incrementally.'}
-            </p>
+        <div className="space-y-4 rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+          <div className="flex items-center gap-2 text-sm font-bold text-slate-900">
+            <Layers size={16} className="text-blue-600" />
+            {lang === 'ar' ? 'تحليل النوافذ الزمنية' : 'Time Windows Analysis'}
           </div>
-
-          <div className="overflow-x-auto">
-            <table className="w-full text-xs">
-              <thead className="bg-slate-50 text-slate-700 border-b border-slate-200 font-bold">
-                <tr>
-                  <th className="p-3 text-right">{lang === 'ar' ? 'النافذة التحليلية' : 'Window'}</th>
-                  <th className="p-3 text-right">{lang === 'ar' ? 'الفترة الزمنية' : 'Period'}</th>
-                  <th className="p-3 text-right">{lang === 'ar' ? 'المسار الحرج في النافذة' : 'Critical Path'}</th>
-                  <th className="p-3 text-center">{lang === 'ar' ? 'الإنجاز (مخطط / فعلي)' : 'Plan / Act %'}</th>
-                  <th className="p-3 text-center">{lang === 'ar' ? 'انزلاق النافذة' : 'Window Slip'}</th>
-                  <th className="p-3 text-center">{lang === 'ar' ? 'تأخير المالك' : 'Owner Delay'}</th>
-                  <th className="p-3 text-center">{lang === 'ar' ? 'تأخير المقاول' : 'Contr. Delay'}</th>
-                  <th className="p-3 text-center">{lang === 'ar' ? 'EOT المستحق' : 'Net EOT'}</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100">
-                {timeWindows.map((w) => (
-                  <tr key={w.id} className="hover:bg-slate-50">
-                    <td className="p-3 font-bold text-slate-800">
-                      <span className="font-mono bg-blue-50 text-blue-700 px-1.5 py-0.5 rounded mr-1">[{w.id}]</span>
-                      {lang === 'ar' ? w.nameAr : w.nameEn}
-                    </td>
-                    <td className="p-3 font-mono text-slate-600 whitespace-nowrap">{w.period}</td>
-                    <td className="p-3 text-slate-700 font-medium">{w.criticalPathInWindow}</td>
-                    <td className="p-3 text-center font-mono">
-                      <span className="text-slate-500">{w.plannedProgress}%</span> / <span className="font-bold text-blue-700">{w.actualProgress}%</span>
-                    </td>
-                    <td className="p-3 text-center font-mono font-bold text-red-600">
-                      {w.windowSlippage > 0 ? `+${w.windowSlippage} d` : '0 d'}
-                    </td>
-                    <td className="p-3 text-center font-mono text-amber-700 font-bold">{w.ownerDelay} d</td>
-                    <td className="p-3 text-center font-mono text-rose-700 font-bold">{w.contractorDelay} d</td>
-                    <td className="p-3 text-center font-mono font-bold bg-emerald-50 text-emerald-800">
-                      +{w.netEotDays} d
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+          <div className="rounded-lg border border-dashed border-slate-300 bg-slate-50 p-5">
+            <div className="font-bold text-slate-700">N/A</div>
+            <p className="mt-1 text-xs text-slate-600">
+              {lang === 'ar'
+                ? 'لا توجد لقطات جدول حالة معتمدة ومؤرخة أو سجلات نوافذ فعلية محملة. لم تُنشأ نوافذ أو نسب إنجاز أو نتائج تأخير تجريبية.'
+                : 'No dated, approved schedule snapshots or recorded window assessments are loaded. No sample windows, progress percentages, or delay conclusions are generated.'}
+            </p>
           </div>
         </div>
       )}
 
-      {/* TAB 3: Concurrent Delays (SCL Protocol) */}
       {activeTab === 'concurrency' && (
-        <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden space-y-4 p-5">
+        <div className="space-y-4 rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
           <div>
-            <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+            <h3 className="flex items-center gap-2 text-sm font-bold text-slate-900">
               <GitPullRequest size={16} className="text-amber-600" />
-              {lang === 'ar' ? 'مصفوفة تحليل التزامن وبروتوكول SCL (Concurrent Delays Resolution)' : 'Concurrent Delays Matrix & SCL Protocol'}
+              {lang === 'ar' ? 'أدلة تداخل أحداث التأخير المسجلة' : 'Recorded delay-event overlap evidence'}
             </h3>
-            <p className="text-xs text-slate-500 mt-1">
+            <p className="mt-1 text-xs text-slate-500">
               {lang === 'ar'
-                ? 'تطبيق القواعد القياسية لبروتوكول جمعية قانون الإنشاءات البريطانية (SCL 2nd Edition) لفض التزامن بين أحداث المالك والمقاول.'
-                : 'Application of Society of Construction Law (SCL) Delay & Disruption Protocol 2nd Edition for concurrent events.'}
+                ? 'يعرض هذا القسم تداخل فترات أحداث مسجلة ذات أثر CPM مقاس فقط. التداخل المحتمل ليس حكماً بالتزامن أو استحقاقاً تعاقدياً.'
+                : 'This section compares recorded event periods with measured CPM impact only. Potential overlap is not a concurrency or entitlement ruling.'}
             </p>
           </div>
-
-          <div className="grid grid-cols-1 gap-4">
-            {concurrencyMatrix.map((item) => (
-              <div key={item.id} className="p-4 rounded-xl border border-slate-200 bg-slate-50/60 space-y-3 text-xs">
-                <div className="flex items-center justify-between border-b border-slate-200 pb-2">
-                  <span className="font-mono font-bold text-slate-900 bg-amber-100 px-2 py-0.5 rounded">
-                    {item.id} | {item.period}
-                  </span>
-                  <span className={`px-2.5 py-0.5 rounded-full font-bold ${item.isConcurrent ? 'bg-purple-100 text-purple-800 border border-purple-200' : 'bg-emerald-100 text-emerald-800'}`}>
-                    {item.isConcurrent ? (lang === 'ar' ? 'تأخير متزامن (Concurrent)' : 'Concurrent Delay') : (lang === 'ar' ? 'تأخير أحادي (Single Source)' : 'Single Delay')}
-                  </span>
-                </div>
-
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                  <div className="p-3 bg-white rounded-lg border border-amber-200">
-                    <span className="text-[10px] text-amber-800 font-bold block mb-1">حدث تأخير المالك (Employer Event)</span>
-                    <p className="text-slate-800 font-medium">{item.employerEvent}</p>
+          {claims.length === 0 && <p className="rounded-lg border border-dashed border-slate-300 bg-slate-50 p-5 text-sm text-slate-600">N/A — no recorded delay events.</p>}
+          <div className="grid grid-cols-1 gap-3">
+            {claims.map((claim) => {
+              const concurrency = concurrencyFor(claim);
+              return (
+                <div key={claim.id} className="rounded-xl border border-slate-200 bg-slate-50/70 p-4 text-xs">
+                  <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 pb-2">
+                    <span className="font-mono font-bold text-slate-900">{claim.claim_number} · {claim.analysis_method === TIA_ANALYSIS_METHOD ? `${claim.start_date} → ${claim.end_date}` : 'N/A'}</span>
+                    <span className={`rounded-full border px-2.5 py-0.5 font-bold ${concurrency.status === 'potential_overlap' ? 'border-amber-300 bg-amber-100 text-amber-900' : 'border-slate-300 bg-white text-slate-600'}`}>
+                      {concurrency.status === 'potential_overlap' ? (lang === 'ar' ? 'تداخل محتمل مسجل' : 'Potential recorded overlap') : 'N/A'}
+                    </span>
                   </div>
-
-                  <div className="p-3 bg-white rounded-lg border border-rose-200">
-                    <span className="text-[10px] text-rose-800 font-bold block mb-1">حدث تأخير المقاول (Contractor Event)</span>
-                    <p className="text-slate-800 font-medium">{item.contractorEvent}</p>
-                  </div>
+                  <p className="mt-2 text-slate-700">{concurrency.note}</p>
+                  <div className="mt-2 text-slate-600">{lang === 'ar' ? 'أثر نهاية المشروع المقاس:' : 'Measured project-finish impact:'} {claim.analysis_method === TIA_ANALYSIS_METHOD ? displayNumber(claim.critical_delay_days, 'd') : 'N/A'} · {lang === 'ar' ? 'المسؤولية:' : 'responsibility:'} {claim.responsibility}</div>
+                  {concurrency.evidence.map((evidence) => (
+                    <div key={`${evidence.claimId}-${evidence.overlapStart}`} className="mt-2 rounded border border-slate-200 bg-white p-2 text-slate-700">
+                      {lang === 'ar' ? 'سجل متداخل:' : 'Overlapping record:'} <span className="font-mono font-bold">{evidence.claimNumber}</span> · {evidence.overlapStart} → {evidence.overlapEnd} · {lang === 'ar' ? 'أثر CPM المقاس' : 'measured CPM impact'} {evidence.measuredCriticalDelayDays}d
+                    </div>
+                  ))}
                 </div>
-
-                <div className="p-3 bg-blue-50/80 border border-blue-200 rounded-lg text-blue-900 space-y-1">
-                  <div className="font-bold">{lang === 'ar' ? 'حكم بروتوكول SCL المعتمد:' : 'SCL Protocol Ruling:'}</div>
-                  <div>{lang === 'ar' ? item.sclRuleAr : item.sclRuleEn}</div>
-                  <div className="pt-1 flex gap-4 font-mono font-bold text-emerald-800 text-[11px]">
-                    <span>✓ {item.eotEntitlement}</span>
-                    <span>✓ {item.costEntitlement}</span>
-                  </div>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
       )}
 
-      {/* TAB 4: Float Ownership & Float Erosion Tracker */}
       {activeTab === 'float_governance' && (
-        <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden space-y-4 p-5">
+        <div className="space-y-4 overflow-hidden rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
           <div>
-            <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+            <h3 className="flex items-center gap-2 text-sm font-bold text-slate-900">
               <Clock size={16} className="text-purple-600" />
-              {lang === 'ar' ? 'حوكمة ملكية واستهلاك الهوامش (Total Float Ownership & Erosion)' : 'Total Float Ownership & Erosion Governance'}
+              {lang === 'ar' ? 'حوكمة ملكية واستهلاك الهوامش' : 'Total Float Ownership & Erosion Governance'}
             </h3>
-            <p className="text-xs text-slate-500 mt-1">
+            <p className="mt-1 text-xs text-slate-500">
               {lang === 'ar'
-                ? 'مبدأ SCL: الهامش ملك للمشروع ككل ويحق للطرف الذي يحتاجه أولاً استخدامه دون دفع تعويضات حتى استنفاذه بالكامل.'
-                : 'SCL Principle: Float belongs to the project; whoever needs it first can use it until fully exhausted.'}
+                ? 'يعرض هذا الملخص قيم الهامش الحالية من بيانات الأنشطة؛ ولا يُعد دليلاً على استهلاك تاريخي للهامش.'
+                : 'This summary reads current activity float values; it is not evidence of historical float consumption.'}
             </p>
           </div>
-
-          <div className="overflow-x-auto max-h-96">
+          <div className="max-h-96 overflow-x-auto">
             <table className="w-full text-xs">
-              <thead className="bg-slate-50 text-slate-700 border-b border-slate-200 font-bold sticky top-0">
+              <thead className="sticky top-0 border-b border-slate-200 bg-slate-50 text-slate-700">
                 <tr>
-                  <th className="p-3 text-right">{lang === 'ar' ? 'الكود' : 'Code'}</th>
-                  <th className="p-3 text-right">{lang === 'ar' ? 'اسم النشاط' : 'Activity Name'}</th>
+                  <th className="p-3 text-left">{lang === 'ar' ? 'الكود' : 'Code'}</th>
+                  <th className="p-3 text-left">{lang === 'ar' ? 'اسم النشاط' : 'Activity Name'}</th>
                   <th className="p-3 text-center">{lang === 'ar' ? 'الهامش الكلي (TF)' : 'Total Float'}</th>
-                  <th className="p-3 text-center">{lang === 'ar' ? 'الهامش المستهلك' : 'Consumed Float'}</th>
-                  <th className="p-3 text-right">{lang === 'ar' ? 'حالة ملكية الهامش' : 'Ownership Status'}</th>
+                  <th className="p-3 text-center">{lang === 'ar' ? 'الاستهلاك التاريخي' : 'Historical Consumption'}</th>
+                  <th className="p-3 text-left">{lang === 'ar' ? 'الحالة' : 'Status'}</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {floatGovernanceList.map((item) => (
                   <tr key={item.id} className="hover:bg-slate-50">
                     <td className="p-3 font-mono font-bold text-slate-700">{item.code}</td>
-                    <td className="p-3 text-slate-800 font-medium truncate max-w-xs">{item.name}</td>
-                    <td className={`p-3 text-center font-mono font-bold ${item.totalFloat <= 0 ? 'text-red-600 bg-red-50/50' : 'text-slate-700'}`}>
-                      {item.totalFloat} {lang === 'ar' ? 'يوم' : 'd'}
-                    </td>
-                    <td className="p-3 text-center font-mono text-amber-700 font-bold">
-                      {item.consumedFloat} {lang === 'ar' ? 'يوم' : 'd'}
-                    </td>
+                    <td className="max-w-xs truncate p-3 font-medium text-slate-800">{item.name}</td>
+                    <td className={`p-3 text-center font-mono font-bold ${item.totalFloat <= 0 ? 'bg-red-50/50 text-red-600' : 'text-slate-700'}`}>{item.totalFloat}d</td>
+                    <td className="p-3 text-center font-mono font-bold text-slate-500">N/A</td>
                     <td className="p-3">
-                      <span className={`px-2 py-0.5 rounded text-[11px] font-bold ${
-                        item.isCritical ? 'bg-red-100 text-red-800 border border-red-200' : 'bg-slate-100 text-slate-700'
-                      }`}>
+                      <span className={`rounded px-2 py-0.5 text-[11px] font-bold ${item.isCritical ? 'border border-red-200 bg-red-100 text-red-800' : 'bg-slate-100 text-slate-700'}`}>
                         {lang === 'ar' ? item.ownershipStatusAr : item.ownershipStatusEn}
                       </span>
                     </td>
@@ -735,130 +657,104 @@ export default function TimeImpactAnalysisView({ project }: TimeImpactAnalysisVi
                 ))}
               </tbody>
             </table>
+            {floatGovernanceList.length === 0 && <p className="p-5 text-center text-slate-500">N/A — no schedule activities.</p>}
           </div>
         </div>
       )}
 
-      {/* Add Fragnet Modal */}
       {showAddModal && (
-        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
-          <div className="bg-white rounded-xl max-w-lg w-full p-6 space-y-4 shadow-xl">
-            <h3 className="text-base font-bold text-slate-800">{lang === 'ar' ? 'إدخال حدث تأخير وإجراء تحليل الأثر الزمني (TIA)' : 'Insert Delay Fragnet & Perform TIA'}</h3>
-
-            <div className="space-y-3 text-xs">
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-slate-600 mb-1 font-semibold">{lang === 'ar' ? 'رقم المطالبة' : 'Claim Number'}</label>
-                  <input
-                    type="text"
-                    value={form.claimNumber}
-                    onChange={(e) => setForm({ ...form, claimNumber: e.target.value })}
-                    className="w-full p-2 border rounded-lg font-mono"
-                  />
-                </div>
-                <div>
-                  <label className="block text-slate-600 mb-1 font-semibold">{lang === 'ar' ? 'مدة التأخير (أيام عمل)' : 'Delay Duration (Days)'}</label>
-                  <input
-                    type="number"
-                    min="1"
-                    value={form.delayDurationDays}
-                    onChange={(e) => setForm({ ...form, delayDurationDays: Number(e.target.value) })}
-                    className="w-full p-2 border rounded-lg"
-                  />
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-slate-600 mb-1 font-semibold">{lang === 'ar' ? 'عنوان حدث التأخير' : 'Delay Event Title'}</label>
-                <input
-                  type="text"
-                  value={form.title}
-                  onChange={(e) => setForm({ ...form, title: e.target.value })}
-                  placeholder="مثال: تأخر اعتماد استشاري أو أمر تغييري"
-                  className="w-full p-2 border rounded-lg"
-                />
-              </div>
-
-              <div>
-                <label className="block text-slate-600 mb-1 font-semibold">{lang === 'ar' ? 'النشاط المتأثر في الجدول (Affected Activity)' : 'Affected Schedule Activity'}</label>
-                <select
-                  value={form.affectedActivityId}
-                  onChange={(e) => setForm({ ...form, affectedActivityId: e.target.value })}
-                  className="w-full p-2 border rounded-lg bg-white"
-                >
-                  {activities.map((a) => (
-                    <option key={a.id} value={a.id}>{a.code} - {a.name} ({a.early_start})</option>
-                  ))}
-                </select>
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-slate-600 mb-1 font-semibold">{lang === 'ar' ? 'تصنيف المسؤولية التعاقدية' : 'Responsibility'}</label>
-                  <select
-                    value={form.responsibility}
-                    onChange={(e) => setForm({ ...form, responsibility: e.target.value as any })}
-                    className="w-full p-2 border rounded-lg bg-white"
-                  >
-                    <option value="excusable_compensable">مبرر مع تعويض مالي (مالك/استشاري)</option>
-                    <option value="excusable_non_compensable">مبرر دون تعويض (قوة قاهرة)</option>
-                    <option value="non_excusable">غير مبرر (تقصير المقاول)</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-slate-600 mb-1 font-semibold">{lang === 'ar' ? 'تاريخ حدوث الأثر' : 'Impact Start Date'}</label>
-                  <input
-                    type="date"
-                    value={form.impactStartDate}
-                    onChange={(e) => setForm({ ...form, impactStartDate: e.target.value })}
-                    className="w-full p-2 border rounded-lg"
-                  />
-                  <p className="text-[10px] text-slate-500 mt-1 leading-relaxed">
-                    {lang === 'ar'
-                      ? `تاريخ خط الحالة المعتمد: ${governedDataDate} — يُعبّأ تاريخ الأثر به افتراضياً.`
-                      : `Governing Data Date: ${governedDataDate} — the impact date defaults to it.`}
-                  </p>
-                  {isAfterDataDate(form.impactStartDate, governedDataDate) && (
-                    <div className="mt-1.5 p-2 rounded-lg bg-amber-50 border border-amber-200 text-[10px] text-amber-900 font-bold flex items-start gap-1.5">
-                      <AlertOctagon size={12} className="flex-shrink-0 mt-0.5" />
-                      <span>
-                        {lang === 'ar'
-                          ? 'التاريخ المختار بعد تاريخ خط الحالة: يُسجَّل الحدث كمسودة سيناريو مستقبلي، ولا يدخل في إجمالي التمديد أو التعويض المعتمد.'
-                          : 'The chosen date is after the Data Date: the event is recorded as a future-scenario draft and stays out of the approved EOT and compensation totals.'}
-                      </span>
-                    </div>
-                  )}
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-slate-600 mb-1 font-semibold">{lang === 'ar' ? 'معدل التكاليف غير المباشرة اليومية (SAR/Day)' : 'Daily Indirect Cost Rate (SAR)'}</label>
-                <input
-                  type="number"
-                  value={form.dailyIndirectCostRate}
-                  onChange={(e) => setForm({ ...form, dailyIndirectCostRate: Number(e.target.value) })}
-                  className="w-full p-2 border rounded-lg"
-                />
-              </div>
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+          <div className="max-h-[92vh] w-full max-w-2xl space-y-4 overflow-y-auto rounded-xl bg-white p-6 shadow-xl">
+            <div>
+              <h3 className="text-base font-bold text-slate-800">{lang === 'ar' ? 'إدخال حدث وتحليل Fragnet' : 'Record Delay Event & Analyze Fragnet'}</h3>
+              <p className="mt-1 text-xs text-slate-500">{lang === 'ar' ? 'جميع قيم الحدث ونقطة الإدراج والمعدل اختيارية فقط عند تقديمها صراحةً. التحليل لا يحفظ تغييرات في الجدول.' : 'Event, insertion point, duration, and any rate are explicit inputs. Analysis does not save changes to the schedule.'}</p>
             </div>
 
-            <div className="flex justify-end gap-2 pt-4 border-t">
-              <button
-                onClick={() => setShowAddModal(false)}
-                className="px-4 py-2 border rounded-lg text-slate-600 text-xs font-semibold cursor-pointer"
-              >
-                {lang === 'ar' ? 'إلغاء' : 'Cancel'}
-              </button>
-              <button
-                onClick={handleCreateClaim}
-                className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-semibold shadow-md cursor-pointer"
-              >
-                {lang === 'ar' ? 'تشغيل تحليل TIA وإصدار المطالبة' : 'Run TIA & Generate EOT'}
-              </button>
+            <div className="grid grid-cols-1 gap-3 text-xs sm:grid-cols-2">
+              <Field label={lang === 'ar' ? 'رقم الحدث' : 'Event / Claim Number'}>
+                <input value={form.claimNumber} onChange={(event) => setForm({ ...form, claimNumber: event.target.value })} className="w-full rounded-lg border p-2 font-mono" />
+              </Field>
+              <Field label={lang === 'ar' ? 'مدة Fragnet (أيام عمل)' : 'Fragnet duration (working days)'}>
+                <input type="number" min="1" step="1" value={form.delayDurationDays} onChange={(event) => setForm({ ...form, delayDurationDays: event.target.value })} className="w-full rounded-lg border p-2" />
+              </Field>
+              <Field label={lang === 'ar' ? 'عنوان الحدث' : 'Event title'} className="sm:col-span-2">
+                <input value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} className="w-full rounded-lg border p-2" />
+              </Field>
+              <Field label={lang === 'ar' ? 'وصف/مرجع الحدث' : 'Event description / record'} className="sm:col-span-2">
+                <textarea value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} rows={2} className="w-full rounded-lg border p-2" />
+              </Field>
+              <Field label={lang === 'ar' ? 'نوع الحدث' : 'Event type'}>
+                <select value={form.eventType} onChange={(event) => setForm({ ...form, eventType: event.target.value as FormEventType })} className="w-full rounded-lg border bg-white p-2">
+                  <option value="">{lang === 'ar' ? 'اختر النوع' : 'Select event type'}</option>
+                  {(Object.keys(EVENT_TYPE_LABELS) as DelayEventType[]).map((type) => <option key={type} value={type}>{EVENT_TYPE_LABELS[type][lang === 'ar' ? 'ar' : 'en']}</option>)}
+                </select>
+              </Field>
+              <Field label={lang === 'ar' ? 'تصنيف المسؤولية (مدخل المستخدم)' : 'Responsibility (user-recorded)'}>
+                <select value={form.responsibility} onChange={(event) => setForm({ ...form, responsibility: event.target.value as FormResponsibility })} className="w-full rounded-lg border bg-white p-2">
+                  <option value="">{lang === 'ar' ? 'اختر التصنيف' : 'Select classification'}</option>
+                  <option value="excusable_compensable">{lang === 'ar' ? 'مبرر مع تعويض' : 'Excusable / compensable'}</option>
+                  <option value="excusable_non_compensable">{lang === 'ar' ? 'مبرر دون تعويض' : 'Excusable / non-compensable'}</option>
+                  <option value="non_excusable">{lang === 'ar' ? 'غير مبرر' : 'Non-excusable'}</option>
+                </select>
+              </Field>
+              <Field label={lang === 'ar' ? 'علاقة الإدراج (السابق → اللاحق)' : 'Insertion relationship (predecessor → successor)'} className="sm:col-span-2">
+                <select value={form.insertionLinkId} onChange={(event) => setForm({ ...form, insertionLinkId: event.target.value })} className="w-full rounded-lg border bg-white p-2">
+                  <option value="">{lang === 'ar' ? 'اختر علاقة قائمة في الجدول' : 'Select an existing schedule relationship'}</option>
+                  {selectableLinks.map((link) => <option key={link.id} value={link.id}>{linkDescription(link)}</option>)}
+                </select>
+                <p className="mt-1 text-[10px] text-slate-500">{lang === 'ar' ? 'يُستبدل الرابط المختار داخل نسخة التحليل فقط؛ تُحفظ علاقته الأصلية على مدخل Fragnet.' : 'The selected link is replaced in the analysis copy only; its relationship/lag is retained on the incoming fragnet link.'}</p>
+              </Field>
+              <Field label={lang === 'ar' ? 'تاريخ بدء الحدث' : 'Event impact start date'}>
+                <input type="date" value={form.impactStartDate} onChange={(event) => setForm({ ...form, impactStartDate: event.target.value })} className="w-full rounded-lg border p-2" />
+                <p className="mt-1 text-[10px] text-slate-500">{lang === 'ar' ? `تاريخ الحالة: ${governedDataDate}. لا يُعبأ تاريخ الحدث تلقائياً.` : `Schedule data date: ${governedDataDate}. Event date is not pre-filled.`}</p>
+                {form.impactStartDate && isAfterDataDate(form.impactStartDate, governedDataDate) && (
+                  <span className="mt-1 flex items-start gap-1 rounded bg-amber-50 p-2 text-[10px] font-semibold text-amber-900"><AlertOctagon size={12} />{lang === 'ar' ? 'حدث مستقبلي؛ ليس تأخيراً واقعاً حتى تاريخ الحالة.' : 'Future scenario; not an occurred delay by the data date.'}</span>
+                )}
+              </Field>
+              <Field label={lang === 'ar' ? 'معدل يومي تعاقدي/مدخل صراحةً (SAR)' : 'Explicit contractual/user daily rate (SAR)'}>
+                <input type="number" min="0" step="any" value={form.dailyIndirectCostRate} onChange={(event) => setForm({ ...form, dailyIndirectCostRate: event.target.value })} className="w-full rounded-lg border p-2" />
+                <p className="mt-1 text-[10px] text-slate-500">{lang === 'ar' ? 'اتركه فارغاً عند غياب دليل تكلفة أو معدل موثق.' : 'Leave blank when no documented rate/cost evidence is available.'}</p>
+              </Field>
+              <Field label={lang === 'ar' ? 'مرجع تعاقدي (اختياري)' : 'Contract clause / reference (optional)'} className="sm:col-span-2">
+                <input value={form.contractualClause} onChange={(event) => setForm({ ...form, contractualClause: event.target.value })} className="w-full rounded-lg border p-2" />
+              </Field>
+            </div>
+
+            {analysisError && <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-xs text-red-800">{analysisError}</div>}
+            <div className="flex justify-end gap-2 border-t pt-4">
+              <button onClick={() => setShowAddModal(false)} className="cursor-pointer rounded-lg border px-4 py-2 text-xs font-semibold text-slate-600">{lang === 'ar' ? 'إلغاء' : 'Cancel'}</button>
+              <button onClick={handleCreateClaim} className="cursor-pointer rounded-lg bg-blue-600 px-4 py-2 text-xs font-semibold text-white shadow-md hover:bg-blue-700">{lang === 'ar' ? 'تحليل CPM وإضافة سجل محلي' : 'Run CPM & Add Local Analysis'}</button>
             </div>
           </div>
         </div>
       )}
     </div>
+  );
+}
+
+function Metric({ label, value, emphasis = false }: { label: string; value: string; emphasis?: boolean }) {
+  return (
+    <div className="rounded-xl border border-slate-200 bg-white p-3.5 shadow-sm">
+      <span className="mb-1 block text-[11px] text-slate-500">{label}</span>
+      <span className={`font-mono text-sm font-bold ${emphasis ? 'text-red-700' : 'text-slate-800'}`}>{value}</span>
+    </div>
+  );
+}
+
+function EvidenceCard({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <div className="space-y-2 rounded-xl border border-slate-200 bg-white p-3.5 shadow-sm">
+      <h4 className="font-bold text-slate-700">{title}</h4>
+      {children}
+    </div>
+  );
+}
+
+function Field({ label, className = '', children }: { label: string; className?: string; children: ReactNode }) {
+  return (
+    <label className={`block font-semibold text-slate-600 ${className}`}>
+      <span className="mb-1 block">{label}</span>
+      {children}
+    </label>
   );
 }

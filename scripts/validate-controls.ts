@@ -43,6 +43,12 @@ import {
   type DataDateBearer,
 } from '@/lib/chronologyGuard';
 import { calculateCpm } from '@/lib/cpmEngine';
+import {
+  assessConcurrencyEvidence,
+  performTimeImpactAnalysis,
+  TIA_ANALYSIS_METHOD,
+  TIAValidationError,
+} from '@/lib/tiaEngine';
 import { buildRecoveryScenarioPatches, generateScheduleRecoveryPlan } from '@/lib/recoveryOptimizerEngine';
 import { getCalendar, countWorkingDays, addWorkingDays } from '@/lib/calendarEngine';
 import { calculateBaselineVariances } from '@/lib/trendEngine';
@@ -119,7 +125,7 @@ import {
 } from '@/lib/complexScenarioSimulator';
 import type {
   Activity, ActivityBoqAllocation, ActivityLink, ActivityResource, BaselineActivity, BoqItem, BudgetLine,
-  ComplexScenarioModel, ComplexScenarioResult, CostControlSnapshot, CostTransaction, ParsedBoqRow,
+  ComplexScenarioModel, ComplexScenarioResult, CostControlSnapshot, CostTransaction, DelayClaimEvent, ParsedBoqRow,
   Project, ProgressUpdate, Resource, ScenarioSensitivityTornado, ScheduleUpdateSnapshot, WbsNode,
 } from '@/types';
 
@@ -4534,20 +4540,23 @@ console.log('--- S18 Pilot Closure (F9.5)');
     'src/lib/supabase.ts',
     'supabase/migrations/20260924120000_atomic_schedule_recovery_apply.sql',
   ]);
+  const batch2bTiaPaths = new Set([
+    'src/lib/tiaEngine.ts',
+    'src/components/views/TimeImpactAnalysisView.tsx',
+  ]);
+  const s24ChangedPaths = [...changedPaths].filter((path) => !batch2bTiaPaths.has(path));
   const protectedControlPaths = [
     'src/lib/scheduleControlEngine.ts',
     'src/lib/costControlEngine.ts',
     'src/lib/integratedDecisionEngine.ts',
     'src/lib/cpmEngine.ts',
     'src/lib/calendarEngine.ts',
-    'src/lib/tiaEngine.ts',
-    'src/components/views/TimeImpactAnalysisView.tsx',
     'src/lib/resourceLevelingEngine.ts',
     'src/lib/boqResourceLeveling.ts',
   ];
   ok('S24 changes stay within the recovery engine/view, required validation and shared types',
-    [...changedPaths].every((path) => allowedRecoveryPaths.has(path)));
-  ok('S24 F5/F6/F7, CPM/calendar, TIA and Resource Leveling files are unchanged',
+    s24ChangedPaths.every((path) => allowedRecoveryPaths.has(path)));
+  ok('S24 F5/F6/F7, CPM/calendar and Resource Leveling files are unchanged',
     protectedControlPaths.every((path) => !changedPaths.has(path)));
 }
 
@@ -5181,6 +5190,181 @@ console.log('--- S18 Pilot Closure (F9.5)');
   ok('S22 the portfolio never divides by a denominator it did not validate',
     !/totalPortfolioPv > 0 \?/.test(portfolioSrc) && !/totalPortfolioAc > 0 \?/.test(portfolioSrc));
   eq('S22 the watchdog still reports the cash-flow audit as unmeasured', s22Cash?.deviation, null);
+}
+
+// ---------------------------------------------------------------------------
+// S26 — Launch Batch 2B: single-fragnet TIA, evidence-qualified EOT/concurrency/cost.
+// ---------------------------------------------------------------------------
+{
+  console.log('--- S26 Launch Batch 2B TIA / Fragnet / EOT deepening');
+  const tiaSource = readFileSync(resolvePath(process.cwd(), 'src/lib/tiaEngine.ts'), 'utf8');
+  const tiaViewSource = readFileSync(resolvePath(process.cwd(), 'src/components/views/TimeImpactAnalysisView.tsx'), 'utf8');
+  const tiaDate = '2026-09-13';
+  const tiaOptions = {
+    calendarType: '6_days' as const,
+    dataDate: tiaDate,
+    statusLogic: 'retained_logic' as const,
+  };
+  const tiaActivities = [
+    act({ id: 'TIA-A', code: 'TIA-A', duration_days: 5, early_start: tiaDate }),
+    act({ id: 'TIA-B', code: 'TIA-B', duration_days: 4 }),
+  ];
+  const tiaLinks = [link('TIA-LAB', 'TIA-A', 'TIA-B')];
+  const tiaInput = {
+    projectId: 'p1',
+    claimNumber: 'TIA-REG-01',
+    title: 'Recorded delay event',
+    description: 'User-entered delay event for regression coverage.',
+    eventType: 'client_delay' as const,
+    responsibility: 'excusable_compensable' as const,
+    insertionLinkId: 'TIA-LAB',
+    delayDurationDays: 3,
+    impactStartDate: tiaDate,
+    activities: tiaActivities,
+    links: tiaLinks,
+    cpmOptions: tiaOptions,
+  };
+  const tiaInputSnapshot = JSON.stringify({ activities: tiaActivities, links: tiaLinks });
+  const singleFragnet = performTimeImpactAnalysis(tiaInput);
+  eq('S26 exactly one fragnet item is recorded', singleFragnet.fragnets.length, 1);
+  eq('S26 the in-memory scenario adds exactly one activity', singleFragnet.scenarioActivities.length, tiaActivities.length + 1);
+  eq('S26 the selected relationship is replaced by exactly two fragnet edges', singleFragnet.scenarioLinks.length, tiaLinks.length + 1);
+  eq('S26 the original selected relationship is absent from the scenario copy',
+    singleFragnet.scenarioLinks.some((item) => item.id === 'TIA-LAB'), false);
+  eq('S26 only one new activity has the fragnet ID',
+    singleFragnet.scenarioActivities.filter((item) => item.id === singleFragnet.fragnets[0].id).length, 1);
+  eq('S26 original predecessor duration is not extended',
+    singleFragnet.scenarioActivities.find((item) => item.id === 'TIA-A')?.duration_days, 5);
+  eq('S26 original successor duration is unchanged',
+    singleFragnet.scenarioActivities.find((item) => item.id === 'TIA-B')?.duration_days, 4);
+  eq('S26 source schedule objects are byte-for-byte unchanged',
+    JSON.stringify({ activities: tiaActivities, links: tiaLinks }), tiaInputSnapshot);
+  eq('S26 the critical delay equals canonical finish movement for a single FS insertion',
+    singleFragnet.critical_delay_days,
+    Math.max(0, countWorkingDays(singleFragnet.pre_impact_project_finish, singleFragnet.post_impact_project_finish, getCalendar('6_days')) - 1));
+  eq('S26 the simple critical chain measures the inserted fragnet duration once', singleFragnet.critical_delay_days, 3);
+
+  const nonCriticalActivities = [
+    act({ id: 'TIA-NCA', code: 'TIA-NCA', duration_days: 2, early_start: tiaDate }),
+    act({ id: 'TIA-NCB', code: 'TIA-NCB', duration_days: 2 }),
+    act({ id: 'TIA-NCC', code: 'TIA-NCC', duration_days: 10, early_start: tiaDate }),
+  ];
+  const nonCriticalLinks = [link('TIA-NCL', 'TIA-NCA', 'TIA-NCB')];
+  const zeroMovement = performTimeImpactAnalysis({
+    ...tiaInput,
+    claimNumber: 'TIA-REG-02',
+    insertionLinkId: 'TIA-NCL',
+    delayDurationDays: 4,
+    activities: nonCriticalActivities,
+    links: nonCriticalLinks,
+  });
+  eq('S26 no project-finish movement means exactly zero measured critical delay', zeroMovement.critical_delay_days, 0);
+  eq('S26 event duration is not used as a zero-impact fallback', zeroMovement.critical_delay_days, 0);
+  eq('S26 zero CPM impact leaves EOT claim days null', zeroMovement.eot_days_claimed, null);
+  eq('S26 zero CPM impact is explicitly not recommended as positive EOT', zeroMovement.eotRecommendation.days, 0);
+
+  const missingEvidence = performTimeImpactAnalysis(tiaInput);
+  eq('S26 missing rate stays null', missingEvidence.daily_indirect_cost_rate, null);
+  eq('S26 missing rate and entitlement leave prolongation cost null', missingEvidence.compensation_claimed_sar, null);
+  eq('S26 missing entitlement evidence leaves EOT days null', missingEvidence.eot_days_claimed, null);
+  eq('S26 positive CPM impact without determination is unproven / N/A', missingEvidence.eotRecommendation.status, 'unproven');
+  eq('S26 unproven EOT has no fabricated number of days', missingEvidence.eotRecommendation.days, null);
+  eq('S26 missing concurrency evidence is unavailable, not a negative finding', missingEvidence.concurrencyAssessment.status, 'unavailable');
+  ok('S26 missing-evidence assessment explicitly reports N/A',
+    missingEvidence.concurrencyAssessment.note.includes('N/A') && missingEvidence.eotRecommendation.note.includes('Unproven / N/A'));
+
+  const explicitRateButNoDetermination = performTimeImpactAnalysis({ ...tiaInput, dailyIndirectCostRate: 2500 });
+  eq('S26 an explicit rate is recorded as user input', explicitRateButNoDetermination.daily_indirect_cost_rate, 2500);
+  eq('S26 an explicit rate alone does not manufacture a prolongation cost', explicitRateButNoDetermination.compensation_claimed_sar, null);
+
+  const recordedConcurrentEvent: DelayClaimEvent = {
+    ...missingEvidence,
+    id: 'TIA-RECORDED-OTHER',
+    claim_number: 'TIA-RECORDED-OTHER',
+    start_date: '2026-09-10',
+    end_date: '2026-09-15',
+    critical_delay_days: 2,
+    eot_days_claimed: null,
+    daily_indirect_cost_rate: null,
+    compensation_claimed_sar: null,
+    status: 'draft',
+    analysis_method: TIA_ANALYSIS_METHOD,
+  };
+  const overlapAssessment = assessConcurrencyEvidence(missingEvidence, [recordedConcurrentEvent], tiaDate);
+  eq('S26 concurrency is surfaced only when recorded measured event windows overlap', overlapAssessment.status, 'potential_overlap');
+  eq('S26 overlap evidence identifies the recorded event and data-date-bounded dates',
+    overlapAssessment.evidence.map((item) => [item.claimNumber, item.overlapStart, item.overlapEnd]),
+    [['TIA-RECORDED-OTHER', '2026-09-13', '2026-09-13']]);
+  ok('S26 potential overlap is not presented as a concurrency ruling',
+    overlapAssessment.note.includes('not a concurrency or entitlement determination'));
+
+  const cyclicActivities = [
+    act({ id: 'TIA-CYA', code: 'TIA-CYA', duration_days: 2, early_start: tiaDate }),
+    act({ id: 'TIA-CYB', code: 'TIA-CYB', duration_days: 2 }),
+  ];
+  let cyclicError: unknown = null;
+  try {
+    performTimeImpactAnalysis({
+      ...tiaInput,
+      claimNumber: 'TIA-CYCLE',
+      insertionLinkId: 'TIA-CYAB',
+      activities: cyclicActivities,
+      links: [link('TIA-CYAB', 'TIA-CYA', 'TIA-CYB'), link('TIA-CYBA', 'TIA-CYB', 'TIA-CYA')],
+    });
+  } catch (error) {
+    cyclicError = error;
+  }
+  ok('S26 cyclic schedule/fragnet scenario is rejected',
+    cyclicError instanceof TIAValidationError && cyclicError.code === 'cyclic_schedule');
+
+  let missingLinkError: unknown = null;
+  try {
+    performTimeImpactAnalysis({ ...tiaInput, insertionLinkId: 'not-a-real-link' });
+  } catch (error) {
+    missingLinkError = error;
+  }
+  ok('S26 missing relationship insertion point is rejected',
+    missingLinkError instanceof TIAValidationError && missingLinkError.code === 'missing_insertion_link');
+
+  let invalidDurationError: unknown = null;
+  try {
+    performTimeImpactAnalysis({ ...tiaInput, delayDurationDays: 0 });
+  } catch (error) {
+    invalidDurationError = error;
+  }
+  ok('S26 zero/invalid fragnet duration is rejected',
+    invalidDurationError instanceof TIAValidationError && invalidDurationError.code === 'invalid_input');
+
+  ok('S26 TIA view contains no hardcoded demo windows, fake concurrency rulings, percentages, or fixed rate',
+    !/CONC-0\d|2026-11-10|60%|33,600|4800|Window 1|CONC-01/.test(tiaViewSource));
+  ok('S26 TIA view visibly gates absent evidence as N/A / Unproven',
+    tiaViewSource.includes('Unproven / N/A') && tiaViewSource.includes('No dated, approved schedule snapshots'));
+  ok('S26 new analysis records are in-memory only and the view has no schedule writes',
+    !/supabase\.from\(['"](?:activities|activity_links)['"]\)\.(?:insert|update|upsert|delete)\s*\(/.test(tiaViewSource));
+  ok('S26 TIA engine has no default daily rate or event-duration critical-delay fallback',
+    !/4800|criticalDelayDays\s*=\s*delayDurationDays/.test(tiaSource));
+
+  const batch2bChangedPaths = new Set([
+    ...execFileSync('git', ['diff', '--name-only'], { encoding: 'utf8' }).split('\n').filter(Boolean),
+    ...execFileSync('git', ['diff', '--name-only', '--cached'], { encoding: 'utf8' }).split('\n').filter(Boolean),
+    ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
+  ]);
+  const allowedBatch2bPaths = new Set([
+    'src/lib/tiaEngine.ts',
+    'src/components/views/TimeImpactAnalysisView.tsx',
+    'src/types/index.ts',
+    'scripts/validate-controls.ts',
+  ]);
+  ok('S26 changed files stay within TIA engine/view, directly required types, and regression harness',
+    [...batch2bChangedPaths].every((path) => allowedBatch2bPaths.has(path)));
+  const protectedBatch2bPaths = [
+    'src/lib/scheduleControlEngine.ts', 'src/lib/costControlEngine.ts', 'src/lib/integratedDecisionEngine.ts',
+    'src/lib/cpmEngine.ts', 'src/lib/calendarEngine.ts', 'src/lib/resourceLevelingEngine.ts',
+    'src/components/views/ScheduleRecoveryView.tsx', 'src/components/views/DashboardView.tsx',
+    'src/components/views/ExecutiveReportView.tsx', 'src/lib/mockSeed.ts',
+  ];
+  ok('S26 F5/F6/F7, CPM/calendar, recovery, dashboard/report, and seed files remain untouched',
+    protectedBatch2bPaths.every((path) => !batch2bChangedPaths.has(path)));
 }
 
 // ---------------------------------------------------------------------------
