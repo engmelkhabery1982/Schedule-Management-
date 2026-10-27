@@ -1,5 +1,5 @@
 import { useState, useMemo, useEffect } from 'react';
-import { supabase } from '@/lib/supabase';
+import { isDemoMode, loadDemoWorkspace, supabase } from '@/lib/supabase';
 import { getLanguage, type Language } from '@/lib/i18n';
 import type { Project, ViewName, ProjectSector, Activity, BudgetLine, BoqItem, CostTransaction, ProgressUpdate, Risk, ActivityLink, BaselineActivity } from '@/types';
 // F9.4 (Controlled Pilot defect 1): every project's EVM here is a QUOTE of the canonical F6
@@ -50,19 +50,30 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
   const [searchQuery, setSearchQuery] = useState('');
   const [showAddProjectModal, setShowAddProjectModal] = useState(false);
 
-  // New Project Form
+  /**
+   * S29 — genuine new-project form.
+   *
+   * It used to be pre-filled with an invented contract value (15,000,000), an invented location, and
+   * invented start/finish dates; submitting then auto-generated a WBS, three BOQ items summing to the
+   * contract value, three CPM activities, two links and three budget lines. A "real" project therefore
+   * arrived with fabricated scope, cost and progress. Now every field starts empty, and a created
+   * project contains ONLY what the user typed: no BOQ, no activities, no links, no budget, no cost, no
+   * progress. Demo data is created by the separate, explicitly labelled demo action below.
+   */
   const [newProjectForm, setNewProjectForm] = useState({
     name: '',
     client: '',
-    location: 'الرياض',
-    contract_value: 15000000,
-    currency: 'SAR',
-    start_date: '2026-10-01',
-    end_date: '2027-12-31',
+    location: '',
+    contract_value: '',
+    start_date: '',
+    end_date: '',
     sector: 'commercial_building' as ProjectSector,
-    duration_days: 365,
     description: '',
   });
+  const [formErrors, setFormErrors] = useState<string[]>([]);
+  const [createError, setCreateError] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [demoNotice, setDemoNotice] = useState<string | null>(null);
 
   useEffect(() => {
     loadPortfolio();
@@ -268,71 +279,119 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
       )
     : null;
 
+  /** Client-side validation of the genuine project form. Returns bilingual messages. */
+  function validateNewProject(): string[] {
+    const errors: string[] = [];
+    const isAr = lang === 'ar';
+    if (newProjectForm.name.trim().length < 2) {
+      errors.push(isAr ? 'اسم المشروع مطلوب (حرفان على الأقل).' : 'Project name is required (at least 2 characters).');
+    }
+    if (newProjectForm.client.trim().length === 0) {
+      errors.push(isAr ? 'اسم العميل/المالك مطلوب.' : 'Client / owner is required.');
+    }
+    const contractValue = Number(newProjectForm.contract_value);
+    if (newProjectForm.contract_value.trim() === '' || !Number.isFinite(contractValue)) {
+      errors.push(isAr ? 'قيمة العقد يجب أن تكون رقماً.' : 'Contract value must be a number.');
+    } else if (contractValue <= 0) {
+      errors.push(isAr ? 'قيمة العقد يجب أن تكون أكبر من صفر.' : 'Contract value must be greater than zero.');
+    }
+    const isoDate = /^\d{4}-\d{2}-\d{2}$/;
+    if (!isoDate.test(newProjectForm.start_date)) {
+      errors.push(isAr ? 'تاريخ البداية مطلوب بصيغة YYYY-MM-DD.' : 'Start date is required (YYYY-MM-DD).');
+    }
+    if (!isoDate.test(newProjectForm.end_date)) {
+      errors.push(isAr ? 'تاريخ الانتهاء التعاقدي مطلوب بصيغة YYYY-MM-DD.' : 'Contractual finish date is required (YYYY-MM-DD).');
+    }
+    if (isoDate.test(newProjectForm.start_date) && isoDate.test(newProjectForm.end_date)
+      && newProjectForm.start_date > newProjectForm.end_date) {
+      errors.push(isAr ? 'تاريخ البداية يجب ألا يتجاوز تاريخ الانتهاء.' : 'The start date must not be after the finish date.');
+    }
+    return errors;
+  }
+
+  /**
+   * Create a REAL project: exactly one `projects` row, containing only user-entered values.
+   *
+   * No WBS, BOQ, activity, link, budget line, cost transaction or progress row is generated — a new
+   * project is genuinely empty and says so. The contractual duration is DERIVED from the dates the
+   * user typed (calendar days, inclusive), and the governed Data Date is applied as policy, not as
+   * invented progress.
+   */
   const handleCreateProject = async () => {
-    if (!newProjectForm.name) return;
-    const contractVal = Number(newProjectForm.contract_value) || 10000000;
-    const { data: newProj, error } = await supabase.from('projects').insert({
-      name: newProjectForm.name,
-      client: newProjectForm.client || 'عميل تجريبي',
-      location: newProjectForm.location,
-      contract_value: contractVal,
-      currency: 'SAR',
-      start_date: newProjectForm.start_date,
-      end_date: newProjectForm.end_date,
-      duration_days: Number(newProjectForm.duration_days) || 365,
-      status: 'active',
-      calendar_type: '6_days',
-      sector: newProjectForm.sector,
-      // GAP-010: a newly created project starts at the governed Data Date, not at a hardcoded date
-      // two months beyond it (which would make every actual record of the new project "future").
-      data_date: DEFAULT_DATA_DATE,
-      description: newProjectForm.description,
-    }).select().single();
+    const errors = validateNewProject();
+    setFormErrors(errors);
+    setCreateError(null);
+    if (errors.length > 0) return;
 
-    if (newProj) {
-      // Auto-generate WBS, BOQ, CPM Activities, Links and Budget lines
-      const now = new Date().toISOString();
-      const pId = newProj.id;
-      const sDate = newProj.start_date;
-      
-      // 1. WBS Nodes
-      const wbs1 = { id: `wbs-${pId}-01`, project_id: pId, code: '1.0', name: 'أعمال التأسيس والموقع العام', level: 1, sort_order: 1, created_at: now };
-      const wbs2 = { id: `wbs-${pId}-02`, project_id: pId, code: '2.0', name: 'الهياكل الإنشائية الرئيسية', level: 1, sort_order: 2, created_at: now };
-      const wbs3 = { id: `wbs-${pId}-03`, project_id: pId, code: '3.0', name: 'التشطيبات المعمارية والكهروميكانيكية', level: 1, sort_order: 3, created_at: now };
-      await supabase.from('wbs_nodes').insert([wbs1, wbs2, wbs3]);
+    setCreating(true);
+    try {
+      const startDate = newProjectForm.start_date;
+      const endDate = newProjectForm.end_date;
+      const durationDays = Math.round(
+        (new Date(`${endDate}T00:00:00Z`).getTime() - new Date(`${startDate}T00:00:00Z`).getTime()) / 86400000,
+      ) + 1;
 
-      // 2. BOQ Items summing to contractVal
-      const b1Val = Math.round(contractVal * 0.20);
-      const b2Val = Math.round(contractVal * 0.45);
-      const b3Val = contractVal - b1Val - b2Val;
-      const boq1 = { id: `boq-${pId}-01`, project_id: pId, code: 'BOQ-01', description: 'أعمال الموقع العام والأساسات', unit: 'm3', quantity: 1000, unit_price: Math.round(b1Val / 1000), total_price: b1Val, sort_order: 1, created_at: now };
-      const boq2 = { id: `boq-${pId}-02`, project_id: pId, code: 'BOQ-02', description: 'الأعمال الإنشائية والخرسانات المسلحة', unit: 'm3', quantity: 2000, unit_price: Math.round(b2Val / 2000), total_price: b2Val, sort_order: 2, created_at: now };
-      const boq3 = { id: `boq-${pId}-03`, project_id: pId, code: 'BOQ-03', description: 'التشطيبات والأنظمة الكهروميكانيكية', unit: 'lot', quantity: 1, unit_price: b3Val, total_price: b3Val, sort_order: 3, created_at: now };
-      await supabase.from('boq_items').insert([boq1, boq2, boq3]);
+      const { data: newProj, error } = await supabase.from('projects').insert({
+        name: newProjectForm.name.trim(),
+        client: newProjectForm.client.trim(),
+        location: newProjectForm.location.trim() || null,
+        contract_value: Number(newProjectForm.contract_value),
+        currency: 'SAR',
+        start_date: startDate,
+        end_date: endDate,
+        duration_days: durationDays,
+        status: 'active',
+        status_logic: 'retained_logic',
+        calendar_type: '6_days',
+        sector: newProjectForm.sector,
+        // GAP-010: a newly created project starts at the governed Data Date, not at a hardcoded date
+        // two months beyond it (which would make every actual record of the new project "future").
+        data_date: DEFAULT_DATA_DATE,
+        description: newProjectForm.description.trim() || null,
+      }).select().single();
 
-      // 3. CPM Activities
-      const act1 = { id: `act-${pId}-01`, project_id: pId, code: 'ACT-01', name: 'أعمال الحفريات والأساسات', duration_days: 30, early_start: sDate, early_finish: sDate, late_start: sDate, late_finish: sDate, total_float: 0, free_float: 0, percent_complete: 0, is_critical: true, is_milestone: false, sort_order: 1, wbs_node_id: wbs1.id, planned_quantity: 1000, actual_quantity: 0, unit: 'm3', created_at: now };
-      const act2 = { id: `act-${pId}-02`, project_id: pId, code: 'ACT-02', name: 'الهيكل الخرساني الرئيسي', duration_days: 60, early_start: sDate, early_finish: sDate, late_start: sDate, late_finish: sDate, total_float: 0, free_float: 0, percent_complete: 0, is_critical: true, is_milestone: false, sort_order: 2, wbs_node_id: wbs2.id, planned_quantity: 2000, actual_quantity: 0, unit: 'm3', created_at: now };
-      const act3 = { id: `act-${pId}-03`, project_id: pId, code: 'ACT-03', name: 'التشطيبات المعمارية والكهروميكانيك', duration_days: 60, early_start: sDate, early_finish: sDate, late_start: sDate, late_finish: sDate, total_float: 0, free_float: 0, percent_complete: 0, is_critical: true, is_milestone: false, sort_order: 3, wbs_node_id: wbs3.id, planned_quantity: 1, actual_quantity: 0, unit: 'lot', created_at: now };
-      await supabase.from('activities').insert([act1, act2, act3]);
+      if (error) {
+        // S29: an insert that was refused (validation, quota, denied storage) must be reported, not
+        // silently swallowed and then presented as a created project.
+        setCreateError(error.message);
+        return;
+      }
+      if (!newProj) {
+        setCreateError(lang === 'ar' ? 'لم تُعِد قاعدة البيانات المشروع الجديد.' : 'The new project was not returned by the database.');
+        return;
+      }
 
-      // 4. Activity Links
-      await supabase.from('activity_links').insert([
-        { id: `lnk-${pId}-01`, project_id: pId, predecessor_id: act1.id, successor_id: act2.id, link_type: 'FS', lag_days: 0 },
-        { id: `lnk-${pId}-02`, project_id: pId, predecessor_id: act2.id, successor_id: act3.id, link_type: 'FS', lag_days: 0 },
-      ]);
-
-      // 5. Budget Lines
-      await supabase.from('budget_lines').insert([
-        { id: `bgt-${pId}-01`, project_id: pId, wbs_node_id: wbs1.id, boq_item_id: boq1.id, description: 'أعمال التأسيس والموقع', planned_cost: b1Val, committed_cost: b1Val, actual_cost: 0, remaining_cost: b1Val, created_at: now },
-        { id: `bgt-${pId}-02`, project_id: pId, wbs_node_id: wbs2.id, boq_item_id: boq2.id, description: 'الهياكل الإنشائية', planned_cost: b2Val, committed_cost: b2Val, actual_cost: 0, remaining_cost: b2Val, created_at: now },
-        { id: `bgt-${pId}-03`, project_id: pId, wbs_node_id: wbs3.id, boq_item_id: boq3.id, description: 'التشطيبات والكهروميكانيك', planned_cost: b3Val, committed_cost: b3Val, actual_cost: 0, remaining_cost: b3Val, created_at: now },
-      ]);
-
+      const created = newProj as Project;
       setShowAddProjectModal(false);
+      setNewProjectForm({
+        name: '', client: '', location: '', contract_value: '', start_date: '', end_date: '',
+        sector: 'commercial_building', description: '',
+      });
+      setFormErrors([]);
       await loadPortfolio();
+      // New projects become the selected project, and the selection survives a reload (S29).
+      onSelectProject(created);
+      onNavigate('dashboard');
+    } catch (err) {
+      setCreateError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setCreating(false);
     }
   };
+
+  /** Explicit DEMO creation — never mixed with the real project form. */
+  function handleLoadDemoWorkspace() {
+    const message = lang === 'ar'
+      ? 'سيتم استبدال مساحة العمل المحلية ببيانات تجريبية مُتخيَّلة (4 مشاريع). ستُحفظ النسخة الحالية كنسخة قابلة للاستعادة. المتابعة؟'
+      : 'This replaces the local workspace with DEMO data (four invented projects). The current workspace is preserved as a recoverable copy. Continue?';
+    if (!window.confirm(message)) return;
+    const result = loadDemoWorkspace();
+    if (!result.ok) {
+      setDemoNotice(result.error);
+      return;
+    }
+    window.location.reload();
+  }
 
   const getSectorBadge = (sec: ProjectSector) => {
     switch (sec) {
@@ -376,13 +435,33 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
           </p>
         </div>
 
-        <button
-          onClick={() => setShowAddProjectModal(true)}
-          className="flex items-center gap-1.5 px-4 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-amber-400 text-xs font-bold transition-all shadow-sm cursor-pointer"
-        >
-          <Plus size={15} />
-          <span>{lang === 'ar' ? 'إضافة مشروع جديد للمحفظة' : 'New Project'}</span>
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            onClick={() => {
+              setFormErrors([]);
+              setCreateError(null);
+              setShowAddProjectModal(true);
+            }}
+            className="flex items-center gap-1.5 px-4 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-amber-400 text-xs font-bold transition-all shadow-sm cursor-pointer"
+          >
+            <Plus size={15} />
+            <span>{lang === 'ar' ? 'إضافة مشروع جديد للمحفظة' : 'New Project'}</span>
+          </button>
+          {/* S29: demo data is a SEPARATE, explicitly labelled action — never the result of
+              creating a project. */}
+          {isDemoMode && (
+            <button
+              onClick={handleLoadDemoWorkspace}
+              className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-amber-100 border border-amber-300 text-amber-900 text-[11px] font-bold transition-all cursor-pointer"
+              title={lang === 'ar'
+                ? 'ينشئ مساحة عمل تجريبية ببيانات مُتخيَّلة (4 مشاريع) — مختلف تماماً عن إنشاء مشروع حقيقي'
+                : 'Creates a demo workspace with four invented projects — entirely different from creating a real project'}
+            >
+              <Sparkles size={14} />
+              <span>{lang === 'ar' ? 'تحميل مساحة عمل تجريبية (بيانات مُتخيَّلة)' : 'Load demo workspace (invented data)'}</span>
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Aggregated Portfolio Executive KPI Cards */}
@@ -525,6 +604,25 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
         </div>
       </div>
 
+      {demoNotice && (
+        <div className="rounded-xl border border-rose-300 bg-rose-50 p-3 text-xs text-rose-900" role="alert">
+          {demoNotice}
+        </div>
+      )}
+
+      {filteredProjects.length === 0 && (
+        <div className="bg-white rounded-xl border border-slate-200 p-6 text-center space-y-1">
+          <p className="text-sm font-black text-slate-800">
+            {lang === 'ar' ? 'لا توجد مشاريع حقيقية في مساحة العمل المحلية' : 'No real projects in this local workspace'}
+          </p>
+          <p className="text-xs text-slate-500">
+            {lang === 'ar'
+              ? 'مساحة العمل فارغة وصالحة — لم يتم توليد أي بيانات. أنشئ مشروعاً حقيقياً، أو استعد نسخة احتياطية كاملة من شاشة التصدير.'
+              : 'The workspace is empty and valid — nothing was generated. Create a real project, or restore a complete backup from the Export screen.'}
+          </p>
+        </div>
+      )}
+
       {/* Multi-Project Cards Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
         {filteredProjects.map((p) => {
@@ -654,10 +752,10 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
 
             <div className="space-y-3">
               <div>
-                <label className="block text-slate-600 font-bold mb-1">{lang === 'ar' ? 'اسم المشروع' : 'Project Name'}</label>
+                <label className="block text-slate-600 font-bold mb-1">{lang === 'ar' ? 'اسم المشروع' : 'Project Name'} *</label>
                 <input
                   type="text"
-                  placeholder="مثال: مشروع إنشاء برج إداري وسكني - جدة"
+                  placeholder={lang === 'ar' ? 'مثال: مشروع إنشاء برج إداري وسكني - جدة' : 'e.g. Office tower — Riyadh'}
                   value={newProjectForm.name}
                   onChange={(e) => setNewProjectForm({ ...newProjectForm, name: e.target.value })}
                   className="w-full p-2 border rounded-lg font-semibold"
@@ -666,18 +764,13 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
 
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-slate-600 font-bold mb-1">{lang === 'ar' ? 'القطاع الهندسي' : 'Sector'}</label>
-                  <select
-                    value={newProjectForm.sector}
-                    onChange={(e) => setNewProjectForm({ ...newProjectForm, sector: e.target.value as any })}
-                    className="w-full p-2 border rounded-lg bg-white font-bold"
-                  >
-                    <option value="commercial_building">🏢 مباني تجارية وإدارية</option>
-                    <option value="infrastructure_highway">🛣️ بنية تحتية وطرق</option>
-                    <option value="healthcare_hospital">🏥 مستشفيات ورعاية صحية</option>
-                    <option value="residential_complex">🏡 مجمعات سكنية</option>
-                    <option value="industrial_plant">🏭 مصانع ومنشآت صناعية</option>
-                  </select>
+                  <label className="block text-slate-600 font-bold mb-1">{lang === 'ar' ? 'العميل / المالك' : 'Client / Owner'} *</label>
+                  <input
+                    type="text"
+                    value={newProjectForm.client}
+                    onChange={(e) => setNewProjectForm({ ...newProjectForm, client: e.target.value })}
+                    className="w-full p-2 border rounded-lg"
+                  />
                 </div>
                 <div>
                   <label className="block text-slate-600 font-bold mb-1">{lang === 'ar' ? 'الموقع' : 'Location'}</label>
@@ -692,28 +785,35 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
 
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-slate-600 font-bold mb-1">{lang === 'ar' ? 'قيمة العقد (SAR)' : 'Contract Value'}</label>
-                  <input
-                    type="number"
-                    value={newProjectForm.contract_value}
-                    onChange={(e) => setNewProjectForm({ ...newProjectForm, contract_value: Number(e.target.value) })}
-                    className="w-full p-2 border rounded-lg font-mono font-bold"
-                  />
+                  <label className="block text-slate-600 font-bold mb-1">{lang === 'ar' ? 'القطاع الهندسي' : 'Sector'}</label>
+                  <select
+                    value={newProjectForm.sector}
+                    onChange={(e) => setNewProjectForm({ ...newProjectForm, sector: e.target.value as ProjectSector })}
+                    className="w-full p-2 border rounded-lg bg-white font-bold"
+                  >
+                    <option value="commercial_building">🏢 {lang === 'ar' ? 'مباني تجارية وإدارية' : 'Commercial building'}</option>
+                    <option value="infrastructure_highway">🛣️ {lang === 'ar' ? 'بنية تحتية وطرق' : 'Infrastructure & highway'}</option>
+                    <option value="healthcare_hospital">🏥 {lang === 'ar' ? 'مستشفيات ورعاية صحية' : 'Healthcare'}</option>
+                    <option value="residential_complex">🏡 {lang === 'ar' ? 'مجمعات سكنية' : 'Residential complex'}</option>
+                    <option value="oil_gas_industrial">🏭 {lang === 'ar' ? 'صناعي ونفط وغاز' : 'Oil, gas & industrial'}</option>
+                  </select>
                 </div>
                 <div>
-                  <label className="block text-slate-600 font-bold mb-1">{lang === 'ar' ? 'المدة (أيام)' : 'Duration (Days)'}</label>
+                  <label className="block text-slate-600 font-bold mb-1">{lang === 'ar' ? 'قيمة العقد (SAR)' : 'Contract Value (SAR)'} *</label>
                   <input
                     type="number"
-                    value={newProjectForm.duration_days}
-                    onChange={(e) => setNewProjectForm({ ...newProjectForm, duration_days: Number(e.target.value) })}
-                    className="w-full p-2 border rounded-lg font-mono"
+                    min="0"
+                    step="any"
+                    value={newProjectForm.contract_value}
+                    onChange={(e) => setNewProjectForm({ ...newProjectForm, contract_value: e.target.value })}
+                    className="w-full p-2 border rounded-lg font-mono font-bold"
                   />
                 </div>
               </div>
 
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-slate-600 font-bold mb-1">{lang === 'ar' ? 'تاريخ البداية' : 'Start Date'}</label>
+                  <label className="block text-slate-600 font-bold mb-1">{lang === 'ar' ? 'تاريخ البداية' : 'Start Date'} *</label>
                   <input
                     type="date"
                     value={newProjectForm.start_date}
@@ -722,7 +822,7 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
                   />
                 </div>
                 <div>
-                  <label className="block text-slate-600 font-bold mb-1">{lang === 'ar' ? 'تاريخ الانتهاء التعاقدي' : 'Finish Date'}</label>
+                  <label className="block text-slate-600 font-bold mb-1">{lang === 'ar' ? 'تاريخ الانتهاء التعاقدي' : 'Contractual Finish Date'} *</label>
                   <input
                     type="date"
                     value={newProjectForm.end_date}
@@ -731,7 +831,22 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
                   />
                 </div>
               </div>
+
+              <div className="rounded-lg bg-slate-50 border border-slate-200 p-2.5 text-[11px] text-slate-600 leading-relaxed">
+                {lang === 'ar'
+                  ? 'المشروع الجديد يُنشأ فارغاً تماماً: بدون BOQ أو أنشطة أو روابط أو تكاليف أو إنجاز. المدة التعاقدية تُحسب من التاريخين، وتاريخ البيانات المحكوم يُطبَّق كسياسة (2026-09-13).'
+                  : 'The new project is created completely empty: no BOQ, activities, links, cost or progress. The contractual duration is derived from the two dates, and the governed Data Date (2026-09-13) is applied as policy.'}
+              </div>
             </div>
+
+            {(formErrors.length > 0 || createError) && (
+              <div className="rounded-lg border border-rose-300 bg-rose-50 p-2.5 text-[11px] text-rose-900 space-y-1" role="alert">
+                {createError && <p className="font-bold">{createError}</p>}
+                {formErrors.map((message) => (
+                  <p key={message}>• {message}</p>
+                ))}
+              </div>
+            )}
 
             <div className="flex justify-end gap-2 pt-3 border-t">
               <button
@@ -742,9 +857,12 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
               </button>
               <button
                 onClick={handleCreateProject}
-                className="px-4 py-2 bg-slate-900 text-amber-400 font-bold rounded-lg shadow-sm cursor-pointer"
+                disabled={creating}
+                className="px-4 py-2 bg-slate-900 text-amber-400 font-bold rounded-lg shadow-sm cursor-pointer disabled:opacity-60"
               >
-                {lang === 'ar' ? 'إنشاء وتجهيز المشروع' : 'Create Project'}
+                {creating
+                  ? (lang === 'ar' ? 'جارٍ الإنشاء…' : 'Creating…')
+                  : (lang === 'ar' ? 'إنشاء المشروع (فارغ)' : 'Create empty project')}
               </button>
             </div>
           </div>

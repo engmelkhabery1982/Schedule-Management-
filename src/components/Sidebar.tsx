@@ -50,7 +50,9 @@ export default function Sidebar({ activeView, onViewChange, project, onProjectCh
 
   async function loadProjects() {
     const { data } = await supabase.from('projects').select('*').order('created_at', { ascending: false });
-    if (data && data.length > 0) setProjects(data);
+    // S29: an empty workspace must empty the selector too — the old `length > 0` guard left deleted
+    // projects listed (and selectable) after a reset.
+    setProjects(Array.isArray(data) ? data : []);
   }
 
   async function selectProject(p: Project) {
@@ -221,14 +223,16 @@ export default function Sidebar({ activeView, onViewChange, project, onProjectCh
               <span>{currentLang === 'ar' ? 'وضع المعاينة الميداني (Enterprise)' : 'Enterprise Live Demo'}</span>
             </div>
             <p className="text-slate-400 text-[9px] leading-tight mb-2">
-              {currentLang === 'ar' ? 'حسابات TIA والمسار الحرج تعمل بالكامل.' : 'TIA & CPM calculations active.'}
+              {currentLang === 'ar'
+                ? 'مساحة عمل محلية في هذا المتصفح. زر التالي يُنشئ بيانات تجريبية مُتخيَّلة (4 مشاريع) فوق مساحة العمل الحالية، بعد حفظ نسخة قابلة للاستعادة.'
+                : 'Local workspace in this browser. The button below creates invented DEMO data (four projects) over the current workspace, after preserving a recoverable copy.'}
             </p>
             <button
               onClick={resetDemoDatabase}
               className="w-full flex items-center justify-center gap-1 bg-slate-700/80 hover:bg-slate-700 text-slate-200 py-1 rounded text-[10px] transition-colors cursor-pointer"
             >
               <RotateCcw size={10} />
-              {currentLang === 'ar' ? 'إعادة ضبط البيانات التجريبية' : 'Reset Demo Data'}
+              {currentLang === 'ar' ? 'تحميل مساحة عمل تجريبية (بيانات مُتخيَّلة)' : 'Load demo workspace (invented data)'}
             </button>
           </div>
         )}

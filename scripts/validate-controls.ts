@@ -136,6 +136,40 @@ import {
   applySaveVariationOrderDraft,
   applyTransitionVariationOrder,
 } from '@/lib/scopeChangeDbContracts';
+// S29 (SCH-20261027-SAFETY): the local workspace owner and its query builder are Supabase-free by
+// design, so this harness drives the EXACT storage code the browser runs — including the atomic
+// commit, preservation, migration, backup and restore paths.
+import {
+  AUXILIARY_STORAGE_PREFIXES,
+  PERSISTED_TABLES,
+  PERSISTED_TABLE_NAMES,
+  PRESERVED_KEY_PREFIX,
+  PRE_RESTORE_KEY_PREFIX,
+  SELECTED_PROJECT_STORAGE_KEY,
+  WORKSPACE_SCHEMA_VERSION,
+  WORKSPACE_STORAGE_KEY,
+  buildBackup,
+  canonicalJson,
+  commitWorkspace,
+  createEmptyWorkspace,
+  isEmptyWorkspace,
+  listPreservedCopies,
+  loadWorkspaceState,
+  readAuxiliaryStores,
+  readSelectedProjectId,
+  readWorkspace,
+  resetWorkspaceToEmpty,
+  resolveStartupProject,
+  restoreWorkspace,
+  seedDemoWorkspace,
+  serializeBackup,
+  tableRows,
+  validateBackup,
+  writeSelectedProjectId,
+  type WorkspaceState,
+  type WorkspaceStorage,
+} from '@/lib/localWorkspace';
+import { MockQueryBuilder, type LocalWorkspacePort } from '@/lib/localQueryBuilder';
 
 // ---------------------------------------------------------------------------
 // Assertion helpers
@@ -157,6 +191,28 @@ const BATCH3A_GOVERNANCE_PATHS = new Set([
   'scripts/validate-controls.ts',
   'supabase/migrations/20260924140000_scope_baseline_change_governance.sql',
 ]);
+/**
+ * SCH-20261027-SAFETY (S29) — the files this task owns.
+ *
+ * The batch guards below were written as "this batch's diff stays inside its own scope". The working
+ * diff now also contains the storage-safety increment, so — exactly as S24/S26/S27 already subtract
+ * the later Batch 2B/2C/3A path sets — they subtract this set too. S29 then asserts the current diff
+ * is confined to ITS paths, so nothing can be smuggled in by loosening the older guards.
+ */
+const S29_WORKSPACE_SAFETY_PATHS = new Set([
+  'src/lib/localWorkspace.ts',
+  'src/lib/localQueryBuilder.ts',
+  'src/lib/supabase.ts',
+  'src/App.tsx',
+  'src/components/Sidebar.tsx',
+  'src/components/views/PortfolioView.tsx',
+  'src/components/views/ExportView.tsx',
+  'src/components/views/WorkspaceBackupPanel.tsx',
+  'scripts/validate-controls.ts',
+  'docs/FIRST-USE-AND-BACKUP.md',
+  'docs/PILOT-STORAGE-SAFETY.md',
+]);
+
 function eq(name: string, actual: unknown, expected: unknown): void {
   checks += 1;
   const a = JSON.stringify(actual);
@@ -1835,8 +1891,10 @@ console.log('--- S17 Controlled Pilot defects (F9.4)');
 
   // The demo store's dot-notation `eq` must fail CLOSED, matching PostgREST `!inner`: a row whose
   // joined parent is absent is excluded, not waved through.
-  const supSrc = readSrc('src/lib/supabase.ts');
-  const eqBody = supSrc.slice(supSrc.indexOf('  eq(column: string, value: any) {'));
+  // S29: the query builder now lives in `src/lib/localQueryBuilder.ts` (extracted so the harness can
+  // drive the real code). The semantic assertion is unchanged — it just reads the file that owns it.
+  const supSrc = readSrc('src/lib/localQueryBuilder.ts');
+  const eqBody = supSrc.slice(supSrc.indexOf('  eq(column: string, value: unknown) {'));
   const eqDotBranch = eqBody.slice(0, eqBody.indexOf('return item[column] === value;'));
   ok('S17-E the demo store resolves a dot-notation parent before comparing',
     eqDotBranch.includes("column.includes('.')") && eqDotBranch.includes('typeof direct ==='));
@@ -4595,7 +4653,8 @@ console.log('--- S18 Pilot Closure (F9.5)');
     'supabase/migrations/20260924130000_atomic_resource_leveling_apply.sql',
   ]);
   const s24ChangedPaths = [...changedPaths].filter((path) =>
-    !batch2bTiaPaths.has(path) && !batch2cResourcePaths.has(path) && !BATCH3A_GOVERNANCE_PATHS.has(path));
+    !batch2bTiaPaths.has(path) && !batch2cResourcePaths.has(path) && !BATCH3A_GOVERNANCE_PATHS.has(path)
+      && !S29_WORKSPACE_SAFETY_PATHS.has(path));
   const protectedControlPaths = [
     'src/lib/scheduleControlEngine.ts',
     'src/lib/costControlEngine.ts',
@@ -4761,10 +4820,11 @@ console.log('--- S18 Pilot Closure (F9.5)');
       && atomicApplyBody.includes('p_cpm_results: cpmResults'));
   ok('S25 no sequential Supabase row updates remain in Apply',
     !/supabase\.from\(['"][^'"]+['"]\)\.(?:update|insert|upsert|delete)\s*\(/.test(atomicApplyBody));
-  ok('S25 demo mode routes the same RPC to its staged atomic contract and saves only on success',
-    atomicSupabaseSrc.includes("fnName === 'apply_schedule_recovery_scenario'")
-      && atomicSupabaseSrc.includes('applyScheduleRecoveryScenario(db, params)')
-      && atomicSupabaseSrc.includes('if (!result.error) saveDb(db)')
+  ok('S25 demo mode routes the same RPC to its staged atomic contract and commits only on success',
+    atomicSupabaseSrc.includes('apply_schedule_recovery_scenario: (db, p) =>')
+      && atomicSupabaseSrc.includes('applyScheduleRecoveryScenario(db, p as unknown as AtomicScheduleRecoveryParams)')
+      && atomicSupabaseSrc.includes('commitWorkspace(storage, (draft) =>')
+      && atomicSupabaseSrc.includes('if (!commitResult.ok) return { data: null, error: commitResult.error };')
       && atomicDemoContractSrc.includes('const stagedActivities = liveActivities.map')
       && atomicDemoContractSrc.includes("db['activities'] = stagedActivities"));
   ok('S25 atomic RPC result is checked and the single Apply-time CPM is built from evaluated clones',
@@ -5413,7 +5473,7 @@ console.log('--- S18 Pilot Closure (F9.5)');
     'supabase/migrations/20260924130000_atomic_resource_leveling_apply.sql',
   ]);
   const s26ChangedPaths = [...batch2bChangedPaths].filter((path) =>
-    !batch2cTiaExclusions.has(path) && !BATCH3A_GOVERNANCE_PATHS.has(path));
+    !batch2cTiaExclusions.has(path) && !BATCH3A_GOVERNANCE_PATHS.has(path) && !S29_WORKSPACE_SAFETY_PATHS.has(path));
   ok('S26 changed files stay within TIA engine/view, directly required types, and regression harness',
     s26ChangedPaths.every((path) => allowedBatch2bPaths.has(path)));
   const protectedBatch2bPaths = [
@@ -5725,9 +5785,11 @@ console.log('--- S18 Pilot Closure (F9.5)');
     levelingViewSource.includes("scenario?.status === 'ready'")
       && levelingViewSource.includes('scenario.unresolvedConflicts.length === 0')
       && levelingViewSource.includes('window.confirm'));
-  ok('S27 demo RPC dispatcher saves only a successful one-shot local contract',
-    levelingSupabaseSource.includes("fnName === 'apply_resource_leveling_scenario'")
-      && /applyResourceLevelingScenario\(db, params\)[\s\S]{0,200}if \(!result\.error\) saveDb\(db\)/.test(levelingSupabaseSource));
+  ok('S27 demo RPC dispatcher commits only a successful one-shot local contract',
+    levelingSupabaseSource.includes('apply_resource_leveling_scenario: (db, p) =>')
+      && levelingSupabaseSource.includes('applyResourceLevelingScenario(db, p as unknown as AtomicResourceLevelingParams)')
+      && levelingSupabaseSource.includes('commitWorkspace(storage, (draft) =>')
+      && levelingSupabaseSource.includes('if (!commitResult.ok) return { data: null, error: commitResult.error };'));
   const demoApplyStart = levelingDemoContractSource.indexOf('export function applyResourceLevelingScenario');
   const demoApplyEnd = levelingDemoContractSource.indexOf('Faithful demo-store implementation of the `review_cost_transaction`', demoApplyStart);
   const demoApplySource = demoApplyStart >= 0 ? levelingDemoContractSource.slice(demoApplyStart, demoApplyEnd) : '';
@@ -5761,7 +5823,8 @@ console.log('--- S18 Pilot Closure (F9.5)');
     'src/lib/supabase.ts',
     'supabase/migrations/20260924130000_atomic_resource_leveling_apply.sql',
   ]);
-  const s27ChangedPaths = [...changedPaths].filter((path) => !BATCH3A_GOVERNANCE_PATHS.has(path));
+  const s27ChangedPaths = [...changedPaths].filter((path) =>
+    !BATCH3A_GOVERNANCE_PATHS.has(path) && !S29_WORKSPACE_SAFETY_PATHS.has(path));
   ok('S27 changes stay within Batch 2C resource-leveling, required types/tests, and atomic Apply support',
     s27ChangedPaths.every((path) => allowedBatch2cPaths.has(path)));
   const protectedUnchanged = [
@@ -6084,8 +6147,8 @@ console.log('--- S18 Pilot Closure (F9.5)');
     ...execFileSync('git', ['diff', '--name-only', '--cached'], { encoding: 'utf8' }).split('\n').filter(Boolean),
     ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
   ]);
-  ok('S28 changed files stay inside the requested Batch 3A governance boundary',
-    [...s28ChangedPaths].every((path) => BATCH3A_GOVERNANCE_PATHS.has(path)));
+  ok('S28 changed files stay inside the requested Batch 3A governance boundary (or the later S29 scope)',
+    [...s28ChangedPaths].every((path) => BATCH3A_GOVERNANCE_PATHS.has(path) || S29_WORKSPACE_SAFETY_PATHS.has(path)));
   const protectedBatch3aFiles = [
     'src/lib/scheduleControlEngine.ts', 'src/lib/costControlEngine.ts', 'src/lib/integratedDecisionEngine.ts',
     'src/lib/canonicalEvm.ts', 'src/lib/sCurveEngine.ts', 'src/lib/sCurveTimePhasing.ts',
@@ -6103,6 +6166,740 @@ console.log('--- S18 Pilot Closure (F9.5)');
   ];
   ok('S28 protected F5/F6/F7, CPM/calendar, Recovery, TIA/EOT, Resource Leveling and seed files are unchanged',
     protectedBatch3aFiles.every((path) => !s28ChangedPaths.has(path)));
+}
+
+// ---------------------------------------------------------------------------
+// S29 — SCH-20261027-SAFETY: local single-user pilot storage safety.
+//
+// Exercises the REAL modules (`@/lib/localWorkspace`, `@/lib/localQueryBuilder`) against synthetic
+// storage, so every acceptance item below is a behavioural check rather than a source-text claim:
+//
+//   A  the three known defects, reproduced against a faithful replica of the PRE-FIX loader
+//   B  loader: absent / valid-empty / malformed / bad shape / unsupported version / migrations
+//   C  atomic commit: denied writes, quota writes, verification failure, RPC contract writes
+//   D  real pilot lifecycle: two genuinely empty projects, three activities + two links, reload,
+//      id/link/date/zero-vs-null/selection preservation
+//   E  complete versioned backup: full table inventory, no unrelated browser keys or credentials
+//   F  restore into a fresh workspace: canonical tables + independently checked CPM and EVM,
+//      approvals and Data Date rules preserved
+//   G  every invalid backup class: storage left byte-identical
+//   H  the shipped adapter keeps those contracts (no swallowed writes, no implicit seeding)
+//   I  the persisted-table inventory matches every table the app actually uses
+// ---------------------------------------------------------------------------
+{
+  console.log('--- S29 local workspace safety (SCH-20261027-SAFETY)');
+
+  const srcRoot = (() => {
+    const cwd = process.cwd();
+    if (existsSync(resolvePath(cwd, 'package.json'))) return cwd;
+    let dir = dirname(fileURLToPath(import.meta.url));
+    for (let i = 0; i < 8; i += 1) {
+      if (existsSync(resolvePath(dir, 'package.json'))) return dir;
+      dir = dirname(dir);
+    }
+    return cwd;
+  })();
+
+  // -- synthetic storage -----------------------------------------------------
+  interface StoreOptions {
+    denyWrites?: boolean;
+    quota?: boolean;
+    dropWrites?: boolean;
+  }
+  interface FakeStore extends WorkspaceStorage {
+    map: Map<string, string>;
+    writes: number;
+  }
+  function makeStore(initial: Record<string, string> = {}, options: StoreOptions = {}): FakeStore {
+    const map = new Map<string, string>(Object.entries(initial));
+    const store: FakeStore = {
+      map,
+      writes: 0,
+      getItem: (key: string) => (map.has(key) ? (map.get(key) as string) : null),
+      setItem: (key: string, value: string) => {
+        if (options.denyWrites) {
+          const error = new Error('denied by policy');
+          error.name = 'SecurityError';
+          throw error;
+        }
+        if (options.quota) {
+          const error = new Error('quota exceeded');
+          error.name = 'QuotaExceededError';
+          throw error;
+        }
+        store.writes += 1;
+        // `dropWrites` simulates a store that accepts the call but silently keeps nothing — the case
+        // a plain try/catch around setItem cannot detect.
+        if (!options.dropWrites) map.set(key, value);
+      },
+      removeItem: (key: string) => { map.delete(key); },
+      key: (index: number) => [...map.keys()][index] ?? null,
+      get length() { return map.size; },
+    };
+    return store;
+  }
+
+  // Sync adapter for the thenable query builder (this harness has no await/TLA by design).
+  function runQuery<T>(builder: MockQueryBuilder<T>): { data: T | null; error: { message: string } | null } {
+    const box: { result?: { data: T | null; error: { message: string } | null } } = {};
+    builder.then((result) => {
+      box.result = result as { data: T | null; error: { message: string } | null };
+      return result;
+    });
+    if (!box.result) throw new Error('S29 harness: query builder did not resolve synchronously');
+    return box.result;
+  }
+
+  const portFor = (store: WorkspaceStorage): LocalWorkspacePort => ({
+    read() {
+      const loaded = loadWorkspaceState(store);
+      return {
+        state: loaded.state,
+        error: loaded.fault ? { message: loaded.fault.message, kind: 'workspace_fault' as const } : null,
+      };
+    },
+    commit(mutate) {
+      const result = commitWorkspace(store, mutate);
+      return result.ok
+        ? { data: result.data, error: null }
+        : { data: null, error: result.error };
+    },
+  });
+  const query = <T = unknown>(store: WorkspaceStorage, table: string) =>
+    new MockQueryBuilder<T>(table, portFor(store));
+
+  // -------------------------------------------------------------------------
+  // S29-A — the three known defects, reproduced against the pre-fix algorithm.
+  //
+  // The replica is the exact logic shipped at commit 1a12ad7 in `src/lib/supabase.ts`
+  // (`LOCAL_STORAGE_KEY` -> `resetDemoDatabase`), reduced to its storage semantics. It is kept here
+  // so the defect cannot silently return: these three checks FAIL if the legacy behaviour stops being
+  // the behaviour we repaired, and the checks immediately after them pin the repaired behaviour.
+  // -------------------------------------------------------------------------
+  const legacyKey = 'schedule_mgmt_db_v5';
+  const legacySeedCalls = { count: 0 };
+  const legacySeed = () => {
+    legacySeedCalls.count += 1;
+    return { projects: [{ id: 'proj-seed-001' }], activities: [{ id: 'act-01', project_id: 'proj-seed-001' }] };
+  };
+  function legacySaveDb(store: WorkspaceStorage, data: unknown): void {
+    try {
+      store.setItem(legacyKey, JSON.stringify(data));
+    } catch {
+      // THE DEFECT: swallowed. The caller is told nothing and reports success.
+    }
+  }
+  function legacyLoadDb(store: WorkspaceStorage): Record<string, any> {
+    try {
+      const saved = store.getItem(legacyKey);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (
+          parsed &&
+          Array.isArray(parsed.projects) && parsed.projects.length > 0 &&
+          Array.isArray(parsed.activities) && parsed.activities.length > 0
+        ) {
+          return parsed;
+        }
+      }
+    } catch {
+      // THE DEFECT: no preservation of the bytes that failed to parse.
+    }
+    const initial = legacySeed();
+    legacySaveDb(store, initial); // THE DEFECT: seed-on-read, over whatever was there.
+    return initial;
+  }
+
+  // A1: swallowed write error.
+  const legacyQuota = makeStore({}, { quota: true });
+  let legacyThrew = false;
+  try { legacySaveDb(legacyQuota, { projects: [], activities: [] }); } catch { legacyThrew = true; }
+  ok('S29-A1 legacy replica reproduces defect 1: a failed write returns without throwing and nothing is stored',
+    legacyThrew === false && legacyQuota.getItem(legacyKey) === null);
+
+  // A2: valid empty state re-seeded.
+  const emptyValid = { projects: [], activities: [], wbs_nodes: [] };
+  const legacyEmpty = makeStore({ [legacyKey]: JSON.stringify(emptyValid) });
+  legacySeedCalls.count = 0;
+  const legacyReloaded = legacyLoadDb(legacyEmpty);
+  ok('S29-A2 legacy replica reproduces defect 2: a valid workspace with zero projects is replaced by invented seed data',
+    legacySeedCalls.count === 1
+      && legacyReloaded.projects.length === 1
+      && legacyEmpty.getItem(legacyKey) !== JSON.stringify(emptyValid));
+
+  // A3: corrupt JSON replaced without preservation.
+  const corruptRaw = '{"projects": [{"id": "p1", "name": "my real';
+  const legacyCorrupt = makeStore({ [legacyKey]: corruptRaw });
+  legacySeedCalls.count = 0;
+  const legacyServed = legacyLoadDb(legacyCorrupt);
+  ok('S29-A3 legacy replica reproduces defect 3: corrupt bytes are overwritten by the seed and no copy is kept',
+    legacySeedCalls.count === 1
+      && legacyCorrupt.getItem(legacyKey) !== corruptRaw
+      && [...legacyCorrupt.map.keys()].length === 1
+      && legacyServed.projects[0].id === 'proj-seed-001');
+
+  // -------------------------------------------------------------------------
+  // S29-B — loader semantics (reads never write; failures preserve bytes).
+  // -------------------------------------------------------------------------
+  const absentStore = makeStore();
+  const absentLoad = readWorkspace(absentStore);
+  eq('S29-B1 an absent workspace loads as EMPTY (no seed) and writes nothing', absentLoad.status, 'absent');
+  eq('S29-B2 an absent workspace has no projects', absentLoad.status === 'absent' ? tableRows(absentLoad.state, 'projects').length : -1, 0);
+  eq('S29-B3 loading an absent workspace performs zero writes', absentStore.writes, 0);
+
+  const emptyState = JSON.stringify({ projects: [], activities: [], wbs_nodes: [] });
+  const emptyStore = makeStore({ [WORKSPACE_STORAGE_KEY]: emptyState });
+  const emptyLoad = readWorkspace(emptyStore);
+  eq('S29-B4 a VALID empty workspace loads as ok', emptyLoad.status, 'ok');
+  eq('S29-B5 a valid empty workspace is not re-seeded', emptyLoad.status === 'ok' ? tableRows(emptyLoad.state, 'projects').length : -1, 0);
+  eq('S29-B6 a valid empty workspace is left byte-identical by the read', emptyStore.getItem(WORKSPACE_STORAGE_KEY), emptyState);
+  eq('S29-B7 a valid empty workspace read performs zero writes', emptyStore.writes, 0);
+  ok('S29-B8 a valid empty workspace is recognised as empty-but-valid', emptyLoad.status === 'ok' && isEmptyWorkspace(emptyLoad.state));
+
+  const malformedStore = makeStore({ [WORKSPACE_STORAGE_KEY]: corruptRaw });
+  const malformedLoad = readWorkspace(malformedStore);
+  eq('S29-B9 malformed JSON is a typed fault, not demo data', malformedLoad.status === 'fault' ? malformedLoad.fault.kind : `status:${malformedLoad.status}`, 'malformed_json');
+  eq('S29-B10 malformed JSON: the primary key keeps the exact original bytes', malformedStore.getItem(WORKSPACE_STORAGE_KEY), corruptRaw);
+  const malformedPreserved = malformedLoad.status === 'fault' ? malformedLoad.fault.preservedKey : null;
+  ok('S29-B11 malformed JSON: a preserved copy holds the exact original bytes',
+    malformedPreserved !== null
+      && malformedPreserved!.startsWith(PRESERVED_KEY_PREFIX)
+      && malformedStore.getItem(malformedPreserved!) === corruptRaw);
+  const malformedAgain = readWorkspace(malformedStore);
+  eq('S29-B12 preserving the same corrupt payload repeatedly does not multiply copies',
+    listPreservedCopies(malformedStore).length,
+    1);
+  ok('S29-B13 a repeat read still faults with the same preserved copy',
+    malformedAgain.status === 'fault' && malformedAgain.fault.preservedKey === malformedPreserved);
+
+  const badShapeRaw = JSON.stringify({ projects: { not: 'an array' }, activities: [] });
+  const badShapeStore = makeStore({ [WORKSPACE_STORAGE_KEY]: badShapeRaw });
+  const badShapeLoad = readWorkspace(badShapeStore);
+  eq('S29-B14 an invalid table shape is a typed fault', badShapeLoad.status === 'fault' ? badShapeLoad.fault.kind : 'no-fault', 'invalid_shape');
+  eq('S29-B15 invalid shape leaves the bytes untouched', badShapeStore.getItem(WORKSPACE_STORAGE_KEY), badShapeRaw);
+
+  const futureRaw = JSON.stringify({ projects: [], __meta: { schema_version: 99, workspace_kind: 'user', created_at: '2026-10-27T00:00:00Z' } });
+  const futureStore = makeStore({ [WORKSPACE_STORAGE_KEY]: futureRaw });
+  const futureLoad = readWorkspace(futureStore);
+  eq('S29-B16 a newer schema version is refused, not guessed', futureLoad.status === 'fault' ? futureLoad.fault.kind : 'no-fault', 'unsupported_version');
+  eq('S29-B17 a newer schema version leaves the bytes identical', futureStore.getItem(WORKSPACE_STORAGE_KEY), futureRaw);
+
+  // Supported migration: the shipped pre-versioning shape (no __meta) is v1.
+  const legacyPayload = JSON.stringify({
+    projects: [{ id: 'proj-legacy', name: 'Legacy project', contract_value: 10, start_date: '2026-01-01', end_date: '2026-02-01', data_date: '2026-09-13', created_at: '2026-01-01T00:00:00Z' }],
+    activities: [{ id: 'act-legacy', project_id: 'proj-legacy', code: 'A', duration_days: 5 }],
+  });
+  const migrateStore = makeStore({ [WORKSPACE_STORAGE_KEY]: legacyPayload });
+  const migrateLoad = readWorkspace(migrateStore);
+  ok('S29-B18 an unversioned v1 workspace migrates in memory to the current schema',
+    migrateLoad.status === 'ok' && migrateLoad.migrated === true && migrateLoad.migratedFrom === 1);
+  eq('S29-B19 migration keeps every stored row untouched',
+    migrateLoad.status === 'ok' ? canonicalJson(tableRows(migrateLoad.state, 'projects')) : 'no-state',
+    canonicalJson(JSON.parse(legacyPayload).projects));
+  eq('S29-B20 migration stamps the current schema version',
+    migrateLoad.status === 'ok' ? migrateLoad.state.__meta.schema_version : -1, WORKSPACE_SCHEMA_VERSION);
+  ok('S29-B21 migration completes the table inventory without inventing rows',
+    migrateLoad.status === 'ok'
+      && PERSISTED_TABLE_NAMES.every((name) => Array.isArray(migrateLoad.state[name]))
+      && tableRows(migrateLoad.state, 'boq_items').length === 0);
+  eq('S29-B22 migration is a read: the stored v1 bytes are not rewritten', migrateStore.getItem(WORKSPACE_STORAGE_KEY), legacyPayload);
+
+  const failedMigrationPayload = JSON.stringify({ projects: [], activities: [null] });
+  const failedMigrationStore = makeStore({ [WORKSPACE_STORAGE_KEY]: failedMigrationPayload });
+  const failedMigrationLoad = readWorkspace(failedMigrationStore);
+  eq('S29-B23 a migration that cannot complete is a typed fault', failedMigrationLoad.status === 'fault' ? failedMigrationLoad.fault.kind : 'no-fault', 'migration_failed');
+  eq('S29-B24 a failed migration leaves the bytes byte-identical', failedMigrationStore.getItem(WORKSPACE_STORAGE_KEY), failedMigrationPayload);
+  ok('S29-B25 a failed migration preserves a copy of the bytes it refused to migrate',
+    failedMigrationLoad.status === 'fault'
+      && failedMigrationLoad.fault.preservedKey !== null
+      && failedMigrationStore.getItem(failedMigrationLoad.fault.preservedKey!) === failedMigrationPayload);
+
+  const deniedReadStore = {
+    getItem: () => { throw new Error('storage disabled'); },
+    setItem: () => { throw new Error('storage disabled'); },
+    removeItem: () => { throw new Error('storage disabled'); },
+  } as WorkspaceStorage;
+  const deniedRead = readWorkspace(deniedReadStore);
+  eq('S29-B26 an unreadable store is an explicit fault', deniedRead.status === 'fault' ? deniedRead.fault.kind : 'no-fault', 'storage_unavailable');
+
+  // -------------------------------------------------------------------------
+  // S29-C — atomic commit: a write that did not happen is never reported as success.
+  // -------------------------------------------------------------------------
+  const p1Row = { id: 'proj-1', name: 'Real pilot project', client: 'Owner', contract_value: 1000, start_date: '2026-01-01', end_date: '2026-12-31', data_date: '2026-09-13', created_at: '2026-01-01T00:00:00Z' };
+  const denyBase = makeStore();
+  eq('S29-C0 baseline insert succeeds into a healthy store', runQuery(query(denyBase, 'projects').insert(p1Row)).error, null);
+
+  const denyWrites = makeStore(Object.fromEntries(denyBase.map), { denyWrites: true });
+  const denyBefore = denyWrites.getItem(WORKSPACE_STORAGE_KEY);
+  const deniedInsert = runQuery(query(denyWrites, 'projects').insert({ ...p1Row, id: 'proj-denied' }));
+  ok('S29-C1 a denied (SecurityError) write returns an error, not success',
+    deniedInsert.data === null && deniedInsert.error !== null);
+  ok('S29-C2 a denied write reports a write failure kind', deniedInsert.error?.kind === 'write_failed');
+  eq('S29-C3 a denied write leaves the stored bytes identical', denyWrites.getItem(WORKSPACE_STORAGE_KEY), denyBefore);
+  const denyAfterReload = readWorkspace(denyWrites);
+  eq('S29-C4 a denied write stores no row',
+    tableRows(denyAfterReload.status === 'ok' ? denyAfterReload.state : createEmptyWorkspace(), 'projects').map((row) => row.id),
+    ['proj-1']);
+
+  const quotaWrites = makeStore(Object.fromEntries(denyBase.map), { quota: true });
+  const quotaBefore = quotaWrites.getItem(WORKSPACE_STORAGE_KEY);
+  const quotaUpdate = runQuery(query(quotaWrites, 'projects').update({ name: 'Renamed' }).eq('id', 'proj-1'));
+  ok('S29-C5 a quota-exceeded write returns an error, not success', quotaUpdate.error !== null);
+  eq('S29-C6 a quota-exceeded write leaves the bytes identical', quotaWrites.getItem(WORKSPACE_STORAGE_KEY), quotaBefore);
+  eq('S29-C7 a quota-exceeded write leaves the row unchanged',
+    tableRows((readWorkspace(quotaWrites) as { status: 'ok'; state: WorkspaceState }).state, 'projects')[0].name, 'Real pilot project');
+
+  const dropWrites = makeStore(Object.fromEntries(denyBase.map), { dropWrites: true });
+  const droppedInsert = runQuery(query(dropWrites, 'projects').insert({ ...p1Row, id: 'proj-dropped' }));
+  ok('S29-C8 a store that accepts but drops the bytes is caught by read-back verification',
+    droppedInsert.error !== null && /verification/i.test(droppedInsert.error!.message));
+
+  const contractStore = makeStore();
+  runQuery(query(contractStore, 'projects').insert(p1Row));
+  runQuery(query(contractStore, 'activities').insert({ id: 'act-1', project_id: 'proj-1', code: 'A1', name: 'A1', duration_days: 5, percent_complete: 0, actual_quantity: null, created_at: '2026-01-01T00:00:00Z' }));
+  runQuery(query(contractStore, 'cost_transactions').insert({ id: 'cst-1', project_id: 'proj-1', activity_id: 'act-1', amount: 100, status: 'submitted', approval_level: 1, transaction_date: '2026-09-01', created_at: '2026-09-01T00:00:00Z' }));
+  const approveViaContract = (store: WorkspaceStorage) => {
+    const outcome = commitWorkspace(store, (draft) => {
+      const result = applyReviewCostTransaction(
+        draft as unknown as Record<string, Record<string, unknown>[]>,
+        { transaction_uuid: 'cst-1', approver: 'operator', decision: 'approve' } as never,
+        '2026-09-14T00:00:00Z',
+      );
+      if (result.error) return { ok: false as const, error: { message: String(result.error.message ?? 'rejected'), kind: 'validation' as const } };
+      return { ok: true as const, data: null };
+    });
+    return outcome;
+  };
+  const contractDenied = makeStore(Object.fromEntries(contractStore.map), { quota: true });
+  const contractDeniedBefore = contractDenied.getItem(WORKSPACE_STORAGE_KEY);
+  const contractDeniedOutcome = approveViaContract(contractDenied);
+  ok('S29-C9 an RPC contract write that cannot be persisted returns an error', contractDeniedOutcome.ok === false);
+  eq('S29-C10 a failed RPC contract write leaves the bytes identical', contractDenied.getItem(WORKSPACE_STORAGE_KEY), contractDeniedBefore);
+  eq('S29-C11 a failed RPC contract write leaves the transaction unapproved',
+    tableRows((readWorkspace(contractDenied) as { status: 'ok'; state: WorkspaceState }).state, 'cost_transactions')[0].status, 'submitted');
+
+  const contractOk = approveViaContract(contractStore);
+  ok('S29-C12 an RPC contract write that persists reports success', contractOk.ok === true);
+  eq('S29-C13 a persisted RPC contract write is visible after reload',
+    tableRows((readWorkspace(contractStore) as { status: 'ok'; state: WorkspaceState }).state, 'cost_transactions')[0].status, 'approved');
+
+  // -------------------------------------------------------------------------
+  // S29-D — a real pilot lifecycle: two genuinely empty projects, then scope on ONE of them.
+  // -------------------------------------------------------------------------
+  const pilotStore = makeStore();
+  const projectRow = (id: string, name: string, start: string, end: string, created: string) => ({
+    id, name, client: `Owner ${name}`, location: null, contract_value: 5000000, currency: 'SAR',
+    start_date: start, end_date: end, duration_days: null, status: 'active', status_logic: 'retained_logic',
+    calendar_type: '6_days', sector: 'commercial_building', data_date: '2026-09-13',
+    description: null, created_at: created,
+  });
+  const createdA = runQuery(query(pilotStore, 'projects').insert(projectRow('proj-a', 'Pilot A', '2026-01-05', '2026-12-31', '2026-10-27T08:00:00Z')));
+  const createdB = runQuery(query(pilotStore, 'projects').insert(projectRow('proj-b', 'Pilot B', '2026-03-01', '2027-03-01', '2026-10-27T09:00:00Z')));
+  ok('S29-D1 two real projects are created', createdA.error === null && createdB.error === null);
+  const pilotAfterCreate = readWorkspace(pilotStore) as { status: 'ok'; state: WorkspaceState };
+  eq('S29-D2 each real project is created with NO invented BOQ', [
+    tableRows(pilotAfterCreate.state, 'boq_items').length,
+    tableRows(pilotAfterCreate.state, 'budget_lines').length,
+    tableRows(pilotAfterCreate.state, 'cost_transactions').length,
+    tableRows(pilotAfterCreate.state, 'progress_updates').length,
+  ], [0, 0, 0, 0]);
+  ok('S29-D3 each real project is created with NO invented activities or links',
+    tableRows(pilotAfterCreate.state, 'activities').length === 0 && tableRows(pilotAfterCreate.state, 'activity_links').length === 0);
+
+  runQuery(query(pilotStore, 'activities').insert([
+    { id: 'act-a1', project_id: 'proj-a', code: 'A1', name: 'Site setup', duration_days: 5, early_start: '2026-01-05', early_finish: '2026-01-10', late_start: '2026-01-05', late_finish: '2026-01-10', actual_start: null, actual_finish: null, percent_complete: 0, actual_quantity: null, planned_quantity: 100, is_critical: true, is_milestone: false, sort_order: 1, wbs_node_id: null, unit: 'm3', created_at: '2026-10-27T10:00:00Z' },
+    { id: 'act-a2', project_id: 'proj-a', code: 'A2', name: 'Foundations', duration_days: 10, early_start: '2026-01-11', early_finish: '2026-01-21', late_start: '2026-01-11', late_finish: '2026-01-21', actual_start: null, actual_finish: null, percent_complete: 0, actual_quantity: 24, planned_quantity: 100, is_critical: true, is_milestone: false, sort_order: 2, wbs_node_id: null, unit: 'm3', created_at: '2026-10-27T10:00:00Z' },
+    { id: 'act-a3', project_id: 'proj-a', code: 'A3', name: 'Handover', duration_days: 0, early_start: '2026-01-21', early_finish: '2026-01-21', late_start: '2026-01-21', late_finish: '2026-01-21', actual_start: null, actual_finish: null, percent_complete: 100, actual_quantity: 0, planned_quantity: 0, is_critical: true, is_milestone: true, sort_order: 3, wbs_node_id: null, unit: null, created_at: '2026-10-27T10:00:00Z' },
+  ]));
+  runQuery(query(pilotStore, 'activity_links').insert([
+    { id: 'lnk-a1', project_id: 'proj-a', predecessor_id: 'act-a1', successor_id: 'act-a2', link_type: 'FS', lag_days: 0, created_at: '2026-10-27T10:05:00Z' },
+    { id: 'lnk-a2', project_id: 'proj-a', predecessor_id: 'act-a2', successor_id: 'act-a3', link_type: 'FS', lag_days: 2, created_at: '2026-10-27T10:05:00Z' },
+  ]));
+  writeSelectedProjectId(pilotStore, 'proj-a');
+
+  // "Reopen": every builder below is a NEW instance reading the persisted bytes only.
+  const reopened = readWorkspace(pilotStore) as { status: 'ok'; state: WorkspaceState };
+  const reopenedActivities = tableRows(reopened.state, 'activities').filter((a) => a.project_id === 'proj-a')
+    .sort((a, b) => Number(a.sort_order) - Number(b.sort_order));
+  eq('S29-D4 reopening restores exactly three activities with their original ids',
+    reopenedActivities.map((a) => a.id), ['act-a1', 'act-a2', 'act-a3']);
+  eq('S29-D5 reopening restores both logic links with their ids and types',
+    tableRows(reopened.state, 'activity_links').map((l) => [l.id, l.predecessor_id, l.successor_id, l.link_type, l.lag_days]),
+    [['lnk-a1', 'act-a1', 'act-a2', 'FS', 0], ['lnk-a2', 'act-a2', 'act-a3', 'FS', 2]]);
+  eq('S29-D6 reopening preserves the activity dates exactly',
+    reopenedActivities.map((a) => [a.early_start, a.early_finish]),
+    [['2026-01-05', '2026-01-10'], ['2026-01-11', '2026-01-21'], ['2026-01-21', '2026-01-21']]);
+  ok('S29-D7 zero and null are distinct after a reload (0 stays 0, null stays null)',
+    reopenedActivities[0].percent_complete === 0
+      && reopenedActivities[0].actual_quantity === null
+      && reopenedActivities[1].actual_quantity === 24
+      && reopenedActivities[2].actual_quantity === 0
+      && reopenedActivities[2].percent_complete === 100);
+  eq('S29-D8 the other real project stayed empty', tableRows(reopened.state, 'activities').filter((a) => a.project_id === 'proj-b').length, 0);
+  eq('S29-D9 the selected project survives a reopen', readSelectedProjectId(pilotStore), 'proj-a');
+  const reopenedProjects = tableRows(reopened.state, 'projects') as unknown as Array<{ id: string; created_at: string }>;
+  eq('S29-D10 startup resolves the remembered project, not merely the newest',
+    resolveStartupProject(reopenedProjects, readSelectedProjectId(pilotStore))?.id, 'proj-a');
+  eq('S29-D11 startup falls back to the newest project when the remembered one is gone',
+    resolveStartupProject(reopenedProjects, 'proj-deleted')?.id, 'proj-b');
+  eq('S29-D12 startup invents no project when the workspace has none', resolveStartupProject([], 'proj-a'), null);
+  const readBackViaQuery = runQuery<Array<Record<string, unknown>>>(query(pilotStore, 'activity_links').select('*').eq('project_id', 'proj-a'));
+  eq('S29-D13 query reads resolve link predecessors and successors after reload',
+    readBackViaQuery.data?.map((l: any) => [l.predecessor?.code, l.successor?.code]),
+    [['A1', 'A2'], ['A2', 'A3']]);
+  eq('S29-D14 the selection pointer is a UI preference, not workspace data',
+    Object.keys(reopened.state).includes(SELECTED_PROJECT_STORAGE_KEY), false);
+
+  // -------------------------------------------------------------------------
+  // S29-E — a complete, versioned backup: whole inventory, no unrelated keys.
+  // -------------------------------------------------------------------------
+  const demoStore = makeStore({
+    app_lang: 'ar',
+    'supabase.auth.token': JSON.stringify({ access_token: 'SECRET-TOKEN-VALUE', refresh_token: 'SECRET-REFRESH' }),
+    unrelated_app_key: JSON.stringify({ note: 'not ours' }),
+  });
+  const seeded = seedDemoWorkspace(demoStore, getInitialSeedData() as unknown as Record<string, Record<string, unknown>[]>);
+  ok('S29-E1 the explicit demo action writes a demo workspace', seeded.ok === true);
+  const demoLoaded = readWorkspace(demoStore) as { status: 'ok'; state: WorkspaceState };
+  ok('S29-E2 the demo workspace is stamped as kind=demo', demoLoaded.state.__meta.workspace_kind === 'demo');
+  const backup = buildBackup(demoLoaded.state, '2026-10-27T12:00:00Z');
+  const backupText = serializeBackup(backup);
+  eq('S29-E3 the backup carries the versioned format identity', [backup.format, backup.format_version, backup.schema_version],
+    ['schedule-management.local-workspace-backup', 1, WORKSPACE_SCHEMA_VERSION]);
+  eq('S29-E4 the backup contains EVERY persisted table', Object.keys(backup.tables).sort(), [...PERSISTED_TABLE_NAMES].sort());
+  eq('S29-E5 the backup contains nothing but its declared envelope', Object.keys(backup).sort(),
+    ['auxiliary', 'checksum', 'counts', 'created_at', 'format', 'format_version', 'schema_version', 'source', 'tables'].sort());
+  ok('S29-E6 the backup never contains unrelated browser keys or credentials',
+    !backupText.includes('SECRET-TOKEN-VALUE') && !backupText.includes('SECRET-REFRESH')
+      && !backupText.includes('unrelated_app_key') && !backupText.includes('app_lang'));
+  ok('S29-E7 the backup carries no preserved/pre-restore copies',
+    !backupText.includes(PRESERVED_KEY_PREFIX) && !backupText.includes(PRE_RESTORE_KEY_PREFIX));
+  eq('S29-E8 the backup checksum is deterministic for the same state',
+    buildBackup(demoLoaded.state, '2026-01-01T00:00:00Z').checksum, backup.checksum);
+  ok('S29-E9 the backup validates against its own validator', validateBackup(backupText).ok);
+  eq('S29-E10 the demo backup holds all four seeded projects', backup.counts.projects, 4);
+  eq('S29-E11 the unrelated keys survive untouched in storage', [demoStore.getItem('app_lang'), demoStore.map.has('supabase.auth.token')], ['ar', true]);
+
+  // -------------------------------------------------------------------------
+  // S29-F — restore into a FRESH workspace; canonical tables + CPM/EVM.
+  // -------------------------------------------------------------------------
+  const freshStore = makeStore({ app_lang: 'en', 'supabase.auth.token': '{"access_token":"OTHER"}' });
+  const validation = validateBackup(backupText);
+  ok('S29-F1 the backup validates before any mutation', validation.ok && validation.state !== null);
+  eq('S29-F2 validation reports the checksum as verified', validation.summary?.checksumVerified, true);
+  eq('S29-F3 validation previews every project in the file',
+    validation.summary?.projects.map((p) => p.id).sort(), ['proj-seed-001', 'proj-seed-002', 'proj-seed-003', 'proj-seed-004']);
+  eq('S29-F4 the fresh workspace holds nothing before the restore', readWorkspace(freshStore).status, 'absent');
+  const restored = restoreWorkspace(freshStore, validation, '2026-10-27T12:05:00Z');
+  ok('S29-F5 the restore reports success', restored.ok === true && restored.error === null);
+  ok('S29-F6 an empty target needs no pre-restore copy (nothing existed to lose)', restored.preRestoreKey === null);
+  const freshLoaded = readWorkspace(freshStore) as { status: 'ok'; state: WorkspaceState };
+  eq('S29-F7 the restored workspace is stamped as restored', freshLoaded.state.__meta.workspace_kind, 'restored');
+  const tableDiffs = PERSISTED_TABLES
+    .filter((spec) => canonicalJson(tableRows(demoLoaded.state, spec.name)) !== canonicalJson(tableRows(freshLoaded.state, spec.name)))
+    .map((spec) => spec.name);
+  eq('S29-F8 every canonical table is byte-identical after the restore', tableDiffs, []);
+
+  // Approvals and Data Date rules survive the round trip.
+  const approvalsOf = (state: WorkspaceState) => tableRows(state, 'progress_updates').map((row) => [row.id, row.status, row.approved_at]);
+  eq('S29-F9 approvals and their approval timestamps are preserved', canonicalJson(approvalsOf(freshLoaded.state)), canonicalJson(approvalsOf(demoLoaded.state)));
+  eq('S29-F10 every project Data Date is preserved',
+    tableRows(freshLoaded.state, 'projects').map((p) => [p.id, p.data_date]).sort(),
+    tableRows(demoLoaded.state, 'projects').map((p) => [p.id, p.data_date]).sort());
+  ok('S29-F11 no restored progress or cost record is dated after its Data Date',
+    tableRows(freshLoaded.state, 'progress_updates').every((row) => String(row.update_date) <= '2026-09-13')
+      && tableRows(freshLoaded.state, 'cost_transactions').every((row) => String(row.transaction_date) <= '2026-09-13'));
+  eq('S29-F12 the Hospital contract value invariant survives the restore',
+    tableRows(freshLoaded.state, 'projects').find((p) => p.id === 'proj-seed-003')?.contract_value, 125000000);
+  eq('S29-F13 unrelated browser keys are untouched by the restore',
+    [freshStore.getItem('app_lang'), freshStore.getItem('supabase.auth.token')], ['en', '{"access_token":"OTHER"}']);
+
+  // CPM, computed independently over SOURCE and RESTORED rows.
+  const cpmSignature = (state: WorkspaceState) => {
+    const signature: string[] = [];
+    for (const project of tableRows(state, 'projects')) {
+      const acts = tableRows(state, 'activities').filter((a) => a.project_id === project.id) as unknown as Activity[];
+      const lks = tableRows(state, 'activity_links').filter((l) => l.project_id === project.id) as unknown as ActivityLink[];
+      if (acts.length === 0) continue;
+      const calc = calculateCpm(acts, lks, { calendarType: '6_days', dataDate: String(project.data_date ?? DEFAULT_DATA_DATE) });
+      signature.push(JSON.stringify({
+        project: project.id,
+        cycle: calc.cycle,
+        finish: calc.projectEarlyFinish,
+        critical: calc.results.filter((r) => r.isCritical).map((r) => r.activityId).sort(),
+        starts: calc.results.map((r) => [r.activityId, r.earlyStart, r.earlyFinish]).sort(),
+      }));
+    }
+    return signature;
+  };
+  const sourceCpm = cpmSignature(demoLoaded.state);
+  const restoredCpm = cpmSignature(freshLoaded.state);
+  ok('S29-F14 the deterministic CPM schedule is identical on the restored workspace',
+    sourceCpm.length >= 4 && canonicalJson(sourceCpm) === canonicalJson(restoredCpm));
+  ok('S29-F15 the CPM signature is non-trivial (critical path computed for every project)',
+    sourceCpm.every((entry) => JSON.parse(entry).critical.length > 0));
+
+  // EVM: quote the canonical F6 report over source and restored rows, then check one figure by hand.
+  const evmOf = (state: WorkspaceState, projectId: string) => {
+    const project = tableRows(state, 'projects').find((p) => p.id === projectId)!;
+    const acts = tableRows(state, 'activities').filter((a) => a.project_id === projectId) as unknown as Activity[];
+    const activityIds = new Set(acts.map((a) => a.id));
+    const baselines = (tableRows(state, 'baseline_activities') as unknown as BaselineActivity[]).filter((b) => activityIds.has(b.activity_id));
+    const report = analyzeCostControl({
+      project: project as unknown as Project,
+      activities: acts,
+      baselines,
+      budgetLines: tableRows(state, 'budget_lines').filter((b) => b.project_id === projectId) as unknown as BudgetLine[],
+      costTransactions: tableRows(state, 'cost_transactions').filter((c) => c.project_id === projectId) as unknown as CostTransaction[],
+      progressUpdates: tableRows(state, 'progress_updates').filter((p) => p.project_id === projectId) as unknown as ProgressUpdate[],
+      wbsNodes: [],
+      boqItems: tableRows(state, 'boq_items').filter((b) => b.project_id === projectId) as unknown as BoqItem[],
+      allocations: [],
+      dataDate: String(project.data_date ?? DEFAULT_DATA_DATE),
+      calendarType: '6_days',
+      manualEtc: null,
+    } as never);
+    return selectCanonicalEvm(report);
+  };
+  const hospitalSource = evmOf(demoLoaded.state, 'proj-seed-003');
+  const hospitalRestored = evmOf(freshLoaded.state, 'proj-seed-003');
+  ok('S29-F16 the canonical EVM of the Hospital project is identical after the restore',
+    hospitalSource.bac === hospitalRestored.bac
+      && hospitalSource.pv === hospitalRestored.pv
+      && hospitalSource.ev === hospitalRestored.ev
+      && hospitalSource.ac === hospitalRestored.ac
+      && hospitalSource.spi === hospitalRestored.spi
+      && hospitalSource.cpi === hospitalRestored.cpi);
+  const hospitalBaselineSum = (tableRows(freshLoaded.state, 'baseline_activities') as unknown as BaselineActivity[])
+    .filter((row) => tableRows(freshLoaded.state, 'activities').some((a) => a.id === row.activity_id && a.project_id === 'proj-seed-003'))
+    .reduce((sum, row) => sum + Number(row.planned_cost || 0), 0);
+  near('S29-F17 the restored Hospital BAC equals the independently summed baseline costs',
+    hospitalRestored.bac, hospitalBaselineSum, 0.01);
+  ok('S29-F18 the restored Hospital EVM is measured, not null (real evidence survived)',
+    hospitalRestored.bac !== null && hospitalRestored.bac > 0 && hospitalRestored.ev !== null);
+
+  // An empty-but-valid backup restores as an empty workspace — and never as demo data.
+  const emptyBackupText = serializeBackup(buildBackup(createEmptyWorkspace('user'), '2026-10-27T13:00:00Z'));
+  const emptyValidation = validateBackup(emptyBackupText);
+  ok('S29-F19 a valid empty workspace is a valid backup', emptyValidation.ok === true);
+  const emptyTarget = makeStore();
+  const emptyRestore = restoreWorkspace(emptyTarget, emptyValidation, '2026-10-27T13:05:00Z');
+  ok('S29-F20 an empty backup restores as an empty workspace', emptyRestore.ok === true);
+  eq('S29-F21 the restored empty workspace stays empty (no seed appears)',
+    tableRows((readWorkspace(emptyTarget) as { status: 'ok'; state: WorkspaceState }).state, 'projects').length, 0);
+
+  // A restore over existing data keeps the previous bytes recoverable.
+  const overExisting = makeStore();
+  runQuery(query(overExisting, 'projects').insert(projectRow('proj-old', 'Old project', '2026-01-01', '2026-06-01', '2026-10-01T00:00:00Z')));
+  const overExistingBefore = overExisting.getItem(WORKSPACE_STORAGE_KEY)!;
+  const overRestore = restoreWorkspace(overExisting, validation, '2026-10-27T14:00:00Z');
+  ok('S29-F22 restoring over existing data writes a pre-restore copy',
+    overRestore.ok === true && overRestore.preRestoreKey !== null
+      && overExisting.getItem(overRestore.preRestoreKey!) === overExistingBefore);
+  eq('S29-F23 the pre-restore copy restores the previous workspace exactly',
+    canonicalJson(tableRows(JSON.parse(overExisting.getItem(overRestore.preRestoreKey!)!) as WorkspaceState, 'projects')),
+    canonicalJson([projectRow('proj-old', 'Old project', '2026-01-01', '2026-06-01', '2026-10-01T00:00:00Z')]));
+
+  // -------------------------------------------------------------------------
+  // S29-G — every invalid backup class leaves storage byte-identical.
+  // -------------------------------------------------------------------------
+  const guardStore = makeStore(Object.fromEntries(overExisting.map));
+  const guardBefore = guardStore.getItem(WORKSPACE_STORAGE_KEY);
+  const guardKeysBefore = guardStore.map.size;
+  const tampered = JSON.parse(backupText);
+  tampered.tables.projects[0].contract_value = 1;
+  const badBackups: Array<[string, string, string]> = [
+    ['not JSON', 'this is not json at all', 'not_json'],
+    ['a JSON array instead of an envelope', '[]', 'not_an_object'],
+    ['a CSV schedule export', 'code,name,start\nA1,Site,2026-01-01', 'not_json'],
+    ['an XER export', 'ERMHDR\t18.8\t2026-01-01\tProject\tadmin', 'not_json'],
+    ['a file with no format identity', JSON.stringify({ tables: {} }), 'unknown_format'],
+    ['an unsupported format version', JSON.stringify({ ...JSON.parse(backupText), format_version: 7 }), 'unsupported_format_version'],
+    ['an unsupported schema version', JSON.stringify({ ...JSON.parse(backupText), schema_version: 99 }), 'unsupported_schema_version'],
+    ['an unknown table', JSON.stringify({ ...JSON.parse(backupText), tables: { ...JSON.parse(backupText).tables, strangers: [] } }), 'unknown_table'],
+    ['a table that is not an array', JSON.stringify({ ...JSON.parse(backupText), tables: { ...JSON.parse(backupText).tables, projects: {} } }), 'invalid_table'],
+    ['a row without an id', JSON.stringify({ ...JSON.parse(backupText), tables: { ...JSON.parse(backupText).tables, activities: [{ project_id: 'proj-seed-001' }] }, checksum: 'x' }), 'required_field'],
+    ['duplicate ids', JSON.stringify({ ...JSON.parse(backupText), tables: { ...JSON.parse(backupText).tables, projects: [JSON.parse(backupText).tables.projects[0], JSON.parse(backupText).tables.projects[0]] }, checksum: 'x' }), 'duplicate_id'],
+    ['a dangling project reference', JSON.stringify({ ...JSON.parse(backupText), tables: { ...JSON.parse(backupText).tables, activities: [{ ...JSON.parse(backupText).tables.activities[0], project_id: 'proj-ghost' }] }, checksum: 'x' }), 'missing_reference'],
+    ['a link that crosses projects', JSON.stringify({ ...JSON.parse(backupText), tables: { ...JSON.parse(backupText).tables, activity_links: [{ ...JSON.parse(backupText).tables.activity_links[0], project_id: 'proj-seed-002' }] }, checksum: 'x' }), 'project_mismatch'],
+    ['reversed project dates', JSON.stringify({ ...JSON.parse(backupText), tables: { ...JSON.parse(backupText).tables, projects: [{ ...JSON.parse(backupText).tables.projects[0], start_date: '2026-12-31', end_date: '2026-01-01' }] }, checksum: 'x' }), 'date_order'],
+    ['a progress update after the Data Date', JSON.stringify({ ...JSON.parse(backupText), tables: { ...JSON.parse(backupText).tables, progress_updates: [{ ...JSON.parse(backupText).tables.progress_updates[0], update_date: '2026-12-31' }] }, checksum: 'x' }), 'chronology'],
+    ['a tampered checksum', JSON.stringify(tampered), 'checksum_mismatch'],
+  ];
+  for (const [label, payload, expectedCode] of badBackups) {
+    const result = validateBackup(payload);
+    const firstCode = result.errors[0]?.code ?? 'none';
+    ok(`S29-G invalid backup (${label}) is rejected with ${expectedCode}`, result.ok === false && firstCode === expectedCode);
+    ok(`S29-G invalid backup (${label}) yields no restorable state`, result.state === null);
+    eq(`S29-G invalid backup (${label}) performed no storage write`, guardStore.getItem(WORKSPACE_STORAGE_KEY), guardBefore);
+    eq(`S29-G invalid backup (${label}) created no preserved/recovery keys`, guardStore.map.size, guardKeysBefore);
+  }
+  ok('S29-G validation alone never mutates storage', guardStore.getItem(WORKSPACE_STORAGE_KEY) === guardBefore && guardStore.writes === 0);
+
+  // -------------------------------------------------------------------------
+  // S29-H — the shipped adapter honours these contracts.
+  // -------------------------------------------------------------------------
+  const supabaseSrc = readFileSync(resolvePath(srcRoot, 'src/lib/supabase.ts'), 'utf8');
+  const workspaceSrc = readFileSync(resolvePath(srcRoot, 'src/lib/localWorkspace.ts'), 'utf8');
+  const portfolioSrc = readFileSync(resolvePath(srcRoot, 'src/components/views/PortfolioView.tsx'), 'utf8');
+  const appSrc = readFileSync(resolvePath(srcRoot, 'src/App.tsx'), 'utf8');
+  ok('S29-H1 supabase.ts no longer swallows write failures', !supabaseSrc.includes('Failed to save to localStorage'));
+  ok('S29-H2 supabase.ts performs every local write through the atomic commit', supabaseSrc.includes('commitWorkspace(') && !supabaseSrc.includes('saveDb('));
+  ok('S29-H3 supabase.ts seeds demo data only through the explicit demo action',
+    supabaseSrc.includes('seedDemoWorkspace(')
+      && (supabaseSrc.match(/getInitialSeedData\(\)/g) ?? []).length === 1
+      && !supabaseSrc.includes('loadDb()'));
+  ok('S29-H4 supabase.ts has no seed-on-read path and no raw LocalStorage writes of its own',
+    !supabaseSrc.includes('localStorage.setItem') && !supabaseSrc.includes("localStorage.getItem(WORKSPACE_STORAGE_KEY)"));
+  ok('S29-H5 every RPC write path goes through the atomic commit', supabaseSrc.includes('commitWorkspace(storage'));
+  ok('S29-H6 the demo store still implements each contract it exposes',
+    ['review_cost_transaction', 'apply_schedule_recovery_scenario', 'apply_resource_leveling_scenario',
+      'approve_project_scope_baseline', 'save_variation_order_draft', 'transition_variation_order']
+      .every((name) => supabaseSrc.includes(name)));
+  ok('S29-H7 PortfolioView creates no invented BOQ/activities/links/budget on project creation',
+    !/if \(newProj\) \{[\s\S]*?boq_items/.test(portfolioSrc)
+      && portfolioSrc.includes('Create empty project')
+      && portfolioSrc.includes('validateNewProject'));
+  ok('S29-H8 PortfolioView validates required fields, numeric values and date ordering',
+    portfolioSrc.includes('Contract value must be greater than zero')
+      && portfolioSrc.includes('The start date must not be after the finish date')
+      && portfolioSrc.includes('Client / owner is required'));
+  ok('S29-H9 demo creation is a separate, explicitly labelled action in the portfolio',
+    portfolioSrc.includes('Load demo workspace (invented data)') && portfolioSrc.includes('loadDemoWorkspace()'));
+  ok('S29-H10 App selects the remembered project and never falls back to invented seed data',
+    appSrc.includes('resolveStartupProject')
+      && appSrc.includes('writeSelectedProjectId')
+      && !appSrc.includes("from '@/lib/mockSeed'"));
+  // Comments may mention `localStorage`; the CODE of this module must only touch the storage handle it
+  // is given (so it is testable with a synthetic store and never reaches for the global directly).
+  const workspaceCodeOnly = workspaceSrc
+    .split('\n')
+    .filter((line) => !/^\s*(\*|\/\*|\/\/)/.test(line))
+    .join('\n');
+  ok('S29-H11 the storage module owns the single LocalStorage key and never touches the global store itself',
+    workspaceSrc.includes("WORKSPACE_STORAGE_KEY = 'schedule_mgmt_db_v5'")
+      && !/localStorage\./i.test(workspaceCodeOnly));
+
+  // -------------------------------------------------------------------------
+  // S29-I — the persisted-table inventory covers every table the app uses.
+  // -------------------------------------------------------------------------
+  const usedTables = new Set<string>();
+  for (const match of execFileSync('git', ['grep', '-ohE', "from\\('[a-z_]+'\\)", '--', 'src'], { encoding: 'utf8' }).split('\n')) {
+    const name = match.replace(/^from\('/, '').replace(/'\)$/, '');
+    if (name) usedTables.add(name);
+  }
+  const inventory = new Set(PERSISTED_TABLE_NAMES);
+  const missingFromInventory = [...usedTables].filter((name) => !inventory.has(name)).sort();
+  const unusedInSource = [...inventory].filter((name) => !usedTables.has(name)).sort();
+  eq('S29-I1 every table the app addresses is in the persisted-table inventory', missingFromInventory, []);
+  eq('S29-I2 the inventory lists no table the app never addresses', unusedInSource, []);
+  eq('S29-I3 the inventory has no duplicate entries', PERSISTED_TABLE_NAMES.length, new Set(PERSISTED_TABLE_NAMES).size);
+  ok('S29-I4 every inventoried table declares an id field or a documented composite key',
+    PERSISTED_TABLES.every((spec) => spec.idField === null ? spec.name === 'project_scope_baseline_current' : true));
+
+  // -------------------------------------------------------------------------
+  // S29-L — auxiliary project-scoped stores are part of a complete backup.
+  // -------------------------------------------------------------------------
+  const revisionKey = 'schedule_diff_revisions_proj-seed-003';
+  const revisionRaw = JSON.stringify([{ id: 'rev-1', name: 'Cut-off 2026-09', dataDate: '2026-09-13', activitiesSnapshot: [{ id: 'act-p3-01', percent_complete: 100 }] }]);
+  const subcontractKey = 'construction_subcontracts_data_proj-seed-001';
+  const subcontractRaw = JSON.stringify([{ id: 'sp-1', code: 'SC-01', value: 100 }]);
+  const importFlagKey = 'construction_subcontracts_db_import_proj-seed-001';
+  const auxStore = makeStore({
+    [WORKSPACE_STORAGE_KEY]: demoStore.getItem(WORKSPACE_STORAGE_KEY)!,
+    [revisionKey]: revisionRaw,
+    [subcontractKey]: subcontractRaw,
+    [importFlagKey]: '2026-09-20T00:00:00Z',
+    app_lang: 'ar',
+    'supabase.auth.token': '{"access_token":"SECRET-TOKEN-VALUE"}',
+  });
+  const auxState = (readWorkspace(auxStore) as { status: 'ok'; state: WorkspaceState }).state;
+  const auxRead = readAuxiliaryStores(auxStore);
+  eq('S29-L1 only whitelisted auxiliary stores are read', auxRead.map((entry) => entry.key),
+    [subcontractKey, importFlagKey, revisionKey]);
+  ok('S29-L2 every auxiliary prefix is covered by the whitelist',
+    AUXILIARY_STORAGE_PREFIXES.every((prefix) => prefix.length > 0) && auxRead.length === 3);
+  const auxBackup = buildBackup(auxState, '2026-10-27T16:00:00Z', auxRead);
+  const auxBackupText = serializeBackup(auxBackup);
+  eq('S29-L3 the backup carries the cut-off revision and the legacy subcontract register',
+    JSON.parse(auxBackupText).auxiliary.map((entry: { key: string }) => entry.key), [subcontractKey, importFlagKey, revisionKey]);
+  ok('S29-L4 the auxiliary payload is byte-faithful',
+    JSON.parse(auxBackupText).auxiliary.find((entry: { key: string }) => entry.key === revisionKey).raw === revisionRaw);
+  ok('S29-L5 auxiliary credentials and unrelated keys are still excluded',
+    !auxBackupText.includes('SECRET-TOKEN-VALUE') && !auxBackupText.includes('app_lang'));
+  const auxValidation = validateBackup(auxBackupText);
+  ok('S29-L6 a backup carrying auxiliary stores validates', auxValidation.ok === true);
+  eq('S29-L7 the restore preview lists the auxiliary stores', auxValidation.summary?.auxiliary.length, 3);
+  const auxTarget = makeStore({ [revisionKey]: '[]' });
+  const auxRestore = restoreWorkspace(auxTarget, auxValidation, '2026-10-27T16:05:00Z');
+  ok('S29-L8 the restore reports success and keeps a recovery copy of the replaced auxiliary stores',
+    auxRestore.ok === true && auxRestore.preRestoreAuxiliary.length === 1 && auxRestore.preRestoreAuxiliary[0].raw === '[]');
+  eq('S29-L9 every auxiliary store is byte-identical after the restore',
+    [auxTarget.getItem(revisionKey), auxTarget.getItem(subcontractKey), auxTarget.getItem(importFlagKey)],
+    [revisionRaw, subcontractRaw, '2026-09-20T00:00:00Z']);
+  eq('S29-L10 the restored main workspace still matches the source tables',
+    canonicalJson(tableRows((readWorkspace(auxTarget) as { status: 'ok'; state: WorkspaceState }).state, 'activities')),
+    canonicalJson(tableRows(auxState, 'activities')));
+
+  const injectedAux = JSON.parse(auxBackupText);
+  injectedAux.auxiliary.push({ key: 'supabase.auth.token', raw: '{"access_token":"x"}' });
+  eq('S29-L11 an auxiliary entry outside the workspace whitelist is rejected',
+    validateBackup(JSON.stringify(injectedAux)).errors[0]?.code, 'invalid_auxiliary');
+  const corruptedAux = JSON.parse(auxBackupText);
+  corruptedAux.auxiliary[0].raw = 42;
+  eq('S29-L12 an auxiliary entry with a non-string payload is rejected',
+    validateBackup(JSON.stringify(corruptedAux)).errors[0]?.code, 'invalid_auxiliary');
+  const opaqueAux = JSON.parse(auxBackupText);
+  ok('S29-L12b an opaque auxiliary payload (the import timestamp) is accepted as stored',
+    typeof opaqueAux.auxiliary.find((entry: { key: string }) => entry.key.startsWith('construction_subcontracts_db_import_')).raw === 'string');
+  const tamperedAux = JSON.parse(auxBackupText);
+  tamperedAux.auxiliary[0].raw = JSON.stringify([{ id: 'sp-1', value: 999999 }]);
+  eq('S29-L13 a tampered auxiliary payload breaks the checksum',
+    validateBackup(JSON.stringify(tamperedAux)).errors[0]?.code, 'checksum_mismatch');
+  ok('S29-L14 a refused restore never writes auxiliary stores', (() => {
+    const target = makeStore({ [revisionKey]: '[]' });
+    const before = [target.getItem(revisionKey), target.map.size];
+    const refused = restoreWorkspace(target, validateBackup(JSON.stringify(tamperedAux)));
+    return refused.ok === false
+      && target.getItem(revisionKey) === before[0]
+      && target.map.size === before[1];
+  })());
+
+  // S29 owns this increment; the working diff must not reach outside it.
+  const s29ChangedPaths = new Set([
+    ...execFileSync('git', ['diff', '--name-only'], { encoding: 'utf8' }).split('\n').filter(Boolean),
+    ...execFileSync('git', ['diff', '--name-only', '--cached'], { encoding: 'utf8' }).split('\n').filter(Boolean),
+    ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
+  ]);
+  eq('S29-K1 the increment is confined to the storage-safety paths it declares',
+    [...s29ChangedPaths].filter((path) => !S29_WORKSPACE_SAFETY_PATHS.has(path)), []);
+  ok('S29-K2 the increment actually touches the storage core it claims to repair',
+    s29ChangedPaths.has('src/lib/localWorkspace.ts')
+      && s29ChangedPaths.has('src/lib/localQueryBuilder.ts')
+      && s29ChangedPaths.has('src/lib/supabase.ts'));
+
+  // -------------------------------------------------------------------------
+  // S29-J — explicit lifecycle actions never destroy the previous workspace.
+  // -------------------------------------------------------------------------
+  const lifeStore = makeStore();
+  runQuery(query(lifeStore, 'projects').insert(projectRow('proj-keep', 'Keep me', '2026-01-01', '2026-06-01', '2026-10-01T00:00:00Z')));
+  const lifeBefore = lifeStore.getItem(WORKSPACE_STORAGE_KEY)!;
+  const lifeReset = resetWorkspaceToEmpty(lifeStore, '2026-10-27T15:00:00Z');
+  ok('S29-J1 "start empty" preserves the previous bytes', lifeReset.ok === true
+    && listPreservedCopies(lifeStore).some((copy) => lifeStore.getItem(copy.key) === lifeBefore));
+  eq('S29-J2 "start empty" leaves a valid empty workspace',
+    tableRows((readWorkspace(lifeStore) as { status: 'ok'; state: WorkspaceState }).state, 'projects').length, 0);
+  ok('S29-J3 a demo load preserves the bytes it replaces', (() => {
+    const before = lifeStore.getItem(WORKSPACE_STORAGE_KEY)!;
+    const seededDemo = seedDemoWorkspace(lifeStore, getInitialSeedData() as unknown as Record<string, Record<string, unknown>[]>);
+    return seededDemo.ok === true && listPreservedCopies(lifeStore).some((copy) => lifeStore.getItem(copy.key) === before);
+  })());
+  ok('S29-J4 a demo load on a refusing store reports the failure instead of pretending',
+    (() => {
+      const refusing = makeStore({}, { quota: true });
+      const outcome = seedDemoWorkspace(refusing, getInitialSeedData() as unknown as Record<string, Record<string, unknown>[]>);
+      return outcome.ok === false;
+    })());
 }
 
 // ---------------------------------------------------------------------------
