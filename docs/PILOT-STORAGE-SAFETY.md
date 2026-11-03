@@ -121,3 +121,78 @@ exhibit them (S29-B4…B13).
    automatic re-rotation of backups. Backups are the user's responsibility.
 4. S29's `changed-file` guard asserts the increment stays inside the paths it declares; when a later
    task extends these files it must extend that list (same convention as the earlier batch guards).
+
+---
+
+## 5. SCH-20261028-RESTORE-REPAIR — assistant review delivery
+
+Session branch: `arena/473194ba-schedule-management`. Delivered starting point verified locally
+and against the remote `arena/d9730ed9-schedule-management`:
+`4e03e8e303028edbbfa5ccb57037ad123465b802`. No later commits existed at session start.
+No factory code, owner data, dependencies, downloads, deployment, main merge or history rewrite.
+
+### Reproduction before repair
+
+`node --experimental-strip-types scripts/validate-restore-repair.mjs` was first run with the
+unmodified delivered storage module. All nine initial cases failed: second auxiliary throw,
+second auxiliary dropped write, stale deletion throw, auxiliary read failure, main read failure,
+enumeration failure, silent omission from auxiliary backup, rollback failure evidence, and
+successful replacement of stale auxiliary keys. The first two showed the first auxiliary value
+remaining `[{"new":1}]` instead of `[{"old":1}]` after failure.
+
+Separately, `git archive 4e03e8e` into ignored `.cache/delivered`, with an independent index loaded
+by `git read-tree 4e03e8e` and explicit `GIT_WORK_TREE`/`GIT_DIR`, exercised the actual original
+harness against the clean delivered tree (no branch switch, no fake dirty files). Result:
+`FAIL S29-K2 ...`, `VALIDATION FAILED: 1 of 1749 checks failed.`
+
+### Repair and review boundaries
+
+* Complete snapshots now reject unavailable enumeration, null/duplicate enumeration entries,
+  changed enumeration length, auxiliary disappearance, and thrown owned reads. Only owned payloads
+  are read; unrelated key names are enumerated to select the whitelist, never their values.
+  Export surfaces failure rather than claiming a complete backup.
+* Before any business mutation, a read-back-verified recovery archive carries exact main bytes
+  (including absence) and **all** auxiliary bytes. The historical main-only copy remains for
+  compatibility. The archive uses a distinct `__auxiliary` key under the pre-restore prefix; the
+  failure message identifies it, the recovery list can download it, and failed restore UI also
+  downloads available recovery evidence. Recovery archives are not validated restore envelopes.
+* Restore replaces the entire owned auxiliary set. Every write/delete is read-back-checked;
+  final values and auxiliary membership are checked. A journal records attempted keys before the
+  operation (including writes that might mutate then throw). Failure reverses all attempted
+  main/aux operations, removes new keys, verifies each rollback and explicitly reports any failed
+  rollback with the archive key and in-memory exact bytes. Recovery copies are deliberately retained.
+* Browser storage is not a database transaction: permanent policy/quota failures can prevent
+  rollback. Recovery evidence and explicit failure are the contract, not an impossible guarantee
+  against permanent storage denial, browser termination or concurrent tabs. Run restore in one tab.
+* S29 paths compare explicit safety base `1a12ad7b17dd7db9e394461b976d1bfd1c6b8a3a`
+  against HEAD **plus** unstaged, staged and untracked paths. K1/K2 remain enforced on clean commits.
+* Exact protected-file exception: ProgressView adds only the `writeAuxiliaryStores` import and
+  replaces the monthly revision `setItem` with its checked result, throwing into the existing
+  error path on a thrown or dropped write. Success text/wizard advance occur only afterward.
+  S28's other protected files remain unchanged. S29-M compares the entire ProgressView to delivered
+  SHA after reversing exactly these two substitutions, and separately requires the checked path.
+  No planning, governance, chronology, approval, CPM, EVM or seed logic is changed.
+
+### Verification and remaining gates
+
+The standalone suite passes **14/14** synthetic cases (the initial nine plus new-key removal,
+dropped stale deletion, dropped protection archive, absent enumeration and dropped monthly write).
+It is also executed by the full controls harness. Full harness with Node's built-in TypeScript
+transformation and a temporary ignored alias resolver: **1752/1752 PASS** before commit.
+This fallback executes the real controls, not a substitute implementation; the resolver only maps
+`@/` and extensionless TypeScript imports. Temporary resolver/output are not committed.
+
+Normal requested commands were attempted: `npm run typecheck`, `npm run build`,
+`npm run validate:controls` fail to start because `tsc`, `vite`, and `esbuild` are absent respectively.
+No installation/download was performed under the task prohibition. Typecheck and production build
+therefore remain **BLOCKED**, not passed. Run all three normal commands in the assistant's existing
+provisioned environment before integration. The checked-in standalone test needs Node 22.6+ with
+`--experimental-strip-types`; the fallback full-harness execution used Node 22.22.3.
+
+Real isolated Arabic/English browser create/edit/reload/export/restore, denied/quota storage,
+monthly cut-off error display and recovery archive download remain **NOT RUN**. Synthetic storage
+is not a replacement for that real-browser gate. No owner acceptance is claimed.
+
+Changed files: `src/lib/localWorkspace.ts`, `src/components/views/ProgressView.tsx`,
+`src/components/views/WorkspaceBackupPanel.tsx`, `scripts/validate-controls.ts`,
+`scripts/validate-restore-repair.mjs`, and this document.

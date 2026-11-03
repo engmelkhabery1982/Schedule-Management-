@@ -211,6 +211,8 @@ const S29_WORKSPACE_SAFETY_PATHS = new Set([
   'scripts/validate-controls.ts',
   'docs/FIRST-USE-AND-BACKUP.md',
   'docs/PILOT-STORAGE-SAFETY.md',
+  'scripts/validate-restore-repair.mjs',
+  'src/components/views/ProgressView.tsx',
 ]);
 
 function eq(name: string, actual: unknown, expected: unknown): void {
@@ -6165,7 +6167,7 @@ console.log('--- S18 Pilot Closure (F9.5)');
     'supabase/migrations/20260924130000_atomic_resource_leveling_apply.sql',
   ];
   ok('S28 protected F5/F6/F7, CPM/calendar, Recovery, TIA/EOT, Resource Leveling and seed files are unchanged',
-    protectedBatch3aFiles.every((path) => !s28ChangedPaths.has(path)));
+    protectedBatch3aFiles.every((path) => path === 'src/components/views/ProgressView.tsx' || !s28ChangedPaths.has(path)));
 }
 
 // ---------------------------------------------------------------------------
@@ -6867,6 +6869,7 @@ console.log('--- S18 Pilot Closure (F9.5)');
 
   // S29 owns this increment; the working diff must not reach outside it.
   const s29ChangedPaths = new Set([
+    ...execFileSync('git', ['diff', '--name-only', '1a12ad7b17dd7db9e394461b976d1bfd1c6b8a3a', 'HEAD'], { encoding: 'utf8' }).split('\n').filter(Boolean),
     ...execFileSync('git', ['diff', '--name-only'], { encoding: 'utf8' }).split('\n').filter(Boolean),
     ...execFileSync('git', ['diff', '--name-only', '--cached'], { encoding: 'utf8' }).split('\n').filter(Boolean),
     ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
@@ -6877,6 +6880,23 @@ console.log('--- S18 Pilot Closure (F9.5)');
     s29ChangedPaths.has('src/lib/localWorkspace.ts')
       && s29ChangedPaths.has('src/lib/localQueryBuilder.ts')
       && s29ChangedPaths.has('src/lib/supabase.ts'));
+
+  ok('S29 restore-repair synthetic failure suite passes',
+    execFileSync(process.execPath, ['--experimental-strip-types', 'scripts/validate-restore-repair.mjs'],
+      { encoding: 'utf8' }).includes('PASS successful replacement'));
+
+  // Exact bounded exception: no ProgressView change beyond the checked cut-off write/import.
+  const repairedProgress = readFileSync(resolvePath(process.cwd(), 'src/components/views/ProgressView.tsx'), 'utf8');
+  const deliveredProgress = execFileSync('git', ['show', '4e03e8e303028edbbfa5ccb57037ad123465b802:src/components/views/ProgressView.tsx'], { encoding: 'utf8' });
+  ok('S29-M checked monthly persistence is present', repairedProgress.includes('if (!revisionWrite.ok) throw new Error(revisionWrite.error);'));
+  eq('S29-M ProgressView differs only by the checked monthly revision persistence path',
+    repairedProgress.replace("import { writeAuxiliaryStores } from '@/lib/localWorkspace';\n", '')
+      .replace(`      const revisionWrite = writeAuxiliaryStores(localStorage, [
+        { key: revisionKey, projectId: project.id, raw: JSON.stringify([newRev, ...existingRevs]) },
+      ]);
+      if (!revisionWrite.ok) throw new Error(revisionWrite.error);`,
+      '      localStorage.setItem(revisionKey, JSON.stringify([newRev, ...existingRevs]));'),
+    deliveredProgress);
 
   // -------------------------------------------------------------------------
   // S29-J — explicit lifecycle actions never destroy the previous workspace.

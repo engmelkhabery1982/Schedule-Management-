@@ -80,7 +80,8 @@ export default function WorkspaceBackupPanel() {
 
   function refreshCopies() {
     const storage = getWorkspaceStorage();
-    setCopies(storage ? listPreservedCopies(storage) : []);
+    try { setCopies(storage ? listPreservedCopies(storage) : []); }
+    catch (err) { setStatus({ tone: 'error', message: String(err) }); }
   }
 
   function handleExport() {
@@ -89,28 +90,32 @@ export default function WorkspaceBackupPanel() {
       setStatus({ tone: 'error', message: isAr ? 'لا تتوفر مساحة تخزين محلية في هذا المتصفح.' : 'This browser exposes no local workspace storage.' });
       return;
     }
-    const loaded = readWorkspace(storage);
-    if (loaded.status === 'fault') {
+    try {
+      const loaded = readWorkspace(storage);
+      if (loaded.status === 'fault') {
+        setStatus({
+          tone: 'error',
+          message: isAr
+            ? `تعذّر تصدير مساحة العمل: ${loaded.fault.message}. الملف التالف محفوظ كما هو (${loaded.fault.preservedKey ?? '—'}).`
+            : `The workspace could not be exported: ${loaded.fault.message}. The damaged payload is preserved as-is (${loaded.fault.preservedKey ?? '—'}).`,
+        });
+        return;
+      }
+      // A complete backup carries the inventoried tables AND the workspace-owned project-scoped
+      // auxiliary stores (monthly cut-off revisions, legacy subcontract register). No other browser key
+      // is ever read.
+      const backup = buildBackup(loaded.state, new Date().toISOString(), readAuxiliaryStores(storage));
+      downloadText(serializeBackup(backup), backupFileName(backup));
       setStatus({
-        tone: 'error',
+        tone: 'ok',
         message: isAr
-          ? `تعذّر تصدير مساحة العمل: ${loaded.fault.message}. الملف التالف محفوظ كما هو (${loaded.fault.preservedKey ?? '—'}).`
-          : `The workspace could not be exported: ${loaded.fault.message}. The damaged payload is preserved as-is (${loaded.fault.preservedKey ?? '—'}).`,
+          ? `تم تصدير نسخة كاملة: ${backup.source.project_count} مشروعاً و${backup.source.row_count} سجلاً في ${Object.keys(backup.counts).length} جدولاً.`
+          : `Complete backup exported: ${backup.source.project_count} projects, ${backup.source.row_count} rows across ${Object.keys(backup.counts).length} tables.`,
       });
-      return;
+      refreshCopies();
+    } catch (err) {
+      setStatus({ tone: 'error', message: isAr ? `تعذّر تصدير نسخة كاملة: ${String(err)}` : `Complete backup refused: ${String(err)}` });
     }
-    // A complete backup carries the inventoried tables AND the workspace-owned project-scoped
-    // auxiliary stores (monthly cut-off revisions, legacy subcontract register). No other browser key
-    // is ever read.
-    const backup = buildBackup(loaded.state, new Date().toISOString(), readAuxiliaryStores(storage));
-    downloadText(serializeBackup(backup), backupFileName(backup));
-    setStatus({
-      tone: 'ok',
-      message: isAr
-        ? `تم تصدير نسخة كاملة: ${backup.source.project_count} مشروعاً و${backup.source.row_count} سجلاً في ${Object.keys(backup.counts).length} جدولاً.`
-        : `Complete backup exported: ${backup.source.project_count} projects, ${backup.source.row_count} rows across ${Object.keys(backup.counts).length} tables.`,
-    });
-    refreshCopies();
   }
 
   async function handleFile(file: File | null) {
@@ -139,6 +144,12 @@ export default function WorkspaceBackupPanel() {
     try {
       const result = restoreWorkspace(storage, validation);
       if (!result.ok) {
+        if (result.preRestoreKey !== null || result.preRestoreAuxiliary.length > 0) {
+          downloadText(JSON.stringify({ main_workspace_bytes: result.preRestoreBytes,
+            auxiliary: result.preRestoreAuxiliary, error: result.error }, null, 2),
+          'schedule-workspace-failed-restore-recovery.json');
+        }
+        refreshCopies();
         setStatus({ tone: 'error', message: result.error ?? 'restore failed' });
         return;
       }

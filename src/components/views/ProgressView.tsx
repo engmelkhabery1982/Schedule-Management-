@@ -1,5 +1,6 @@
 import { useState, useEffect, useMemo } from 'react';
 import { supabase } from '@/lib/supabase';
+import { writeAuxiliaryStores } from '@/lib/localWorkspace';
 import { assertDbWriteOk } from '@/lib/supabaseErrors';
 import type {
   Project,
@@ -1201,7 +1202,10 @@ export default function ProgressView({ project }: ProgressViewProps) {
           total_float: a.total_float,
         })),
       };
-      localStorage.setItem(revisionKey, JSON.stringify([newRev, ...existingRevs]));
+      const revisionWrite = writeAuxiliaryStores(localStorage, [
+        { key: revisionKey, projectId: project.id, raw: JSON.stringify([newRev, ...existingRevs]) },
+      ]);
+      if (!revisionWrite.ok) throw new Error(revisionWrite.error);
 
       setMessage(`تم إقفال الموقف الشهري وحفظ الإصدار (${revisionName}) بنجاح.`);
       setWizardStep(3);

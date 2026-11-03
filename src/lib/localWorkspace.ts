@@ -313,11 +313,14 @@ export function isEmptyWorkspace(state: WorkspaceState): boolean {
 
 function listStorageKeys(storage: WorkspaceStorage): string[] {
   const keys: string[] = [];
-  if (typeof storage.length !== 'number' || typeof storage.key !== 'function') return keys;
-  for (let i = 0; i < storage.length; i += 1) {
+  if (typeof storage.length !== 'number' || typeof storage.key !== 'function') throw new Error('storage enumeration unavailable');
+  const length = storage.length;
+  for (let i = 0; i < length; i += 1) {
     const key = storage.key(i);
-    if (key !== null) keys.push(key);
+    if (key === null || keys.includes(key)) throw new Error('storage enumeration changed');
+    keys.push(key);
   }
+  if (storage.length !== length) throw new Error('storage enumeration changed');
   return keys;
 }
 
@@ -345,6 +348,7 @@ export function preserveRawBytes(
     }
     const key = `${prefix}${reason}__${stamp()}`;
     storage.setItem(key, raw);
+    if (storage.getItem(key) !== raw) return null;
     return key;
   } catch {
     return null;
@@ -412,13 +416,8 @@ export function readAuxiliaryStores(
     if (!prefix) continue;
     const projectId = key.slice(prefix.length) || null;
     if (projectIds && projectId !== null && !projectIds.has(projectId)) continue;
-    let raw: string | null;
-    try {
-      raw = storage.getItem(key);
-    } catch {
-      raw = null;
-    }
-    if (raw === null) continue;
+    const raw = storage.getItem(key);
+    if (raw === null) throw new Error(`auxiliary store disappeared: ${key}`);
     entries.push({ key, projectId, raw });
   }
   return entries;
@@ -1486,33 +1485,72 @@ export function restoreWorkspace(
     return none(revalidated.errors[0]?.message ?? 'the backup did not pass validation, nothing was restored');
   }
 
-  const previousRaw = safeGetRaw(storage);
-  const previousAuxiliary = readAuxiliaryStores(storage);
-  const failed = (error: string, preRestoreKey: string | null): RestoreResult => ({
-    ok: false,
-    error,
-    preRestoreKey,
-    preRestoreBytes: previousRaw,
-    preRestoreAuxiliary: previousAuxiliary,
-    state: null,
-  });
-
+  let previousRaw: string | null;
+  let previousAuxiliary: AuxiliaryEntry[];
+  try {
+    previousRaw = storage.getItem(WORKSPACE_STORAGE_KEY);
+    previousAuxiliary = readAuxiliaryStores(storage);
+  } catch (err) {
+    return none(`complete pre-restore snapshot failed: ${String(err)}; nothing was restored`);
+  }
   let preRestoreKey: string | null = null;
-  if (previousRaw !== null && previousRaw.length > 0) {
-    preRestoreKey = preserveRawBytes(storage, previousRaw, 'pre_restore');
-    if (preRestoreKey === null) {
-      return failed('a recoverable pre-restore copy could not be written, so nothing was restored', null);
+  const failed = (error: string): RestoreResult => ({
+    ok: false, error, preRestoreKey, preRestoreBytes: previousRaw,
+    preRestoreAuxiliary: previousAuxiliary, state: null,
+  });
+  // Preserve the historical main-byte copy contract AND a complete raw recovery archive.
+  // Neither depends on the old workspace being valid JSON or on it having any projects.
+  let recoveryKey = `${PRE_RESTORE_KEY_PREFIX}${stamp()}__auxiliary`;
+  try {
+    const baseKey = recoveryKey;
+    let suffix = 0;
+    while (storage.getItem(recoveryKey) !== null) recoveryKey = `${baseKey}_${++suffix}`;
+    const archive = JSON.stringify({ main_workspace_bytes: previousRaw, auxiliary: previousAuxiliary });
+    storage.setItem(recoveryKey, archive);
+    if (storage.getItem(recoveryKey) !== archive) throw new Error('recovery archive verification failed');
+    if (previousRaw !== null) {
+      preRestoreKey = preserveRawBytes(storage, previousRaw, 'pre_restore');
+      if (preRestoreKey === null) throw new Error('main recovery copy failed');
     }
+  } catch (err) {
+    return failed(`pre-restore protection failed: ${String(err)}; nothing was restored`);
   }
 
-  const written = writeWholeState(storage, revalidated.state);
-  if (!written.ok) return failed(written.error.message, preRestoreKey);
-
-  const auxiliaryWritten = writeAuxiliaryStores(storage, revalidated.auxiliary);
-  if (!auxiliaryWritten.ok) {
-    // Roll the main workspace back to the exact previous bytes so a partial restore never stands.
-    rollback(storage, previousRaw);
-    return failed(auxiliaryWritten.error, preRestoreKey);
+  const before = new Map<string, string | null>([
+    [WORKSPACE_STORAGE_KEY, previousRaw],
+    ...previousAuxiliary.map((e): [string, string] => [e.key, e.raw]),
+  ]);
+  const desired = new Map<string, string | null>([
+    [WORKSPACE_STORAGE_KEY, JSON.stringify(revalidated.state)],
+    ...previousAuxiliary.map((e): [string, null] => [e.key, null]),
+    ...revalidated.auxiliary.map((e): [string, string] => [e.key, e.raw]),
+  ]);
+  const attempted: string[] = [];
+  const put = (key: string, raw: string | null) => {
+    if (raw === null) storage.removeItem(key);
+    else storage.setItem(key, raw);
+    if (storage.getItem(key) !== raw) throw new Error(`verification failed: ${key}`);
+  };
+  try {
+    for (const [key, raw] of desired) {
+      if (!before.has(key)) before.set(key, null);
+      attempted.push(key); // Include a throwing write: browser adapters may mutate then throw.
+      put(key, raw);
+    }
+    for (const [key, raw] of desired) {
+      if (storage.getItem(key) !== raw) throw new Error(`final verification failed: ${key}`);
+    }
+    const actual = readAuxiliaryStores(storage);
+    if (actual.length !== revalidated.auxiliary.length
+      || actual.some(e => desired.get(e.key) !== e.raw)) throw new Error('auxiliary set verification failed');
+  } catch (err) {
+    const failures: string[] = [];
+    for (const key of attempted.reverse()) {
+      try { put(key, before.get(key) ?? null); }
+      catch (rollbackError) { failures.push(`${key}: ${String(rollbackError)}`); }
+    }
+    return failed(`restore failed: ${String(err)}; ${failures.length
+      ? `ROLLBACK FAILED: ${failures.join('; ')}` : 'rollback verified'}; recovery archive: ${recoveryKey}`);
   }
 
   return {
