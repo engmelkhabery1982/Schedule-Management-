@@ -6886,8 +6886,10 @@ console.log('--- S18 Pilot Closure (F9.5)');
       { encoding: 'utf8' }).includes('PASS successful replacement'));
 
   // Exact bounded exception: no ProgressView change beyond the checked cut-off write/import.
-  const repairedProgress = readFileSync(resolvePath(process.cwd(), 'src/components/views/ProgressView.tsx'), 'utf8');
-  const deliveredProgress = execFileSync('git', ['show', '4e03e8e303028edbbfa5ccb57037ad123465b802:src/components/views/ProgressView.tsx'], { encoding: 'utf8' });
+  // Git may check out CRLF on Windows while git show returns LF. Compare source,
+  // retaining the exact bounded substitutions below, independently of EOL format.
+  const repairedProgress = readFileSync(resolvePath(process.cwd(), 'src/components/views/ProgressView.tsx'), 'utf8').replace(/\r\n/g, '\n');
+  const deliveredProgress = execFileSync('git', ['show', '4e03e8e303028edbbfa5ccb57037ad123465b802:src/components/views/ProgressView.tsx'], { encoding: 'utf8' }).replace(/\r\n/g, '\n');
   ok('S29-M checked monthly persistence is present', repairedProgress.includes('if (!revisionWrite.ok) throw new Error(revisionWrite.error);'));
   eq('S29-M ProgressView differs only by the checked monthly revision persistence path',
     repairedProgress.replace("import { writeAuxiliaryStores } from '@/lib/localWorkspace';\n", '')
