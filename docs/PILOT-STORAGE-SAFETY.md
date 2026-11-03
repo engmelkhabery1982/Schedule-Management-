@@ -209,3 +209,7 @@ Windows-only guard defect: the exact ProgressView substitution compared CRLF che
 
 Still open: actual isolated AR/EN browser project creation/reopen, backup/restore and error/recovery-download UI. No owner acceptance, owner F update, main merge or deploy.
 
+
+## Owner browser date-entry review — 3 November2026
+React date inputs now handle the input event as well as committed change events. Before this narrow fix, native date values displayed correctly but form state stayed empty and rejected creation. On the isolated browser origin, the same ISO date entry now persists through project creation and reload. Existing date validation and native picker remain unchanged. Typecheck/build pass and1752controls pass. This closes project-creation browser evidence only; full restore browser acceptance and owner installation remain pending.
+

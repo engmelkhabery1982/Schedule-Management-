@@ -817,6 +817,7 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
                   <input
                     type="date"
                     value={newProjectForm.start_date}
+                    onInput={(e) => setNewProjectForm({ ...newProjectForm, start_date: e.currentTarget.value })}
                     onChange={(e) => setNewProjectForm({ ...newProjectForm, start_date: e.target.value })}
                     className="w-full p-2 border rounded-lg font-mono"
                   />
@@ -826,6 +827,7 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
                   <input
                     type="date"
                     value={newProjectForm.end_date}
+                    onInput={(e) => setNewProjectForm({ ...newProjectForm, end_date: e.currentTarget.value })}
                     onChange={(e) => setNewProjectForm({ ...newProjectForm, end_date: e.target.value })}
                     className="w-full p-2 border rounded-lg font-mono"
                   />
