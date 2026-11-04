@@ -42,6 +42,64 @@ function validationError(message: string): LocalQueryError {
   return { message, kind: 'validation' };
 }
 
+function validateCertificateRecord(draft: WorkspaceState, tableName: string, item: Row): LocalQueryError | null {
+  if (tableName !== 'payment_certificates' && tableName !== 'subcontractor_payment_certificates') {
+    return null;
+  }
+  const projectId = item.project_id;
+  if (!projectId || typeof projectId !== 'string') {
+    return validationError('Certificate record must specify a valid project_id');
+  }
+  const projects = tableRows(draft, 'projects');
+  const project = projects.find((p) => String(p.id) === String(projectId));
+  if (!project) {
+    return validationError(`Certificate references non-existent project "${projectId}"`);
+  }
+  const projectDataDate = typeof project.data_date === 'string' ? project.data_date : null;
+  const certDate = typeof item.certificateDate === 'string' ? item.certificateDate : typeof item.certificate_date === 'string' ? item.certificate_date : null;
+  const status = item.status;
+
+  if (tableName === 'payment_certificates') {
+    const isApprovedOrPaid = status === 'paid' || status === 'certified_by_consultant' || status === 'approved_by_client';
+    if (isApprovedOrPaid && certDate && projectDataDate && certDate > projectDataDate) {
+      return validationError(`Payment certificate dated ${certDate} with approved status "${status}" violates project Data Date ${projectDataDate}`);
+    }
+    if (Array.isArray(item.items)) {
+      const boqItems = tableRows(draft, 'boq_items');
+      for (const line of item.items) {
+        if (line && typeof line === 'object') {
+          const boqId = (line as Record<string, unknown>).boqItemId ?? (line as Record<string, unknown>).boq_item_id;
+          if (boqId) {
+            const boq = boqItems.find((b) => String(b.id) === String(boqId));
+            if (!boq) return validationError(`Certificate line item references non-existent BOQ item "${boqId}"`);
+            if (String(boq.project_id) !== String(projectId)) {
+              return validationError(`Certificate line item references BOQ item "${boqId}" of another project`);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (tableName === 'subcontractor_payment_certificates') {
+    const isApprovedOrPaid = status === 'paid' || status === 'approved';
+    if (isApprovedOrPaid && certDate && projectDataDate && certDate > projectDataDate) {
+      return validationError(`Subcontractor certificate dated ${certDate} with approved status "${status}" violates project Data Date ${projectDataDate}`);
+    }
+    const pkgCode = item.subcontractPackageCode ?? item.subcontract_package_code;
+    if (pkgCode) {
+      const packages = tableRows(draft, 'subcontract_packages');
+      const foreignPkg = packages.find((p) => (p.code === pkgCode || p.id === pkgCode) && String(p.project_id) !== String(projectId));
+      const matchingPkg = packages.find((p) => (p.code === pkgCode || p.id === pkgCode) && String(p.project_id) === String(projectId));
+      if (foreignPkg && !matchingPkg) {
+        return validationError(`Subcontractor certificate references package "${pkgCode}" of another project`);
+      }
+    }
+  }
+
+  return null;
+}
+
 export class MockQueryBuilder<T = unknown> implements PromiseLike<LocalQueryResult<T>> {
   private tableName: string;
   private io: LocalWorkspacePort;
@@ -171,6 +229,12 @@ export class MockQueryBuilder<T = unknown> implements PromiseLike<LocalQueryResu
           if (error) return { ok: false, error: validationError(`${error.message} — ${error.details}`) };
         }
       }
+      if (this.tableName === 'payment_certificates' || this.tableName === 'subcontractor_payment_certificates') {
+        for (const item of inserted) {
+          const err = validateCertificateRecord(draft, this.tableName, item);
+          if (err) return { ok: false, error: err };
+        }
+      }
       setTableRows(draft, this.tableName, [...table, ...inserted]);
       return { ok: true, data: Array.isArray(this.payload) ? inserted : inserted[0] };
     }
@@ -189,6 +253,10 @@ export class MockQueryBuilder<T = unknown> implements PromiseLike<LocalQueryResu
           created_at: (matchIndex >= 0 ? currentTable[matchIndex].created_at : undefined) || new Date().toISOString(),
           ...item,
         };
+        if (this.tableName === 'payment_certificates' || this.tableName === 'subcontractor_payment_certificates') {
+          const err = validateCertificateRecord(draft, this.tableName, recordToSave);
+          if (err) return { ok: false, error: err };
+        }
         if (matchIndex >= 0) currentTable[matchIndex] = { ...currentTable[matchIndex], ...recordToSave };
         else currentTable.push(recordToSave);
       }
@@ -213,6 +281,12 @@ export class MockQueryBuilder<T = unknown> implements PromiseLike<LocalQueryResu
         for (const item of updatedItems) {
           const { error } = checkControlRecordProjectBoundary(draft as unknown as Record<string, Record<string, unknown>[]>, 'cost_transactions', item);
           if (error) return { ok: false, error: validationError(`${error.message} — ${error.details}`) };
+        }
+      }
+      if (this.tableName === 'payment_certificates' || this.tableName === 'subcontractor_payment_certificates') {
+        for (const item of updatedItems) {
+          const err = validateCertificateRecord(draft, this.tableName, item);
+          if (err) return { ok: false, error: err };
         }
       }
       setTableRows(draft, this.tableName, updatedTable);

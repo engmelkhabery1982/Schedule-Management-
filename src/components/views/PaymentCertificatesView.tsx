@@ -2,7 +2,7 @@ import { useState, useMemo, useEffect } from 'react';
 import { supabase } from '@/lib/supabase';
 import { getLanguage, type Language } from '@/lib/i18n';
 import { resolveContractBaseline } from '@/lib/budgetForecastEngine';
-import type { Project, PaymentCertificate, SubcontractPackage } from '@/types';
+import type { Project, PaymentCertificate, SubcontractPackage, SubcontractorIpc, PaymentCertificateItem, SubcontractorIpcItem } from '@/types';
 import ScopeChangeRegister from './ScopeChangeRegister';
 import { DEFAULT_DATA_DATE } from '@/lib/projectControlsConstants';
 import { loadSubcontractPackages } from '@/lib/subcontractEngine';
@@ -20,604 +20,169 @@ import {
   AlertCircle,
   FileText,
   Building,
+  Plus,
+  Trash2,
+  X,
+  CheckCircle2,
 } from 'lucide-react';
+
+export type { SubcontractorIpc };
 
 interface PaymentCertificatesViewProps {
   project: Project | null;
 }
 
-export interface SubcontractorIpc {
-  id: string;
-  ipcNumber: string;
-  subcontractorName: string;
-  trade: string; // e.g. "أعمال الخرسانات والهياكل", "أعمال MEP والتكييف"
-  certificateDate: string;
-  periodStart: string;
-  periodEnd: string;
-  status: 'draft' | 'approved' | 'paid';
-  /**
-   * Business code of the subcontract package this certificate bills ('SUB-PKG-01'). It is the link
-   * used to read that package's CONTRACTUAL retention percent from the database (GAP-019/020); the
-   * code is never parsed as a uuid.
-   */
-  subcontractPackageCode?: string | null;
-  grossAmountToDate: number;
-  currentGrossAmount: number;
-  /** Retention actually withheld on this certificate; checked against the package's contract. */
-  retentionDeduction: number;
-  materialDeductions: number; // خصومات تشوينات أو محروقات
-  netPayableToSubcontractor: number;
-  // Back to back main contractor comparison
-  mainContractorRevenueForSameQty: number;
-  mainContractorProfitMarginSar: number;
-  mainContractorMarginPercent: number;
-  items: {
-    id: string;
-    description: string;
-    unit: string;
-    quantity: number;
-    subcontractorRate: number; // سعر مقاول الباطن
-    subcontractorAmount: number;
-    mainContractorRate: number; // سعر المقاول الرئيسي مع المالك
-    mainContractorAmount: number;
-    marginSar: number;
-  }[];
-}
-
 export default function PaymentCertificatesView({ project }: PaymentCertificatesViewProps) {
   const [lang, setLang] = useState<Language>(getLanguage());
   const [activeTab, setActiveTab] = useState<'ipcs' | 'subcontractors' | 'vos'>('ipcs');
-  const [selectedIpcId, setSelectedIpcId] = useState<string>('IPC-03');
-  const [selectedSubIpcId, setSelectedSubIpcId] = useState<string>('SUB-IPC-01');
-  const [showAddSubIpcModal, setShowAddSubIpcModal] = useState(false);
 
-  // Subcontractor IPCs.
-  //
-  // GAP-018: SUB-IPC-001 keeps a header (215,000) that disagrees with its own lines (214,400) so the
-  // reconciliation surfaces a `mismatch` with the exact delta instead of presenting both as valid.
-  // GAP-020: each certificate's retention is the CONTRACTUAL percent of the package it belongs to
-  // (SUB-PKG-01 = 10%, SUB-PKG-02 = 5%), not a flat rate applied by the screen.
-  // GAP-021: certificates dated on or before the Data Date are actuals; SUB-IPC-003 is a draft claim.
-  const [subcontractorIpcs, setSubcontractorIpcs] = useState<SubcontractorIpc[]>([
-    {
-      id: 'SUB-IPC-01',
-      ipcNumber: 'SUB-IPC-001',
-      subcontractPackageCode: 'SUB-PKG-01',
-      subcontractorName: 'شركة البنيان لأعمال الخرسانات والهياكل',
-      trade: 'مقاول باطن - أعمال الهيكل الإنشائي والخرسانات',
-      certificateDate: '2026-08-25',
-      periodStart: '2026-08-01',
-      periodEnd: '2026-08-25',
-      status: 'paid',
-      grossAmountToDate: 215000,
-      // Header gross deliberately 600 SAR above the sum of the lines below: the reconciliation must
-      // flag it, never silently accept both figures.
-      currentGrossAmount: 215000,
-      retentionDeduction: 21500, // 10% contractual retention of SUB-PKG-01
-      materialDeductions: 4500, // ديزل وتشوينات
-      netPayableToSubcontractor: 189000,
-      mainContractorRevenueForSameQty: 323150,
-      mainContractorProfitMarginSar: 108750,
-      mainContractorMarginPercent: 33.7,
-      items: [
-        {
-          id: 'SUB-IPC-01-L1',
-          description: 'خرسانة مسلحة للقواعد والميد الأرضية (CW-002)',
-          unit: 'م3',
-          quantity: 280,
-          subcontractorRate: 380,
-          subcontractorAmount: 106400,
-          mainContractorRate: 680,
-          mainContractorAmount: 190400,
-          marginSar: 84000,
-        },
-        {
-          id: 'SUB-IPC-01-L2',
-          description: 'حديد تسليح للقواعد والأعمدة (RS-001)',
-          unit: 'طن',
-          quantity: 45,
-          subcontractorRate: 2400,
-          subcontractorAmount: 108000,
-          mainContractorRate: 2950,
-          mainContractorAmount: 132750,
-          marginSar: 24750,
-        },
-      ],
-    },
-    {
-      id: 'SUB-IPC-02',
-      ipcNumber: 'SUB-IPC-002',
-      subcontractPackageCode: 'SUB-PKG-02',
-      subcontractorName: 'شركة الإعمار والمساندة الخرسانية المحدودة',
-      trade: 'مقاول باطن مساند - أعمال خرسانات القطاع B',
-      certificateDate: '2026-09-08',
-      periodStart: '2026-09-01',
-      periodEnd: '2026-09-08',
-      status: 'approved',
-      grossAmountToDate: 19440,
-      currentGrossAmount: 19440,
-      retentionDeduction: 972, // 5% contractual retention of SUB-PKG-02 (not 10%)
-      materialDeductions: 0,
-      netPayableToSubcontractor: 18468,
-      mainContractorRevenueForSameQty: 34560,
-      mainContractorProfitMarginSar: 15120,
-      mainContractorMarginPercent: 43.8,
-      items: [
-        {
-          id: 'SUB-IPC-02-L1',
-          description: 'خرسانة مسلحة للأعمدة والأسقف - حصة القطاع B (CW-003)',
-          unit: 'م3',
-          quantity: 48,
-          subcontractorRate: 405,
-          subcontractorAmount: 19440,
-          mainContractorRate: 720,
-          mainContractorAmount: 34560,
-          marginSar: 15120,
-        },
-      ],
-    },
-    {
-      id: 'SUB-IPC-03',
-      ipcNumber: 'SUB-IPC-003',
-      subcontractPackageCode: 'SUB-PKG-01',
-      subcontractorName: 'شركة البنيان لأعمال الخرسانات والهياكل',
-      trade: 'مقاول باطن - أعمال الهيكل الإنشائي والخرسانات',
-      certificateDate: '2026-09-11',
-      periodStart: '2026-09-01',
-      periodEnd: '2026-09-10',
-      // Draft claim awaiting review: excluded from paid/approved subcontractor totals (GAP-021).
-      status: 'draft',
-      grossAmountToDate: 240600,
-      currentGrossAmount: 25600,
-      retentionDeduction: 2560, // 10% contractual retention of SUB-PKG-01
-      materialDeductions: 0,
-      netPayableToSubcontractor: 23040,
-      mainContractorRevenueForSameQty: 46080,
-      mainContractorProfitMarginSar: 20480,
-      mainContractorMarginPercent: 44.4,
-      items: [
-        {
-          id: 'SUB-IPC-03-L1',
-          description: 'خرسانة مسلحة للأعمدة والأسقف - حصة القطاع A (CW-003)',
-          unit: 'م3',
-          quantity: 64,
-          subcontractorRate: 400,
-          subcontractorAmount: 25600,
-          mainContractorRate: 720,
-          mainContractorAmount: 46080,
-          marginSar: 20480,
-        },
-      ],
-    },
-  ]);
+  // Loaded project-scoped certificates
+  const [certificates, setCertificates] = useState<PaymentCertificate[]>([]);
+  const [subcontractorIpcs, setSubcontractorIpcs] = useState<SubcontractorIpc[]>([]);
+  const [selectedIpcId, setSelectedIpcId] = useState<string | null>(null);
+  const [selectedSubIpcId, setSelectedSubIpcId] = useState<string | null>(null);
+
+  // Status and feedback
+  const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [saveSuccess, setSaveSuccess] = useState<string | null>(null);
+
+  // Modals
+  const [showAddIpcModal, setShowAddIpcModal] = useState(false);
+  const [showAddSubIpcModal, setShowAddSubIpcModal] = useState(false);
+  const [subcontractPackages, setSubcontractPackages] = useState<SubcontractPackage[]>([]);
+
+  // Form states for new IPC
+  const [newIpcNumber, setNewIpcNumber] = useState('');
+  const [newCertDate, setNewCertDate] = useState('');
+  const [newPeriodStart, setNewPeriodStart] = useState('');
+  const [newPeriodEnd, setNewPeriodEnd] = useState('');
+  const [newIpcStatus, setNewIpcStatus] = useState<PaymentCertificate['status']>('draft');
+  const [newCurrentGross, setNewCurrentGross] = useState(0);
+  const [newPreviousGross, setNewPreviousGross] = useState(0);
+  const [newAdvanceDeduction, setNewAdvanceDeduction] = useState(0);
+  const [newRetentionDeduction, setNewRetentionDeduction] = useState(0);
+  const [newPenaltyDeduction, setNewPenaltyDeduction] = useState(0);
+  const [newVatAmount, setNewVatAmount] = useState(0);
+  const [newIpcItems, setNewIpcItems] = useState<PaymentCertificateItem[]>([]);
+
+  // Form states for new Subcontractor IPC
+  const [newSubIpcNumber, setNewSubIpcNumber] = useState('');
+  const [newSubName, setNewSubName] = useState('');
+  const [newSubTrade, setNewSubTrade] = useState('');
+  const [newSubPkgCode, setNewSubPkgCode] = useState('');
+  const [newSubCertDate, setNewSubCertDate] = useState('');
+  const [newSubPeriodStart, setNewSubPeriodStart] = useState('');
+  const [newSubPeriodEnd, setNewSubPeriodEnd] = useState('');
+  const [newSubStatus, setNewSubStatus] = useState<'draft' | 'approved' | 'paid'>('draft');
+  const [newSubCurrentGross, setNewSubCurrentGross] = useState(0);
+  const [newSubGrossToDate, setNewSubGrossToDate] = useState(0);
+  const [newSubRetention, setNewSubRetention] = useState(0);
+  const [newSubMaterialDeductions, setNewSubMaterialDeductions] = useState(0);
+  const [newSubMainRevenue, setNewSubMainRevenue] = useState(0);
+  const [newSubItems, setNewSubItems] = useState<SubcontractorIpcItem[]>([]);
+
+  const dataDate = project?.data_date || DEFAULT_DATA_DATE;
 
   useEffect(() => {
-    const handleLangChange = (e: any) => {
-      setLang(e.detail?.lang || getLanguage());
+    const handleLangChange = (e: Event) => {
+      const custom = e as CustomEvent<{ lang?: 'en' | 'ar' }>;
+      setLang(custom.detail?.lang || getLanguage());
     };
     window.addEventListener('app-language-changed', handleLangChange);
     return () => window.removeEventListener('app-language-changed', handleLangChange);
   }, []);
 
-  // List of Payment Certificates.
-  //
-  // GAP-018: every certificate that has itemised lines carries a header whose current and cumulative
-  // gross equal the sum of those lines; the one certificate whose header disagrees with its lines is
-  // left disagreeing on purpose so the reconciliation status reports `mismatch` instead of hiding it.
-  // GAP-021: certificates dated on or before the governed Data Date (2026-09-13) are the actuals;
-  // the fourth one is a Q4 forecast in `draft` and is excluded from certified totals.
-  const [certificates, setCertificates] = useState<PaymentCertificate[]>([
-    {
-      id: 'IPC-01',
-      ipcNumber: 'IPC-01',
-      certificateDate: '2026-07-31',
-      periodStart: '2026-07-01',
-      periodEnd: '2026-07-31',
-      status: 'paid',
-      grossAmountToDate: 102150,
-      previousGrossAmount: 0,
-      currentGrossAmount: 102150,
-      advancePaymentDeduction: 10215, // 10% of the current gross
-      retentionMoneyDeduction: 5107.5, // 5% main-contract retention
-      penaltyDeduction: 0,
-      vatAmount: 15322.5, // 15%
-      netPayableAmount: 102150,
-      items: [
-        {
-          id: 'IPC-01-L1',
-          boqItemId: 'boq-01',
-          boqCode: 'EW-001',
-          description: 'حفريات الموقع العام ونقل المخلفات',
-          unit: 'm3',
-          contractQuantity: 1200,
-          unitRateSar: 35,
-          previousQuantity: 0,
-          currentQuantity: 1200,
-          cumulativeQuantity: 1200,
-          cumulativeAmountSar: 42000,
-          currentAmountSar: 42000,
-        },
-        {
-          id: 'IPC-01-L2',
-          boqItemId: 'boq-02',
-          boqCode: 'EW-002',
-          description: 'أعمال الردم بطبقات ورش المياه والدمك',
-          unit: 'm3',
-          contractQuantity: 450,
-          unitRateSar: 45,
-          previousQuantity: 0,
-          currentQuantity: 450,
-          cumulativeQuantity: 450,
-          cumulativeAmountSar: 20250,
-          currentAmountSar: 20250,
-        },
-        {
-          id: 'IPC-01-L3',
-          boqItemId: 'boq-03',
-          boqCode: 'CW-001',
-          description: 'خرسانة نظافة عادية أسفل القواعد',
-          unit: 'm3',
-          contractQuantity: 95,
-          unitRateSar: 420,
-          previousQuantity: 0,
-          currentQuantity: 95,
-          cumulativeQuantity: 95,
-          cumulativeAmountSar: 39900,
-          currentAmountSar: 39900,
-        },
-      ],
-    },
-    {
-      id: 'IPC-02',
-      ipcNumber: 'IPC-02',
-      certificateDate: '2026-08-31',
-      periodStart: '2026-08-01',
-      periodEnd: '2026-08-31',
-      status: 'paid',
-      grossAmountToDate: 425300,
-      previousGrossAmount: 102150,
-      currentGrossAmount: 323150,
-      advancePaymentDeduction: 32315,
-      retentionMoneyDeduction: 16157.5,
-      penaltyDeduction: 0,
-      vatAmount: 48472.5,
-      netPayableAmount: 323150,
-      items: [
-        {
-          id: 'IPC-02-L1',
-          boqItemId: 'boq-01',
-          boqCode: 'EW-001',
-          description: 'حفريات الموقع العام ونقل المخلفات',
-          unit: 'm3',
-          contractQuantity: 1200,
-          unitRateSar: 35,
-          previousQuantity: 1200,
-          currentQuantity: 0,
-          cumulativeQuantity: 1200,
-          cumulativeAmountSar: 42000,
-          currentAmountSar: 0,
-        },
-        {
-          id: 'IPC-02-L2',
-          boqItemId: 'boq-02',
-          boqCode: 'EW-002',
-          description: 'أعمال الردم بطبقات ورش المياه والدمك',
-          unit: 'm3',
-          contractQuantity: 450,
-          unitRateSar: 45,
-          previousQuantity: 450,
-          currentQuantity: 0,
-          cumulativeQuantity: 450,
-          cumulativeAmountSar: 20250,
-          currentAmountSar: 0,
-        },
-        {
-          id: 'IPC-02-L3',
-          boqItemId: 'boq-03',
-          boqCode: 'CW-001',
-          description: 'خرسانة نظافة عادية أسفل القواعد',
-          unit: 'm3',
-          contractQuantity: 95,
-          unitRateSar: 420,
-          previousQuantity: 95,
-          currentQuantity: 0,
-          cumulativeQuantity: 95,
-          cumulativeAmountSar: 39900,
-          currentAmountSar: 0,
-        },
-        {
-          id: 'IPC-02-L4',
-          boqItemId: 'boq-04',
-          boqCode: 'CW-002',
-          description: 'خرسانة مسلحة للقواعد والميد الأرضية',
-          unit: 'm3',
-          contractQuantity: 280,
-          unitRateSar: 680,
-          previousQuantity: 0,
-          currentQuantity: 280,
-          cumulativeQuantity: 280,
-          cumulativeAmountSar: 190400,
-          currentAmountSar: 190400,
-        },
-        {
-          id: 'IPC-02-L5',
-          boqItemId: 'boq-05',
-          boqCode: 'RS-001',
-          description: 'حديد تسليح للقواعد والأعمدة',
-          unit: 'ton',
-          contractQuantity: 45,
-          unitRateSar: 2950,
-          previousQuantity: 0,
-          currentQuantity: 45,
-          cumulativeQuantity: 45,
-          cumulativeAmountSar: 132750,
-          currentAmountSar: 132750,
-        }
-      ],
-    },
-    {
-      id: 'IPC-03',
-      ipcNumber: 'IPC-03',
-      certificateDate: '2026-09-10',
-      periodStart: '2026-09-01',
-      periodEnd: '2026-09-10',
-      status: 'certified_by_consultant',
-      grossAmountToDate: 505940,
-      previousGrossAmount: 425300,
-      currentGrossAmount: 80640,
-      advancePaymentDeduction: 8064,
-      retentionMoneyDeduction: 4032,
-      penaltyDeduction: 0,
-      vatAmount: 12096,
-      netPayableAmount: 80640,
-      items: [
-        {
-          id: 'IPC-03-L1',
-          boqItemId: 'boq-01',
-          boqCode: 'EW-001',
-          description: 'حفريات الموقع العام ونقل المخلفات',
-          unit: 'm3',
-          contractQuantity: 1200,
-          unitRateSar: 35,
-          previousQuantity: 1200,
-          currentQuantity: 0,
-          cumulativeQuantity: 1200,
-          cumulativeAmountSar: 42000,
-          currentAmountSar: 0,
-        },
-        {
-          id: 'IPC-03-L2',
-          boqItemId: 'boq-02',
-          boqCode: 'EW-002',
-          description: 'أعمال الردم بطبقات ورش المياه والدمك',
-          unit: 'm3',
-          contractQuantity: 450,
-          unitRateSar: 45,
-          previousQuantity: 450,
-          currentQuantity: 0,
-          cumulativeQuantity: 450,
-          cumulativeAmountSar: 20250,
-          currentAmountSar: 0,
-        },
-        {
-          id: 'IPC-03-L3',
-          boqItemId: 'boq-03',
-          boqCode: 'CW-001',
-          description: 'خرسانة نظافة عادية أسفل القواعد',
-          unit: 'm3',
-          contractQuantity: 95,
-          unitRateSar: 420,
-          previousQuantity: 95,
-          currentQuantity: 0,
-          cumulativeQuantity: 95,
-          cumulativeAmountSar: 39900,
-          currentAmountSar: 0,
-        },
-        {
-          id: 'IPC-03-L4',
-          boqItemId: 'boq-04',
-          boqCode: 'CW-002',
-          description: 'خرسانة مسلحة للقواعد والميد الأرضية',
-          unit: 'm3',
-          contractQuantity: 280,
-          unitRateSar: 680,
-          previousQuantity: 280,
-          currentQuantity: 0,
-          cumulativeQuantity: 280,
-          cumulativeAmountSar: 190400,
-          currentAmountSar: 0,
-        },
-        {
-          id: 'IPC-03-L5',
-          boqItemId: 'boq-05',
-          boqCode: 'RS-001',
-          description: 'حديد تسليح للقواعد والأعمدة',
-          unit: 'ton',
-          contractQuantity: 45,
-          unitRateSar: 2950,
-          previousQuantity: 45,
-          currentQuantity: 0,
-          cumulativeQuantity: 45,
-          cumulativeAmountSar: 132750,
-          currentAmountSar: 0,
-        },
-        {
-          id: 'IPC-03-L6',
-          boqItemId: 'boq-06',
-          boqCode: 'CW-003',
-          description: 'خرسانة مسلحة للأعمدة والأسقف لجميع الأدوار',
-          unit: 'm3',
-          contractQuantity: 650,
-          unitRateSar: 720,
-          previousQuantity: 0,
-          currentQuantity: 112,
-          cumulativeQuantity: 112,
-          cumulativeAmountSar: 80640,
-          currentAmountSar: 80640,
-        }
-      ],
-    },
-    {
-      id: 'IPC-04',
-      ipcNumber: 'IPC-04',
-      certificateDate: '2026-12-31',
-      periodStart: '2026-10-01',
-      periodEnd: '2026-12-31',
-      // Forecast only: a draft for the fourth quarter, dated after the Data Date, so it is reported
-      // as a projection and stays out of the certified / paid totals (GAP-021).
-      status: 'draft',
-      grossAmountToDate: 885940,
-      previousGrossAmount: 505940,
-      currentGrossAmount: 380000,
-      advancePaymentDeduction: 38000,
-      retentionMoneyDeduction: 19000,
-      penaltyDeduction: 0,
-      vatAmount: 57000,
-      netPayableAmount: 380000,
-      items: [
-        {
-          id: 'IPC-04-L1',
-          boqItemId: 'boq-01',
-          boqCode: 'EW-001',
-          description: 'حفريات الموقع العام ونقل المخلفات',
-          unit: 'm3',
-          contractQuantity: 1200,
-          unitRateSar: 35,
-          previousQuantity: 1200,
-          currentQuantity: 0,
-          cumulativeQuantity: 1200,
-          cumulativeAmountSar: 42000,
-          currentAmountSar: 0,
-        },
-        {
-          id: 'IPC-04-L2',
-          boqItemId: 'boq-02',
-          boqCode: 'EW-002',
-          description: 'أعمال الردم بطبقات ورش المياه والدمك',
-          unit: 'm3',
-          contractQuantity: 450,
-          unitRateSar: 45,
-          previousQuantity: 450,
-          currentQuantity: 0,
-          cumulativeQuantity: 450,
-          cumulativeAmountSar: 20250,
-          currentAmountSar: 0,
-        },
-        {
-          id: 'IPC-04-L3',
-          boqItemId: 'boq-03',
-          boqCode: 'CW-001',
-          description: 'خرسانة نظافة عادية أسفل القواعد',
-          unit: 'm3',
-          contractQuantity: 95,
-          unitRateSar: 420,
-          previousQuantity: 95,
-          currentQuantity: 0,
-          cumulativeQuantity: 95,
-          cumulativeAmountSar: 39900,
-          currentAmountSar: 0,
-        },
-        {
-          id: 'IPC-04-L4',
-          boqItemId: 'boq-04',
-          boqCode: 'CW-002',
-          description: 'خرسانة مسلحة للقواعد والميد الأرضية',
-          unit: 'm3',
-          contractQuantity: 280,
-          unitRateSar: 680,
-          previousQuantity: 280,
-          currentQuantity: 0,
-          cumulativeQuantity: 280,
-          cumulativeAmountSar: 190400,
-          currentAmountSar: 0,
-        },
-        {
-          id: 'IPC-04-L5',
-          boqItemId: 'boq-05',
-          boqCode: 'RS-001',
-          description: 'حديد تسليح للقواعد والأعمدة',
-          unit: 'ton',
-          contractQuantity: 45,
-          unitRateSar: 2950,
-          previousQuantity: 45,
-          currentQuantity: 0,
-          cumulativeQuantity: 45,
-          cumulativeAmountSar: 132750,
-          currentAmountSar: 0,
-        },
-        {
-          id: 'IPC-04-L6',
-          boqItemId: 'boq-06',
-          boqCode: 'CW-003',
-          description: 'خرسانة مسلحة للأعمدة والأسقف لجميع الأدوار (المتوقع للربع الرابع)',
-          unit: 'm3',
-          contractQuantity: 650,
-          unitRateSar: 720,
-          previousQuantity: 112,
-          currentQuantity: 200,
-          cumulativeQuantity: 312,
-          cumulativeAmountSar: 224640,
-          currentAmountSar: 144000,
-        },
-        {
-          id: 'IPC-04-L7',
-          boqItemId: 'boq-07',
-          boqCode: 'MS-001',
-          description: 'مباني بلك إسمنتي معزول وخفيف للجدران (المتوقع للربع الرابع)',
-          unit: 'm2',
-          contractQuantity: 3200,
-          unitRateSar: 95,
-          previousQuantity: 0,
-          currentQuantity: 1600,
-          cumulativeQuantity: 1600,
-          cumulativeAmountSar: 152000,
-          currentAmountSar: 152000,
-        },
-        {
-          id: 'IPC-04-L8',
-          boqItemId: 'boq-09',
-          boqCode: 'PL-001',
-          description: 'أعمال اللياسة الداخلية والخارجية (المتوقع للربع الرابع)',
-          unit: 'm2',
-          contractQuantity: 6400,
-          unitRateSar: 42,
-          previousQuantity: 0,
-          currentQuantity: 2000,
-          cumulativeQuantity: 2000,
-          cumulativeAmountSar: 84000,
-          currentAmountSar: 84000,
-        }
-      ],
-    },
-  ]);
-
-  const selectedIpc = useMemo(() => {
-    return certificates.find((c) => c.id === selectedIpcId) || certificates[certificates.length - 1];
-  }, [certificates, selectedIpcId]);
-
-  // ---------------------------------------------------------------------------
-  // Commercial controls: reconciliation (GAP-018), contractual retention (GAP-020)
-  // and chronology against the governed Data Date (GAP-021).
-  // ---------------------------------------------------------------------------
-
-  /** The cutoff that separates an actual certificate from a forecast or a pending claim. */
-  const dataDate = project?.data_date || DEFAULT_DATA_DATE;
-
-  /**
-   * Subcontract packages are read from the relational tables so a subcontractor certificate can be
-   * checked against the retention percent its own contract states (GAP-019/020).
-   */
-  const [subcontractPackages, setSubcontractPackages] = useState<SubcontractPackage[]>([]);
+  // Load project-scoped certificates, refusing stale asynchronous responses
   useEffect(() => {
     let cancelled = false;
-    (async () => {
-      const packages = await loadSubcontractPackages(project?.id);
-      if (!cancelled) setSubcontractPackages(packages);
-    })();
+    setSaveError(null);
+    setSaveSuccess(null);
+
+    if (!project?.id) {
+      setCertificates([]);
+      setSubcontractorIpcs([]);
+      setSelectedIpcId(null);
+      setSelectedSubIpcId(null);
+      setLoading(false);
+      setLoadError(null);
+      return;
+    }
+
+    setLoading(true);
+    setLoadError(null);
+
+    Promise.all([
+      supabase.from('payment_certificates').select('*').eq('project_id', project.id),
+      supabase.from('subcontractor_payment_certificates').select('*').eq('project_id', project.id),
+    ])
+      .then(([mainRes, subRes]) => {
+        if (cancelled) return;
+        setLoading(false);
+
+        if (mainRes.error) {
+          setLoadError(mainRes.error.message || 'Failed to load main certificates');
+          return;
+        }
+        if (subRes.error) {
+          setLoadError(subRes.error.message || 'Failed to load subcontractor certificates');
+          return;
+        }
+
+        const loadedMain = (mainRes.data || []) as PaymentCertificate[];
+        const loadedSub = (subRes.data || []) as SubcontractorIpc[];
+
+        setCertificates(loadedMain);
+        setSubcontractorIpcs(loadedSub);
+
+        // Safe ID resolution when switching projects
+        setSelectedIpcId((prev) => {
+          if (prev && loadedMain.some((c) => c.id === prev)) return prev;
+          return loadedMain.length > 0 ? loadedMain[loadedMain.length - 1].id : null;
+        });
+
+        setSelectedSubIpcId((prev) => {
+          if (prev && loadedSub.some((s) => s.id === prev)) return prev;
+          return loadedSub.length > 0 ? loadedSub[0].id : null;
+        });
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setLoading(false);
+          setLoadError(err instanceof Error ? err.message : String(err));
+        }
+      });
+
     return () => {
       cancelled = true;
     };
   }, [project?.id]);
+
+  // Load packages for contractual retention resolution
+  useEffect(() => {
+    let cancelled = false;
+    if (!project?.id) {
+      setSubcontractPackages([]);
+      return;
+    }
+    loadSubcontractPackages(project.id).then((pkgs) => {
+      if (!cancelled) setSubcontractPackages(pkgs);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [project?.id]);
+
+  const selectedIpc = useMemo(() => {
+    if (!selectedIpcId) return certificates.length > 0 ? certificates[certificates.length - 1] : null;
+    return certificates.find((c) => c.id === selectedIpcId) || (certificates.length > 0 ? certificates[certificates.length - 1] : null);
+  }, [certificates, selectedIpcId]);
+
+  const selectedSubIpc = useMemo(() => {
+    if (!selectedSubIpcId) return subcontractorIpcs.length > 0 ? subcontractorIpcs[0] : null;
+    return subcontractorIpcs.find((s) => s.id === selectedSubIpcId) || (subcontractorIpcs.length > 0 ? subcontractorIpcs[0] : null);
+  }, [subcontractorIpcs, selectedSubIpcId]);
 
   const retentionPercentByPackage = useMemo(() => {
     const map = new Map<string, number | null>();
@@ -652,9 +217,6 @@ export default function PaymentCertificatesView({ project }: PaymentCertificates
     [subIpcReconciliations],
   );
 
-  // Portfolio totals respect the chronology: only certificates that count as actual at the Data Date
-  // are certified. Drafts and pending claims are reported separately as forecast (GAP-021), so the
-  // former `max(grossAmountToDate)` over every row — including future-dated ones — is gone.
   const ipcSummary = useMemo(() => summarizeCertificates(ipcReconciliations, dataDate), [ipcReconciliations, dataDate]);
   const subIpcSummary = useMemo(
     () => summarizeCertificates(subIpcReconciliations, dataDate),
@@ -662,7 +224,6 @@ export default function PaymentCertificatesView({ project }: PaymentCertificates
   );
 
   const totalCertifiedGross = ipcSummary.certifiedGrossToDate;
-  /** Retention actually withheld on certificates that count as actual — summed, never a flat 5%. */
   const totalRetentionWithheld = ipcReconciliations
     .filter((rec) => rec.chronology.countsAsActual)
     .reduce((sum, rec) => sum + rec.deductions.retention, 0);
@@ -670,13 +231,11 @@ export default function PaymentCertificatesView({ project }: PaymentCertificates
     .filter((rec) => rec.chronology.countsAsActual)
     .reduce((sum, rec) => sum + rec.deductions.retention, 0);
 
-  /** A reconciliation with the optional contractual-retention fields of a subcontractor certificate. */
   type CertificateRec = CertificateReconciliation & {
     retentionMatchesContract?: boolean | null;
     contractRetentionPercent?: number | null;
   };
 
-  /** Badge: does the certificate header agree with its own itemised lines? (GAP-018) */
   const renderReconciliationBadge = (rec?: CertificateRec) => {
     if (!rec) return null;
     const tone =
@@ -700,7 +259,6 @@ export default function PaymentCertificatesView({ project }: PaymentCertificates
     return <span className={`px-1.5 py-0.5 rounded text-[9px] font-black border whitespace-nowrap ${tone}`}>{label}</span>;
   };
 
-  /** Badge: where the record sits against the governed Data Date (GAP-021). */
   const renderChronologyBadge = (rec?: CertificateRec) => {
     if (!rec) return null;
     const cls = rec.chronology.recordClass;
@@ -739,12 +297,8 @@ export default function PaymentCertificatesView({ project }: PaymentCertificates
     return <span className={`px-1.5 py-0.5 rounded text-[9px] font-black border whitespace-nowrap ${tone}`}>{label}</span>;
   };
 
-  /**
-   * The reconciliation panel (GAP-018): header against itemised lines for the current, cumulative,
-   * previous and net figures, plus the retention actually applied against the contractual percent.
-   * Every disagreement is listed — a mismatch is never hidden behind the header figure.
-   */
   const renderReconciliationPanel = (rec: CertificateRec | undefined, titleKey: 'ipc' | 'sub') => {
+    void titleKey;
     if (!rec) return null;
     const ar = lang === 'ar';
     const notItemized = ar ? 'لا توجد بنود' : 'No lines';
@@ -758,8 +312,6 @@ export default function PaymentCertificatesView({ project }: PaymentCertificates
       {
         label: ar ? 'الإجمالي التراكمي حتى تاريخه (Gross to Date)' : 'Cumulative gross to date',
         headerValue: rec.headerCumulative.toLocaleString(),
-        // A subcontractor certificate's lines carry current amounts only, so its cumulative side is
-        // declared not itemized instead of being compared against a sum the lines do not contain.
         linesValue: rec.cumulativeStatus === 'not_itemized' ? notItemized : rec.lineCumulativeSum.toLocaleString(),
         ok: rec.cumulativeStatus === 'not_itemized' ? null : rec.cumulativeStatus === 'balanced',
       },
@@ -767,136 +319,266 @@ export default function PaymentCertificatesView({ project }: PaymentCertificates
         label: ar ? 'المعتمد في المستخلص السابق (Previous)' : 'Previously certified',
         headerValue: rec.headerPrevious === null ? '—' : rec.headerPrevious.toLocaleString(),
         linesValue: rec.derivedPrevious === null ? notItemized : rec.derivedPrevious.toLocaleString(),
-        ok: rec.previousStatus === 'not_itemized' ? null : rec.previousStatus === 'balanced',
+        ok: rec.derivedPrevious === null ? null : rec.previousStatus === 'balanced',
       },
       {
-        label: ar ? 'صافي المستحق بعد الاستقطاعات (Net)' : 'Net payable after deductions',
+        label: ar ? 'صافي المبلغ المستحق (Net Payable)' : 'Net payable',
         headerValue: rec.netHeader === null ? '—' : rec.netHeader.toLocaleString(),
-        linesValue: rec.netDerived === null ? '—' : rec.netDerived.toLocaleString(),
-        ok: rec.netHeader !== null && rec.netDerived !== null ? rec.netStatus === 'balanced' : null,
-      },
-      {
-        label:
-          titleKey === 'sub'
-            ? ar
-              ? 'نسبة الضمان المطبقة مقابل النسبة التعاقدية للباقة'
-              : 'Applied retention vs the package contractual percent'
-            : ar
-              ? 'نسبة الضمان المطبقة على الإجمالي'
-              : 'Applied retention on gross',
-        headerValue: rec.appliedRetentionPercent === null ? (ar ? 'غير محددة' : 'Unknown') : `${rec.appliedRetentionPercent}%`,
-        linesValue:
-          rec.contractRetentionPercent === null || rec.contractRetentionPercent === undefined
-            ? ar
-              ? 'غير منصوص عليها (N/A)'
-              : 'Not stated (N/A)'
-            : `${rec.contractRetentionPercent}%`,
-        ok: rec.retentionMatchesContract === undefined ? null : rec.retentionMatchesContract,
+        linesValue: rec.netDerived === null ? notItemized : rec.netDerived.toLocaleString(),
+        ok: rec.netDerived === null ? null : rec.netStatus === 'balanced',
       },
     ];
-    const mismatches = ar ? rec.mismatchesAr : rec.mismatchesEn;
 
     return (
-      <div
-        className={`rounded-xl border p-4 space-y-3 ${
-          rec.status === 'mismatch' ? 'border-rose-300 bg-rose-50/50' : 'border-slate-200 bg-slate-50/70'
-        }`}
-      >
-        <div className="flex flex-wrap items-center justify-between gap-2">
+      <div className="bg-slate-50 rounded-xl p-4 border border-slate-200 space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 pb-2">
           <div className="flex items-center gap-2">
-            <AlertCircle
-              size={16}
-              className={rec.status === 'mismatch' ? 'text-rose-600' : rec.status === 'balanced' ? 'text-emerald-600' : 'text-slate-400'}
-            />
-            <span className="text-xs font-black text-slate-900">
-              {ar ? 'مطابقة الترويسة مع البنود التفصيلية (Reconciliation)' : 'Header vs itemised lines (Reconciliation)'}
+            <span className="text-xs font-bold text-slate-800">
+              {ar ? 'مطابقة الترويسة مع البنود وتاريخ البيانات' : 'Header vs Lines & Data Date Reconciliation'}
             </span>
-          </div>
-          <div className="flex items-center gap-1.5">
             {renderReconciliationBadge(rec)}
             {renderChronologyBadge(rec)}
           </div>
-        </div>
-
-        <div className="overflow-x-auto">
-          <table className="w-full text-[11px]">
-            <thead className="bg-white/70 text-slate-600 border-b border-slate-200">
-              <tr>
-                <th className="p-2 text-right font-bold">{ar ? 'البند المالي' : 'Financial line'}</th>
-                <th className="p-2 text-center font-bold">{ar ? 'قيمة الترويسة' : 'Header value'}</th>
-                <th className="p-2 text-center font-bold">{ar ? 'مجموع البنود' : 'Sum of lines'}</th>
-                <th className="p-2 text-center font-bold">{ar ? 'الحالة' : 'Status'}</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-200/70 font-mono">
-              {rows.map((row) => (
-                <tr key={row.label}>
-                  <td className="p-2 text-right font-sans font-semibold text-slate-700">{row.label}</td>
-                  <td className="p-2 text-center font-bold text-slate-900">{row.headerValue}</td>
-                  <td className="p-2 text-center font-bold text-slate-700">{row.linesValue}</td>
-                  <td className="p-2 text-center font-sans font-black">
-                    {row.ok === null ? (
-                      <span className="text-slate-400">{ar ? 'لا يمكن المطابقة' : 'Not reconcilable'}</span>
-                    ) : row.ok ? (
-                      <span className="text-emerald-700">{ar ? 'متطابق' : 'Balanced'}</span>
-                    ) : (
-                      <span className="text-rose-700">{ar ? 'فرق' : 'Mismatch'}</span>
-                    )}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-
-        <div className="text-[11px] text-slate-600 space-y-1">
-          <div>
-            {ar ? 'القيمة المدعومة بالبنود (المعتمدة للعرض): ' : 'Value supported by the lines (presented): '}
-            <span className="font-mono font-bold text-slate-900">
-              {rec.reconciledCurrent.toLocaleString()} SAR ({ar ? 'الفترة' : 'current'}) ·{' '}
-              {rec.reconciledCumulative.toLocaleString()} SAR ({ar ? 'تراكمي' : 'cumulative'})
+          {rec.appliedRetentionPercent !== null && (
+            <span className="text-[10px] font-bold text-slate-600 bg-white px-2 py-0.5 rounded border border-slate-200">
+              {ar ? `نسبة الضمان المطبقة: ${rec.appliedRetentionPercent}%` : `Applied retention: ${rec.appliedRetentionPercent}%`}
             </span>
-          </div>
-          <div>
-            {ar ? 'تاريخ البيانات الحاكم: ' : 'Governing Data Date: '}
-            <span className="font-mono font-bold text-slate-900">{rec.chronology.dataDate}</span>
-            {rec.additions.total > 0 && (
-              <>
-                {' · '}
-                {ar ? 'الإضافات المحتسبة في الصافي (ضريبة القيمة المضافة): ' : 'Additions included in the net (VAT): '}
-                <span className="font-mono font-bold text-slate-900">{rec.additions.total.toLocaleString()} SAR</span>
-              </>
-            )}
-          </div>
-          <div>
-            {ar ? 'مجموع المستقطعات المحتسبة: ' : 'Total deductions applied: '}
-            <span className="font-mono font-bold text-slate-900">{rec.deductions.total.toLocaleString()} SAR</span>
-          </div>
+          )}
         </div>
 
-        {mismatches.length > 0 && (
-          <div className="rounded-lg border border-rose-300 bg-white p-2.5 space-y-1">
-            <span className="text-[11px] font-black text-rose-800 block">
-              {ar ? 'الفروقات المرصودة (لا يتم إخفاؤها):' : 'Detected differences (never hidden):'}
-            </span>
-            <ul className="list-disc pr-5 text-[11px] text-rose-800 space-y-0.5">
-              {mismatches.map((m, i) => (
-                <li key={i}>{m}</li>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+          {rows.map((row, idx) => (
+            <div key={idx} className="bg-white p-2.5 rounded-lg border border-slate-200 flex justify-between items-center">
+              <div>
+                <span className="text-slate-600 block text-[11px]">{row.label}</span>
+                <span className="font-mono font-bold text-slate-900">{row.headerValue} SAR</span>
+                <span className="text-[10px] text-slate-400 block font-mono">
+                  {ar ? 'مجموع البنود: ' : 'Lines: '}
+                  {row.linesValue} {row.linesValue !== notItemized && 'SAR'}
+                </span>
+              </div>
+              {row.ok !== null && (
+                <span
+                  className={`text-[10px] px-2 py-0.5 rounded font-black border ${
+                    row.ok ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-rose-50 text-rose-700 border-rose-200'
+                  }`}
+                >
+                  {row.ok ? (ar ? 'مطابق' : 'Balanced') : (ar ? 'غير مطابق' : 'Mismatch')}
+                </span>
+              )}
+            </div>
+          ))}
+        </div>
+
+        {rec.mismatchesAr.length > 0 && (
+          <div className="bg-rose-50 border border-rose-200 p-2.5 rounded-lg text-[11px] space-y-1">
+            <span className="font-bold text-rose-800 block">{ar ? 'ملاحظات المطابقة:' : 'Reconciliation notes:'}</span>
+            <ul className="list-disc list-inside text-rose-700 space-y-0.5">
+              {(ar ? rec.mismatchesAr : rec.mismatchesEn).map((note, i) => (
+                <li key={i}>{note}</li>
               ))}
             </ul>
-          </div>
-        )}
-
-        {!rec.chronology.countsAsActual && rec.chronology.noteAr && (
-          <div className="rounded-lg border border-amber-300 bg-amber-50 p-2.5 text-[11px] font-semibold text-amber-900">
-            {ar ? rec.chronology.noteAr : rec.chronology.noteEn}
           </div>
         )}
       </div>
     );
   };
 
-  // Contract value is shown as recorded, without adding VO exposure or claiming an approved revision.
+  // Actions: Save new IPC
+  const handleSaveIpc = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!project?.id) return;
+    setSaveError(null);
+    setSaveSuccess(null);
+
+    const trimmedNum = newIpcNumber.trim();
+    if (!trimmedNum) {
+      setSaveError(lang === 'ar' ? 'رقم المستخلص مطلوب' : 'IPC number is required');
+      return;
+    }
+    if (!newCertDate || !newPeriodStart || !newPeriodEnd) {
+      setSaveError(lang === 'ar' ? 'جميع التواريخ مطلوبة' : 'All dates are required');
+      return;
+    }
+
+    const isApprovedOrPaid = newIpcStatus === 'paid' || newIpcStatus === 'certified_by_consultant' || newIpcStatus === 'approved_by_client';
+    if (isApprovedOrPaid && newCertDate > dataDate) {
+      setSaveError(
+        lang === 'ar'
+          ? `لا يمكن حفظ مستخلص بحالة معتمدة (${newIpcStatus}) وتاريخ (${newCertDate}) بعد تاريخ البيانات (${dataDate})`
+          : `Approved certificate dated ${newCertDate} violates Data Date ${dataDate}`,
+      );
+      return;
+    }
+
+    const grossToDate = Number(newPreviousGross || 0) + Number(newCurrentGross || 0);
+    const netPayable =
+      Number(newCurrentGross || 0) -
+      Number(newAdvanceDeduction || 0) -
+      Number(newRetentionDeduction || 0) -
+      Number(newPenaltyDeduction || 0) +
+      Number(newVatAmount || 0);
+
+    const newRecord: PaymentCertificate = {
+      id: `IPC-${Date.now().toString(36).toUpperCase()}`,
+      project_id: project.id,
+      ipcNumber: trimmedNum,
+      certificateDate: newCertDate,
+      periodStart: newPeriodStart,
+      periodEnd: newPeriodEnd,
+      status: newIpcStatus,
+      currentGrossAmount: Number(newCurrentGross || 0),
+      previousGrossAmount: Number(newPreviousGross || 0),
+      grossAmountToDate: grossToDate,
+      advancePaymentDeduction: Number(newAdvanceDeduction || 0),
+      retentionMoneyDeduction: Number(newRetentionDeduction || 0),
+      penaltyDeduction: Number(newPenaltyDeduction || 0),
+      vatAmount: Number(newVatAmount || 0),
+      netPayableAmount: netPayable,
+      items: newIpcItems,
+    };
+
+    const res = await supabase.from('payment_certificates').insert(newRecord);
+    if (res.error) {
+      setSaveError(res.error.message || 'Failed to save certificate');
+      return;
+    }
+
+    setCertificates((prev) => [...prev, newRecord]);
+    setSelectedIpcId(newRecord.id);
+    setShowAddIpcModal(false);
+    setSaveSuccess(lang === 'ar' ? 'تم حفظ المستخلص بنجاح' : 'Payment certificate saved successfully');
+
+    // Reset form
+    setNewIpcNumber('');
+    setNewCertDate('');
+    setNewPeriodStart('');
+    setNewPeriodEnd('');
+    setNewCurrentGross(0);
+    setNewPreviousGross(0);
+    setNewAdvanceDeduction(0);
+    setNewRetentionDeduction(0);
+    setNewPenaltyDeduction(0);
+    setNewVatAmount(0);
+    setNewIpcItems([]);
+  };
+
+  // Actions: Save new Subcontractor IPC
+  const handleSaveSubIpc = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!project?.id) return;
+    setSaveError(null);
+    setSaveSuccess(null);
+
+    const trimmedNum = newSubIpcNumber.trim();
+    if (!trimmedNum || !newSubName.trim() || !newSubTrade.trim()) {
+      setSaveError(lang === 'ar' ? 'رقم المستخلص واسم المقاول والمهنة حقول مطلوبة' : 'IPC number, subcontractor name and trade are required');
+      return;
+    }
+    if (!newSubCertDate || !newSubPeriodStart || !newSubPeriodEnd) {
+      setSaveError(lang === 'ar' ? 'جميع التواريخ مطلوبة' : 'All dates are required');
+      return;
+    }
+
+    const isApprovedOrPaid = newSubStatus === 'paid' || newSubStatus === 'approved';
+    if (isApprovedOrPaid && newSubCertDate > dataDate) {
+      setSaveError(
+        lang === 'ar'
+          ? `لا يمكن حفظ مستخلص باطن بحالة معتمدة (${newSubStatus}) وتاريخ (${newSubCertDate}) بعد تاريخ البيانات (${dataDate})`
+          : `Approved subcontractor certificate dated ${newSubCertDate} violates Data Date ${dataDate}`,
+      );
+      return;
+    }
+
+    const netPayable = Number(newSubCurrentGross || 0) - Number(newSubRetention || 0) - Number(newSubMaterialDeductions || 0);
+    const profitMargin = Number(newSubMainRevenue || 0) - Number(newSubCurrentGross || 0);
+    const marginPercent = newSubMainRevenue > 0 ? Number(((profitMargin / newSubMainRevenue) * 100).toFixed(1)) : 0;
+
+    const newRecord: SubcontractorIpc = {
+      id: `SUB-IPC-${Date.now().toString(36).toUpperCase()}`,
+      project_id: project.id,
+      ipcNumber: trimmedNum,
+      subcontractorName: newSubName.trim(),
+      trade: newSubTrade.trim(),
+      subcontractPackageCode: newSubPkgCode.trim() || null,
+      certificateDate: newSubCertDate,
+      periodStart: newSubPeriodStart,
+      periodEnd: newSubPeriodEnd,
+      status: newSubStatus,
+      currentGrossAmount: Number(newSubCurrentGross || 0),
+      grossAmountToDate: Number(newSubGrossToDate || newSubCurrentGross || 0),
+      retentionDeduction: Number(newSubRetention || 0),
+      materialDeductions: Number(newSubMaterialDeductions || 0),
+      netPayableToSubcontractor: netPayable,
+      mainContractorRevenueForSameQty: Number(newSubMainRevenue || 0),
+      mainContractorProfitMarginSar: profitMargin,
+      mainContractorMarginPercent: marginPercent,
+      items: newSubItems,
+    };
+
+    const res = await supabase.from('subcontractor_payment_certificates').insert(newRecord);
+    if (res.error) {
+      setSaveError(res.error.message || 'Failed to save subcontractor certificate');
+      return;
+    }
+
+    setSubcontractorIpcs((prev) => [...prev, newRecord]);
+    setSelectedSubIpcId(newRecord.id);
+    setShowAddSubIpcModal(false);
+    setSaveSuccess(lang === 'ar' ? 'تم حفظ مستخلص مقاول الباطن بنجاح' : 'Subcontractor certificate saved successfully');
+
+    // Reset form
+    setNewSubIpcNumber('');
+    setNewSubName('');
+    setNewSubTrade('');
+    setNewSubPkgCode('');
+    setNewSubCertDate('');
+    setNewSubPeriodStart('');
+    setNewSubPeriodEnd('');
+    setNewSubCurrentGross(0);
+    setNewSubGrossToDate(0);
+    setNewSubRetention(0);
+    setNewSubMaterialDeductions(0);
+    setNewSubMainRevenue(0);
+    setNewSubItems([]);
+  };
+
+  // Actions: Delete main IPC
+  const handleDeleteIpc = async (id: string) => {
+    if (!project?.id) return;
+    setSaveError(null);
+    setSaveSuccess(null);
+    if (!window.confirm(lang === 'ar' ? 'هل أنت متأكد من رغبتك بحذف هذا المستخلص؟' : 'Are you sure you want to delete this certificate?')) return;
+
+    const res = await supabase.from('payment_certificates').delete().eq('id', id);
+    if (res.error) {
+      setSaveError(res.error.message || 'Failed to delete certificate');
+      return;
+    }
+
+    setCertificates((prev) => prev.filter((c) => c.id !== id));
+    setSelectedIpcId((prev) => (prev === id ? null : prev));
+    setSaveSuccess(lang === 'ar' ? 'تم حذف المستخلص بنجاح' : 'Certificate deleted successfully');
+  };
+
+  // Actions: Delete Subcontractor IPC
+  const handleDeleteSubIpc = async (id: string) => {
+    if (!project?.id) return;
+    setSaveError(null);
+    setSaveSuccess(null);
+    if (!window.confirm(lang === 'ar' ? 'هل أنت متأكد من رغبتك بحذف هذا المستخلص؟' : 'Are you sure you want to delete this certificate?')) return;
+
+    const res = await supabase.from('subcontractor_payment_certificates').delete().eq('id', id);
+    if (res.error) {
+      setSaveError(res.error.message || 'Failed to delete certificate');
+      return;
+    }
+
+    setSubcontractorIpcs((prev) => prev.filter((s) => s.id !== id));
+    setSelectedSubIpcId((prev) => (prev === id ? null : prev));
+    setSaveSuccess(lang === 'ar' ? 'تم حذف مستخلص الباطن بنجاح' : 'Subcontractor certificate deleted successfully');
+  };
+
   const contractBaseline = resolveContractBaseline({ project });
   const contractValueLabel = contractBaseline.isAvailable
     ? `${contractBaseline.value.toLocaleString()} SAR`
@@ -964,6 +646,30 @@ export default function PaymentCertificatesView({ project }: PaymentCertificates
         </div>
       </div>
 
+      {/* Notifications */}
+      {loadError && (
+        <div className="p-3 rounded-xl border border-rose-300 bg-rose-50 text-xs font-bold text-rose-800 flex items-center justify-between">
+          <span>{loadError}</span>
+          <button onClick={() => setLoadError(null)} className="text-rose-600 hover:text-rose-800"><X size={16} /></button>
+        </div>
+      )}
+      {saveError && (
+        <div className="p-3 rounded-xl border border-rose-300 bg-rose-50 text-xs font-bold text-rose-800 flex items-center justify-between">
+          <span>{saveError}</span>
+          <button onClick={() => setSaveError(null)} className="text-rose-600 hover:text-rose-800"><X size={16} /></button>
+        </div>
+      )}
+      {saveSuccess && (
+        <div className="p-3 rounded-xl border border-emerald-300 bg-emerald-50 text-xs font-bold text-emerald-800 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <CheckCircle2 size={16} className="text-emerald-600" />
+            <span>{saveSuccess}</span>
+          </div>
+          <button onClick={() => setSaveSuccess(null)} className="text-emerald-600 hover:text-emerald-800"><X size={16} /></button>
+        </div>
+      )}
+
+      {/* Metrics Row */}
       {activeTab !== 'vos' && (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
           <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
@@ -992,7 +698,8 @@ export default function PaymentCertificatesView({ project }: PaymentCertificates
         </div>
       )}
 
-      {activeTab !== 'vos' && (ipcSummary.mismatchedCount > 0 || ipcSummary.contradictionsCount > 0 || subIpcSummary.mismatchedCount > 0 || subIpcSummary.contradictionsCount > 0) && (
+      {/* Alerts for non-empty discrepancies */}
+      {activeTab !== 'vos' && (certificates.length > 0 || subcontractorIpcs.length > 0) && (ipcSummary.mismatchedCount > 0 || ipcSummary.contradictionsCount > 0 || subIpcSummary.mismatchedCount > 0 || subIpcSummary.contradictionsCount > 0) && (
         <div className="p-3 rounded-xl border border-rose-300 bg-rose-50 text-[11px] font-bold text-rose-900 flex flex-wrap items-center gap-3">
           <span className="flex items-center gap-1.5">
             <AlertCircle size={14} className="text-rose-600" />
@@ -1022,165 +729,221 @@ export default function PaymentCertificatesView({ project }: PaymentCertificates
         </div>
       )}
 
-      {/* TAB 1: Interim Payment Certificates */}
+      {/* TAB 1: Main Contractor Payment Certificates */}
       {activeTab === 'ipcs' && (
         <div className="space-y-4">
-          {/* IPC Selector Strip */}
-          <div className="flex items-center gap-2 overflow-x-auto pb-1">
-            {certificates.map((cert) => (
-              <button
-                key={cert.id}
-                onClick={() => setSelectedIpcId(cert.id)}
-                className={`flex-shrink-0 px-4 py-2 rounded-xl text-xs font-bold border transition-all cursor-pointer ${
-                  selectedIpcId === cert.id
-                    ? 'bg-slate-900 text-amber-400 border-slate-900 shadow-sm'
-                    : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
-                }`}
-              >
-                <div className="flex items-center gap-2">
-                  <span className="font-mono">{cert.ipcNumber}</span>
-                  <span className="text-[10px] text-slate-400">({cert.certificateDate})</span>
-                  {renderReconciliationBadge(ipcReconciliationById.get(cert.id))}
-                  {renderChronologyBadge(ipcReconciliationById.get(cert.id))}
-                </div>
-              </button>
-            ))}
-          </div>
-
-          {/* Certificate Official Dossier View */}
-          {selectedIpc && (
-            <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden p-6 space-y-6">
-              {/* Certificate Top Header */}
-              <div className="flex flex-wrap items-center justify-between gap-4 border-b pb-4">
-                <div>
-                  <span className="text-[11px] font-mono font-bold text-amber-800 bg-amber-50 px-2.5 py-1 rounded-md border border-amber-200">
-                    INTERIM PAYMENT CERTIFICATE NO. {selectedIpc.ipcNumber}
-                  </span>
-                  <h2 className="text-base font-black text-slate-900 mt-2">
-                    {lang === 'ar' ? `شهادة الدفع والمستخلص الجاري رقم [${selectedIpc.ipcNumber}]` : `Interim Payment Certificate [${selectedIpc.ipcNumber}]`}
-                  </h2>
-                  <p className="text-xs text-slate-500 mt-0.5">
-                    {lang === 'ar' ? `الفترة من ${selectedIpc.periodStart} إلى ${selectedIpc.periodEnd}` : `Period from ${selectedIpc.periodStart} to ${selectedIpc.periodEnd}`}
-                  </p>
-                </div>
-
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={() => window.print()}
-                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-300 text-xs font-bold text-slate-700 hover:bg-slate-50 cursor-pointer"
-                  >
-                    <Printer size={14} />
-                    <span>{lang === 'ar' ? 'طباعة المستخلص' : 'Print IPC'}</span>
-                  </button>
-                  <span
-                    className={`px-3 py-1 rounded-full text-xs font-bold ${
-                      selectedIpc.status === 'paid'
-                        ? 'bg-emerald-100 text-emerald-800'
-                        : selectedIpc.status === 'certified_by_consultant'
-                        ? 'bg-blue-100 text-blue-800'
-                        : 'bg-amber-100 text-amber-800'
-                    }`}
-                  >
-                    {selectedIpc.status === 'paid' ? 'تم الصرف (Paid)' : selectedIpc.status === 'certified_by_consultant' ? 'معتمد من الاستشاري' : 'مقدم للمراجعة'}
-                  </span>
-                </div>
+          {loading ? (
+            <div className="bg-white rounded-xl border border-slate-200 p-8 text-center text-xs font-bold text-slate-500">
+              {lang === 'ar' ? 'جاري تحميل المستخلصات...' : 'Loading certificates...'}
+            </div>
+          ) : certificates.length === 0 ? (
+            /* Honest empty state for projects without certificates */
+            <div className="bg-white rounded-xl border border-slate-200 p-8 text-center space-y-4 shadow-sm">
+              <div className="w-12 h-12 rounded-full bg-slate-100 flex items-center justify-center mx-auto text-slate-400">
+                <Receipt size={24} />
               </div>
-
-              {/* Financial Calculation Summary Table */}
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-6 text-xs">
-                {/* Gross Amount Breakdown */}
-                <div className="bg-slate-50 p-4 rounded-xl border border-slate-200 space-y-2.5">
-                  <h4 className="font-bold text-slate-900 border-b pb-1.5">{lang === 'ar' ? '1. احتساب قيمة الأعمال المنجزة (Gross Value)' : '1. Gross Work Value'}</h4>
-                  <div className="flex justify-between">
-                    <span className="text-slate-600">{lang === 'ar' ? 'إجمالي الأعمال التراكمية حتى تاريخه:' : 'Cumulative Work to Date:'}</span>
-                    <span className="font-mono font-bold text-slate-800">{selectedIpc.grossAmountToDate.toLocaleString()} SAR</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-slate-600">{lang === 'ar' ? 'يخصم إجمالي المستخلص السابق:' : 'Less Previous Cumulative Gross:'}</span>
-                    <span className="font-mono font-bold text-slate-600">({selectedIpc.previousGrossAmount.toLocaleString()}) SAR</span>
-                  </div>
-                  <div className="flex justify-between border-t pt-1.5 font-bold text-blue-800">
-                    <span>{lang === 'ar' ? 'صافي الأعمال المنجزة خلال هذا الشهر:' : 'Current Period Work Value:'}</span>
-                    <span className="font-mono">{selectedIpc.currentGrossAmount.toLocaleString()} SAR</span>
-                  </div>
-                </div>
-
-                {/* Deductions Breakdown */}
-                <div className="bg-slate-50 p-4 rounded-xl border border-slate-200 space-y-2.5">
-                  <h4 className="font-bold text-slate-900 border-b pb-1.5">{lang === 'ar' ? '2. الاستقطاعات والضريبة (Deductions & VAT)' : '2. Deductions & VAT'}</h4>
-                  <div className="flex justify-between text-rose-700">
-                    <span>{lang === 'ar' ? 'استقطاع الدفعة المقدمة (10%):' : 'Advance Payment Recovery (10%):'}</span>
-                    <span className="font-mono font-bold">- {selectedIpc.advancePaymentDeduction.toLocaleString()} SAR</span>
-                  </div>
-                  <div className="flex justify-between text-amber-700">
-                    {/* The percent shown is the one this certificate actually applied, not a fixed rate. */}
-                    <span>
-                      {lang === 'ar' ? 'محتجز ضمان الأعمال' : 'Retention Money'} (
-                      {ipcReconciliationById.get(selectedIpc.id)?.appliedRetentionPercent ??
-                        (lang === 'ar' ? 'غير محدد' : 'unknown')}
-                      %):
-                    </span>
-                    <span className="font-mono font-bold">- {selectedIpc.retentionMoneyDeduction.toLocaleString()} SAR</span>
-                  </div>
-                  <div className="flex justify-between text-slate-600">
-                    <span>{lang === 'ar' ? 'ضريبة القيمة المضافة (15% VAT):' : 'VAT (15%):'}</span>
-                    <span className="font-mono font-bold">+ {selectedIpc.vatAmount.toLocaleString()} SAR</span>
-                  </div>
-                  <div className="flex justify-between border-t pt-1.5 font-black text-emerald-800 text-sm">
-                    <span>{lang === 'ar' ? 'المبلغ الصافي المستحق للصرف:' : 'Net Payable Amount:'}</span>
-                    <span className="font-mono">{selectedIpc.netPayableAmount.toLocaleString()} SAR</span>
-                  </div>
-                </div>
+              <div className="max-w-md mx-auto space-y-1">
+                <h3 className="text-base font-bold text-slate-900">
+                  {lang === 'ar' ? 'لا توجد مستخلصات مسجلة للمقاول الرئيسي' : 'No Main Contractor IPCs Recorded'}
+                </h3>
+                <p className="text-xs text-slate-500">
+                  {lang === 'ar'
+                    ? 'هذا المشروع لا يحتوي على مستخلصات معتمدة أو مبالغ مصروفة مسجلة. أضف أول مستخلص أدناه.'
+                    : 'This project has no certified amounts or payments recorded. Add the first certificate to begin.'}
+                </p>
               </div>
-
-              {/* Header vs lines reconciliation (GAP-018) and Data Date chronology (GAP-021) */}
-              {renderReconciliationPanel(ipcReconciliationById.get(selectedIpc.id), 'ipc')}
-
-              {/* Items Detail Table */}
-              {selectedIpc.items.length > 0 && (
-                <div className="border rounded-xl overflow-hidden">
-                  <div className="p-3 bg-slate-100 font-bold text-xs text-slate-700">
-                    {lang === 'ar' ? 'تفصيل كميات بنود الأعمال المعتمدة بالمستخلص' : 'IPC Itemized Bill of Quantities Progress'}
-                  </div>
-                  <table className="w-full text-xs">
-                    <thead className="bg-slate-50 text-slate-700 border-b font-bold">
-                      <tr>
-                        <th className="p-2.5 text-right">{lang === 'ar' ? 'البند' : 'Item'}</th>
-                        <th className="p-2.5 text-right">{lang === 'ar' ? 'بيان الأعمال' : 'Description'}</th>
-                        <th className="p-2.5 text-center">{lang === 'ar' ? 'الوحدة' : 'Unit'}</th>
-                        <th className="p-2.5 text-center">{lang === 'ar' ? 'الكمية السابقة' : 'Prev Qty'}</th>
-                        <th className="p-2.5 text-center">{lang === 'ar' ? 'الكمية الحالية' : 'Curr Qty'}</th>
-                        <th className="p-2.5 text-center">{lang === 'ar' ? 'الكمية التراكمية' : 'Cumul Qty'}</th>
-                        <th className="p-2.5 text-right">{lang === 'ar' ? 'القيمة الحالية' : 'Current Value'}</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-100">
-                      {selectedIpc.items.map((item) => (
-                        <tr key={item.id} className="hover:bg-slate-50">
-                          <td className="p-2.5 font-mono font-bold text-slate-700">{item.boqCode}</td>
-                          <td className="p-2.5 font-medium text-slate-800 max-w-xs">{item.description}</td>
-                          <td className="p-2.5 text-center text-slate-500 font-mono">{item.unit}</td>
-                          <td className="p-2.5 text-center font-mono text-slate-500">{item.previousQuantity}</td>
-                          <td className="p-2.5 text-center font-mono font-bold text-blue-700">{item.currentQuantity}</td>
-                          <td className="p-2.5 text-center font-mono font-bold text-slate-800">{item.cumulativeQuantity}</td>
-                          <td className="p-2.5 text-right font-mono font-black text-emerald-700">
-                            {item.currentAmountSar.toLocaleString()} SAR
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
+              {project && (
+                <button
+                  onClick={() => setShowAddIpcModal(true)}
+                  className="inline-flex items-center gap-1.5 px-4 py-2 bg-slate-900 text-amber-400 text-xs font-bold rounded-xl hover:bg-slate-800 transition-colors shadow-sm cursor-pointer"
+                >
+                  <Plus size={14} />
+                  <span>{lang === 'ar' ? 'إضافة مستخلص جديد' : 'New Payment Certificate'}</span>
+                </button>
               )}
             </div>
+          ) : (
+            <>
+              {/* IPC Selector Strip */}
+              <div className="flex items-center justify-between gap-2 overflow-x-auto pb-1">
+                <div className="flex items-center gap-2">
+                  {certificates.map((cert) => (
+                    <button
+                      key={cert.id}
+                      onClick={() => setSelectedIpcId(cert.id)}
+                      className={`flex-shrink-0 px-4 py-2 rounded-xl text-xs font-bold border transition-all cursor-pointer ${
+                        selectedIpcId === cert.id
+                          ? 'bg-slate-900 text-amber-400 border-slate-900 shadow-sm'
+                          : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2">
+                        <span className="font-mono">{cert.ipcNumber}</span>
+                        <span className="text-[10px] text-slate-400">({cert.certificateDate})</span>
+                        {renderReconciliationBadge(ipcReconciliationById.get(cert.id))}
+                        {renderChronologyBadge(ipcReconciliationById.get(cert.id))}
+                      </div>
+                    </button>
+                  ))}
+                </div>
+                {project && (
+                  <button
+                    onClick={() => setShowAddIpcModal(true)}
+                    className="flex-shrink-0 flex items-center gap-1.5 px-3 py-2 bg-slate-900 text-amber-400 text-xs font-bold rounded-xl hover:bg-slate-800 transition-colors shadow-sm cursor-pointer"
+                  >
+                    <Plus size={14} />
+                    <span>{lang === 'ar' ? 'مستخلص جديد' : 'New IPC'}</span>
+                  </button>
+                )}
+              </div>
+
+              {/* Selected Certificate Dossier View */}
+              {selectedIpc && (
+                <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden p-6 space-y-6">
+                  {/* Top Header */}
+                  <div className="flex flex-wrap items-center justify-between gap-4 border-b pb-4">
+                    <div>
+                      <span className="text-[11px] font-mono font-bold text-amber-800 bg-amber-50 px-2.5 py-1 rounded-md border border-amber-200">
+                        INTERIM PAYMENT CERTIFICATE NO. {selectedIpc.ipcNumber}
+                      </span>
+                      <h2 className="text-base font-black text-slate-900 mt-2">
+                        {lang === 'ar' ? `شهادة الدفع والمستخلص الجاري رقم [${selectedIpc.ipcNumber}]` : `Interim Payment Certificate [${selectedIpc.ipcNumber}]`}
+                      </h2>
+                      <p className="text-xs text-slate-500 mt-0.5">
+                        {lang === 'ar' ? `الفترة من ${selectedIpc.periodStart} إلى ${selectedIpc.periodEnd}` : `Period from ${selectedIpc.periodStart} to ${selectedIpc.periodEnd}`}
+                      </p>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => window.print()}
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-300 text-xs font-bold text-slate-700 hover:bg-slate-50 cursor-pointer"
+                      >
+                        <Printer size={14} />
+                        <span>{lang === 'ar' ? 'طباعة المستخلص' : 'Print IPC'}</span>
+                      </button>
+                      <button
+                        onClick={() => handleDeleteIpc(selectedIpc.id)}
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-rose-300 text-xs font-bold text-rose-700 hover:bg-rose-50 cursor-pointer"
+                      >
+                        <Trash2 size={14} />
+                        <span>{lang === 'ar' ? 'حذف' : 'Delete'}</span>
+                      </button>
+                      <span
+                        className={`px-3 py-1 rounded-full text-xs font-bold ${
+                          selectedIpc.status === 'paid'
+                            ? 'bg-emerald-100 text-emerald-800'
+                            : selectedIpc.status === 'certified_by_consultant'
+                            ? 'bg-blue-100 text-blue-800'
+                            : selectedIpc.status === 'approved_by_client'
+                            ? 'bg-indigo-100 text-indigo-800'
+                            : 'bg-amber-100 text-amber-800'
+                        }`}
+                      >
+                        {selectedIpc.status === 'paid'
+                          ? 'تم الصرف (Paid)'
+                          : selectedIpc.status === 'certified_by_consultant'
+                          ? 'معتمد من الاستشاري'
+                          : selectedIpc.status === 'approved_by_client'
+                          ? 'معتمد من العميل'
+                          : 'مقدم للمراجعة'}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Financial Summary */}
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6 text-xs">
+                    <div className="bg-slate-50 p-4 rounded-xl border border-slate-200 space-y-2.5">
+                      <h4 className="font-bold text-slate-900 border-b pb-1.5">{lang === 'ar' ? '1. احتساب قيمة الأعمال المنجزة (Gross Value)' : '1. Gross Work Value'}</h4>
+                      <div className="flex justify-between">
+                        <span className="text-slate-600">{lang === 'ar' ? 'إجمالي الأعمال التراكمية حتى تاريخه:' : 'Cumulative Work to Date:'}</span>
+                        <span className="font-mono font-bold text-slate-800">{selectedIpc.grossAmountToDate.toLocaleString()} SAR</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-slate-600">{lang === 'ar' ? 'يخصم إجمالي المستخلص السابق:' : 'Less Previous Cumulative Gross:'}</span>
+                        <span className="font-mono font-bold text-slate-600">({selectedIpc.previousGrossAmount.toLocaleString()}) SAR</span>
+                      </div>
+                      <div className="flex justify-between border-t pt-1.5 font-bold text-blue-800">
+                        <span>{lang === 'ar' ? 'صافي الأعمال المنجزة خلال هذا الشهر:' : 'Current Period Work Value:'}</span>
+                        <span className="font-mono">{selectedIpc.currentGrossAmount.toLocaleString()} SAR</span>
+                      </div>
+                    </div>
+
+                    <div className="bg-slate-50 p-4 rounded-xl border border-slate-200 space-y-2.5">
+                      <h4 className="font-bold text-slate-900 border-b pb-1.5">{lang === 'ar' ? '2. الاستقطاعات والضريبة (Deductions & VAT)' : '2. Deductions & VAT'}</h4>
+                      <div className="flex justify-between text-rose-700">
+                        <span>{lang === 'ar' ? 'استقطاع الدفعة المقدمة (10%):' : 'Advance Payment Recovery (10%):'}</span>
+                        <span className="font-mono font-bold">- {selectedIpc.advancePaymentDeduction.toLocaleString()} SAR</span>
+                      </div>
+                      <div className="flex justify-between text-amber-700">
+                        <span>
+                          {lang === 'ar' ? 'محتجز ضمان الأعمال' : 'Retention Money'} (
+                          {ipcReconciliationById.get(selectedIpc.id)?.appliedRetentionPercent ?? (lang === 'ar' ? 'غير محدد' : 'unknown')}
+                          %):
+                        </span>
+                        <span className="font-mono font-bold">- {selectedIpc.retentionMoneyDeduction.toLocaleString()} SAR</span>
+                      </div>
+                      <div className="flex justify-between text-slate-600">
+                        <span>{lang === 'ar' ? 'ضريبة القيمة المضافة (15% VAT):' : 'VAT (15%):'}</span>
+                        <span className="font-mono font-bold">+ {selectedIpc.vatAmount.toLocaleString()} SAR</span>
+                      </div>
+                      <div className="flex justify-between border-t pt-1.5 font-black text-emerald-800 text-sm">
+                        <span>{lang === 'ar' ? 'المبلغ الصافي المستحق للصرف:' : 'Net Payable Amount:'}</span>
+                        <span className="font-mono">{selectedIpc.netPayableAmount.toLocaleString()} SAR</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Reconciliation Panel */}
+                  {renderReconciliationPanel(ipcReconciliationById.get(selectedIpc.id), 'ipc')}
+
+                  {/* Items Detail Table */}
+                  {selectedIpc.items.length > 0 && (
+                    <div className="border rounded-xl overflow-hidden">
+                      <div className="p-3 bg-slate-100 font-bold text-xs text-slate-700">
+                        {lang === 'ar' ? 'تفصيل كميات بنود الأعمال المعتمدة بالمستخلص' : 'IPC Itemized Bill of Quantities Progress'}
+                      </div>
+                      <table className="w-full text-xs">
+                        <thead className="bg-slate-50 text-slate-700 border-b font-bold">
+                          <tr>
+                            <th className="p-2.5 text-right">{lang === 'ar' ? 'البند' : 'Item'}</th>
+                            <th className="p-2.5 text-right">{lang === 'ar' ? 'بيان الأعمال' : 'Description'}</th>
+                            <th className="p-2.5 text-center">{lang === 'ar' ? 'الوحدة' : 'Unit'}</th>
+                            <th className="p-2.5 text-center">{lang === 'ar' ? 'الكمية السابقة' : 'Prev Qty'}</th>
+                            <th className="p-2.5 text-center">{lang === 'ar' ? 'الكمية الحالية' : 'Curr Qty'}</th>
+                            <th className="p-2.5 text-center">{lang === 'ar' ? 'الكمية التراكمية' : 'Cumul Qty'}</th>
+                            <th className="p-2.5 text-right">{lang === 'ar' ? 'القيمة الحالية' : 'Current Value'}</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100">
+                          {selectedIpc.items.map((item) => (
+                            <tr key={item.id} className="hover:bg-slate-50">
+                              <td className="p-2.5 font-mono font-bold text-slate-700">{item.boqCode}</td>
+                              <td className="p-2.5 font-medium text-slate-800 max-w-xs">{item.description}</td>
+                              <td className="p-2.5 text-center text-slate-500 font-mono">{item.unit}</td>
+                              <td className="p-2.5 text-center font-mono text-slate-500">{item.previousQuantity}</td>
+                              <td className="p-2.5 text-center font-mono font-bold text-blue-700">{item.currentQuantity}</td>
+                              <td className="p-2.5 text-center font-mono font-bold text-slate-800">{item.cumulativeQuantity}</td>
+                              <td className="p-2.5 text-right font-mono font-black text-emerald-700">
+                                {item.currentAmountSar.toLocaleString()} SAR
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              )}
+            </>
           )}
         </div>
       )}
 
-      {/* TAB 2: Subcontractor IPCs & Cost Accounting */}
+      {/* TAB 2: Subcontractor IPCs */}
       {activeTab === 'subcontractors' && (
         <div className="space-y-5">
-          {/* Architecture Explanatory Infographic Card */}
+          {/* Infographic Model Card */}
           <div className="p-4 bg-gradient-to-r from-blue-50 via-slate-50 to-amber-50 border border-slate-200 rounded-xl space-y-2">
             <div className="flex items-center gap-2">
               <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
@@ -1212,184 +975,574 @@ export default function PaymentCertificatesView({ project }: PaymentCertificates
             </div>
           </div>
 
-          {/* Subcontractor Selector Strip */}
-          <div className="flex items-center gap-2 overflow-x-auto pb-1">
-            {subcontractorIpcs.map((sub) => (
-              <button
-                key={sub.id}
-                onClick={() => setSelectedSubIpcId(sub.id)}
-                className={`flex-shrink-0 px-4 py-2.5 rounded-xl text-xs font-bold border transition-all cursor-pointer ${
-                  selectedSubIpcId === sub.id
-                    ? 'bg-slate-900 text-amber-400 border-slate-900 shadow-sm'
-                    : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
-                }`}
-              >
-                <div className="flex flex-col text-right">
-                  <div className="flex items-center gap-2">
-                    <span className="font-mono font-bold">{sub.ipcNumber}</span>
-                    <span className="text-[10px] text-slate-400">({sub.certificateDate})</span>
-                    {renderReconciliationBadge(subIpcReconciliationById.get(sub.id))}
-                    {renderChronologyBadge(subIpcReconciliationById.get(sub.id))}
-                  </div>
-                  <span className="text-[11px] text-slate-300 font-normal truncate max-w-xs">{sub.subcontractorName}</span>
-                </div>
-              </button>
-            ))}
-          </div>
-
-          {/* Active Subcontractor IPC Dossier */}
-          {(() => {
-            const currentSubIpc = subcontractorIpcs.find((s) => s.id === selectedSubIpcId) || subcontractorIpcs[0];
-            if (!currentSubIpc) return null;
-
-            return (
-              <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden p-6 space-y-6">
-                {/* Dossier Header */}
-                <div className="flex flex-wrap items-center justify-between gap-4 border-b pb-4">
-                  <div>
-                    <span className="text-[11px] font-mono font-bold text-amber-900 bg-amber-50 px-2.5 py-1 rounded-md border border-amber-200">
-                      SUBCONTRACTOR PAYMENT CERTIFICATE: {currentSubIpc.ipcNumber}
-                    </span>
-                    <h2 className="text-base font-black text-slate-900 mt-2">
-                      {currentSubIpc.subcontractorName}
-                    </h2>
-                    <p className="text-xs text-slate-500 font-semibold mt-0.5">
-                      {currentSubIpc.trade} · الفترة: من {currentSubIpc.periodStart} إلى {currentSubIpc.periodEnd}
-                    </p>
-                  </div>
-
-                  <div className="flex items-center gap-2">
-                    <button
-                      onClick={() => window.print()}
-                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-300 text-xs font-bold text-slate-700 hover:bg-slate-50 cursor-pointer"
-                    >
-                      <Printer size={14} />
-                      <span>{lang === 'ar' ? 'طباعة مستخلص الباطن' : 'Print Sub IPC'}</span>
-                    </button>
-                    <span className="px-3 py-1 rounded-full text-xs font-bold bg-emerald-100 text-emerald-800">
-                      {currentSubIpc.status === 'paid' ? 'تم الصرف للباطن (Paid)' : 'معتمد للترحيل والتكاليف'}
-                    </span>
-                  </div>
-                </div>
-
-                {/* Header vs lines reconciliation, contractual retention (GAP-018/020) and
-                    Data Date chronology (GAP-021) for this subcontractor certificate */}
-                {renderReconciliationPanel(subIpcReconciliationById.get(currentSubIpc.id), 'sub')}
-
-                {/* Back-to-Back Comparison Dashboard */}
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
-                  {/* Subcontractor Payable Box */}
-                  <div className="bg-amber-50/70 p-4 rounded-xl border border-amber-200 space-y-2">
-                    <span className="text-[11px] text-amber-900 font-bold block">مستحقات مقاول الباطن (صافي التكلفة)</span>
-                    <div className="text-xl font-black text-amber-950 font-mono">
-                      {currentSubIpc.netPayableToSubcontractor.toLocaleString()} SAR
-                    </div>
-                    <div className="text-[10px] text-amber-800 space-y-0.5 border-t border-amber-200/60 pt-1.5">
-                      <div className="flex justify-between">
-                        <span>إجمالي الأعمال المنجزة:</span>
-                        <span className="font-mono font-bold">{currentSubIpc.currentGrossAmount.toLocaleString()} SAR</span>
-                      </div>
-                      <div className="flex justify-between text-rose-700">
-                        <span>محتجز ضمان الباطن (10%):</span>
-                        <span className="font-mono">- {currentSubIpc.retentionDeduction.toLocaleString()} SAR</span>
-                      </div>
-                      <div className="flex justify-between text-rose-700">
-                        <span>خصومات تشوينات/ديزل:</span>
-                        <span className="font-mono">- {currentSubIpc.materialDeductions.toLocaleString()} SAR</span>
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Main Contractor Revenue for Same Work Box */}
-                  <div className="bg-blue-50/70 p-4 rounded-xl border border-blue-200 space-y-2">
-                    <span className="text-[11px] text-blue-900 font-bold block">إيراد المقاول الرئيسي مع المالك لنفس البنود</span>
-                    <div className="text-xl font-black text-blue-950 font-mono">
-                      {currentSubIpc.mainContractorRevenueForSameQty.toLocaleString()} SAR
-                    </div>
-                    <div className="text-[10px] text-blue-800 space-y-0.5 border-t border-blue-200/60 pt-1.5">
-                      <div className="flex justify-between">
-                        <span>السعر التعاقدي مع المالك:</span>
-                        <span className="font-mono font-bold">معتمد في مستخلص المالك</span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span>القيمة المكتسبة (EV) للمشروع:</span>
-                        <span className="font-mono font-bold">+{currentSubIpc.mainContractorRevenueForSameQty.toLocaleString()} SAR</span>
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Main Contractor Profit Margin Box */}
-                  <div className="bg-emerald-50/70 p-4 rounded-xl border border-emerald-200 space-y-2">
-                    <span className="text-[11px] text-emerald-900 font-bold block">هامش ربح المقاول الرئيسي (Gross Margin)</span>
-                    <div className="text-xl font-black text-emerald-700 font-mono">
-                      +{currentSubIpc.mainContractorProfitMarginSar.toLocaleString()} SAR
-                    </div>
-                    <div className="text-[10px] text-emerald-800 space-y-0.5 border-t border-emerald-200/60 pt-1.5">
-                      <div className="flex justify-between">
-                        <span>نسبة الهامش الربحي:</span>
-                        <span className="font-mono font-bold text-emerald-900">%{currentSubIpc.mainContractorMarginPercent}</span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span>الأثر على الميزانية:</span>
-                        <span className="font-bold text-emerald-700">إيجابي (وفر تكلفة)</span>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-
-                {/* Detailed Back-to-Back Quantity & Two-Tier Unit Price Table */}
-                <div className="border border-slate-200 rounded-xl overflow-hidden">
-                  <div className="p-3 bg-slate-100 font-bold text-xs text-slate-800 flex items-center justify-between">
-                    <span>جدول مقارنة الأسعار المزدوجة (سعر المالك vs سعر الباطن) لنفس الكميات المنفذة</span>
-                    <span className="text-[11px] text-slate-500 font-mono">Two-Tier Unit Rate Breakdown</span>
-                  </div>
-
-                  <table className="w-full text-xs">
-                    <thead className="bg-slate-50 text-slate-700 border-b font-bold">
-                      <tr>
-                        <th className="p-3 text-right">بيان البند والعمل المنفذ</th>
-                        <th className="p-3 text-center">الوحدة</th>
-                        <th className="p-3 text-center">الكمية المنجزة</th>
-                        <th className="p-3 text-center bg-amber-50/70 text-amber-900 border-x border-amber-200">سعر الباطن (شراء)</th>
-                        <th className="p-3 text-right bg-amber-50/70 text-amber-900">مستحق الباطن (تكلفة)</th>
-                        <th className="p-3 text-center bg-blue-50/70 text-blue-900 border-x border-blue-200">سعر المالك (بيع)</th>
-                        <th className="p-3 text-right bg-blue-50/70 text-blue-900">إيراد المقاول الرئيسي</th>
-                        <th className="p-3 text-right bg-emerald-50 text-emerald-900">هامش الربح (SAR)</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-100">
-                      {currentSubIpc.items.map((item) => (
-                        <tr key={item.id} className="hover:bg-slate-50">
-                          <td className="p-3 font-semibold text-slate-800 max-w-xs">{item.description}</td>
-                          <td className="p-3 text-center text-slate-500 font-mono">{item.unit}</td>
-                          <td className="p-3 text-center font-mono font-bold text-slate-900">{item.quantity}</td>
-                          <td className="p-3 text-center font-mono font-bold text-amber-800 bg-amber-50/40 border-x border-amber-100">
-                            {item.subcontractorRate} ر.س
-                          </td>
-                          <td className="p-3 text-right font-mono font-bold text-amber-900 bg-amber-50/40">
-                            {item.subcontractorAmount.toLocaleString()} ر.س
-                          </td>
-                          <td className="p-3 text-center font-mono font-bold text-blue-800 bg-blue-50/40 border-x border-blue-100">
-                            {item.mainContractorRate} ر.س
-                          </td>
-                          <td className="p-3 text-right font-mono font-bold text-blue-900 bg-blue-50/40">
-                            {item.mainContractorAmount.toLocaleString()} ر.س
-                          </td>
-                          <td className="p-3 text-right font-mono font-black text-emerald-700 bg-emerald-50/40">
-                            +{item.marginSar.toLocaleString()} ر.س
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
+          {loading ? (
+            <div className="bg-white rounded-xl border border-slate-200 p-8 text-center text-xs font-bold text-slate-500">
+              {lang === 'ar' ? 'جاري تحميل المستخلصات...' : 'Loading certificates...'}
+            </div>
+          ) : subcontractorIpcs.length === 0 ? (
+            /* Honest empty state for projects without subcontractor certificates */
+            <div className="bg-white rounded-xl border border-slate-200 p-8 text-center space-y-4 shadow-sm">
+              <div className="w-12 h-12 rounded-full bg-slate-100 flex items-center justify-center mx-auto text-slate-400">
+                <Building size={24} />
               </div>
-            );
-          })()}
+              <div className="max-w-md mx-auto space-y-1">
+                <h3 className="text-base font-bold text-slate-900">
+                  {lang === 'ar' ? 'لا توجد مستخلصات مسجلة لمقاولي الباطن' : 'No Subcontractor IPCs Recorded'}
+                </h3>
+                <p className="text-xs text-slate-500">
+                  {lang === 'ar'
+                    ? 'هذا المشروع لا يحتوي على تكاليف باطن أو أرباح مسجلة. أضف أول مستخلص باطن للبدء.'
+                    : 'This project has no subcontractor costs or margins recorded. Add the first subcontractor certificate to begin.'}
+                </p>
+              </div>
+              {project && (
+                <button
+                  onClick={() => setShowAddSubIpcModal(true)}
+                  className="inline-flex items-center gap-1.5 px-4 py-2 bg-slate-900 text-amber-400 text-xs font-bold rounded-xl hover:bg-slate-800 transition-colors shadow-sm cursor-pointer"
+                >
+                  <Plus size={14} />
+                  <span>{lang === 'ar' ? 'إضافة مستخلص باطن جديد' : 'New Subcontractor IPC'}</span>
+                </button>
+              )}
+            </div>
+          ) : (
+            <>
+              {/* Subcontractor Selector Strip */}
+              <div className="flex items-center justify-between gap-2 overflow-x-auto pb-1">
+                <div className="flex items-center gap-2">
+                  {subcontractorIpcs.map((sub) => (
+                    <button
+                      key={sub.id}
+                      onClick={() => setSelectedSubIpcId(sub.id)}
+                      className={`flex-shrink-0 px-4 py-2.5 rounded-xl text-xs font-bold border transition-all cursor-pointer ${
+                        selectedSubIpcId === sub.id
+                          ? 'bg-slate-900 text-amber-400 border-slate-900 shadow-sm'
+                          : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+                      }`}
+                    >
+                      <div className="flex flex-col text-right">
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono font-bold">{sub.ipcNumber}</span>
+                          <span className="text-[10px] text-slate-400">({sub.certificateDate})</span>
+                          {renderReconciliationBadge(subIpcReconciliationById.get(sub.id))}
+                          {renderChronologyBadge(subIpcReconciliationById.get(sub.id))}
+                        </div>
+                        <span className="text-[11px] text-slate-300 font-normal truncate max-w-xs">{sub.subcontractorName}</span>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+                {project && (
+                  <button
+                    onClick={() => setShowAddSubIpcModal(true)}
+                    className="flex-shrink-0 flex items-center gap-1.5 px-3 py-2 bg-slate-900 text-amber-400 text-xs font-bold rounded-xl hover:bg-slate-800 transition-colors shadow-sm cursor-pointer"
+                  >
+                    <Plus size={14} />
+                    <span>{lang === 'ar' ? 'مستخلص باطن جديد' : 'New Sub IPC'}</span>
+                  </button>
+                )}
+              </div>
+
+              {/* Active Subcontractor IPC Dossier */}
+              {selectedSubIpc && (
+                <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden p-6 space-y-6">
+                  {/* Header */}
+                  <div className="flex flex-wrap items-center justify-between gap-4 border-b pb-4">
+                    <div>
+                      <span className="text-[11px] font-mono font-bold text-amber-900 bg-amber-50 px-2.5 py-1 rounded-md border border-amber-200">
+                        SUBCONTRACTOR PAYMENT CERTIFICATE: {selectedSubIpc.ipcNumber}
+                      </span>
+                      <h2 className="text-base font-black text-slate-900 mt-2">
+                        {selectedSubIpc.subcontractorName}
+                      </h2>
+                      <p className="text-xs text-slate-500 font-semibold mt-0.5">
+                        {selectedSubIpc.trade} · {lang === 'ar' ? `الفترة: من ${selectedSubIpc.periodStart} إلى ${selectedSubIpc.periodEnd}` : `Period: from ${selectedSubIpc.periodStart} to ${selectedSubIpc.periodEnd}`}
+                      </p>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => window.print()}
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-300 text-xs font-bold text-slate-700 hover:bg-slate-50 cursor-pointer"
+                      >
+                        <Printer size={14} />
+                        <span>{lang === 'ar' ? 'طباعة مستخلص الباطن' : 'Print Sub IPC'}</span>
+                      </button>
+                      <button
+                        onClick={() => handleDeleteSubIpc(selectedSubIpc.id)}
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-rose-300 text-xs font-bold text-rose-700 hover:bg-rose-50 cursor-pointer"
+                      >
+                        <Trash2 size={14} />
+                        <span>{lang === 'ar' ? 'حذف' : 'Delete'}</span>
+                      </button>
+                      <span className="px-3 py-1 rounded-full text-xs font-bold bg-emerald-100 text-emerald-800">
+                        {selectedSubIpc.status === 'paid' ? 'تم الصرف للباطن (Paid)' : selectedSubIpc.status === 'approved' ? 'معتمد للترحيل والتكاليف' : 'مسودة (Draft)'}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Reconciliation Panel */}
+                  {renderReconciliationPanel(subIpcReconciliationById.get(selectedSubIpc.id), 'sub')}
+
+                  {/* Comparison Dashboard */}
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
+                    <div className="bg-amber-50/70 p-4 rounded-xl border border-amber-200 space-y-2">
+                      <span className="text-[11px] text-amber-900 font-bold block">{lang === 'ar' ? 'مستحقات مقاول الباطن (صافي التكلفة)' : 'Subcontractor Payable (Net Cost)'}</span>
+                      <div className="text-xl font-black text-amber-950 font-mono">
+                        {selectedSubIpc.netPayableToSubcontractor.toLocaleString()} SAR
+                      </div>
+                      <div className="text-[10px] text-amber-800 space-y-0.5 border-t border-amber-200/60 pt-1.5">
+                        <div className="flex justify-between">
+                          <span>{lang === 'ar' ? 'إجمالي الأعمال المنجزة:' : 'Gross Work:'}</span>
+                          <span className="font-mono font-bold">{selectedSubIpc.currentGrossAmount.toLocaleString()} SAR</span>
+                        </div>
+                        <div className="flex justify-between text-rose-700">
+                          <span>{lang === 'ar' ? 'محتجز ضمان الباطن:' : 'Retention:'}</span>
+                          <span className="font-mono">- {selectedSubIpc.retentionDeduction.toLocaleString()} SAR</span>
+                        </div>
+                        <div className="flex justify-between text-rose-700">
+                          <span>{lang === 'ar' ? 'خصومات تشوينات/ديزل:' : 'Material deductions:'}</span>
+                          <span className="font-mono">- {selectedSubIpc.materialDeductions.toLocaleString()} SAR</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="bg-blue-50/70 p-4 rounded-xl border border-blue-200 space-y-2">
+                      <span className="text-[11px] text-blue-900 font-bold block">{lang === 'ar' ? 'إيراد المقاول الرئيسي مع المالك لنفس البنود' : 'Client Revenue for Same Work'}</span>
+                      <div className="text-xl font-black text-blue-950 font-mono">
+                        {selectedSubIpc.mainContractorRevenueForSameQty.toLocaleString()} SAR
+                      </div>
+                      <div className="text-[10px] text-blue-800 space-y-0.5 border-t border-blue-200/60 pt-1.5">
+                        <div className="flex justify-between">
+                          <span>{lang === 'ar' ? 'السعر التعاقدي مع المالك:' : 'Contract rate:'}</span>
+                          <span className="font-mono font-bold">{lang === 'ar' ? 'معتمد في مستخلص المالك' : 'Client IPC rate'}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span>{lang === 'ar' ? 'القيمة المكتسبة (EV) للمشروع:' : 'Earned Value (EV):'}</span>
+                          <span className="font-mono font-bold">+{selectedSubIpc.mainContractorRevenueForSameQty.toLocaleString()} SAR</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="bg-emerald-50/70 p-4 rounded-xl border border-emerald-200 space-y-2">
+                      <span className="text-[11px] text-emerald-900 font-bold block">{lang === 'ar' ? 'هامش ربح المقاول الرئيسي (Gross Margin)' : 'Main Contractor Profit Margin'}</span>
+                      <div className="text-xl font-black text-emerald-700 font-mono">
+                        +{selectedSubIpc.mainContractorProfitMarginSar.toLocaleString()} SAR
+                      </div>
+                      <div className="text-[10px] text-emerald-800 space-y-0.5 border-t border-emerald-200/60 pt-1.5">
+                        <div className="flex justify-between">
+                          <span>{lang === 'ar' ? 'نسبة الهامش الربحي:' : 'Margin percent:'}</span>
+                          <span className="font-mono font-bold text-emerald-900">%{selectedSubIpc.mainContractorMarginPercent}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span>{lang === 'ar' ? 'الأثر على الميزانية:' : 'Budget impact:'}</span>
+                          <span className="font-bold text-emerald-700">{lang === 'ar' ? 'إيجابي (وفر تكلفة)' : 'Positive margin'}</span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Two-Tier Unit Price Table */}
+                  {selectedSubIpc.items.length > 0 && (
+                    <div className="border border-slate-200 rounded-xl overflow-hidden">
+                      <div className="p-3 bg-slate-100 font-bold text-xs text-slate-800 flex items-center justify-between">
+                        <span>{lang === 'ar' ? 'جدول مقارنة الأسعار المزدوجة (سعر المالك vs سعر الباطن) لنفس الكميات المنفذة' : 'Two-Tier Unit Rate Comparison'}</span>
+                        <span className="text-[11px] text-slate-500 font-mono">Two-Tier Unit Rate Breakdown</span>
+                      </div>
+
+                      <table className="w-full text-xs">
+                        <thead className="bg-slate-50 text-slate-700 border-b font-bold">
+                          <tr>
+                            <th className="p-3 text-right">{lang === 'ar' ? 'بيان البند والعمل المنفذ' : 'Description'}</th>
+                            <th className="p-3 text-center">{lang === 'ar' ? 'الوحدة' : 'Unit'}</th>
+                            <th className="p-3 text-center">{lang === 'ar' ? 'الكمية المنجزة' : 'Quantity'}</th>
+                            <th className="p-3 text-center bg-amber-50/70 text-amber-900 border-x border-amber-200">{lang === 'ar' ? 'سعر الباطن (شراء)' : 'Sub Rate'}</th>
+                            <th className="p-3 text-right bg-amber-50/70 text-amber-900">{lang === 'ar' ? 'مستحق الباطن (تكلفة)' : 'Sub Amount'}</th>
+                            <th className="p-3 text-center bg-blue-50/70 text-blue-900 border-x border-blue-200">{lang === 'ar' ? 'سعر المالك (بيع)' : 'Client Rate'}</th>
+                            <th className="p-3 text-right bg-blue-50/70 text-blue-900">{lang === 'ar' ? 'إيراد المقاول الرئيسي' : 'Client Amount'}</th>
+                            <th className="p-3 text-right bg-emerald-50 text-emerald-900">{lang === 'ar' ? 'هامش الربح (SAR)' : 'Margin (SAR)'}</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100">
+                          {selectedSubIpc.items.map((item) => (
+                            <tr key={item.id} className="hover:bg-slate-50">
+                              <td className="p-3 font-semibold text-slate-800 max-w-xs">{item.description}</td>
+                              <td className="p-3 text-center text-slate-500 font-mono">{item.unit}</td>
+                              <td className="p-3 text-center font-mono font-bold text-slate-900">{item.quantity}</td>
+                              <td className="p-3 text-center font-mono font-bold text-amber-800 bg-amber-50/40 border-x border-amber-100">
+                                {item.subcontractorRate} SAR
+                              </td>
+                              <td className="p-3 text-right font-mono font-bold text-amber-900 bg-amber-50/40">
+                                {item.subcontractorAmount.toLocaleString()} SAR
+                              </td>
+                              <td className="p-3 text-center font-mono font-bold text-blue-800 bg-blue-50/40 border-x border-blue-100">
+                                {item.mainContractorRate} SAR
+                              </td>
+                              <td className="p-3 text-right font-mono font-bold text-blue-900 bg-blue-50/40">
+                                {item.mainContractorAmount.toLocaleString()} SAR
+                              </td>
+                              <td className="p-3 text-right font-mono font-black text-emerald-700 bg-emerald-50/40">
+                                +{item.marginSar.toLocaleString()} SAR
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              )}
+            </>
+          )}
         </div>
       )}
 
+      {/* TAB 3: Variation Orders */}
       {activeTab === 'vos' && <ScopeChangeRegister project={project} />}
+
+      {/* MODAL: Add Main Contractor IPC */}
+      {showAddIpcModal && (
+        <div className="fixed inset-0 bg-slate-900/50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-xl shadow-xl max-w-lg w-full p-6 space-y-4 max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between border-b pb-3">
+              <h3 className="text-base font-bold text-slate-900">
+                {lang === 'ar' ? 'إضافة مستخلص جديد للمقاول الرئيسي' : 'New Main Contractor IPC'}
+              </h3>
+              <button onClick={() => setShowAddIpcModal(false)} className="text-slate-400 hover:text-slate-600">
+                <X size={18} />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveIpc} className="space-y-3 text-xs">
+              <div>
+                <label className="block text-slate-700 font-bold mb-1">{lang === 'ar' ? 'رقم المستخلص *' : 'IPC Number *'}</label>
+                <input
+                  type="text"
+                  required
+                  value={newIpcNumber}
+                  onChange={(e) => setNewIpcNumber(e.target.value)}
+                  placeholder="e.g. IPC-01"
+                  className="w-full px-3 py-2 border rounded-lg"
+                />
+              </div>
+
+              <div className="grid grid-cols-3 gap-2">
+                <div>
+                  <label className="block text-slate-700 font-bold mb-1">{lang === 'ar' ? 'تاريخ المستخلص *' : 'Certificate Date *'}</label>
+                  <input
+                    type="date"
+                    required
+                    value={newCertDate}
+                    onChange={(e) => setNewCertDate(e.target.value)}
+                    className="w-full px-2 py-1.5 border rounded-lg"
+                  />
+                </div>
+                <div>
+                  <label className="block text-slate-700 font-bold mb-1">{lang === 'ar' ? 'بداية الفترة *' : 'Period Start *'}</label>
+                  <input
+                    type="date"
+                    required
+                    value={newPeriodStart}
+                    onChange={(e) => setNewPeriodStart(e.target.value)}
+                    className="w-full px-2 py-1.5 border rounded-lg"
+                  />
+                </div>
+                <div>
+                  <label className="block text-slate-700 font-bold mb-1">{lang === 'ar' ? 'نهاية الفترة *' : 'Period End *'}</label>
+                  <input
+                    type="date"
+                    required
+                    value={newPeriodEnd}
+                    onChange={(e) => setNewPeriodEnd(e.target.value)}
+                    className="w-full px-2 py-1.5 border rounded-lg"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-slate-700 font-bold mb-1">{lang === 'ar' ? 'حالة الاعتماد' : 'Status'}</label>
+                <select
+                  value={newIpcStatus}
+                  onChange={(e) => setNewIpcStatus(e.target.value as PaymentCertificate['status'])}
+                  className="w-full px-3 py-2 border rounded-lg"
+                >
+                  <option value="draft">{lang === 'ar' ? 'مسودة (Draft)' : 'Draft'}</option>
+                  <option value="submitted_by_contractor">{lang === 'ar' ? 'مقدم من المقاول' : 'Submitted'}</option>
+                  <option value="certified_by_consultant">{lang === 'ar' ? 'معتمد من الاستشاري' : 'Certified'}</option>
+                  <option value="approved_by_client">{lang === 'ar' ? 'معتمد من المالك' : 'Approved'}</option>
+                  <option value="paid">{lang === 'ar' ? 'تم الصرف (Paid)' : 'Paid'}</option>
+                </select>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="block text-slate-700 font-bold mb-1">{lang === 'ar' ? 'إجمالي أعمال الفترة (SAR)' : 'Current Gross (SAR)'}</label>
+                  <input
+                    type="number"
+                    min="0"
+                    step="any"
+                    value={newCurrentGross}
+                    onChange={(e) => {
+                      const val = Number(e.target.value);
+                      setNewCurrentGross(val);
+                      setNewVatAmount(Number((val * 0.15).toFixed(2)));
+                      setNewAdvanceDeduction(Number((val * 0.1).toFixed(2)));
+                      setNewRetentionDeduction(Number((val * 0.05).toFixed(2)));
+                    }}
+                    className="w-full px-3 py-2 border rounded-lg font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block text-slate-700 font-bold mb-1">{lang === 'ar' ? 'إجمالي المستخلص السابق (SAR)' : 'Previous Gross (SAR)'}</label>
+                  <input
+                    type="number"
+                    min="0"
+                    step="any"
+                    value={newPreviousGross}
+                    onChange={(e) => setNewPreviousGross(Number(e.target.value))}
+                    className="w-full px-3 py-2 border rounded-lg font-mono"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-3 gap-2">
+                <div>
+                  <label className="block text-slate-700 font-bold mb-1">{lang === 'ar' ? 'خصم دفعة مقدمة' : 'Advance Recovery'}</label>
+                  <input
+                    type="number"
+                    min="0"
+                    step="any"
+                    value={newAdvanceDeduction}
+                    onChange={(e) => setNewAdvanceDeduction(Number(e.target.value))}
+                    className="w-full px-2 py-1.5 border rounded-lg font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block text-slate-700 font-bold mb-1">{lang === 'ar' ? 'محتجز ضمان' : 'Retention'}</label>
+                  <input
+                    type="number"
+                    min="0"
+                    step="any"
+                    value={newRetentionDeduction}
+                    onChange={(e) => setNewRetentionDeduction(Number(e.target.value))}
+                    className="w-full px-2 py-1.5 border rounded-lg font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block text-slate-700 font-bold mb-1">{lang === 'ar' ? 'ضريبة (15% VAT)' : 'VAT (15%)'}</label>
+                  <input
+                    type="number"
+                    min="0"
+                    step="any"
+                    value={newVatAmount}
+                    onChange={(e) => setNewVatAmount(Number(e.target.value))}
+                    className="w-full px-2 py-1.5 border rounded-lg font-mono"
+                  />
+                </div>
+              </div>
+
+              <div className="flex justify-end gap-2 pt-3 border-t">
+                <button
+                  type="button"
+                  onClick={() => setShowAddIpcModal(false)}
+                  className="px-4 py-2 border border-slate-300 rounded-lg text-slate-700 hover:bg-slate-50 cursor-pointer"
+                >
+                  {lang === 'ar' ? 'إلغاء' : 'Cancel'}
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-2 bg-slate-900 text-amber-400 font-bold rounded-lg hover:bg-slate-800 cursor-pointer"
+                >
+                  {lang === 'ar' ? 'حفظ المستخلص' : 'Save Certificate'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: Add Subcontractor IPC */}
+      {showAddSubIpcModal && (
+        <div className="fixed inset-0 bg-slate-900/50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-xl shadow-xl max-w-lg w-full p-6 space-y-4 max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between border-b pb-3">
+              <h3 className="text-base font-bold text-slate-900">
+                {lang === 'ar' ? 'إضافة مستخلص جديد لمقاول باطن' : 'New Subcontractor IPC'}
+              </h3>
+              <button onClick={() => setShowAddSubIpcModal(false)} className="text-slate-400 hover:text-slate-600">
+                <X size={18} />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveSubIpc} className="space-y-3 text-xs">
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="block text-slate-700 font-bold mb-1">{lang === 'ar' ? 'رقم المستخلص *' : 'IPC Number *'}</label>
+                  <input
+                    type="text"
+                    required
+                    value={newSubIpcNumber}
+                    onChange={(e) => setNewSubIpcNumber(e.target.value)}
+                    placeholder="e.g. SUB-IPC-001"
+                    className="w-full px-3 py-2 border rounded-lg"
+                  />
+                </div>
+                <div>
+                  <label className="block text-slate-700 font-bold mb-1">{lang === 'ar' ? 'كود الباقة (اختياري)' : 'Package Code'}</label>
+                  <input
+                    type="text"
+                    value={newSubPkgCode}
+                    onChange={(e) => setNewSubPkgCode(e.target.value)}
+                    placeholder="e.g. SUB-PKG-01"
+                    className="w-full px-3 py-2 border rounded-lg"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-slate-700 font-bold mb-1">{lang === 'ar' ? 'اسم مقاول الباطن *' : 'Subcontractor Name *'}</label>
+                <input
+                  type="text"
+                  required
+                  value={newSubName}
+                  onChange={(e) => setNewSubName(e.target.value)}
+                  placeholder="e.g. شركة البنيان"
+                  className="w-full px-3 py-2 border rounded-lg"
+                />
+              </div>
+
+              <div>
+                <label className="block text-slate-700 font-bold mb-1">{lang === 'ar' ? 'المهنة / نطاق الأعمال *' : 'Trade / Scope *'}</label>
+                <input
+                  type="text"
+                  required
+                  value={newSubTrade}
+                  onChange={(e) => setNewSubTrade(e.target.value)}
+                  placeholder="e.g. أعمال الخرسانات والهياكل"
+                  className="w-full px-3 py-2 border rounded-lg"
+                />
+              </div>
+
+              <div className="grid grid-cols-3 gap-2">
+                <div>
+                  <label className="block text-slate-700 font-bold mb-1">{lang === 'ar' ? 'تاريخ المستخلص *' : 'Certificate Date *'}</label>
+                  <input
+                    type="date"
+                    required
+                    value={newSubCertDate}
+                    onChange={(e) => setNewSubCertDate(e.target.value)}
+                    className="w-full px-2 py-1.5 border rounded-lg"
+                  />
+                </div>
+                <div>
+                  <label className="block text-slate-700 font-bold mb-1">{lang === 'ar' ? 'بداية الفترة *' : 'Period Start *'}</label>
+                  <input
+                    type="date"
+                    required
+                    value={newSubPeriodStart}
+                    onChange={(e) => setNewSubPeriodStart(e.target.value)}
+                    className="w-full px-2 py-1.5 border rounded-lg"
+                  />
+                </div>
+                <div>
+                  <label className="block text-slate-700 font-bold mb-1">{lang === 'ar' ? 'نهاية الفترة *' : 'Period End *'}</label>
+                  <input
+                    type="date"
+                    required
+                    value={newSubPeriodEnd}
+                    onChange={(e) => setNewSubPeriodEnd(e.target.value)}
+                    className="w-full px-2 py-1.5 border rounded-lg"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-slate-700 font-bold mb-1">{lang === 'ar' ? 'حالة الاعتماد' : 'Status'}</label>
+                <select
+                  value={newSubStatus}
+                  onChange={(e) => setNewSubStatus(e.target.value as 'draft' | 'approved' | 'paid')}
+                  className="w-full px-3 py-2 border rounded-lg"
+                >
+                  <option value="draft">{lang === 'ar' ? 'مسودة (Draft)' : 'Draft'}</option>
+                  <option value="approved">{lang === 'ar' ? 'معتمد للترحيل والتكاليف' : 'Approved'}</option>
+                  <option value="paid">{lang === 'ar' ? 'تم الصرف (Paid)' : 'Paid'}</option>
+                </select>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="block text-slate-700 font-bold mb-1">{lang === 'ar' ? 'إجمالي أعمال الفترة للباطن' : 'Sub Current Gross'}</label>
+                  <input
+                    type="number"
+                    min="0"
+                    step="any"
+                    value={newSubCurrentGross}
+                    onChange={(e) => {
+                      const val = Number(e.target.value);
+                      setNewSubCurrentGross(val);
+                      setNewSubRetention(Number((val * 0.1).toFixed(2)));
+                      setNewSubGrossToDate(val);
+                    }}
+                    className="w-full px-3 py-2 border rounded-lg font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block text-slate-700 font-bold mb-1">{lang === 'ar' ? 'إيراد المقاول الرئيسي لنفس العمل' : 'Main Contractor Revenue'}</label>
+                  <input
+                    type="number"
+                    min="0"
+                    step="any"
+                    value={newSubMainRevenue}
+                    onChange={(e) => setNewSubMainRevenue(Number(e.target.value))}
+                    className="w-full px-3 py-2 border rounded-lg font-mono"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="block text-slate-700 font-bold mb-1">{lang === 'ar' ? 'محتجز ضمان الباطن' : 'Retention'}</label>
+                  <input
+                    type="number"
+                    min="0"
+                    step="any"
+                    value={newSubRetention}
+                    onChange={(e) => setNewSubRetention(Number(e.target.value))}
+                    className="w-full px-3 py-2 border rounded-lg font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block text-slate-700 font-bold mb-1">{lang === 'ar' ? 'خصومات تشوينات/ديزل' : 'Material Deductions'}</label>
+                  <input
+                    type="number"
+                    min="0"
+                    step="any"
+                    value={newSubMaterialDeductions}
+                    onChange={(e) => setNewSubMaterialDeductions(Number(e.target.value))}
+                    className="w-full px-3 py-2 border rounded-lg font-mono"
+                  />
+                </div>
+              </div>
+
+              <div className="flex justify-end gap-2 pt-3 border-t">
+                <button
+                  type="button"
+                  onClick={() => setShowAddSubIpcModal(false)}
+                  className="px-4 py-2 border border-slate-300 rounded-lg text-slate-700 hover:bg-slate-50 cursor-pointer"
+                >
+                  {lang === 'ar' ? 'إلغاء' : 'Cancel'}
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-2 bg-slate-900 text-amber-400 font-bold rounded-lg hover:bg-slate-800 cursor-pointer"
+                >
+                  {lang === 'ar' ? 'حفظ المستخلص' : 'Save Certificate'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

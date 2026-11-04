@@ -1252,6 +1252,7 @@ export interface PaymentCertificateItem {
 
 export interface PaymentCertificate {
   id: string;
+  project_id?: string;
   ipcNumber: string; // e.g. "IPC-004"
   certificateDate: string;
   periodStart: string;
@@ -1266,6 +1267,40 @@ export interface PaymentCertificate {
   vatAmount: number; // 15%
   netPayableAmount: number;
   items: PaymentCertificateItem[];
+}
+
+export interface SubcontractorIpcItem {
+  id: string;
+  description: string;
+  unit: string;
+  quantity: number;
+  subcontractorRate: number;
+  subcontractorAmount: number;
+  mainContractorRate: number;
+  mainContractorAmount: number;
+  marginSar: number;
+}
+
+export interface SubcontractorIpc {
+  id: string;
+  project_id?: string;
+  ipcNumber: string;
+  subcontractorName: string;
+  trade: string;
+  certificateDate: string;
+  periodStart: string;
+  periodEnd: string;
+  status: 'draft' | 'approved' | 'paid';
+  subcontractPackageCode?: string | null;
+  grossAmountToDate: number;
+  currentGrossAmount: number;
+  retentionDeduction: number;
+  materialDeductions: number;
+  netPayableToSubcontractor: number;
+  mainContractorRevenueForSameQty: number;
+  mainContractorProfitMarginSar: number;
+  mainContractorMarginPercent: number;
+  items: SubcontractorIpcItem[];
 }
 
 export type VariationOrderStatus = 'draft' | 'submitted' | 'under_review' | 'approved' | 'rejected' | 'withdrawn';

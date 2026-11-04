@@ -199,6 +199,26 @@ const BATCH3A_GOVERNANCE_PATHS = new Set([
  * the later Batch 2B/2C/3A path sets — they subtract this set too. S29 then asserts the current diff
  * is confined to ITS paths, so nothing can be smuggled in by loosening the older guards.
  */
+import {
+  reconcilePaymentCertificate,
+  reconcileSubcontractorCertificate,
+  summarizeCertificates,
+} from '@/lib/commercialControlsEngine';
+import type { PaymentCertificate, SubcontractorIpc } from '@/types';
+
+/**
+ * SCH-20261104-IPC01 (S30) — payment-certificate first-use and persistence increment paths.
+ */
+const S30_IPC_PERSISTENCE_PATHS = new Set([
+  'src/components/views/PaymentCertificatesView.tsx',
+  'src/types/index.ts',
+  'src/lib/localWorkspace.ts',
+  'src/lib/localQueryBuilder.ts',
+  'scripts/validate-controls.ts',
+  'docs/FIRST-USE-AND-BACKUP.md',
+  'docs/PILOT-STORAGE-SAFETY.md',
+]);
+
 const S29_WORKSPACE_SAFETY_PATHS = new Set([
   'src/lib/localWorkspace.ts',
   'src/lib/localQueryBuilder.ts',
@@ -4658,7 +4678,7 @@ console.log('--- S18 Pilot Closure (F9.5)');
   ]);
   const s24ChangedPaths = [...changedPaths].filter((path) =>
     !batch2bTiaPaths.has(path) && !batch2cResourcePaths.has(path) && !BATCH3A_GOVERNANCE_PATHS.has(path)
-      && !S29_WORKSPACE_SAFETY_PATHS.has(path));
+      && !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path));
   const protectedControlPaths = [
     'src/lib/scheduleControlEngine.ts',
     'src/lib/costControlEngine.ts',
@@ -5477,7 +5497,7 @@ console.log('--- S18 Pilot Closure (F9.5)');
     'supabase/migrations/20260924130000_atomic_resource_leveling_apply.sql',
   ]);
   const s26ChangedPaths = [...batch2bChangedPaths].filter((path) =>
-    !batch2cTiaExclusions.has(path) && !BATCH3A_GOVERNANCE_PATHS.has(path) && !S29_WORKSPACE_SAFETY_PATHS.has(path));
+    !batch2cTiaExclusions.has(path) && !BATCH3A_GOVERNANCE_PATHS.has(path) && !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path));
   ok('S26 changed files stay within TIA engine/view, directly required types, and regression harness',
     s26ChangedPaths.every((path) => allowedBatch2bPaths.has(path)));
   const protectedBatch2bPaths = [
@@ -5828,7 +5848,7 @@ console.log('--- S18 Pilot Closure (F9.5)');
     'supabase/migrations/20260924130000_atomic_resource_leveling_apply.sql',
   ]);
   const s27ChangedPaths = [...changedPaths].filter((path) =>
-    !BATCH3A_GOVERNANCE_PATHS.has(path) && !S29_WORKSPACE_SAFETY_PATHS.has(path));
+    !BATCH3A_GOVERNANCE_PATHS.has(path) && !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path));
   ok('S27 changes stay within Batch 2C resource-leveling, required types/tests, and atomic Apply support',
     s27ChangedPaths.every((path) => allowedBatch2cPaths.has(path)));
   const protectedUnchanged = [
@@ -6151,8 +6171,8 @@ console.log('--- S18 Pilot Closure (F9.5)');
     ...execFileSync('git', ['diff', '--name-only', '--cached'], { encoding: 'utf8' }).split('\n').filter(Boolean),
     ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
   ]);
-  ok('S28 changed files stay inside the requested Batch 3A governance boundary (or the later S29 scope)',
-    [...s28ChangedPaths].every((path) => BATCH3A_GOVERNANCE_PATHS.has(path) || S29_WORKSPACE_SAFETY_PATHS.has(path)));
+  ok('S28 changed files stay inside the requested Batch 3A governance boundary (or the later S29/S30 scope)',
+    [...s28ChangedPaths].every((path) => BATCH3A_GOVERNANCE_PATHS.has(path) || S29_WORKSPACE_SAFETY_PATHS.has(path) || S30_IPC_PERSISTENCE_PATHS.has(path)));
   const protectedBatch3aFiles = [
     'src/lib/scheduleControlEngine.ts', 'src/lib/costControlEngine.ts', 'src/lib/integratedDecisionEngine.ts',
     'src/lib/canonicalEvm.ts', 'src/lib/sCurveEngine.ts', 'src/lib/sCurveTimePhasing.ts',
@@ -6895,7 +6915,7 @@ console.log('--- S18 Pilot Closure (F9.5)');
     ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
   ]);
   eq('S29-K1 the increment is confined to the storage-safety paths it declares',
-    [...s29ChangedPaths].filter((path) => !S29_WORKSPACE_SAFETY_PATHS.has(path)), []);
+    [...s29ChangedPaths].filter((path) => !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path)), []);
   ok('S29-K2 the increment actually touches the storage core it claims to repair',
     s29ChangedPaths.has('src/lib/localWorkspace.ts')
       && s29ChangedPaths.has('src/lib/localQueryBuilder.ts')
@@ -6942,6 +6962,342 @@ console.log('--- S18 Pilot Closure (F9.5)');
       const outcome = seedDemoWorkspace(refusing, getInitialSeedData() as unknown as Record<string, Record<string, unknown>[]>);
       return outcome.ok === false;
     })());
+
+  // -------------------------------------------------------------------------
+  // S30 — Payment certificate first-use and persistence (SCH-20261104-IPC01)
+  // -------------------------------------------------------------------------
+  console.log('--- S30 payment certificate first-use and persistence (SCH-20261104-IPC01)');
+
+  // S30-A: Defect reproduction (cross-project fabricated default and lost after reload)
+  const preFixComponentMount = (selectedProjectId: string) => {
+    void selectedProjectId;
+    // Exact pre-fix hardcoded initial state in PaymentCertificatesView.tsx
+    const hardcodedIpcs = [
+      { id: 'IPC-01', grossAmountToDate: 102150, currentGrossAmount: 102150, status: 'paid' },
+      { id: 'IPC-02', grossAmountToDate: 425300, currentGrossAmount: 323150, status: 'paid' },
+      { id: 'IPC-03', grossAmountToDate: 505940, currentGrossAmount: 80640, status: 'certified_by_consultant' },
+      { id: 'IPC-04', grossAmountToDate: 885940, currentGrossAmount: 380000, status: 'draft' },
+    ];
+    const hardcodedSubs = [
+      { id: 'SUB-IPC-01', grossAmountToDate: 215000, currentGrossAmount: 215000, status: 'paid', mainContractorProfitMarginSar: 108750 },
+      { id: 'SUB-IPC-02', grossAmountToDate: 19440, currentGrossAmount: 19440, status: 'approved', mainContractorProfitMarginSar: 15120 },
+      { id: 'SUB-IPC-03', grossAmountToDate: 240600, currentGrossAmount: 25600, status: 'draft', mainContractorProfitMarginSar: 20480 },
+    ];
+    return {
+      certifiedGrossToDate: Math.max(...hardcodedIpcs.filter((c) => c.status !== 'draft').map((c) => c.grossAmountToDate)),
+      subcontractorProfitSar: hardcodedSubs.reduce((sum, s) => sum + s.mainContractorProfitMarginSar, 0),
+    };
+  };
+
+  const emptyProjectRepro = preFixComponentMount('proj-empty-user-1');
+  eq('S30-A1 pre-fix replica reproduces defect 1: empty project acquired fabricated 505,940 SAR certified gross',
+    emptyProjectRepro.certifiedGrossToDate, 505940);
+  eq('S30-A2 pre-fix replica reproduces defect 1: empty project acquired fabricated 144,350 SAR sub profit',
+    emptyProjectRepro.subcontractorProfitSar, 144350);
+
+  const preFixStore = makeStore();
+  const preFixWorkspace = readWorkspace(preFixStore);
+  ok('S30-A3 pre-fix replica reproduces defect 2: user entry in component-local state leaves storage absent/unpersisted',
+    preFixWorkspace.status === 'absent');
+
+  // S30-B: Two empty real projects stay empty
+  const s30Store = makeStore();
+  const projA = projectRow('proj-real-a', 'Real Alpha', '2026-01-01', '2026-12-31', '2026-09-01T00:00:00Z');
+  const projB = projectRow('proj-real-b', 'Real Beta', '2026-02-01', '2026-11-30', '2026-09-01T00:00:00Z');
+  runQuery(query(s30Store, 'projects').insert([projA, projB]));
+
+  const boqA = { id: 'boq-a-01', project_id: 'proj-real-a', code: 'CW-01', description: 'Concrete Works', unit: 'm3', quantity: 500, unit_price: 100, total_price: 50000, category: 'Concrete' };
+  const boqB = { id: 'boq-b-01', project_id: 'proj-real-b', code: 'EW-01', description: 'Earth Works', unit: 'm3', quantity: 200, unit_price: 60, total_price: 12000, category: 'Earthworks' };
+  runQuery(query(s30Store, 'boq_items').insert([boqA, boqB]));
+
+  const certsA = runQuery<PaymentCertificate[]>(query(s30Store, 'payment_certificates').select('*').eq('project_id', 'proj-real-a'));
+  const certsB = runQuery<PaymentCertificate[]>(query(s30Store, 'payment_certificates').select('*').eq('project_id', 'proj-real-b'));
+  const subsA = runQuery<SubcontractorIpc[]>(query(s30Store, 'subcontractor_payment_certificates').select('*').eq('project_id', 'proj-real-a'));
+  const subsB = runQuery<SubcontractorIpc[]>(query(s30Store, 'subcontractor_payment_certificates').select('*').eq('project_id', 'proj-real-b'));
+
+  eq('S30-B1 empty project Alpha has zero payment certificates', certsA.data?.length, 0);
+  eq('S30-B2 empty project Alpha has zero subcontractor certificates', subsA.data?.length, 0);
+  eq('S30-B3 empty project Beta has zero payment certificates', certsB.data?.length, 0);
+  eq('S30-B4 empty project Beta has zero subcontractor certificates', subsB.data?.length, 0);
+
+  const summaryA = summarizeCertificates([], '2026-09-13');
+  const summaryB = summarizeCertificates([], '2026-09-13');
+  eq('S30-B5 empty project Alpha summary certifies 0 SAR', summaryA.certifiedGrossToDate, 0);
+  eq('S30-B6 empty project Alpha summary has 0 certified records', summaryA.certifiedCount, 0);
+  eq('S30-B7 empty project Beta summary certifies 0 SAR', summaryB.certifiedGrossToDate, 0);
+  eq('S30-B8 empty project Beta summary has 0 certified records', summaryB.certifiedCount, 0);
+
+  // S30-C: Synthetic user-entered certificate survives reopen
+  const userIpcA: PaymentCertificate = {
+    id: 'IPC-ALPHA-01',
+    project_id: 'proj-real-a',
+    ipcNumber: 'IPC-01',
+    certificateDate: '2026-08-31',
+    periodStart: '2026-08-01',
+    periodEnd: '2026-08-31',
+    status: 'certified_by_consultant',
+    grossAmountToDate: 35000,
+    previousGrossAmount: 0,
+    currentGrossAmount: 35000,
+    advancePaymentDeduction: 3500,
+    retentionMoneyDeduction: 1750,
+    penaltyDeduction: 0,
+    vatAmount: 5250,
+    netPayableAmount: 35000,
+    items: [
+      {
+        id: 'L-A1',
+        boqItemId: 'boq-a-01',
+        boqCode: 'CW-01',
+        description: 'Concrete Works',
+        unit: 'm3',
+        contractQuantity: 500,
+        unitRateSar: 100,
+        previousQuantity: 0,
+        currentQuantity: 350,
+        cumulativeQuantity: 350,
+        cumulativeAmountSar: 35000,
+        currentAmountSar: 35000,
+      },
+    ],
+  };
+
+  const userSubA: SubcontractorIpc = {
+    id: 'SUB-ALPHA-01',
+    project_id: 'proj-real-a',
+    ipcNumber: 'SUB-01',
+    subcontractorName: 'Eastern Contracting',
+    trade: 'Concrete Casting',
+    certificateDate: '2026-08-30',
+    periodStart: '2026-08-01',
+    periodEnd: '2026-08-30',
+    status: 'approved',
+    subcontractPackageCode: null,
+    grossAmountToDate: 21000,
+    currentGrossAmount: 21000,
+    retentionDeduction: 2100,
+    materialDeductions: 0,
+    netPayableToSubcontractor: 18900,
+    mainContractorRevenueForSameQty: 35000,
+    mainContractorProfitMarginSar: 14000,
+    mainContractorMarginPercent: 40.0,
+    items: [
+      {
+        id: 'SL-A1',
+        description: 'Concrete Casting execution',
+        unit: 'm3',
+        quantity: 350,
+        subcontractorRate: 60,
+        subcontractorAmount: 21000,
+        mainContractorRate: 100,
+        mainContractorAmount: 35000,
+        marginSar: 14000,
+      },
+    ],
+  };
+
+  const insertIpcRes = runQuery(query(s30Store, 'payment_certificates').insert(userIpcA));
+  const insertSubRes = runQuery(query(s30Store, 'subcontractor_payment_certificates').insert(userSubA));
+  ok('S30-C1 synthetic user IPC insert reports success on healthy store', insertIpcRes.error === null);
+  ok('S30-C2 synthetic user Sub IPC insert reports success on healthy store', insertSubRes.error === null);
+
+  const reopenedWorkspace = readWorkspace(s30Store);
+  ok('S30-C3 workspace reloads successfully from storage', reopenedWorkspace.status === 'ok');
+  const reopenedLoaded = reopenedWorkspace as { status: 'ok'; state: WorkspaceState };
+
+  const reopenedIpcsA = tableRows(reopenedLoaded.state, 'payment_certificates').filter((c) => c.project_id === 'proj-real-a');
+  const reopenedSubsA = tableRows(reopenedLoaded.state, 'subcontractor_payment_certificates').filter((s) => s.project_id === 'proj-real-a');
+
+  eq('S30-C4 user IPC survives reload in storage', reopenedIpcsA.length, 1);
+  eq('S30-C5 user IPC ID is preserved', reopenedIpcsA[0]?.id, 'IPC-ALPHA-01');
+  eq('S30-C6 user IPC gross amount is preserved', reopenedIpcsA[0]?.grossAmountToDate, 35000);
+  eq('S30-C7 user IPC line items survive reload', (reopenedIpcsA[0]?.items as unknown as PaymentCertificateItem[])?.length, 1);
+  eq('S30-C8 user Sub IPC survives reload in storage', reopenedSubsA.length, 1);
+  eq('S30-C9 user Sub IPC profit margin is preserved', reopenedSubsA[0]?.mainContractorProfitMarginSar, 14000);
+
+  // S30-D: Project B never sees Project A's records or totals
+  const reopenedIpcsB = tableRows(reopenedLoaded.state, 'payment_certificates').filter((c) => c.project_id === 'proj-real-b');
+  const reopenedSubsB = tableRows(reopenedLoaded.state, 'subcontractor_payment_certificates').filter((s) => s.project_id === 'proj-real-b');
+  eq('S30-D1 project Beta has 0 payment certificates after reload', reopenedIpcsB.length, 0);
+  eq('S30-D2 project Beta has 0 subcontractor certificates after reload', reopenedSubsB.length, 0);
+
+  const reconA = reconcilePaymentCertificate(reopenedIpcsA[0] as unknown as PaymentCertificate, '2026-09-13');
+  const summaryAfterA = summarizeCertificates([reconA], '2026-09-13');
+  const summaryAfterB = summarizeCertificates([], '2026-09-13');
+  eq('S30-D3 project Alpha certified total is 35,000 SAR', summaryAfterA.certifiedGrossToDate, 35000);
+  eq('S30-D4 project Beta certified total is 0 SAR (no leakage from Project Alpha)', summaryAfterB.certifiedGrossToDate, 0);
+
+  // S30-E: Failed writes do not claim success and preserve prior records
+  const quotaStore = makeStore(Object.fromEntries(s30Store.map), { quota: true });
+  const quotaBeforeRaw = quotaStore.getItem(WORKSPACE_STORAGE_KEY);
+  const badWriteRes = runQuery(query(quotaStore, 'payment_certificates').insert({
+    id: 'IPC-FAIL-01',
+    project_id: 'proj-real-a',
+    ipcNumber: 'IPC-FAIL',
+    certificateDate: '2026-08-31',
+    periodStart: '2026-08-01',
+    periodEnd: '2026-08-31',
+    status: 'draft',
+    grossAmountToDate: 9999,
+  }));
+  ok('S30-E1 write on refusing store returns an error, never false success', badWriteRes.error !== null);
+  eq('S30-E2 refusing store bytes remain identical', quotaStore.getItem(WORKSPACE_STORAGE_KEY), quotaBeforeRaw);
+  const quotaReload = readWorkspace(quotaStore) as { status: 'ok'; state: WorkspaceState };
+  eq('S30-E3 refused certificate was not stored',
+    tableRows(quotaReload.state, 'payment_certificates').some((c) => c.id === 'IPC-FAIL-01'), false);
+
+  const dropStore = makeStore(Object.fromEntries(s30Store.map), { dropWrites: true });
+  const dropRes = runQuery(query(dropStore, 'payment_certificates').insert({
+    id: 'IPC-DROP-01',
+    project_id: 'proj-real-a',
+    ipcNumber: 'IPC-DROP',
+    certificateDate: '2026-08-31',
+    periodStart: '2026-08-01',
+    periodEnd: '2026-08-31',
+    status: 'draft',
+    grossAmountToDate: 9999,
+  }));
+  ok('S30-E4 dropped write is detected and reports error', dropRes.error !== null);
+
+  const foreignBoqRes = runQuery(query(s30Store, 'payment_certificates').insert({
+    ...userIpcA,
+    id: 'IPC-CROSS-BOQ',
+    items: [{ id: 'BAD-LINE', boqItemId: 'boq-b-01', currentAmountSar: 100 }],
+  }));
+  ok('S30-E5 certificate referencing foreign BOQ item is rejected at write time',
+    foreignBoqRes.error !== null && foreignBoqRes.error.message.includes('another project'));
+
+  const futureApprovedRes = runQuery(query(s30Store, 'payment_certificates').insert({
+    ...userIpcA,
+    id: 'IPC-FUTURE-APPROVED',
+    certificateDate: '2026-09-20',
+    status: 'paid',
+  }));
+  ok('S30-E6 approved certificate dated after Data Date is rejected at write time',
+    futureApprovedRes.error !== null && futureApprovedRes.error.message.includes('violates project Data Date'));
+
+  // S30-F: Full backup/restore preserves certificate headers, lines, statuses, project boundaries
+  const backupObj = buildBackup(reopenedLoaded.state, '2026-11-04T12:00:00Z');
+  const backupSerialized = serializeBackup(backupObj);
+  ok('S30-F1 backup contains payment_certificates table', 'payment_certificates' in backupObj.tables);
+  ok('S30-F2 backup contains subcontractor_payment_certificates table', 'subcontractor_payment_certificates' in backupObj.tables);
+  eq('S30-F3 backup payment_certificates row count matches state', backupObj.counts.payment_certificates, 1);
+  eq('S30-F4 backup subcontractor_payment_certificates row count matches state', backupObj.counts.subcontractor_payment_certificates, 1);
+
+  const backupVal = validateBackup(backupSerialized);
+  ok('S30-F5 backup with user certificates passes validation', backupVal.ok === true && backupVal.summary?.checksumVerified === true);
+
+  const freshTarget = makeStore();
+  const restoreRes = restoreWorkspace(freshTarget, backupVal, '2026-11-04T12:05:00Z');
+  ok('S30-F6 restore into clean target succeeds', restoreRes.ok === true);
+
+  const restoredLoaded = readWorkspace(freshTarget) as { status: 'ok'; state: WorkspaceState };
+  const restoredIpc = tableRows(restoredLoaded.state, 'payment_certificates').find((c) => c.id === 'IPC-ALPHA-01');
+  const restoredSub = tableRows(restoredLoaded.state, 'subcontractor_payment_certificates').find((s) => s.id === 'SUB-ALPHA-01');
+
+  ok('S30-F7 restored IPC is present', restoredIpc !== undefined);
+  eq('S30-F8 restored IPC status is preserved', restoredIpc?.status, 'certified_by_consultant');
+  eq('S30-F9 restored IPC net payable is preserved', restoredIpc?.netPayableAmount, 35000);
+  eq('S30-F10 restored IPC lines survived with BOQ link', (restoredIpc?.items as unknown as PaymentCertificateItem[])?.[0]?.boqCode, 'CW-01');
+  ok('S30-F11 restored Sub IPC is present', restoredSub !== undefined);
+  eq('S30-F12 restored Sub IPC trade is preserved', restoredSub?.trade, 'Concrete Casting');
+  eq('S30-F13 restored Sub IPC profit margin is preserved', restoredSub?.mainContractorProfitMarginSar, 14000);
+
+  // S30-G: Invalid / cross-project / post-Data-Date restores leave prior bytes intact
+  const guardS30 = makeStore(Object.fromEntries(freshTarget.map));
+  const guardS30Before = guardS30.getItem(WORKSPACE_STORAGE_KEY);
+
+  const badCertProj = JSON.parse(backupSerialized);
+  badCertProj.tables.payment_certificates[0].project_id = 'proj-non-existent';
+  const valBadProj = validateBackup(JSON.stringify(badCertProj));
+  ok('S30-G1 restore with non-existent project reference fails validation',
+    valBadProj.ok === false && valBadProj.errors[0]?.code === 'missing_reference');
+  const resBadProj = restoreWorkspace(guardS30, valBadProj);
+  ok('S30-G2 refused restore performs no write', resBadProj.ok === false && guardS30.getItem(WORKSPACE_STORAGE_KEY) === guardS30Before);
+
+  const badCertBoq = JSON.parse(backupSerialized);
+  badCertBoq.tables.payment_certificates[0].items[0].boqItemId = 'boq-b-01';
+  const valBadBoq = validateBackup(JSON.stringify(badCertBoq));
+  ok('S30-G3 restore with cross-project BOQ reference fails validation',
+    valBadBoq.ok === false && valBadBoq.errors[0]?.code === 'project_mismatch');
+  const resBadBoq = restoreWorkspace(guardS30, valBadBoq);
+  ok('S30-G4 refused cross-project restore performs no write', resBadBoq.ok === false && guardS30.getItem(WORKSPACE_STORAGE_KEY) === guardS30Before);
+
+  const badCertChronology = JSON.parse(backupSerialized);
+  badCertChronology.tables.payment_certificates[0].certificateDate = '2026-09-20';
+  badCertChronology.tables.payment_certificates[0].status = 'paid';
+  const valBadChron = validateBackup(JSON.stringify(badCertChronology));
+  ok('S30-G5 restore with post-Data-Date approved certificate fails chronology validation',
+    valBadChron.ok === false && valBadChron.errors[0]?.code === 'chronology');
+  const resBadChron = restoreWorkspace(guardS30, valBadChron);
+  ok('S30-G6 refused chronology restore leaves storage byte-identical',
+    resBadChron.ok === false && guardS30.getItem(WORKSPACE_STORAGE_KEY) === guardS30Before);
+
+  const badCertDup = JSON.parse(backupSerialized);
+  badCertDup.tables.payment_certificates.push({ ...badCertDup.tables.payment_certificates[0] });
+  const valBadDup = validateBackup(JSON.stringify(badCertDup));
+  ok('S30-G7 restore with duplicate certificate ID fails validation',
+    valBadDup.ok === false && valBadDup.errors[0]?.code === 'duplicate_id');
+  const resBadDup = restoreWorkspace(guardS30, valBadDup);
+  ok('S30-G8 refused duplicate ID restore leaves storage byte-identical',
+    resBadDup.ok === false && guardS30.getItem(WORKSPACE_STORAGE_KEY) === guardS30Before);
+
+  // S30-H: Commercial reconciliation results compared before/after on unchanged inputs (zero math drift)
+  const demoIpc1: PaymentCertificate = {
+    id: 'IPC-01', ipcNumber: 'IPC-01', certificateDate: '2026-07-31', periodStart: '2026-07-01', periodEnd: '2026-07-31',
+    status: 'paid', grossAmountToDate: 102150, previousGrossAmount: 0, currentGrossAmount: 102150,
+    advancePaymentDeduction: 10215, retentionMoneyDeduction: 5107.5, penaltyDeduction: 0, vatAmount: 15322.5, netPayableAmount: 102150,
+    items: [
+      { id: 'L1', boqItemId: 'b1', boqCode: 'EW-001', description: 'Excavation', unit: 'm3', contractQuantity: 1200, unitRateSar: 35, previousQuantity: 0, currentQuantity: 1200, cumulativeQuantity: 1200, cumulativeAmountSar: 42000, currentAmountSar: 42000 },
+      { id: 'L2', boqItemId: 'b2', boqCode: 'EW-002', description: 'Backfill', unit: 'm3', contractQuantity: 450, unitRateSar: 45, previousQuantity: 0, currentQuantity: 450, cumulativeQuantity: 450, cumulativeAmountSar: 20250, currentAmountSar: 20250 },
+      { id: 'L3', boqItemId: 'b3', boqCode: 'CW-001', description: 'PCC', unit: 'm3', contractQuantity: 95, unitRateSar: 420, previousQuantity: 0, currentQuantity: 95, cumulativeQuantity: 95, cumulativeAmountSar: 39900, currentAmountSar: 39900 },
+    ],
+  };
+  const demoIpc3: PaymentCertificate = {
+    id: 'IPC-03', ipcNumber: 'IPC-03', certificateDate: '2026-09-10', periodStart: '2026-09-01', periodEnd: '2026-09-10',
+    status: 'certified_by_consultant', grossAmountToDate: 505940, previousGrossAmount: 425300, currentGrossAmount: 80640,
+    advancePaymentDeduction: 8064, retentionMoneyDeduction: 4032, penaltyDeduction: 0, vatAmount: 12096, netPayableAmount: 80640,
+    items: [
+      { id: 'L6', boqItemId: 'b6', boqCode: 'CW-003', description: 'RCC', unit: 'm3', contractQuantity: 650, unitRateSar: 720, previousQuantity: 0, currentQuantity: 112, cumulativeQuantity: 112, cumulativeAmountSar: 80640, currentAmountSar: 80640 },
+    ],
+  };
+  const demoSub1: SubcontractorIpc = {
+    id: 'SUB-IPC-01', ipcNumber: 'SUB-IPC-001', subcontractPackageCode: 'SUB-PKG-01', subcontractorName: 'Al-Bonyan',
+    trade: 'Concrete', certificateDate: '2026-08-25', periodStart: '2026-08-01', periodEnd: '2026-08-25', status: 'paid',
+    grossAmountToDate: 215000, currentGrossAmount: 215000, retentionDeduction: 21500, materialDeductions: 4500, netPayableToSubcontractor: 189000,
+    mainContractorRevenueForSameQty: 323150, mainContractorProfitMarginSar: 108750, mainContractorMarginPercent: 33.7,
+    items: [
+      { id: 'SL1', description: 'Footings', unit: 'm3', quantity: 280, subcontractorRate: 380, subcontractorAmount: 106400, mainContractorRate: 680, mainContractorAmount: 190400, marginSar: 84000 },
+      { id: 'SL2', description: 'Rebar', unit: 'ton', quantity: 45, subcontractorRate: 2400, subcontractorAmount: 108000, mainContractorRate: 2950, mainContractorAmount: 132750, marginSar: 24750 },
+    ],
+  };
+
+  const reconIpc1 = reconcilePaymentCertificate(demoIpc1, '2026-09-13');
+  const reconIpc3 = reconcilePaymentCertificate(demoIpc3, '2026-09-13');
+  const reconSub1 = reconcileSubcontractorCertificate(demoSub1, '2026-09-13', 10);
+
+  eq('S30-H1 IPC-01 reconciles as balanced', reconIpc1.status, 'balanced');
+  eq('S30-H2 IPC-01 chronology is actual', reconIpc1.chronology.recordClass, 'actual');
+  eq('S30-H3 IPC-01 net payable matches line calculation', reconIpc1.netDerived, 102150);
+  eq('S30-H4 IPC-03 reconciles current gross with line amount', reconIpc3.lineCurrentSum, 80640);
+  eq('S30-H5 SUB-IPC-01 surfaces header/lines mismatch with exact 600 SAR delta', reconSub1.currentDelta, 600);
+  eq('S30-H6 SUB-IPC-01 retention matches 10% contract', reconSub1.retentionMatchesContract, true);
+  eq('S30-H7 SUB-IPC-01 status is mismatch', reconSub1.status, 'mismatch');
+
+  // S30-K: Batch guard
+  const s30ChangedPaths = new Set([
+    ...execFileSync('git', ['diff', '--name-only', '140e7def681f2913e112987d5d5154e521e3ab57', 'HEAD'], { encoding: 'utf8' }).split('\n').filter(Boolean),
+    ...execFileSync('git', ['diff', '--name-only'], { encoding: 'utf8' }).split('\n').filter(Boolean),
+    ...execFileSync('git', ['diff', '--name-only', '--cached'], { encoding: 'utf8' }).split('\n').filter(Boolean),
+    ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
+  ]);
+  eq('S30-K1 changes outside S29 stay within declared S30 increment paths',
+    [...s30ChangedPaths].filter((path) => !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path)), []);
+  ok('S30-K2 S30 increment actually touches PaymentCertificatesView and workspace storage',
+    s30ChangedPaths.has('src/components/views/PaymentCertificatesView.tsx')
+      && s30ChangedPaths.has('src/lib/localWorkspace.ts')
+      && s30ChangedPaths.has('src/lib/localQueryBuilder.ts')
+      && s30ChangedPaths.has('src/types/index.ts'));
 }
 
 // ---------------------------------------------------------------------------

@@ -15,7 +15,7 @@ The pilot keeps **one** LocalStorage key:
 | --- | --- |
 | Storage key | `schedule_mgmt_db_v5` |
 | Schema version | `2` (`__meta.schema_version`); version `1` (unversioned) is migrated **in memory** on read |
-| Scope | every table listed in `PERSISTED_TABLES` (`src/lib/localWorkspace.ts`) — projects, WBS, BOQ, activities, links, resources, assignments, allocations, budgets, costs, progress/approvals, risks, issues, submittals, inspections, calendars, alerts, delay claims, snapshots, subcontracts, baselines (header + activity/WBS/BOQ snapshots), the active scope-baseline pointer, and the variation-order register with its links/impacts/events |
+| Scope | every table listed in `PERSISTED_TABLES` (`src/lib/localWorkspace.ts`, 34 tables) — projects, WBS, BOQ, activities, links, resources, assignments, allocations, budgets, costs, progress/approvals, risks, issues, submittals, inspections, calendars, alerts, delay claims, snapshots, subcontracts, payment certificates (`payment_certificates`), subcontractor payment certificates (`subcontractor_payment_certificates`), baselines (header + activity/WBS/BOQ snapshots), the active scope-baseline pointer, and the variation-order register with its links/impacts/events |
 | Project-scoped auxiliary stores (also part of a complete backup) | `schedule_diff_revisions_<projectId>` (monthly cut-off revisions + activity snapshots), `construction_subcontracts_data_<projectId>` (legacy subcontract register), `construction_subcontracts_db_import_<projectId>` (one-time import timestamp) |
 | Not stored there | language/UI preference (`app_lang`), the selected-project pointer (`schedule_mgmt_selected_project`), and anything belonging to another application or to Supabase auth — these are never read and never exported |
 
@@ -33,11 +33,11 @@ and a damaged or unreadable one is reported — it is never replaced by demo dat
    الانتهاء التعاقدي. الحقول المطلوبة معلَّمة بـ `*`، والأخطاء تظهر داخل النافذة قبل الإرسال.
 3. اضغط **«إنشاء المشروع (فارغ)» / “Create empty project”**.
 
-المشروع الجديد يُنشأ **فارغاً تماماً**: لا BOQ ولا أنشطة ولا روابط ولا بنود تكلفة ولا إنجاز. المدة
+المشروع الجديد يُنشأ **فارغاً تماماً**: لا BOQ ولا أنشطة ولا روابط ولا بنود تكلفة ولا مستخلصات مالية ولا إنجاز. المدة
 التعاقدية تُحسب من التاريخين، وتاريخ البيانات المحكوم (`2026-09-13`) يُطبَّق كسياسة. المشروع الجديد
 يصبح المشروع النشط، ويبقى محدَّداً بعد إعادة تحميل المتصفح.
 
-> The new project is created **completely empty** — no BOQ, activities, links, cost lines or progress.
+> The new project is created **completely empty** — no BOQ, activities, links, cost lines, payment certificates or progress.
 > Its contractual duration is derived from the two dates; the governed Data Date (`2026-09-13`) is
 > applied as policy. It becomes the active project and the selection survives a reload.
 

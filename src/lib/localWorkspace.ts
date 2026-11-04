@@ -150,6 +150,8 @@ export const PERSISTED_TABLES: readonly PersistedTableSpec[] = [
   { name: 'variation_order_wbs_links', idField: 'id', projectScoped: false, label: 'Variation order WBS links' },
   { name: 'variation_order_activity_links', idField: 'id', projectScoped: false, label: 'Variation order activity links' },
   { name: 'variation_order_events', idField: 'id', projectScoped: false, label: 'Variation order audit events' },
+  { name: 'payment_certificates', idField: 'id', projectScoped: true, label: 'Main contractor payment certificates' },
+  { name: 'subcontractor_payment_certificates', idField: 'id', projectScoped: true, label: 'Subcontractor payment certificates' },
 ];
 
 /** Table names only (fast membership checks and inventory assertions). */
@@ -798,6 +800,184 @@ function writeWholeState(
 }
 
 /**
+ * Demo payment certificates scoped to demo project 1 (proj-seed-001).
+ * Demo lifecycle only: real user-created projects and empty workspaces stay completely clean.
+ */
+export const DEMO_PAYMENT_CERTIFICATES: readonly WorkspaceRow[] = [
+  {
+    id: 'IPC-01',
+    project_id: 'proj-seed-001',
+    ipcNumber: 'IPC-01',
+    certificateDate: '2026-07-31',
+    periodStart: '2026-07-01',
+    periodEnd: '2026-07-31',
+    status: 'paid',
+    grossAmountToDate: 102150,
+    previousGrossAmount: 0,
+    currentGrossAmount: 102150,
+    advancePaymentDeduction: 10215,
+    retentionMoneyDeduction: 5107.5,
+    penaltyDeduction: 0,
+    vatAmount: 15322.5,
+    netPayableAmount: 102150,
+    items: [
+      { id: 'IPC-01-L1', boqItemId: 'boq-01', boqCode: 'EW-001', description: 'حفريات الموقع العام ونقل المخلفات', unit: 'm3', contractQuantity: 1200, unitRateSar: 35, previousQuantity: 0, currentQuantity: 1200, cumulativeQuantity: 1200, cumulativeAmountSar: 42000, currentAmountSar: 42000 },
+      { id: 'IPC-01-L2', boqItemId: 'boq-02', boqCode: 'EW-002', description: 'أعمال الردم بطبقات ورش المياه والدمك', unit: 'm3', contractQuantity: 450, unitRateSar: 45, previousQuantity: 0, currentQuantity: 450, cumulativeQuantity: 450, cumulativeAmountSar: 20250, currentAmountSar: 20250 },
+      { id: 'IPC-01-L3', boqItemId: 'boq-03', boqCode: 'CW-001', description: 'خرسانة نظافة عادية أسفل القواعد', unit: 'm3', contractQuantity: 95, unitRateSar: 420, previousQuantity: 0, currentQuantity: 95, cumulativeQuantity: 95, cumulativeAmountSar: 39900, currentAmountSar: 39900 },
+    ],
+  },
+  {
+    id: 'IPC-02',
+    project_id: 'proj-seed-001',
+    ipcNumber: 'IPC-02',
+    certificateDate: '2026-08-31',
+    periodStart: '2026-08-01',
+    periodEnd: '2026-08-31',
+    status: 'paid',
+    grossAmountToDate: 425300,
+    previousGrossAmount: 102150,
+    currentGrossAmount: 323150,
+    advancePaymentDeduction: 32315,
+    retentionMoneyDeduction: 16157.5,
+    penaltyDeduction: 0,
+    vatAmount: 48472.5,
+    netPayableAmount: 323150,
+    items: [
+      { id: 'IPC-02-L1', boqItemId: 'boq-01', boqCode: 'EW-001', description: 'حفريات الموقع العام ونقل المخلفات', unit: 'm3', contractQuantity: 1200, unitRateSar: 35, previousQuantity: 1200, currentQuantity: 0, cumulativeQuantity: 1200, cumulativeAmountSar: 42000, currentAmountSar: 0 },
+      { id: 'IPC-02-L2', boqItemId: 'boq-02', boqCode: 'EW-002', description: 'أعمال الردم بطبقات ورش المياه والدمك', unit: 'm3', contractQuantity: 450, unitRateSar: 45, previousQuantity: 450, currentQuantity: 0, cumulativeQuantity: 450, cumulativeAmountSar: 20250, currentAmountSar: 0 },
+      { id: 'IPC-02-L3', boqItemId: 'boq-03', boqCode: 'CW-001', description: 'خرسانة نظافة عادية أسفل القواعد', unit: 'm3', contractQuantity: 95, unitRateSar: 420, previousQuantity: 95, currentQuantity: 0, cumulativeQuantity: 95, cumulativeAmountSar: 39900, currentAmountSar: 0 },
+      { id: 'IPC-02-L4', boqItemId: 'boq-04', boqCode: 'CW-002', description: 'خرسانة مسلحة للقواعد والميد الأرضية', unit: 'm3', contractQuantity: 280, unitRateSar: 680, previousQuantity: 0, currentQuantity: 280, cumulativeQuantity: 280, cumulativeAmountSar: 190400, currentAmountSar: 190400 },
+      { id: 'IPC-02-L5', boqItemId: 'boq-05', boqCode: 'RS-001', description: 'حديد تسليح للقواعد والأعمدة', unit: 'ton', contractQuantity: 45, unitRateSar: 2950, previousQuantity: 0, currentQuantity: 45, cumulativeQuantity: 45, cumulativeAmountSar: 132750, currentAmountSar: 132750 },
+    ],
+  },
+  {
+    id: 'IPC-03',
+    project_id: 'proj-seed-001',
+    ipcNumber: 'IPC-03',
+    certificateDate: '2026-09-10',
+    periodStart: '2026-09-01',
+    periodEnd: '2026-09-10',
+    status: 'certified_by_consultant',
+    grossAmountToDate: 505940,
+    previousGrossAmount: 425300,
+    currentGrossAmount: 80640,
+    advancePaymentDeduction: 8064,
+    retentionMoneyDeduction: 4032,
+    penaltyDeduction: 0,
+    vatAmount: 12096,
+    netPayableAmount: 80640,
+    items: [
+      { id: 'IPC-03-L1', boqItemId: 'boq-01', boqCode: 'EW-001', description: 'حفريات الموقع العام ونقل المخلفات', unit: 'm3', contractQuantity: 1200, unitRateSar: 35, previousQuantity: 1200, currentQuantity: 0, cumulativeQuantity: 1200, cumulativeAmountSar: 42000, currentAmountSar: 0 },
+      { id: 'IPC-03-L2', boqItemId: 'boq-02', boqCode: 'EW-002', description: 'أعمال الردم بطبقات ورش المياه والدمك', unit: 'm3', contractQuantity: 450, unitRateSar: 45, previousQuantity: 450, currentQuantity: 0, cumulativeQuantity: 450, cumulativeAmountSar: 20250, currentAmountSar: 0 },
+      { id: 'IPC-03-L3', boqItemId: 'boq-03', boqCode: 'CW-001', description: 'خرسانة نظافة عادية أسفل القواعد', unit: 'm3', contractQuantity: 95, unitRateSar: 420, previousQuantity: 95, currentQuantity: 0, cumulativeQuantity: 95, cumulativeAmountSar: 39900, currentAmountSar: 0 },
+      { id: 'IPC-03-L4', boqItemId: 'boq-04', boqCode: 'CW-002', description: 'خرسانة مسلحة للقواعد والميد الأرضية', unit: 'm3', contractQuantity: 280, unitRateSar: 680, previousQuantity: 280, currentQuantity: 0, cumulativeQuantity: 280, cumulativeAmountSar: 190400, currentAmountSar: 0 },
+      { id: 'IPC-03-L5', boqItemId: 'boq-05', boqCode: 'RS-001', description: 'حديد تسليح للقواعد والأعمدة', unit: 'ton', contractQuantity: 45, unitRateSar: 2950, previousQuantity: 45, currentQuantity: 0, cumulativeQuantity: 45, cumulativeAmountSar: 132750, currentAmountSar: 0 },
+      { id: 'IPC-03-L6', boqItemId: 'boq-06', boqCode: 'CW-003', description: 'خرسانة مسلحة للأعمدة والأسقف لجميع الأدوار', unit: 'm3', contractQuantity: 650, unitRateSar: 720, previousQuantity: 0, currentQuantity: 112, cumulativeQuantity: 112, cumulativeAmountSar: 80640, currentAmountSar: 80640 },
+    ],
+  },
+  {
+    id: 'IPC-04',
+    project_id: 'proj-seed-001',
+    ipcNumber: 'IPC-04',
+    certificateDate: '2026-12-31',
+    periodStart: '2026-10-01',
+    periodEnd: '2026-12-31',
+    status: 'draft',
+    grossAmountToDate: 885940,
+    previousGrossAmount: 505940,
+    currentGrossAmount: 380000,
+    advancePaymentDeduction: 38000,
+    retentionMoneyDeduction: 19000,
+    penaltyDeduction: 0,
+    vatAmount: 57000,
+    netPayableAmount: 380000,
+    items: [
+      { id: 'IPC-04-L1', boqItemId: 'boq-01', boqCode: 'EW-001', description: 'حفريات الموقع العام ونقل المخلفات', unit: 'm3', contractQuantity: 1200, unitRateSar: 35, previousQuantity: 1200, currentQuantity: 0, cumulativeQuantity: 1200, cumulativeAmountSar: 42000, currentAmountSar: 0 },
+      { id: 'IPC-04-L2', boqItemId: 'boq-02', boqCode: 'EW-002', description: 'أعمال الردم بطبقات ورش المياه والدمك', unit: 'm3', contractQuantity: 450, unitRateSar: 45, previousQuantity: 450, currentQuantity: 0, cumulativeQuantity: 450, cumulativeAmountSar: 20250, currentAmountSar: 0 },
+      { id: 'IPC-04-L3', boqItemId: 'boq-03', boqCode: 'CW-001', description: 'خرسانة نظافة عادية أسفل القواعد', unit: 'm3', contractQuantity: 95, unitRateSar: 420, previousQuantity: 95, currentQuantity: 0, cumulativeQuantity: 95, cumulativeAmountSar: 39900, currentAmountSar: 0 },
+      { id: 'IPC-04-L4', boqItemId: 'boq-04', boqCode: 'CW-002', description: 'خرسانة مسلحة للقواعد والميد الأرضية', unit: 'm3', contractQuantity: 280, unitRateSar: 680, previousQuantity: 280, currentQuantity: 0, cumulativeQuantity: 280, cumulativeAmountSar: 190400, currentAmountSar: 0 },
+      { id: 'IPC-04-L5', boqItemId: 'boq-05', boqCode: 'RS-001', description: 'حديد تسليح للقواعد والأعمدة', unit: 'ton', contractQuantity: 45, unitRateSar: 2950, previousQuantity: 45, currentQuantity: 0, cumulativeQuantity: 45, cumulativeAmountSar: 132750, currentAmountSar: 0 },
+      { id: 'IPC-04-L6', boqItemId: 'boq-06', boqCode: 'CW-003', description: 'خرسانة مسلحة للأعمدة والأسقف لجميع الأدوار (المتوقع للربع الرابع)', unit: 'm3', contractQuantity: 650, unitRateSar: 720, previousQuantity: 112, currentQuantity: 200, cumulativeQuantity: 312, cumulativeAmountSar: 224640, currentAmountSar: 144000 },
+      { id: 'IPC-04-L7', boqItemId: 'boq-07', boqCode: 'MS-001', description: 'مباني بلك إسمنتي معزول وخفيف للجدران (المتوقع للربع الرابع)', unit: 'm2', contractQuantity: 3200, unitRateSar: 95, previousQuantity: 0, currentQuantity: 1600, cumulativeQuantity: 1600, cumulativeAmountSar: 152000, currentAmountSar: 152000 },
+      { id: 'IPC-04-L8', boqItemId: 'boq-09', boqCode: 'PL-001', description: 'أعمال اللياسة الداخلية والخارجية (المتوقع للربع الرابع)', unit: 'm2', contractQuantity: 6400, unitRateSar: 42, previousQuantity: 0, currentQuantity: 2000, cumulativeQuantity: 2000, cumulativeAmountSar: 84000, currentAmountSar: 84000 },
+    ],
+  },
+];
+
+export const DEMO_SUBCONTRACTOR_CERTIFICATES: readonly WorkspaceRow[] = [
+  {
+    id: 'SUB-IPC-01',
+    project_id: 'proj-seed-001',
+    ipcNumber: 'SUB-IPC-001',
+    subcontractPackageCode: 'SUB-PKG-01',
+    subcontractorName: 'شركة البنيان لأعمال الخرسانات والهياكل',
+    trade: 'مقاول باطن - أعمال الهيكل الإنشائي والخرسانات',
+    certificateDate: '2026-08-25',
+    periodStart: '2026-08-01',
+    periodEnd: '2026-08-25',
+    status: 'paid',
+    grossAmountToDate: 215000,
+    currentGrossAmount: 215000,
+    retentionDeduction: 21500,
+    materialDeductions: 4500,
+    netPayableToSubcontractor: 189000,
+    mainContractorRevenueForSameQty: 323150,
+    mainContractorProfitMarginSar: 108750,
+    mainContractorMarginPercent: 33.7,
+    items: [
+      { id: 'SUB-IPC-01-L1', description: 'خرسانة مسلحة للقواعد والميد الأرضية (CW-002)', unit: 'م3', quantity: 280, subcontractorRate: 380, subcontractorAmount: 106400, mainContractorRate: 680, mainContractorAmount: 190400, marginSar: 84000 },
+      { id: 'SUB-IPC-01-L2', description: 'حديد تسليح للقواعد والأعمدة (RS-001)', unit: 'طن', quantity: 45, subcontractorRate: 2400, subcontractorAmount: 108000, mainContractorRate: 2950, mainContractorAmount: 132750, marginSar: 24750 },
+    ],
+  },
+  {
+    id: 'SUB-IPC-02',
+    project_id: 'proj-seed-001',
+    ipcNumber: 'SUB-IPC-002',
+    subcontractPackageCode: 'SUB-PKG-02',
+    subcontractorName: 'شركة الإعمار والمساندة الخرسانية المحدودة',
+    trade: 'مقاول باطن مساند - أعمال خرسانات القطاع B',
+    certificateDate: '2026-09-08',
+    periodStart: '2026-09-01',
+    periodEnd: '2026-09-08',
+    status: 'approved',
+    grossAmountToDate: 19440,
+    currentGrossAmount: 19440,
+    retentionDeduction: 972,
+    materialDeductions: 0,
+    netPayableToSubcontractor: 18468,
+    mainContractorRevenueForSameQty: 34560,
+    mainContractorProfitMarginSar: 15120,
+    mainContractorMarginPercent: 43.8,
+    items: [
+      { id: 'SUB-IPC-02-L1', description: 'خرسانة مسلحة للأعمدة والأسقف - حصة القطاع B (CW-003)', unit: 'م3', quantity: 48, subcontractorRate: 405, subcontractorAmount: 19440, mainContractorRate: 720, mainContractorAmount: 34560, marginSar: 15120 },
+    ],
+  },
+  {
+    id: 'SUB-IPC-03',
+    project_id: 'proj-seed-001',
+    ipcNumber: 'SUB-IPC-003',
+    subcontractPackageCode: 'SUB-PKG-01',
+    subcontractorName: 'شركة البنيان لأعمال الخرسانات والهياكل',
+    trade: 'مقاول باطن - أعمال الهيكل الإنشائي والخرسانات',
+    certificateDate: '2026-09-11',
+    periodStart: '2026-09-01',
+    periodEnd: '2026-09-10',
+    status: 'draft',
+    grossAmountToDate: 240600,
+    currentGrossAmount: 25600,
+    retentionDeduction: 2560,
+    materialDeductions: 0,
+    netPayableToSubcontractor: 23040,
+    mainContractorRevenueForSameQty: 46080,
+    mainContractorProfitMarginSar: 20480,
+    mainContractorMarginPercent: 44.4,
+    items: [
+      { id: 'SUB-IPC-03-L1', description: 'خرسانة مسلحة للأعمدة والأسقف - حصة القطاع A (CW-003)', unit: 'م3', quantity: 64, subcontractorRate: 400, subcontractorAmount: 25600, mainContractorRate: 720, mainContractorAmount: 46080, marginSar: 20480 },
+    ],
+  },
+];
+
+/**
  * Explicit demo creation. The ONLY path that writes invented demo data, and it is never reached
  * implicitly: the caller (a clearly labelled "Load demo workspace" button) asks for it.
  *
@@ -825,6 +1005,14 @@ export function seedDemoWorkspace(
     ...deepClone(seedTables),
     __meta: { schema_version: WORKSPACE_SCHEMA_VERSION, workspace_kind: kind, created_at: createdAt },
   };
+  if (kind === 'demo') {
+    if (!state.payment_certificates || (state.payment_certificates as WorkspaceRow[]).length === 0) {
+      state.payment_certificates = deepClone(DEMO_PAYMENT_CERTIFICATES as WorkspaceRow[]);
+    }
+    if (!state.subcontractor_payment_certificates || (state.subcontractor_payment_certificates as WorkspaceRow[]).length === 0) {
+      state.subcontractor_payment_certificates = deepClone(DEMO_SUBCONTRACTOR_CERTIFICATES as WorkspaceRow[]);
+    }
+  }
   return writeWholeState(storage, state);
 }
 
@@ -1375,6 +1563,109 @@ export function validateBackup(input: string | unknown): BackupValidation {
       if (!baselineById.has(String(row.baseline_id))) {
         return fail('missing_reference', `tables.${spec}[${i}].baseline_id`, 'baseline revision does not exist');
       }
+    }
+  }
+
+  // --- payment certificates: boundary + Data Date chronology + finite numbers ------------
+  for (let i = 0; i < tables.payment_certificates.length; i += 1) {
+    const cert = tables.payment_certificates[i];
+    const path = `tables.payment_certificates[${i}]`;
+    const certDate = typeof cert.certificateDate === 'string' ? cert.certificateDate : typeof cert.certificate_date === 'string' ? cert.certificate_date : null;
+    const status = cert.status;
+    const project = projectById.get(String(cert.project_id));
+    const projectDataDate = project && isIsoDateValue(project.data_date) ? project.data_date : null;
+
+    for (const field of ['grossAmountToDate', 'previousGrossAmount', 'currentGrossAmount', 'netPayableAmount', 'advancePaymentDeduction', 'retentionMoneyDeduction', 'penaltyDeduction', 'vatAmount']) {
+      const val = cert[field];
+      if (val !== undefined && val !== null && num(val) === null) {
+        return fail('required_field', `${path}.${field}`, `${field} must be numeric or null`);
+      }
+    }
+
+    if (cert.items !== undefined && cert.items !== null) {
+      if (!Array.isArray(cert.items)) {
+        return fail('invalid_row', `${path}.items`, 'certificate items must be an array');
+      }
+      for (let j = 0; j < cert.items.length; j += 1) {
+        const item = cert.items[j];
+        const itemPath = `${path}.items[${j}]`;
+        if (!isPlainObject(item)) {
+          return fail('invalid_row', itemPath, 'certificate line item is not an object');
+        }
+        for (const numField of ['contractQuantity', 'unitRateSar', 'previousQuantity', 'currentQuantity', 'cumulativeQuantity', 'cumulativeAmountSar', 'currentAmountSar']) {
+          const val = item[numField];
+          if (val !== undefined && val !== null && num(val) === null) {
+            return fail('required_field', `${itemPath}.${numField}`, `${numField} must be numeric or null`);
+          }
+        }
+        const boqId = item.boqItemId ?? item.boq_item_id;
+        if (boqId !== undefined && boqId !== null && String(boqId).trim() !== '') {
+          const boq = boqById.get(String(boqId));
+          if (!boq) {
+            return fail('missing_reference', `${itemPath}.boqItemId`, 'certificate item references non-existent BOQ item');
+          }
+          if (boq.project_id !== cert.project_id) {
+            return fail('project_mismatch', `${itemPath}.boqItemId`, 'certificate item references BOQ item of another project');
+          }
+        }
+      }
+    }
+
+    const isApprovedOrPaid = status === 'paid' || status === 'certified_by_consultant' || status === 'approved_by_client';
+    if (isApprovedOrPaid && isIsoDateValue(certDate) && projectDataDate && certDate > projectDataDate) {
+      return fail('chronology', path,
+        `payment certificate dated ${certDate} with status "${status}" is after the project Data Date ${projectDataDate}`);
+    }
+  }
+
+  // --- subcontractor payment certificates: boundary + Data Date chronology + finite numbers ------------
+  for (let i = 0; i < tables.subcontractor_payment_certificates.length; i += 1) {
+    const sub = tables.subcontractor_payment_certificates[i];
+    const path = `tables.subcontractor_payment_certificates[${i}]`;
+    const certDate = typeof sub.certificateDate === 'string' ? sub.certificateDate : typeof sub.certificate_date === 'string' ? sub.certificate_date : null;
+    const status = sub.status;
+    const project = projectById.get(String(sub.project_id));
+    const projectDataDate = project && isIsoDateValue(project.data_date) ? project.data_date : null;
+
+    for (const field of ['grossAmountToDate', 'currentGrossAmount', 'retentionDeduction', 'materialDeductions', 'netPayableToSubcontractor', 'mainContractorRevenueForSameQty', 'mainContractorProfitMarginSar', 'mainContractorMarginPercent']) {
+      const val = sub[field];
+      if (val !== undefined && val !== null && num(val) === null) {
+        return fail('required_field', `${path}.${field}`, `${field} must be numeric or null`);
+      }
+    }
+
+    if (sub.items !== undefined && sub.items !== null) {
+      if (!Array.isArray(sub.items)) {
+        return fail('invalid_row', `${path}.items`, 'subcontractor certificate items must be an array');
+      }
+      for (let j = 0; j < sub.items.length; j += 1) {
+        const item = sub.items[j];
+        const itemPath = `${path}.items[${j}]`;
+        if (!isPlainObject(item)) {
+          return fail('invalid_row', itemPath, 'subcontractor line item is not an object');
+        }
+        for (const numField of ['quantity', 'subcontractorRate', 'subcontractorAmount', 'mainContractorRate', 'mainContractorAmount', 'marginSar']) {
+          const val = item[numField];
+          if (val !== undefined && val !== null && num(val) === null) {
+            return fail('required_field', `${itemPath}.${numField}`, `${numField} must be numeric or null`);
+          }
+        }
+      }
+    }
+
+    const pkgCode = sub.subcontractPackageCode ?? sub.subcontract_package_code;
+    if (pkgCode !== undefined && pkgCode !== null && String(pkgCode).trim() !== '') {
+      const foreignPkg = tables.subcontract_packages.find((p) => (p.code === pkgCode || p.id === pkgCode) && p.project_id !== sub.project_id);
+      const matchingPkg = tables.subcontract_packages.find((p) => (p.code === pkgCode || p.id === pkgCode) && p.project_id === sub.project_id);
+      if (foreignPkg && !matchingPkg) {
+        return fail('project_mismatch', `${path}.subcontractPackageCode`, 'subcontractor certificate references package of another project');
+      }
+    }
+
+    const isApprovedOrPaid = status === 'paid' || status === 'approved';
+    if (isApprovedOrPaid && isIsoDateValue(certDate) && projectDataDate && certDate > projectDataDate) {
+      return fail('chronology', path,
+        `subcontractor payment certificate dated ${certDate} with status "${status}" is after the project Data Date ${projectDataDate}`);
     }
   }
 

@@ -232,3 +232,46 @@ Independent browser evidence: exported the existing isolated QA project; malform
 ## Owner dashboard evidence repair —4November2026
 The new real project could show four fabricated live alerts (float erosion, cash deficit, guarantee expiry, claim deadline) and100%Excellenthealth with no activities or measured CPI/SPI. Replace those illustrative cards with persisted project_alerts and an explicit no-recorded-alerts/insufficient-data message. Health stays N/A until activities and valid canonical CPI/SPI exist; correction prompts also report unmeasured values rather than invent1.00 or assume a deficit. Existing EVM/CPM/health scoring math is unchanged. S29 scope inventory narrowly includes Dashboard.tsx for this recorded first-use honesty defect; all controls retained.
 Real isolated browser checks passed EN/AR missing-data cases (no312,000/3.5/Excellent claims), and a validated imported one-project/one-synthetic-alert backup displayed exactly its stored title/message/severity/status. Synthetic alert is QA only, not a real project issue. Typecheck/build pass, controls1752/1752. Targeted lint has pre-existing findings; before/after report retained outside repo. Owner installation/full commercial acceptance remains open.
+
+---
+
+## Payment certificate first-use and persistence repair — 4 November 2026 (TASK SCH-20261104-IPC01)
+
+**Task:** Close the payment certificate first-use and persistence gap in `PaymentCertificatesView.tsx`.
+**Base commit:** `140e7def681f2913e112987d5d5154e521e3ab57` on branch `arena/182ee6f6-schedule-management`.
+
+### 1. Defect reproduction
+
+1. **Cross-project fabricated default:** `PaymentCertificatesView.tsx` initialized `certificates` and `subcontractorIpcs` from hardcoded financial examples (`IPC-01...04`, `SUB-IPC-01...03`) regardless of the selected project. Genuine new/empty projects displayed 505,940 SAR certified gross and 144,350 SAR subcontractor profit without any actual commercial contract or certification records.
+2. **Reload data loss:** Modifications and newly created certificates existed only in component-local React state. Because no persistence adapter was wired, reload or project switching discarded user entries immediately.
+
+Both defects are reproduced in `scripts/validate-controls.ts` under S30-A1...A3.
+
+### 2. Architecture and repairs
+
+| File | Change |
+| --- | --- |
+| `src/types/index.ts` | Added `project_id?: string;` to `PaymentCertificate` and exported `SubcontractorIpc` and `SubcontractorIpcItem` interfaces. |
+| `src/lib/localWorkspace.ts` | Added `payment_certificates` and `subcontractor_payment_certificates` to `PERSISTED_TABLES` (now 34 tables). Registered demo certificates for `proj-seed-001` in `DEMO_PAYMENT_CERTIFICATES` and `DEMO_SUBCONTRACTOR_CERTIFICATES` embedded strictly for explicit `seedDemoWorkspace(..., 'demo')` actions without touching `src/lib/mockSeed.ts`. Enhanced `validateBackup` to verify certificate project integrity, line BOQ item project alignment, subcontract package reference integrity, finite numeric fields, and Data Date chronology. |
+| `src/lib/localQueryBuilder.ts` | Added `validateCertificateRecord` enforcing project scope, Data Date chronology (actual/certified/paid cannot be dated after Data Date), BOQ project consistency, and package reference integrity on insert, upsert, and update mutations. |
+| `src/components/views/PaymentCertificatesView.tsx` | Rewrote view to load project-scoped main and subcontractor certificates asynchronously from `supabase.from('payment_certificates')` and `supabase.from('subcontractor_payment_certificates')`. Added stale-response race cancellation on project switch, honest empty state (zero certificates, 0 SAR certified, 0 sub profit), atomic durable insert/delete mutations, and creation modals for main and subcontractor IPCs with strict Data Date validation and user-visible error/success notifications. |
+| `scripts/validate-controls.ts` | Added S30 test suite (60 checks, S30-A through S30-K) verifying defect reproduction, empty project isolation, reload persistence, cross-project data boundaries, write failures on refusing stores, full backup/restore round-trip with line items, invalid restore rejection, zero commercial math drift in `commercialControlsEngine.ts`, and strict path guards. |
+| `docs/FIRST-USE-AND-BACKUP.md` | Updated table inventory and empty project guarantees to document payment certificates. |
+
+### 3. Preserved domain rules
+
+* **Single calculation authority:** All reconciliation, contractual retention, VAT, and Data Date chronology logic remains strictly delegated to `src/lib/commercialControlsEngine.ts`. Zero math drift across all inputs.
+* **Governed Data Date:** Payment certificates dated after the project Data Date cannot be approved, certified, or paid. Draft certificates are permitted into the future as look-aheads.
+* **Project and BOQ boundary enforcement:** Line items on a project's payment certificate can only reference BOQ items belonging to that exact same project. Cross-project references are rejected at both write and restore time.
+* **Durable writes:** Writes require verified storage commits (`commitWorkspace`). Quota or storage refusal returns an explicit error without claiming false success.
+
+### 4. Gate results
+
+| Gate | Command | Result |
+| --- | --- | --- |
+| TypeScript | `npm run typecheck` | **PASS** (zero errors) |
+| Production build | `npm run build` | **PASS** (`dist/` built successfully) |
+| Validation harness | `npm run validate:controls` | **PASS 1832/1832** (all 1772 prior checks + 60 new S30 checks) |
+| Lint | `npm run lint` | baseline `199 problems (177 errors, 22 warnings)` → now `193 problems (171 errors, 22 warnings)`. Zero lint errors in new/updated code. |
+| Browser binary | `google-chrome`, `chromium`, `firefox` | **NOT INSTALLED IN SANDBOX** — flagged as owner-review gate. |
+
