@@ -69,13 +69,11 @@ import {
   FastForward,
   ShieldCheck,
   Wrench,
-  ShieldAlert,
   FileText,
   Copy,
   Printer,
   Check,
   AlertOctagon,
-  Landmark,
 } from 'lucide-react';
 
 interface DashboardProps {
@@ -459,6 +457,7 @@ ${noticeForm.contractorName}`;
   const behindBaselineCount = baselineVariances.filter((item) => item.status === 'behind').length;
   const resourceConflictCount = alerts.filter((alert) => alert.alert_type === 'resource').length;
   const controlHealth = useMemo(() => calculateControlHealth(evm, alerts, behindBaselineCount, resourceConflictCount), [evm, alerts, behindBaselineCount, resourceConflictCount]);
+  const healthMeasured = activities.length > 0 && evm.spiStatus === 'valid' && evm.cpiStatus === 'valid';
 
   const forecastFinish = forecast.scenarios.realistic;
   const riskAdjustedFinish = useMemo(() => {
@@ -794,8 +793,8 @@ ${noticeForm.contractorName}`;
               </div>
               <p className="text-xs text-slate-300 leading-relaxed">
                 {lang === 'ar'
-                  ? `مؤشر SPI الحالي (${evm.spi.toFixed(2)}). يوصى بتطبيق خطة التعجيل (Crashing Optimizer) لضغط الأنشطة الصفرية الهامش، أو تداخل المسارات المتتابعة.`
-                  : `Current SPI is ${evm.spi.toFixed(2)}. Apply critical path crashing or fast-tracking to recover schedule deficits.`}
+                  ? (evm.spiStatus === 'valid' ? `مؤشر SPI الحالي (${evm.spi.toFixed(2)}). راجع انحراف الجدول قبل اختيار إجراء تصحيحي.` : 'مؤشر SPI غير مقاس؛ أضف خط أساس وتقدماً معتمدين قبل اختيار إجراء تصحيحي.')
+                  : (evm.spiStatus === 'valid' ? `Current SPI is ${evm.spi.toFixed(2)}. Review schedule variance before selecting corrective action.` : 'SPI is not measured. Add an approved baseline and progress before selecting corrective action.')}
               </p>
             </div>
             <button
@@ -869,8 +868,8 @@ ${noticeForm.contractorName}`;
               </div>
               <p className="text-xs text-slate-300 leading-relaxed">
                 {lang === 'ar'
-                  ? `مؤشر CPI الحالي (${evm.cpi.toFixed(2)}). يوصى بتطبيق هندسة القيمة (Value Engineering) لبنود التشطيبات المتبقية وكبح مؤشر EAC.`
-                  : `Current CPI is ${evm.cpi.toFixed(2)}. Apply value engineering and tighten daily productivity rates to curb forecast overruns.`}
+                  ? (evm.cpiStatus === 'valid' ? `مؤشر CPI الحالي (${evm.cpi.toFixed(2)}). راجع انحراف التكلفة قبل اختيار إجراء تصحيحي.` : 'مؤشر CPI غير مقاس؛ أضف التكلفة والقيمة المكتسبة المعتمدتين قبل اختيار إجراء تصحيحي.')
+                  : (evm.cpiStatus === 'valid' ? `Current CPI is ${evm.cpi.toFixed(2)}. Review cost variance before selecting corrective action.` : 'CPI is not measured. Add approved cost and earned-value evidence before selecting corrective action.')}
               </p>
             </div>
             <button
@@ -884,118 +883,21 @@ ${noticeForm.contractorName}`;
         </div>
       </div>
 
-      {/* UNIFIED MULTI-DISCIPLINE EARLY-WARNING RADAR */}
-      <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-5 space-y-4">
-        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 pb-3">
-          <div>
-            <h3 className="text-base font-black text-slate-900 flex items-center gap-2">
-              <ShieldAlert className="text-rose-600" size={20} />
-              <span>{lang === 'ar' ? 'رادار الإنذار المبكر الشامل (Unified Early-Warning Radar)' : 'Unified Multi-Discipline Early-Warning Radar'}</span>
-              <span className="px-2 py-0.5 rounded text-[10px] font-black bg-rose-100 text-rose-800 border border-rose-200">
-                Live Alert Monitor
-              </span>
-            </h3>
-            <p className="text-xs text-slate-500 mt-0.5">
-              {lang === 'ar'
-                ? 'رصد متكامل ومتقاطع للثغرات الحرجة عبر الجدول الزمني، السيولة النقدية، الضمانات البنكية، وانحراف التكاليف قبل حدوث أزمات تعاقدية.'
-                : 'Cross-functional telemetry tracking schedule slippage, cash deficits, bank guarantee expiries, and cost variances.'}
-            </p>
-          </div>
-
-          <button
-            onClick={() => setShowNoticeModal(true)}
-            className="flex items-center gap-2 bg-rose-600 hover:bg-rose-700 text-white px-3.5 py-2 rounded-xl text-xs font-black shadow-md shadow-rose-500/20 transition-all cursor-pointer"
-          >
-            <FileText size={15} />
-            <span>{lang === 'ar' ? 'توليد إخطار تعاقدي فوري (FIDIC Cl. 20.1 Notice)' : 'Generate FIDIC Cl. 20.1 Notice'}</span>
-          </button>
-        </div>
-
-        {/* 4 Multi-Discipline Alert Cards */}
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
-          {/* 1. Schedule & Float Warning */}
-          <div className="p-3.5 bg-rose-50/70 border border-rose-200 rounded-xl flex flex-col justify-between space-y-2.5">
-            <div>
-              <div className="flex items-center justify-between mb-1.5">
-                <span className="font-bold text-rose-950 flex items-center gap-1.5">
-                  <Clock size={14} className="text-rose-600" />
-                  <span>الجدول الزمني والهامش</span>
-                </span>
-                <span className="px-1.5 py-0.2 rounded text-[10px] bg-rose-200 text-rose-900 font-black">حرج</span>
-              </div>
-              <p className="text-rose-900 text-[11px] leading-relaxed">
-                تآكل الهامش الكلي لمسار شبكة التكييف بمعدل 3.5 يوم/أسبوع، واقتراب المسار شبه الحرج من الصفر.
-              </p>
-            </div>
-            <div className="pt-2 flex flex-wrap items-center justify-between gap-1.5 text-[11px] text-rose-800 font-bold border-t border-rose-200">
-              <span>انزلاق متوقع: +14 يوم</span>
-              <button onClick={() => onNavigate('schedule')} className="text-rose-900 hover:text-rose-950 font-black underline cursor-pointer">عرض الجدول ←</button>
-            </div>
-          </div>
-
-          {/* 2. Cash Flow Deficit Warning */}
-          <div className="p-3.5 bg-amber-50/70 border border-amber-200 rounded-xl flex flex-col justify-between space-y-2.5">
-            <div>
-              <div className="flex items-center justify-between mb-1.5">
-                <span className="font-bold text-amber-950 flex items-center gap-1.5">
-                  <DollarSign size={14} className="text-amber-600" />
-                  <span>التدفق النقدي والسيولة</span>
-                </span>
-                <span className="px-1.5 py-0.2 rounded text-[10px] bg-amber-200 text-amber-900 font-black">تنبيه</span>
-              </div>
-              <p className="text-amber-900 text-[11px] leading-relaxed">
-                عجز سيولة متوقع بقيمة (312,000 SAR) خلال الشهرين القادمين بسبب تأخر صرف مستخلص رقم 3.
-              </p>
-            </div>
-            <div className="pt-2 flex flex-wrap items-center justify-between gap-1.5 text-[11px] text-amber-800 font-bold border-t border-amber-200">
-              <span>ذروة العجز: شهر 12</span>
-              <button onClick={() => onNavigate('budget')} className="text-amber-900 hover:text-amber-950 font-black underline cursor-pointer">عرض التدفقات ←</button>
-            </div>
-          </div>
-
-          {/* 3. Bank Guarantees Expiry Warning */}
-          <div className="p-3.5 bg-blue-50/70 border border-blue-200 rounded-xl flex flex-col justify-between space-y-2.5">
-            <div>
-              <div className="flex items-center justify-between mb-1.5">
-                <span className="font-bold text-blue-950 flex items-center gap-1.5">
-                  <Landmark size={14} className="text-blue-600" />
-                  <span>الضمانات البنكية (BG)</span>
-                </span>
-                <span className="px-1.5 py-0.2 rounded text-[10px] bg-blue-200 text-blue-900 font-black">21 يوم متبقي</span>
-              </div>
-              <p className="text-blue-900 text-[11px] leading-relaxed">
-                ضمان الدفعة المقدمة (APG-001) ينتهي في 2026-12-15، ويلزم تقديم خطاب تمديد للبنك لتجنب التسييل.
-              </p>
-            </div>
-            <div className="pt-2 flex flex-wrap items-center justify-between gap-1.5 text-[11px] text-blue-800 font-bold border-t border-blue-200">
-              <span>قيمة الضمان: 1.2M SAR</span>
-              <button onClick={() => onNavigate('financial_controls')} className="text-blue-900 hover:text-blue-950 font-black underline cursor-pointer">إدارة الضمانات ←</button>
-            </div>
-          </div>
-
-          {/* 4. Cost & Claims 28-Day Rule */}
-          <div className="p-3.5 bg-purple-50/70 border border-purple-200 rounded-xl flex flex-col justify-between space-y-2.5">
-            <div>
-              <div className="flex items-center justify-between mb-1.5">
-                <span className="font-bold text-purple-950 flex items-center gap-1.5">
-                  <Scale size={14} className="text-purple-600" />
-                  <span>مهلة الإخطار (FIDIC 20.1)</span>
-                </span>
-                <span className="px-1.5 py-0.2 rounded text-[10px] bg-purple-200 text-purple-900 font-black">ساري</span>
-              </div>
-              <p className="text-purple-900 text-[11px] leading-relaxed">
-                {daysRemainingToClaim === null
-                  ? 'المهلة غير قابلة للاحتساب (N/A): تاريخ وقوع الحدث غير صالح أو غير محدد.'
-                  : `متبقي ${daysRemainingToClaim} يوماً على المهلة القصوى (28 يوماً) لإرسال إخطار المطالبة رسمياً للاستشاري، محسوبة من تاريخ خط الحالة ${governedDataDate}.`}
-              </p>
-            </div>
-            <div className="pt-2 flex flex-wrap items-center justify-between gap-1.5 text-[11px] text-purple-800 font-bold border-t border-purple-200">
-              <span>المهلة: {noticeDeadlineDate ?? 'غير قابلة للاحتساب (N/A)'}</span>
-              <button onClick={() => setShowNoticeModal(true)} className="text-purple-900 hover:text-purple-950 font-black underline cursor-pointer">إصدار الإخطار ←</button>
-            </div>
-          </div>
-        </div>
-      </div>
+      {/* Persisted project alerts only; illustrative contract/cash claims are not telemetry. */}
+      <section className="bg-white rounded-2xl shadow-sm border border-slate-200 p-5 space-y-3" aria-label={lang === 'ar' ? 'تنبيهات المشروع المسجلة' : 'Recorded project alerts'}>
+        <h3 className="font-bold text-slate-900">{lang === 'ar' ? 'تنبيهات المشروع المسجلة' : 'Recorded project alerts'}</h3>
+        {alerts.length === 0 ? (
+          <p className="text-sm text-slate-500">{lang === 'ar' ? 'لا توجد تنبيهات مسجلة لهذا المشروع. غياب التنبيهات لا يثبت سلامة الأداء أو كفاية البيانات.' : 'No recorded alerts for this project. Absence of alerts does not establish healthy performance or sufficient data.'}</p>
+        ) : (
+          <ul className="space-y-2">{alerts.map((alert) => (
+            <li key={alert.id} className="rounded border border-slate-200 p-3 text-sm">
+              <p className="font-semibold">{alert.title}</p>
+              <p className="text-slate-600">{alert.message}</p>
+              <span className="text-xs text-slate-500">{alert.severity} · {alert.status}</span>
+            </li>
+          ))}</ul>
+        )}
+      </section>
 
       {/* KPI Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4 items-stretch">
@@ -1389,15 +1291,15 @@ ${noticeForm.contractorName}`;
           </h3>
           <div className="flex items-center gap-4 mb-4">
             <div className={`text-4xl font-extrabold ${
-              controlHealth.score >= 80 ? 'text-emerald-600' :
+              !healthMeasured ? 'text-slate-500' : controlHealth.score >= 80 ? 'text-emerald-600' :
               controlHealth.score >= 60 ? 'text-blue-600' :
               controlHealth.score >= 40 ? 'text-amber-600' : 'text-red-600'
             }`}>
-              {controlHealth.score}%
+              {healthMeasured ? `${controlHealth.score}%` : 'N/A'}
             </div>
             <div>
               <p className="text-sm font-semibold text-slate-700">
-                {controlHealth.score >= 80 ? (lang === 'ar' ? 'أداء ممتاز ومتحكم به' : 'Excellent & Controlled') :
+                {!healthMeasured ? (lang === 'ar' ? 'بيانات غير كافية لتقييم الأداء' : 'Insufficient evidence to assess health') : controlHealth.score >= 80 ? (lang === 'ar' ? 'أداء ممتاز ومتحكم به' : 'Excellent & Controlled') :
                  controlHealth.score >= 60 ? (lang === 'ar' ? 'تحت المراقبة المستمرة' : 'Under Continuous Monitoring') :
                  controlHealth.score >= 40 ? (lang === 'ar' ? 'معرض لمخاطر وانحراف' : 'At Risk of Variance') : (lang === 'ar' ? 'حالة حرجة تتطلب تدخل' : 'Critical Intervention Required')}
               </p>
@@ -1405,7 +1307,7 @@ ${noticeForm.contractorName}`;
             </div>
           </div>
           <div className="space-y-2">
-            {controlHealth.recommendations.map((rec, i) => (
+            {(healthMeasured ? controlHealth.recommendations : []).map((rec, i) => (
               <div key={i} className="p-2.5 rounded-lg bg-slate-50 text-xs">
                 <span className="font-semibold text-slate-700 block">{rec.title}</span>
                 <span className="text-slate-500">{rec.action}</span>
