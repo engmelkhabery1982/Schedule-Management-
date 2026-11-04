@@ -228,6 +228,16 @@ const S31_XER_INPUT_PATHS = new Set([
   'docs/FIRST-USE-AND-BACKUP.md',
 ]);
 
+// S32 reuses the existing BOQ parser/wizard; its own base-relative guard is mandatory.
+const S32_BOQ_INPUT_PATHS = new Set([
+  'src/components/views/ImportView.tsx',
+  'src/lib/boqParser.ts',
+  'src/lib/boqPlanService.ts',
+  'scripts/validate-boq-input.mjs',
+  'scripts/validate-controls.ts',
+  'docs/FIRST-USE-AND-BACKUP.md',
+]);
+
 const S29_WORKSPACE_SAFETY_PATHS = new Set([
   'src/lib/localWorkspace.ts',
   'src/lib/localQueryBuilder.ts',
@@ -4687,7 +4697,7 @@ console.log('--- S18 Pilot Closure (F9.5)');
   ]);
   const s24ChangedPaths = [...changedPaths].filter((path) =>
     !batch2bTiaPaths.has(path) && !batch2cResourcePaths.has(path) && !BATCH3A_GOVERNANCE_PATHS.has(path)
-      && !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path));
+      && !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path) && !S32_BOQ_INPUT_PATHS.has(path));
   const protectedControlPaths = [
     'src/lib/scheduleControlEngine.ts',
     'src/lib/costControlEngine.ts',
@@ -5506,7 +5516,7 @@ console.log('--- S18 Pilot Closure (F9.5)');
     'supabase/migrations/20260924130000_atomic_resource_leveling_apply.sql',
   ]);
   const s26ChangedPaths = [...batch2bChangedPaths].filter((path) =>
-    !batch2cTiaExclusions.has(path) && !BATCH3A_GOVERNANCE_PATHS.has(path) && !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path));
+    !batch2cTiaExclusions.has(path) && !BATCH3A_GOVERNANCE_PATHS.has(path) && !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path) && !S32_BOQ_INPUT_PATHS.has(path));
   ok('S26 changed files stay within TIA engine/view, directly required types, and regression harness',
     s26ChangedPaths.every((path) => allowedBatch2bPaths.has(path)));
   const protectedBatch2bPaths = [
@@ -5857,7 +5867,7 @@ console.log('--- S18 Pilot Closure (F9.5)');
     'supabase/migrations/20260924130000_atomic_resource_leveling_apply.sql',
   ]);
   const s27ChangedPaths = [...changedPaths].filter((path) =>
-    !BATCH3A_GOVERNANCE_PATHS.has(path) && !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path));
+    !BATCH3A_GOVERNANCE_PATHS.has(path) && !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path) && !S32_BOQ_INPUT_PATHS.has(path));
   ok('S27 changes stay within Batch 2C resource-leveling, required types/tests, and atomic Apply support',
     s27ChangedPaths.every((path) => allowedBatch2cPaths.has(path)));
   const protectedUnchanged = [
@@ -6181,7 +6191,7 @@ console.log('--- S18 Pilot Closure (F9.5)');
     ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
   ]);
   ok('S28 changed files stay inside the requested Batch 3A governance boundary (or the later S29/S30 scope)',
-    [...s28ChangedPaths].every((path) => BATCH3A_GOVERNANCE_PATHS.has(path) || S29_WORKSPACE_SAFETY_PATHS.has(path) || S30_IPC_PERSISTENCE_PATHS.has(path)));
+    [...s28ChangedPaths].every((path) => BATCH3A_GOVERNANCE_PATHS.has(path) || S29_WORKSPACE_SAFETY_PATHS.has(path) || S30_IPC_PERSISTENCE_PATHS.has(path) || S32_BOQ_INPUT_PATHS.has(path)));
   const protectedBatch3aFiles = [
     'src/lib/scheduleControlEngine.ts', 'src/lib/costControlEngine.ts', 'src/lib/integratedDecisionEngine.ts',
     'src/lib/canonicalEvm.ts', 'src/lib/sCurveEngine.ts', 'src/lib/sCurveTimePhasing.ts',
@@ -6924,7 +6934,7 @@ console.log('--- S18 Pilot Closure (F9.5)');
     ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
   ]);
   eq('S29-K1 the increment is confined to the storage-safety paths it declares',
-    [...s29ChangedPaths].filter((path) => !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path) && !S31_XER_INPUT_PATHS.has(path)), []);
+    [...s29ChangedPaths].filter((path) => !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path) && !S31_XER_INPUT_PATHS.has(path) && !S32_BOQ_INPUT_PATHS.has(path)), []);
   ok('S29-K2 the increment actually touches the storage core it claims to repair',
     s29ChangedPaths.has('src/lib/localWorkspace.ts')
       && s29ChangedPaths.has('src/lib/localQueryBuilder.ts')
@@ -7343,7 +7353,7 @@ console.log('--- S18 Pilot Closure (F9.5)');
     ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
   ]);
   eq('S30-K1 changes outside S29 stay within declared S30 increment paths',
-    [...s30ChangedPaths].filter((path) => !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path) && !S31_XER_INPUT_PATHS.has(path)), []);
+    [...s30ChangedPaths].filter((path) => !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path) && !S31_XER_INPUT_PATHS.has(path) && !S32_BOQ_INPUT_PATHS.has(path)), []);
   ok('S30-K2 S30 increment actually touches PaymentCertificatesView and workspace storage',
     s30ChangedPaths.has('src/components/views/PaymentCertificatesView.tsx')
       && s30ChangedPaths.has('src/lib/localWorkspace.ts')
@@ -7356,8 +7366,16 @@ const s31ChangedPaths = new Set([
   ...execFileSync('git', ['diff', '--name-only', '6f7862cc6a780d86b25372085e72e8494dfcab26'], { encoding: 'utf8' }).split('\n').filter(Boolean),
   ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
 ]);
-eq('S31-A existing XER input repair stays inside its three declared paths', [...s31ChangedPaths].filter((path) => !S31_XER_INPUT_PATHS.has(path)), []);
+eq('S31-A existing XER input repair stays inside its three declared paths', [...s31ChangedPaths].filter((path) => !S31_XER_INPUT_PATHS.has(path) && !S32_BOQ_INPUT_PATHS.has(path)), []);
 ok('S31-B existing import screen is actually changed', s31ChangedPaths.has('src/components/views/ImportView.tsx'));
+
+const s32ChangedPaths = new Set([
+  ...execFileSync('git', ['diff', '--name-only', '3b873fbf8bf4e5db1aa5445b0596645de39cc336'], { encoding: 'utf8' }).split('\n').filter(Boolean),
+  ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
+]);
+eq('S32-A BOQ input repair stays in its six declared paths', [...s32ChangedPaths].filter((path) => !S32_BOQ_INPUT_PATHS.has(path)), []);
+ok('S32-B BOQ input and production numeric parser are actually repaired', s32ChangedPaths.has('src/components/views/ImportView.tsx') && s32ChangedPaths.has('src/lib/boqParser.ts'));
+ok('S32-C real CSV/XLSX numeric parser regressions pass without storage writes', execFileSync(process.execPath, ['scripts/validate-boq-input.mjs'], { encoding: 'utf8' }).includes('BOQ INPUT VALIDATION PASSED: 14/14'));
 
 // ---------------------------------------------------------------------------
 console.log('');

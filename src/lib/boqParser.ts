@@ -18,10 +18,15 @@ function normalizeHeader(header: string): string {
 
 function parseNumber(val: unknown): number {
   if (val === null || val === undefined || val === '') return 0;
-  if (typeof val === 'number') return val;
-  const s = String(val).replace(/[,\s]/g, '').replace(/[^\d.-]/g, '');
-  const n = parseFloat(s);
-  return isNaN(n) ? 0 : n;
+  if (typeof val === 'number') {
+    if (!Number.isFinite(val)) throw new Error('BOQ: قيمة رقمية غير صالحة / Invalid numeric value');
+    return val;
+  }
+  const s = String(val).replace(/[,\s]/g, '')
+    .replace(/SAR|USD|AED|EGP|ريال|ر\.س\.?/gi, '').replace(/[$€£﷼]/g, '');
+  const n = Number(s);
+  if (!s || !Number.isFinite(n)) throw new Error('BOQ: قيمة رقمية غير صالحة / Invalid numeric value');
+  return n;
 }
 
 export async function parseBoqFile(file: File): Promise<ParsedBoqRow[]> {
@@ -32,7 +37,8 @@ export async function parseBoqFile(file: File): Promise<ParsedBoqRow[]> {
 
   if (ext === 'csv' || ext === 'txt') {
     const text = new TextDecoder('utf-8').decode(buf);
-    const wb = XLSX.read(text, { type: 'string' });
+    // Keep source text: spreadsheet date guessing must not turn a bad rate into a serial number.
+    const wb = XLSX.read(text, { type: 'string', raw: true });
     const ws = wb.Sheets[wb.SheetNames[0]];
     rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
   } else {

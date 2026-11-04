@@ -117,3 +117,34 @@ null actual dates and zero progress survived; no baseline or financial records
 were invented. Invalid initial text was refused, and editing a valid preview
 immediately disabled import and removed the stale activities. TypeScript/build,
 focused ImportView lint and1858controls passed; prior IPC acceptance was retained.
+
+## Existing BOQ wizard input and data preservation (4 November 2026)
+
+Select Import Project → BOQ (Excel/CSV), then choose a file or expand
+**لصق جدول CSV / Paste BOQ CSV** and paste headers plus item rows. Both routes
+use the existing parser and planning wizard. Review classification, productivity
+assumptions, activities, relationships and cost allocation before explicitly saving
+a planning draft. Parsing itself saves nothing. Editing the source clears the
+previous preview and overrides; late reads cannot restore an obsolete plan.
+
+Malformed/nonfinite numeric text is rejected instead of being saved as zero or
+being guessed as a spreadsheet date. Raw CSV codes retain leading zeroes; scientific
+notation and recognized currency tokens remain supported. Existing blank optional
+number handling and commercial/planning formulas are unchanged. New BOQ records
+retain their existing category field; planning-family classification and the coarse
+BOQ category remain distinct existing classifications.
+
+New generated drafts explicitly start with zero reported progress/actual quantity,
+null actual dates, and the governed default Data Date shown in the preview. This
+creates no actual cost/progress or approved-baseline records. Previously stored
+projects are not rewritten. Approval still requires the existing explicit evidence.
+
+Independent acceptance used three source rows totaling7000, reviewed classifications
+and all generated links, manually changed excavation duration to2days, saved the
+draft, reopened BOQ and CPM, and compared two real exports across all34tables and
+auxiliary stores. Quantities/rates/categories, UUIDs,6links and the duration override
+remained exact; no baseline or actual cost was invented.1861controls,14focused
+CSV/XLSX/persistence regressions, TypeScript, build and focused implementation lint
+passed. This closes a local input workflow, not commercial readiness or field
+validation of library productivity assumptions. Browser file-chooser permission was
+not retried or claimed as passed.

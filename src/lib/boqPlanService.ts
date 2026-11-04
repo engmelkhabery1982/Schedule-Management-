@@ -19,6 +19,7 @@
 // =====================================================================================
 
 import type { BoqPlan } from "./boqPlanningEngine";
+import { DEFAULT_DATA_DATE } from './projectControlsConstants';
 
 export interface BoqDbClient {
   from(table: string): {
@@ -97,7 +98,7 @@ export interface BoqProjectInput {
 export function buildBoqPersistPlan(
   plan: BoqPlan,
   project: BoqProjectInput,
-  boqRows: Array<{ rowKey: string; code: string; description: string; unit: string; quantity: number; unit_price: number; total_price: number }>
+  boqRows: Array<{ rowKey: string; code: string; description: string; unit: string; quantity: number; unit_price: number; total_price: number; category?: string }>
 ): BoqPersistPlan {
   const projectId = uuid();
   const activityIdByStable: Record<string, string> = {};
@@ -119,6 +120,7 @@ export function buildBoqPersistPlan(
     quantity: b.quantity,
     unit_price: b.unit_price,
     total_price: b.total_price,
+    ...(b.category !== undefined ? { category: b.category } : {}),
   }));
 
   const wbs = plan.wbs.map((w) => ({
@@ -141,6 +143,10 @@ export function buildBoqPersistPlan(
     unit: a.quantityUnit,
     duration_days: a.durationDays,
     remaining_duration_days: a.isMilestone ? 0 : a.durationDays,
+    percent_complete: 0,
+    actual_quantity: 0,
+    actual_start: null,
+    actual_finish: null,
     early_start: a.earlyStart ? a.earlyStart.slice(0, 10) : null,
     early_finish: a.earlyFinish ? a.earlyFinish.slice(0, 10) : null,
     late_start: a.lateStart ? a.lateStart.slice(0, 10) : null,
@@ -222,6 +228,7 @@ export function buildBoqPersistPlan(
       status: project.status || "planning",
       currency: project.currency || "SAR",
       calendar_type: project.calendar_type || "6_days",
+      data_date: DEFAULT_DATA_DATE,
     },
     boqItems,
     wbs,
