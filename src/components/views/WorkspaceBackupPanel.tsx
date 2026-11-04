@@ -46,6 +46,8 @@ export default function WorkspaceBackupPanel() {
   const [lang] = useState<Language>(getLanguage());
   const isAr = lang === 'ar';
   const fileInput = useRef<HTMLInputElement | null>(null);
+  const inputRevision = useRef(0);
+  const [pastedBackup, setPastedBackup] = useState('');
 
   const [fileName, setFileName] = useState<string | null>(null);
   const [backupText, setBackupText] = useState<string | null>(null);
@@ -118,12 +120,9 @@ export default function WorkspaceBackupPanel() {
     }
   }
 
-  async function handleFile(file: File | null) {
-    if (!file) return;
-    setFileName(file.name);
-    setValidation(null);
+  function validateInput(text: string, name: string) {
+    setFileName(name);
     setStatus(null);
-    const text = await file.text();
     setBackupText(text);
     const result = validateBackup(text);
     setValidation(result);
@@ -134,6 +133,21 @@ export default function WorkspaceBackupPanel() {
           ? 'الملف غير صالح كنسخة احتياطية لمساحة العمل — لم يتم تغيير أي بيانات.'
           : 'The file is not a valid workspace backup — no data was changed.',
       });
+    }
+  }
+
+  async function handleFile(file: File | null) {
+    if (!file) return;
+    const revision = ++inputRevision.current;
+    setPastedBackup('');
+    setValidation(null);
+    setBackupText(null);
+    setStatus(null);
+    try {
+      const text = await file.text();
+      if (revision === inputRevision.current) validateInput(text, file.name);
+    } catch {
+      if (revision === inputRevision.current) setStatus({ tone: 'error', message: isAr ? 'تعذّر قراءة النسخة؛ لم تتغير البيانات.' : 'Could not read the backup; no data was changed.' });
     }
   }
 
@@ -285,6 +299,36 @@ export default function WorkspaceBackupPanel() {
           />
           {fileName && <span className="text-[11px] text-slate-500 font-mono">{fileName}</span>}
         </div>
+
+        <details className="text-xs space-y-2">
+          <summary className="cursor-pointer font-bold text-indigo-700">{isAr ? 'أو لصق محتوى نسخة JSON' : 'Or paste JSON backup contents'}</summary>
+          <p className="text-slate-500">{isAr ? 'يُفحص النص محلياً بنفس شروط الملف. اللصق والتحقق لا يغيران البيانات؛ الاستعادة تتطلب الزر الصريح أدناه.' : 'Validated locally using the same checks as a file. Pasting and validation change no data; restoring requires the explicit button below.'}</p>
+          <label className="block">
+            <span>{isAr ? 'محتوى نسخة JSON' : 'JSON backup contents'}</span>
+            <textarea
+              value={pastedBackup}
+              onChange={(event) => {
+                ++inputRevision.current;
+                setPastedBackup(event.target.value);
+                setValidation(null);
+                setBackupText(null);
+                setFileName(null);
+                setStatus(null);
+                if (fileInput.current) fileInput.current.value = '';
+              }}
+              rows={5}
+              dir="ltr"
+              spellCheck={false}
+              className="block w-full rounded border border-slate-300 p-2 font-mono text-xs"
+            />
+          </label>
+          <button
+            type="button"
+            disabled={!pastedBackup.trim() || busy}
+            onClick={() => validateInput(pastedBackup, isAr ? 'نص JSON ملصق' : 'Pasted JSON')}
+            className="rounded bg-indigo-600 px-3 py-2 font-bold text-white disabled:opacity-50"
+          >{isAr ? 'التحقق ومعاينة النسخة الملصقة' : 'Validate and preview pasted backup'}</button>
+        </details>
 
         {validation && (
           <div className="space-y-2">
