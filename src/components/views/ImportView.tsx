@@ -87,6 +87,8 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
 
   // XER state
   const [xerFile, setXerFile] = useState<File | null>(null);
+  const [xerText, setXerText] = useState('');
+  const xerReadVersion = useRef(0);
   const [parsedXer, setParsedXer] = useState<ParsedXerResult | null>(null);
   const [xerDataDate, setXerDataDate] = useState('');
   const [xerCurrency, setXerCurrency] = useState('SAR');
@@ -167,14 +169,19 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
     }
   }
 
-  async function handleXerFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setXerFile(file);
+  function clearXerPreview() {
+    xerReadVersion.current += 1;
+    setParsedXer(null);
+    setFinalPlan(null);
+    setFinalRecon(null);
+    setXerBaselineOptIn(false);
+    setParseProgress('');
     setError('');
+  }
+
+  function previewXerContent(text: string) {
+    setParseProgress('');
     try {
-      setParseProgress('جاري قراءة وتحليل ملف Primavera XER...');
-      const text = await file.text();
       const result = parseXerContent(text);
       if (!result.project || result.activities.length === 0) {
         setError('لم يتم العثور على مشروع/أنشطة في ملف XER. تأكد من صلاحية الملف.');
@@ -196,6 +203,26 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
       setParseProgress(`تم استخراج ${result.activities.length} نشاط و ${result.links.length} علاقة و ${result.wbs.length} عقدة WBS و ${result.calendars.length} تقويم`);
     } catch {
       setError('تعذر قراءة ملف XER. تأكد من أنه ملف نصي متوافق مع Primavera P6.');
+    }
+  }
+
+  async function handleXerFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = ''; // Selecting the same file after a failed/replaced preview must work.
+    if (!file) return;
+    clearXerPreview();
+    const version = xerReadVersion.current;
+    setXerFile(file);
+    setXerText('');
+    setParseProgress('جاري قراءة وتحليل ملف Primavera XER...');
+    try {
+      const text = await file.text();
+      if (version !== xerReadVersion.current) return;
+      previewXerContent(text);
+    } catch {
+      if (version !== xerReadVersion.current) return;
+      setParseProgress('');
+      setError('تعذر قراءة ملف XER — لم تُحفظ أي بيانات. Could not read XER file.');
     }
   }
 
@@ -1379,6 +1406,30 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
               </div>
             )}
           </div>
+
+          <details className="mt-4 border border-slate-200 rounded-lg p-3">
+            <summary className="cursor-pointer text-sm font-semibold">لصق محتوى XER / Paste XER text</summary>
+            <p className="text-xs text-slate-500 my-2">الصق محتوى الملف النصي لمعاينته. لا يُحفظ مشروع إلا بعد مراجعة الخطة وتأكيد الاستيراد. Paste the file contents to preview; saving requires confirmation.</p>
+            <label htmlFor="xer-text-input" className="text-xs font-semibold">محتوى XER / XER text contents</label>
+            <textarea
+              id="xer-text-input"
+              value={xerText}
+              onChange={(e) => {
+                clearXerPreview();
+                setXerFile(null);
+                setXerText(e.target.value);
+              }}
+              rows={7}
+              dir="ltr"
+              className="w-full mt-1 p-2 border border-slate-300 rounded-lg font-mono text-xs"
+            />
+            <button
+              type="button"
+              disabled={!xerText.trim()}
+              onClick={() => { clearXerPreview(); previewXerContent(xerText); }}
+              className="mt-2 px-4 py-2 bg-blue-600 text-white rounded-lg disabled:opacity-50"
+            >تحليل ومعاينة XER / Analyze and preview XER</button>
+          </details>
 
           {parsedXer && (
             <div className="mt-4 space-y-3">

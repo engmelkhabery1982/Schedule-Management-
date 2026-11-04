@@ -220,6 +220,14 @@ const S30_IPC_PERSISTENCE_PATHS = new Set([
   'docs/PILOT-STORAGE-SAFETY.md',
 ]);
 
+// S31 only makes the existing XER input route accessible without a file chooser.
+// Its independent diff guard below keeps older batch exclusions bounded.
+const S31_XER_INPUT_PATHS = new Set([
+  'src/components/views/ImportView.tsx',
+  'scripts/validate-controls.ts',
+  'docs/FIRST-USE-AND-BACKUP.md',
+]);
+
 const S29_WORKSPACE_SAFETY_PATHS = new Set([
   'src/lib/localWorkspace.ts',
   'src/lib/localQueryBuilder.ts',
@@ -6916,7 +6924,7 @@ console.log('--- S18 Pilot Closure (F9.5)');
     ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
   ]);
   eq('S29-K1 the increment is confined to the storage-safety paths it declares',
-    [...s29ChangedPaths].filter((path) => !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path)), []);
+    [...s29ChangedPaths].filter((path) => !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path) && !S31_XER_INPUT_PATHS.has(path)), []);
   ok('S29-K2 the increment actually touches the storage core it claims to repair',
     s29ChangedPaths.has('src/lib/localWorkspace.ts')
       && s29ChangedPaths.has('src/lib/localQueryBuilder.ts')
@@ -7335,13 +7343,21 @@ console.log('--- S18 Pilot Closure (F9.5)');
     ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
   ]);
   eq('S30-K1 changes outside S29 stay within declared S30 increment paths',
-    [...s30ChangedPaths].filter((path) => !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path)), []);
+    [...s30ChangedPaths].filter((path) => !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path) && !S31_XER_INPUT_PATHS.has(path)), []);
   ok('S30-K2 S30 increment actually touches PaymentCertificatesView and workspace storage',
     s30ChangedPaths.has('src/components/views/PaymentCertificatesView.tsx')
       && s30ChangedPaths.has('src/lib/localWorkspace.ts')
       && s30ChangedPaths.has('src/lib/localQueryBuilder.ts')
       && s30ChangedPaths.has('src/types/index.ts'));
 }
+
+// S31's actual source delta is checked separately; no other feature/engine is exempted.
+const s31ChangedPaths = new Set([
+  ...execFileSync('git', ['diff', '--name-only', '6f7862cc6a780d86b25372085e72e8494dfcab26'], { encoding: 'utf8' }).split('\n').filter(Boolean),
+  ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
+]);
+eq('S31-A existing XER input repair stays inside its three declared paths', [...s31ChangedPaths].filter((path) => !S31_XER_INPUT_PATHS.has(path)), []);
+ok('S31-B existing import screen is actually changed', s31ChangedPaths.has('src/components/views/ImportView.tsx'));
 
 // ---------------------------------------------------------------------------
 console.log('');

@@ -92,3 +92,28 @@ and a damaged or unreadable one is reported — it is never replaced by demo dat
 * مساحة عمل **محلية لمستخدم واحد** في متصفح واحد؛ لا مزامنة، ولا تعدد مستخدمين، ولا نسخ تلقائي.
 * النسخة الاحتياطية = مسؤولية المستخدم: صدّرها إلى مجلد محفوظ (ليست في المتصفح فقط).
 * لا تُعدّ هذه البوابة قبولاً تجارياً ولا بديلاً عن مراجعة المساعد وتكامله.
+
+## Existing XER import: file or pasted text (4 November 2026)
+
+On Import Project, choose Primavera P6 (.xer). Either select a file or expand
+**لصق محتوى XER / Paste XER text**, paste its original tab-delimited text, and
+press **تحليل ومعاينة XER / Analyze and preview XER**. Both inputs use the same
+parser, reconciliation preview and explicit import confirmation. Previewing does
+not save a project. Changing either source invalidates its old preview and any
+baseline opt-in; late file reads cannot replace a newer source. Invalid text
+cannot import an earlier preview. The same file can be selected again after a
+failed/replaced preview.
+
+Review Data Date, currency, unsupported/dropped fields and calendar warnings before
+confirming. No calendar work pattern or approved baseline is invented by this
+input route. Existing parser warnings and save/cleanup semantics remain visible.
+This is a local single-user workflow; it does not establish remote-backend or
+commercial readiness.
+
+Independent isolated browser acceptance used original XER text for three activities
+and two FS links (not a workspace-restore fixture), then saved, reopened, exported
+and compared all34 tables exactly. IDs, dates, durations, WBS/calendar references,
+null actual dates and zero progress survived; no baseline or financial records
+were invented. Invalid initial text was refused, and editing a valid preview
+immediately disabled import and removed the stale activities. TypeScript/build,
+focused ImportView lint and1858controls passed; prior IPC acceptance was retained.
