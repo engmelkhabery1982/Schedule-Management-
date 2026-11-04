@@ -4,6 +4,7 @@ import { getLanguage, type Language } from '@/lib/i18n';
 import { quoteCanonicalEvm } from '@/lib/canonicalEvm';
 import { reviewStateOf } from '@/lib/demoDbContracts';
 import { assertDbWriteOk } from '@/lib/supabaseErrors';
+import { isValidProgressDate as isValidCostDate } from '@/lib/commercialControlsEngine';
 import { calculateEarnedSchedule, type EarnedScheduleResult } from '@/lib/earnedScheduleEngine';
 import {
   aggregateCbsCostCenters,
@@ -190,7 +191,15 @@ export default function BudgetView({ project }: BudgetViewProps) {
   }
 
   async function addTransaction() {
-    if (!project || !transactionForm.description || transactionForm.amount <= 0) return;
+    if (!project) return;
+    if (!transactionForm.description.trim() || !Number.isFinite(transactionForm.amount) || transactionForm.amount <= 0) {
+      setNotice(lang === 'ar' ? 'أدخل وصفاً ومبلغاً موجباً صالحاً للحركة.' : 'Enter a description and a valid positive amount.');
+      return;
+    }
+    if (!isValidCostDate(txnDate)) {
+      setNotice(lang === 'ar' ? 'أدخل تاريخ حركة صالحاً قبل التسجيل.' : 'Enter a valid transaction date before saving.');
+      return;
+    }
     // F6 §1: a transaction dated after the Data Date is not an actual — blocked at entry.
     if (isAfterDataDate(txnDate, governedDataDate)) {
       setNotice(`تعذر التسجيل: تاريخ الحركة (${txnDate}) بعد تاريخ التحديث المعتمد (${governedDataDate}).`);
@@ -198,7 +207,7 @@ export default function BudgetView({ project }: BudgetViewProps) {
     }
     const { error } = await supabase.from('cost_transactions').insert({
       project_id: project.id,
-      description: transactionForm.description,
+      description: transactionForm.description.trim(),
       amount: transactionForm.amount,
       cost_type: transactionForm.cost_type,
       transaction_date: txnDate,
@@ -475,7 +484,7 @@ export default function BudgetView({ project }: BudgetViewProps) {
     const planned = evm.bac;
     const actual = evm.ac;
     const remaining = planned - actual;
-    const variance = planned - actual;
+    const variance = evm.cv;
     return { planned, committed: committedSummary.total, actual, remaining, variance };
   }, [evm, committedSummary]);
 
