@@ -208,6 +208,8 @@ const S29_WORKSPACE_SAFETY_PATHS = new Set([
   'src/components/views/PortfolioView.tsx',
   'src/components/views/ExportView.tsx',
   'src/components/views/WorkspaceBackupPanel.tsx',
+  // S29 owner review: remove invented dashboard alerts and unmeasured health claims.
+  'src/components/views/Dashboard.tsx',
   'scripts/validate-controls.ts',
   'docs/FIRST-USE-AND-BACKUP.md',
   'docs/PILOT-STORAGE-SAFETY.md',
