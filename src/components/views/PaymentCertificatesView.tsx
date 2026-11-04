@@ -33,6 +33,11 @@ interface PaymentCertificatesViewProps {
 }
 
 export default function PaymentCertificatesView({ project }: PaymentCertificatesViewProps) {
+  // Project changes discard drafts and late save responses from the prior project.
+  return <ProjectPaymentCertificates key={project?.id ?? 'no-project'} project={project} />;
+}
+
+function ProjectPaymentCertificates({ project }: PaymentCertificatesViewProps) {
   const [lang, setLang] = useState<Language>(getLanguage());
   const [activeTab, setActiveTab] = useState<'ipcs' | 'subcontractors' | 'vos'>('ipcs');
 
@@ -550,7 +555,7 @@ export default function PaymentCertificatesView({ project }: PaymentCertificates
     setSaveSuccess(null);
     if (!window.confirm(lang === 'ar' ? 'هل أنت متأكد من رغبتك بحذف هذا المستخلص؟' : 'Are you sure you want to delete this certificate?')) return;
 
-    const res = await supabase.from('payment_certificates').delete().eq('id', id);
+    const res = await supabase.from('payment_certificates').delete().eq('id', id).eq('project_id', project.id);
     if (res.error) {
       setSaveError(res.error.message || 'Failed to delete certificate');
       return;
@@ -568,7 +573,7 @@ export default function PaymentCertificatesView({ project }: PaymentCertificates
     setSaveSuccess(null);
     if (!window.confirm(lang === 'ar' ? 'هل أنت متأكد من رغبتك بحذف هذا المستخلص؟' : 'Are you sure you want to delete this certificate?')) return;
 
-    const res = await supabase.from('subcontractor_payment_certificates').delete().eq('id', id);
+    const res = await supabase.from('subcontractor_payment_certificates').delete().eq('id', id).eq('project_id', project.id);
     if (res.error) {
       setSaveError(res.error.message || 'Failed to delete certificate');
       return;
@@ -872,7 +877,7 @@ export default function PaymentCertificatesView({ project }: PaymentCertificates
                     <div className="bg-slate-50 p-4 rounded-xl border border-slate-200 space-y-2.5">
                       <h4 className="font-bold text-slate-900 border-b pb-1.5">{lang === 'ar' ? '2. الاستقطاعات والضريبة (Deductions & VAT)' : '2. Deductions & VAT'}</h4>
                       <div className="flex justify-between text-rose-700">
-                        <span>{lang === 'ar' ? 'استقطاع الدفعة المقدمة (10%):' : 'Advance Payment Recovery (10%):'}</span>
+                        <span>{lang === 'ar' ? 'استقطاع الدفعة المقدمة المسجل:' : 'Recorded Advance Recovery:'}</span>
                         <span className="font-mono font-bold">- {selectedIpc.advancePaymentDeduction.toLocaleString()} SAR</span>
                       </div>
                       <div className="flex justify-between text-amber-700">
@@ -1214,6 +1219,7 @@ export default function PaymentCertificatesView({ project }: PaymentCertificates
             </div>
 
             <form onSubmit={handleSaveIpc} className="space-y-3 text-xs">
+              {saveError && <p role="alert" className="text-rose-700">{saveError}</p>}
               <div>
                 <label className="block text-slate-700 font-bold mb-1">{lang === 'ar' ? 'رقم المستخلص *' : 'IPC Number *'}</label>
                 <input
@@ -1286,8 +1292,7 @@ export default function PaymentCertificatesView({ project }: PaymentCertificates
                       const val = Number(e.target.value);
                       setNewCurrentGross(val);
                       setNewVatAmount(Number((val * 0.15).toFixed(2)));
-                      setNewAdvanceDeduction(Number((val * 0.1).toFixed(2)));
-                      setNewRetentionDeduction(Number((val * 0.05).toFixed(2)));
+                      // Contract deductions are entered explicitly; no invented rate.
                     }}
                     className="w-full px-3 py-2 border rounded-lg font-mono"
                   />
@@ -1375,6 +1380,7 @@ export default function PaymentCertificatesView({ project }: PaymentCertificates
             </div>
 
             <form onSubmit={handleSaveSubIpc} className="space-y-3 text-xs">
+              {saveError && <p role="alert" className="text-rose-700">{saveError}</p>}
               <div className="grid grid-cols-2 gap-2">
                 <div>
                   <label className="block text-slate-700 font-bold mb-1">{lang === 'ar' ? 'رقم المستخلص *' : 'IPC Number *'}</label>
@@ -1480,7 +1486,7 @@ export default function PaymentCertificatesView({ project }: PaymentCertificates
                     onChange={(e) => {
                       const val = Number(e.target.value);
                       setNewSubCurrentGross(val);
-                      setNewSubRetention(Number((val * 0.1).toFixed(2)));
+                      // Retention depends on the actual subcontract, not a default 10%.
                       setNewSubGrossToDate(val);
                     }}
                     className="w-full px-3 py-2 border rounded-lg font-mono"

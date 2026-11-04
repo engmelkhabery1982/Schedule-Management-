@@ -11,7 +11,7 @@
  * discarded unless the whole statement is both accepted (contract validation) and persisted.
  */
 
-import { setTableRows, tableRows, type WorkspaceMutateResult, type WorkspaceRow, type WorkspaceState, type WorkspaceWriteError } from './localWorkspace';
+import { certificateRecordError, setTableRows, tableRows, type WorkspaceMutateResult, type WorkspaceRow, type WorkspaceState, type WorkspaceWriteError } from './localWorkspace';
 import { checkControlRecordProjectBoundary } from './demoDbContracts';
 
 export type LocalQueryError = WorkspaceWriteError;
@@ -46,6 +46,8 @@ function validateCertificateRecord(draft: WorkspaceState, tableName: string, ite
   if (tableName !== 'payment_certificates' && tableName !== 'subcontractor_payment_certificates') {
     return null;
   }
+  const recordError = certificateRecordError(item, tableName === 'subcontractor_payment_certificates');
+  if (recordError) return validationError(recordError);
   const projectId = item.project_id;
   if (!projectId || typeof projectId !== 'string') {
     return validationError('Certificate record must specify a valid project_id');
@@ -91,6 +93,7 @@ function validateCertificateRecord(draft: WorkspaceState, tableName: string, ite
       const packages = tableRows(draft, 'subcontract_packages');
       const foreignPkg = packages.find((p) => (p.code === pkgCode || p.id === pkgCode) && String(p.project_id) !== String(projectId));
       const matchingPkg = packages.find((p) => (p.code === pkgCode || p.id === pkgCode) && String(p.project_id) === String(projectId));
+      if (!matchingPkg && !foreignPkg) return validationError(`Subcontractor package "${pkgCode}" does not exist in this project`);
       if (foreignPkg && !matchingPkg) {
         return validationError(`Subcontractor certificate references package "${pkgCode}" of another project`);
       }
@@ -230,7 +233,10 @@ export class MockQueryBuilder<T = unknown> implements PromiseLike<LocalQueryResu
         }
       }
       if (this.tableName === 'payment_certificates' || this.tableName === 'subcontractor_payment_certificates') {
+        const ids = new Set(table.map((item) => item.id));
         for (const item of inserted) {
+          if (ids.has(item.id)) return { ok: false, error: validationError('Duplicate certificate ID') };
+          ids.add(item.id);
           const err = validateCertificateRecord(draft, this.tableName, item);
           if (err) return { ok: false, error: err };
         }
@@ -249,6 +255,7 @@ export class MockQueryBuilder<T = unknown> implements PromiseLike<LocalQueryResu
           conflictKeys.every((k) => existing[k] !== undefined && String(existing[k]) === String(item[k])),
         );
         const recordToSave: Row = {
+          ...(matchIndex >= 0 ? currentTable[matchIndex] : {}),
           id: item.id || (matchIndex >= 0 ? currentTable[matchIndex].id : newRowId()),
           created_at: (matchIndex >= 0 ? currentTable[matchIndex].created_at : undefined) || new Date().toISOString(),
           ...item,
@@ -284,6 +291,9 @@ export class MockQueryBuilder<T = unknown> implements PromiseLike<LocalQueryResu
         }
       }
       if (this.tableName === 'payment_certificates' || this.tableName === 'subcontractor_payment_certificates') {
+        if (new Set(updatedTable.map((item) => item.id)).size !== updatedTable.length) {
+          return { ok: false, error: validationError('Duplicate certificate ID') };
+        }
         for (const item of updatedItems) {
           const err = validateCertificateRecord(draft, this.tableName, item);
           if (err) return { ok: false, error: err };

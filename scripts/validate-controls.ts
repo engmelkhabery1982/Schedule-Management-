@@ -149,6 +149,7 @@ import {
   WORKSPACE_SCHEMA_VERSION,
   WORKSPACE_STORAGE_KEY,
   buildBackup,
+  backupChecksum,
   canonicalJson,
   commitWorkspace,
   createEmptyWorkspace,
@@ -7283,6 +7284,48 @@ console.log('--- S18 Pilot Closure (F9.5)');
   eq('S30-H5 SUB-IPC-01 surfaces header/lines mismatch with exact 600 SAR delta', reconSub1.currentDelta, 600);
   eq('S30-H6 SUB-IPC-01 retention matches 10% contract', reconSub1.retentionMatchesContract, true);
   eq('S30-H7 SUB-IPC-01 status is mismatch', reconSub1.status, 'mismatch');
+
+  // Owner review regressions: legacy inventory integrity and invalid durable records.
+  const legacy32 = JSON.parse(backupSerialized);
+  delete legacy32.tables.payment_certificates;
+  delete legacy32.tables.subcontractor_payment_certificates;
+  legacy32.checksum = backupChecksum(legacy32.tables, legacy32.auxiliary);
+  const legacy32Validation = validateBackup(legacy32);
+  ok('S30-R1 original 32-table v2 checksum remains valid after IPC inventory grows', legacy32Validation.ok && legacy32Validation.summary?.checksumVerified === true);
+  eq('S30-R2 legacy restore adds only empty IPC tables', tableRows(legacy32Validation.state!, 'payment_certificates'), []);
+  eq('S30-R3 legacy project records remain exact', legacy32Validation.state?.projects, legacy32.tables.projects);
+  const tamperedLegacy = JSON.parse(JSON.stringify(legacy32));
+  tamperedLegacy.tables.projects[0].name = 'Tampered';
+  ok('S30-R4 legacy checksum still rejects changed bytes', !validateBackup(tamperedLegacy).ok);
+
+  const invalidCertificates = [
+    { ...userIpcA, certificateDate: '2026-02-30' },
+    { ...userIpcA, periodStart: '2026-09-01', periodEnd: '2026-08-31' },
+    { ...userIpcA, status: 'invented_approval' },
+    { ...userIpcA, currentGrossAmount: Infinity },
+    { ...userIpcA, items: [userIpcA.items[0], userIpcA.items[0]] },
+  ];
+  for (const [index, invalid] of invalidCertificates.entries()) {
+    const before = s30Store.getItem(WORKSPACE_STORAGE_KEY);
+    const result = runQuery(query(s30Store, 'payment_certificates').insert({ ...invalid, id: `invalid-${index}` }));
+    ok(`S30-R5-${index} invalid certificate rejected before write`, result.error !== null);
+    eq(`S30-R6-${index} invalid certificate leaves exact storage unchanged`, s30Store.getItem(WORKSPACE_STORAGE_KEY), before);
+    const invalidBackup = JSON.parse(backupSerialized);
+    invalidBackup.tables.payment_certificates = [invalid];
+    invalidBackup.checksum = backupChecksum(invalidBackup.tables, invalidBackup.auxiliary);
+    ok(`S30-R7-${index} invalid certificate refused on restore`, !validateBackup(invalidBackup).ok);
+  }
+  const duplicateResult = runQuery(query(s30Store, 'payment_certificates').insert(userIpcA));
+  ok('S30-R8 duplicate certificate ID refused on insert', duplicateResult.error !== null);
+  const missingPackageResult = runQuery(query(s30Store, 'subcontractor_payment_certificates').insert({ ...userSubA, id: 'missing-package', subcontractPackageCode: 'does-not-exist' }));
+  ok('S30-R9 nonexistent subcontract package refused', missingPackageResult.error !== null);
+  const partialUpsertResult = runQuery(query(s30Store, 'payment_certificates').upsert({ id: userIpcA.id, status: 'paid' }));
+  ok('S30-R10 partial upsert validates the merged durable certificate', partialUpsertResult.error === null);
+  runQuery(query(s30Store, 'payment_certificates').insert({ ...userIpcA, id: 'second-certificate' }));
+  const beforeDuplicateUpdate = s30Store.getItem(WORKSPACE_STORAGE_KEY);
+  const duplicateUpdateResult = runQuery(query(s30Store, 'payment_certificates').update({ id: userIpcA.id }).eq('id', 'second-certificate'));
+  ok('S30-R11 duplicate ID update is refused', duplicateUpdateResult.error !== null);
+  eq('S30-R12 duplicate ID update is atomic', s30Store.getItem(WORKSPACE_STORAGE_KEY), beforeDuplicateUpdate);
 
   // S30-K: Batch guard
   const s30ChangedPaths = new Set([

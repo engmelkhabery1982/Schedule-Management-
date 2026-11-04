@@ -1010,7 +1010,13 @@ export function seedDemoWorkspace(
       state.payment_certificates = deepClone(DEMO_PAYMENT_CERTIFICATES as WorkspaceRow[]);
     }
     if (!state.subcontractor_payment_certificates || (state.subcontractor_payment_certificates as WorkspaceRow[]).length === 0) {
-      state.subcontractor_payment_certificates = deepClone(DEMO_SUBCONTRACTOR_CERTIFICATES as WorkspaceRow[]);
+      state.subcontractor_payment_certificates = deepClone(DEMO_SUBCONTRACTOR_CERTIFICATES as WorkspaceRow[]).map((cert) => ({
+        ...cert,
+        // A demonstration code is not a persisted contractual package reference.
+        subcontractPackageCode: tableRows(state, 'subcontract_packages').some((pkg) =>
+          pkg.project_id === cert.project_id && (pkg.code === cert.subcontractPackageCode || pkg.id === cert.subcontractPackageCode))
+          ? cert.subcontractPackageCode : null,
+      }));
     }
   }
   return writeWholeState(storage, state);
@@ -1212,6 +1218,45 @@ function isIsoDateValue(value: unknown): value is string {
 
 function num(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+/** Shared write/restore validation: invalid records must never become durable. */
+export function certificateRecordError(record: WorkspaceRow, subcontractor: boolean): string | null {
+  if (typeof record.id !== 'string' || !record.id.trim()) return 'Certificate ID is required';
+  if (typeof record.ipcNumber !== 'string' || !record.ipcNumber.trim()) return 'Certificate number is required';
+  const statuses = subcontractor ? ['draft', 'approved', 'paid']
+    : ['draft', 'submitted_by_contractor', 'certified_by_consultant', 'approved_by_client', 'paid'];
+  if (!statuses.includes(String(record.status))) return 'Invalid certificate approval status';
+  for (const key of ['certificateDate', 'periodStart', 'periodEnd']) {
+    const value = record[key];
+    if (!isIsoDateValue(value) || new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) !== value) {
+      return `Invalid certificate date: ${key}`;
+    }
+  }
+  if (String(record.periodStart) > String(record.periodEnd)) return 'Certificate period start is after period end';
+  if (String(record.periodEnd) > String(record.certificateDate)) return 'Certificate date is before period end';
+  const fields = subcontractor
+    ? ['grossAmountToDate', 'currentGrossAmount', 'retentionDeduction', 'materialDeductions', 'netPayableToSubcontractor', 'mainContractorRevenueForSameQty', 'mainContractorProfitMarginSar', 'mainContractorMarginPercent']
+    : ['grossAmountToDate', 'previousGrossAmount', 'currentGrossAmount', 'netPayableAmount', 'advancePaymentDeduction', 'retentionMoneyDeduction', 'penaltyDeduction', 'vatAmount'];
+  for (const field of fields) {
+    const value = record[field];
+    if (num(value) === null) return `${field} must be finite numeric data`;
+  }
+  if (record.items !== undefined && record.items !== null) {
+    if (!Array.isArray(record.items)) return 'Certificate items must be an array';
+    const ids = new Set<string>();
+    const numericFields = subcontractor
+      ? ['quantity', 'subcontractorRate', 'subcontractorAmount', 'mainContractorRate', 'mainContractorAmount', 'marginSar']
+      : ['contractQuantity', 'unitRateSar', 'previousQuantity', 'currentQuantity', 'cumulativeQuantity', 'cumulativeAmountSar', 'currentAmountSar'];
+    for (const line of record.items) {
+      if (!isPlainObject(line) || typeof line.id !== 'string' || !line.id.trim() || ids.has(line.id)) return 'Certificate line IDs must be present and unique';
+      ids.add(line.id);
+      for (const field of numericFields) {
+        if (line[field] !== undefined && line[field] !== null && num(line[field]) === null) return `Invalid line numeric field: ${field}`;
+      }
+    }
+  }
+  return null;
 }
 
 /**
@@ -1570,6 +1615,8 @@ export function validateBackup(input: string | unknown): BackupValidation {
   for (let i = 0; i < tables.payment_certificates.length; i += 1) {
     const cert = tables.payment_certificates[i];
     const path = `tables.payment_certificates[${i}]`;
+    const recordError = certificateRecordError(cert, false);
+    if (recordError) return fail('invalid_row', path, recordError);
     const certDate = typeof cert.certificateDate === 'string' ? cert.certificateDate : typeof cert.certificate_date === 'string' ? cert.certificate_date : null;
     const status = cert.status;
     const project = projectById.get(String(cert.project_id));
@@ -1622,6 +1669,8 @@ export function validateBackup(input: string | unknown): BackupValidation {
   for (let i = 0; i < tables.subcontractor_payment_certificates.length; i += 1) {
     const sub = tables.subcontractor_payment_certificates[i];
     const path = `tables.subcontractor_payment_certificates[${i}]`;
+    const recordError = certificateRecordError(sub, true);
+    if (recordError) return fail('invalid_row', path, recordError);
     const certDate = typeof sub.certificateDate === 'string' ? sub.certificateDate : typeof sub.certificate_date === 'string' ? sub.certificate_date : null;
     const status = sub.status;
     const project = projectById.get(String(sub.project_id));
@@ -1657,6 +1706,9 @@ export function validateBackup(input: string | unknown): BackupValidation {
     if (pkgCode !== undefined && pkgCode !== null && String(pkgCode).trim() !== '') {
       const foreignPkg = tables.subcontract_packages.find((p) => (p.code === pkgCode || p.id === pkgCode) && p.project_id !== sub.project_id);
       const matchingPkg = tables.subcontract_packages.find((p) => (p.code === pkgCode || p.id === pkgCode) && p.project_id === sub.project_id);
+      if (!matchingPkg && !foreignPkg) {
+        return fail('missing_reference', `${path}.subcontractPackageCode`, 'subcontractor package does not exist in this project');
+      }
       if (foreignPkg && !matchingPkg) {
         return fail('project_mismatch', `${path}.subcontractPackageCode`, 'subcontractor certificate references package of another project');
       }
@@ -1710,7 +1762,9 @@ export function validateBackup(input: string | unknown): BackupValidation {
   }
 
   // --- checksum ----------------------------------------------------------
-  const recomputed = backupChecksum(tables, auxiliary);
+  // Verify the exact declared inventory before adding new empty tables. Older v2
+  // backups contain 32 tables; migration must not change their integrity input.
+  const recomputed = backupChecksum(tablesInput as WorkspaceTables, auxiliary);
   const declared = typeof parsed.checksum === 'string' ? parsed.checksum : null;
   let checksumVerified = false;
   if (declared === null) {

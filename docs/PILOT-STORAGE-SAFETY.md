@@ -275,3 +275,24 @@ Both defects are reproduced in `scripts/validate-controls.ts` under S30-A1...A3.
 | Lint | `npm run lint` | baseline `199 problems (177 errors, 22 warnings)` → now `193 problems (171 errors, 22 warnings)`. Zero lint errors in new/updated code. |
 | Browser binary | `google-chrome`, `chromium`, `firefox` | **NOT INSTALLED IN SANDBOX** — flagged as owner-review gate. |
 
+# IPC01 independent owner review — 2026-11-04
+
+The delivered branch passed 1832 controls, but browser review found that valid older
+32-table schema-v2 backups were rejected after adding the two certificate tables.
+Integrity is now checked against the original declared table inventory before the
+missing tables are initialized empty. Tampered older files still fail validation.
+
+Writes and restores now share certificate date/status/numeric/line-ID validation;
+duplicate certificate IDs and nonexistent subcontract packages are refused. Partial
+upserts validate the merged record. Project changes remount the certificate view,
+discarding another project's draft and late response. Contract deductions are entered
+explicitly rather than invented as 5%/10%; the existing VAT calculation is unchanged.
+
+Independent controls: 1856/1856; TypeScript and production build passed. Browser QA
+restored an original 32-table backup, created a paid main IPC in project A and an
+approved subcontract IPC in project B, reopened both, verified isolation and zero
+invented deductions, exported 34 tables, and restored that actual export. All original
+32 tables remained byte-for-byte equal as JSON values. A future-dated paid IPC was
+refused visibly. Header-only certificates remain explicitly **Not itemized**; this
+does not constitute acceptance of commercial readiness or automatic EVM posting.
+
