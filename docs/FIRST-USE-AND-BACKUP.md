@@ -148,3 +148,7 @@ CSV/XLSX/persistence regressions, TypeScript, build and focused implementation l
 passed. This closes a local input workflow, not commercial readiness or field
 validation of library productivity assumptions. Browser file-chooser permission was
 not retried or claimed as passed.
+
+## Daily progress pilot (4 November2026)
+Open Progress → Single activity, select the activity, enter a positive finite physical quantity and a valid daily date on/before the governed DataDate, then save. Reopen the project and compare the approved record and cumulative quantity. Empty/impossible dates are refused before daily writes. Neither daily mode changes the project DataDate.
+Progress valuation quotes the existing canonical F6 activity budget (approved baseline first, otherwise the direct activity budget), converted using its planned physical quantity. No project BAC is split equally across activities and no BOQ-description similarity assigns a price. Missing price basis stays N/A; explicit zero stays zero. This is planned earned-value valuation, not cash received, a paid invoice or proof of profit. Historical stored commercial values remain unchanged. Synthetic QA approval is not owner business approval.

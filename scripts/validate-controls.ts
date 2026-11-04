@@ -201,6 +201,7 @@ const BATCH3A_GOVERNANCE_PATHS = new Set([
  * is confined to ITS paths, so nothing can be smuggled in by loosening the older guards.
  */
 import {
+  quoteActivityProgressRate, quoteProgressValue, isValidProgressDate,
   reconcilePaymentCertificate,
   reconcileSubcontractorCertificate,
   summarizeCertificates,
@@ -229,6 +230,12 @@ const S31_XER_INPUT_PATHS = new Set([
 ]);
 
 // S32 reuses the existing BOQ parser/wizard; its own base-relative guard is mandatory.
+const S33_PROGRESS_ENTRY_PATHS = new Set([
+  'src/components/views/ProgressView.tsx',
+  'src/lib/commercialControlsEngine.ts',
+  'scripts/validate-controls.ts',
+  'docs/FIRST-USE-AND-BACKUP.md',
+]);
 const S32_BOQ_INPUT_PATHS = new Set([
   'src/components/views/ImportView.tsx',
   'src/lib/boqParser.ts',
@@ -4697,7 +4704,7 @@ console.log('--- S18 Pilot Closure (F9.5)');
   ]);
   const s24ChangedPaths = [...changedPaths].filter((path) =>
     !batch2bTiaPaths.has(path) && !batch2cResourcePaths.has(path) && !BATCH3A_GOVERNANCE_PATHS.has(path)
-      && !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path) && !S32_BOQ_INPUT_PATHS.has(path));
+      && !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path) && !S32_BOQ_INPUT_PATHS.has(path) && !S33_PROGRESS_ENTRY_PATHS.has(path));
   const protectedControlPaths = [
     'src/lib/scheduleControlEngine.ts',
     'src/lib/costControlEngine.ts',
@@ -5516,7 +5523,7 @@ console.log('--- S18 Pilot Closure (F9.5)');
     'supabase/migrations/20260924130000_atomic_resource_leveling_apply.sql',
   ]);
   const s26ChangedPaths = [...batch2bChangedPaths].filter((path) =>
-    !batch2cTiaExclusions.has(path) && !BATCH3A_GOVERNANCE_PATHS.has(path) && !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path) && !S32_BOQ_INPUT_PATHS.has(path));
+    !batch2cTiaExclusions.has(path) && !BATCH3A_GOVERNANCE_PATHS.has(path) && !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path) && !S32_BOQ_INPUT_PATHS.has(path) && !S33_PROGRESS_ENTRY_PATHS.has(path));
   ok('S26 changed files stay within TIA engine/view, directly required types, and regression harness',
     s26ChangedPaths.every((path) => allowedBatch2bPaths.has(path)));
   const protectedBatch2bPaths = [
@@ -5867,7 +5874,7 @@ console.log('--- S18 Pilot Closure (F9.5)');
     'supabase/migrations/20260924130000_atomic_resource_leveling_apply.sql',
   ]);
   const s27ChangedPaths = [...changedPaths].filter((path) =>
-    !BATCH3A_GOVERNANCE_PATHS.has(path) && !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path) && !S32_BOQ_INPUT_PATHS.has(path));
+    !BATCH3A_GOVERNANCE_PATHS.has(path) && !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path) && !S32_BOQ_INPUT_PATHS.has(path) && !S33_PROGRESS_ENTRY_PATHS.has(path));
   ok('S27 changes stay within Batch 2C resource-leveling, required types/tests, and atomic Apply support',
     s27ChangedPaths.every((path) => allowedBatch2cPaths.has(path)));
   const protectedUnchanged = [
@@ -6191,7 +6198,7 @@ console.log('--- S18 Pilot Closure (F9.5)');
     ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
   ]);
   ok('S28 changed files stay inside the requested Batch 3A governance boundary (or the later S29/S30 scope)',
-    [...s28ChangedPaths].every((path) => BATCH3A_GOVERNANCE_PATHS.has(path) || S29_WORKSPACE_SAFETY_PATHS.has(path) || S30_IPC_PERSISTENCE_PATHS.has(path) || S32_BOQ_INPUT_PATHS.has(path)));
+    [...s28ChangedPaths].every((path) => BATCH3A_GOVERNANCE_PATHS.has(path) || S29_WORKSPACE_SAFETY_PATHS.has(path) || S30_IPC_PERSISTENCE_PATHS.has(path) || S32_BOQ_INPUT_PATHS.has(path) || S33_PROGRESS_ENTRY_PATHS.has(path)));
   const protectedBatch3aFiles = [
     'src/lib/scheduleControlEngine.ts', 'src/lib/costControlEngine.ts', 'src/lib/integratedDecisionEngine.ts',
     'src/lib/canonicalEvm.ts', 'src/lib/sCurveEngine.ts', 'src/lib/sCurveTimePhasing.ts',
@@ -6934,7 +6941,7 @@ console.log('--- S18 Pilot Closure (F9.5)');
     ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
   ]);
   eq('S29-K1 the increment is confined to the storage-safety paths it declares',
-    [...s29ChangedPaths].filter((path) => !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path) && !S31_XER_INPUT_PATHS.has(path) && !S32_BOQ_INPUT_PATHS.has(path)), []);
+    [...s29ChangedPaths].filter((path) => !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path) && !S31_XER_INPUT_PATHS.has(path) && !S32_BOQ_INPUT_PATHS.has(path) && !S33_PROGRESS_ENTRY_PATHS.has(path)), []);
   ok('S29-K2 the increment actually touches the storage core it claims to repair',
     s29ChangedPaths.has('src/lib/localWorkspace.ts')
       && s29ChangedPaths.has('src/lib/localQueryBuilder.ts')
@@ -6948,10 +6955,11 @@ console.log('--- S18 Pilot Closure (F9.5)');
   // Git may check out CRLF on Windows while git show returns LF. Compare source,
   // retaining the exact bounded substitutions below, independently of EOL format.
   const repairedProgress = readFileSync(resolvePath(process.cwd(), 'src/components/views/ProgressView.tsx'), 'utf8').replace(/\r\n/g, '\n');
+  const acceptedBeforeProgress = execFileSync('git', ['show', '7ff992031755e17c1078c975e322afad10b0d07f:src/components/views/ProgressView.tsx'], { encoding: 'utf8' }).replace(/\r\n/g, '\n');
   const deliveredProgress = execFileSync('git', ['show', '4e03e8e303028edbbfa5ccb57037ad123465b802:src/components/views/ProgressView.tsx'], { encoding: 'utf8' }).replace(/\r\n/g, '\n');
   ok('S29-M checked monthly persistence is present', repairedProgress.includes('if (!revisionWrite.ok) throw new Error(revisionWrite.error);'));
   eq('S29-M ProgressView differs only by the checked monthly revision persistence path',
-    repairedProgress.replace("import { writeAuxiliaryStores } from '@/lib/localWorkspace';\n", '')
+    acceptedBeforeProgress.replace("import { writeAuxiliaryStores } from '@/lib/localWorkspace';\n", '')
       .replace(`      const revisionWrite = writeAuxiliaryStores(localStorage, [
         { key: revisionKey, projectId: project.id, raw: JSON.stringify([newRev, ...existingRevs]) },
       ]);
@@ -7353,7 +7361,7 @@ console.log('--- S18 Pilot Closure (F9.5)');
     ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
   ]);
   eq('S30-K1 changes outside S29 stay within declared S30 increment paths',
-    [...s30ChangedPaths].filter((path) => !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path) && !S31_XER_INPUT_PATHS.has(path) && !S32_BOQ_INPUT_PATHS.has(path)), []);
+    [...s30ChangedPaths].filter((path) => !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path) && !S31_XER_INPUT_PATHS.has(path) && !S32_BOQ_INPUT_PATHS.has(path) && !S33_PROGRESS_ENTRY_PATHS.has(path)), []);
   ok('S30-K2 S30 increment actually touches PaymentCertificatesView and workspace storage',
     s30ChangedPaths.has('src/components/views/PaymentCertificatesView.tsx')
       && s30ChangedPaths.has('src/lib/localWorkspace.ts')
@@ -7366,18 +7374,51 @@ const s31ChangedPaths = new Set([
   ...execFileSync('git', ['diff', '--name-only', '6f7862cc6a780d86b25372085e72e8494dfcab26'], { encoding: 'utf8' }).split('\n').filter(Boolean),
   ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
 ]);
-eq('S31-A existing XER input repair stays inside its three declared paths', [...s31ChangedPaths].filter((path) => !S31_XER_INPUT_PATHS.has(path) && !S32_BOQ_INPUT_PATHS.has(path)), []);
+eq('S31-A existing XER input repair stays inside its three declared paths', [...s31ChangedPaths].filter((path) => !S31_XER_INPUT_PATHS.has(path) && !S32_BOQ_INPUT_PATHS.has(path) && !S33_PROGRESS_ENTRY_PATHS.has(path)), []);
 ok('S31-B existing import screen is actually changed', s31ChangedPaths.has('src/components/views/ImportView.tsx'));
 
 const s32ChangedPaths = new Set([
   ...execFileSync('git', ['diff', '--name-only', '3b873fbf8bf4e5db1aa5445b0596645de39cc336'], { encoding: 'utf8' }).split('\n').filter(Boolean),
   ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
 ]);
-eq('S32-A BOQ input repair stays in its six declared paths', [...s32ChangedPaths].filter((path) => !S32_BOQ_INPUT_PATHS.has(path)), []);
+eq('S32-A BOQ input repair stays in its six declared paths', [...s32ChangedPaths].filter((path) => !S32_BOQ_INPUT_PATHS.has(path) && !S33_PROGRESS_ENTRY_PATHS.has(path)), []);
 ok('S32-B BOQ input and production numeric parser are actually repaired', s32ChangedPaths.has('src/components/views/ImportView.tsx') && s32ChangedPaths.has('src/lib/boqParser.ts'));
 ok('S32-C real CSV/XLSX numeric parser regressions pass without storage writes', execFileSync(process.execPath, ['scripts/validate-boq-input.mjs'], { encoding: 'utf8' }).includes('BOQ INPUT VALIDATION PASSED: 14/14'));
 
 // ---------------------------------------------------------------------------
+
+// S33: physical progress quotes F6's activity budget, with no equal-BAC/name-match invention.
+{
+  const qaActs = [act({ id: 'qa-survey', code: 'A-001', name: 'Setting out / survey', planned_quantity: 1 }),
+    act({ id: 'qa-exc', code: 'A-002', name: 'Bulk excavation', planned_quantity: 300, actual_quantity: 60, percent_complete: 20, actual_start: '2026-09-09' })];
+  const qaBases = [base('qa-bs', 'qa-survey', '2026-09-01', '2026-09-03', 3, 0), base('qa-be', 'qa-exc', '2026-09-04', '2026-09-05', 2, 3000)];
+  const report = analyzeCostControl({ project: { id: 'p1', contract_value: 3000, start_date: '2026-09-01', end_date: '2026-09-10', data_date: '2026-09-13' } as Project, activities: qaActs, baselines: qaBases, budgetLines: [], costTransactions: [], progressUpdates: [{ ...upd('qa-progress', 'qa-exc', '2026-09-09', 20), actual_quantity: 60, quantity_to_date: 60 }], wbsNodes: [], boqItems: [], allocations: [], dataDate: '2026-09-13', calendarType: '7_days' });
+  const excavation = report.activities.find((a) => a.id === 'qa-exc')!;
+  const rate = quoteActivityProgressRate(300, excavation);
+  eq('S33-A unrelated A-002/BOQ descriptions cannot change canonical excavation rate', rate, 10);
+  eq('S33-B 60/300 physical units quote the same600 as canonical F6 EV', quoteProgressValue(60, rate), excavation.ev);
+  eq('S33-C explicit zero-budget survey never absorbs a share of project BAC', quoteActivityProgressRate(1, report.activities.find((a) => a.id === 'qa-survey')), 0);
+  eq('S33-D unavailable activity budget remains N/A', quoteActivityProgressRate(300, { bac: 0, bacSource: 'unavailable' }), null);
+  eq('S33-E missing activity stays N/A', quoteActivityProgressRate(300, undefined), null);
+  eq('S33-F missing rate never becomes zero EV', quoteProgressValue(60, null), null);
+  eq('S33-G zero quantity basis is unpriced', quoteActivityProgressRate(0, excavation), null);
+  eq('S33-H invalid quantity is unpriced', quoteActivityProgressRate(NaN, excavation), null);
+  eq('S33-I explicit zero rate produces recorded zero', quoteProgressValue(60, 0), 0);
+  eq('S33-J nonfinite input cannot produce stored commercial NaN', quoteProgressValue(Infinity, rate), null);
+  eq('S33-K fractional physical quantity does not round the unit rate', quoteActivityProgressRate(0.5, { bac: 3, bacSource: 'baseline' }), 6);
+  for (const date of ['', '2026-02-30', '2026-13-01', '2026-9-1', 'not-a-date']) eq(`S33-L invalid daily date ${date}`, isValidProgressDate(date), false);
+  eq('S33-M valid governed daily date allowed', isValidProgressDate('2026-09-13'), true);
+  eq('S33-N leap-day rollover rejected', isValidProgressDate('2026-02-29'), false);
+  const progressSource = readFileSync('src/components/views/ProgressView.tsx', 'utf8');
+  ok('S33-O both actual daily write paths validate date before persistence', (progressSource.match(/if \(!isValidProgressDate\(entryDate\)\)/g) || []).length === 2);
+  ok('S33-P unit-rate path quotes canonical F6 and removes equal-share fallback', progressSource.includes('costReport?.activities.find') && !progressSource.includes('const defaultBac') && !progressSource.includes('boqItems.find((b) => b.code === act.code || b.description.includes(act.name)'));
+}
+const s33ChangedPaths = new Set([
+  ...execFileSync('git', ['diff', '--name-only', '7ff992031755e17c1078c975e322afad10b0d07f'], { encoding: 'utf8' }).split('\n').filter(Boolean),
+  ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
+]);
+eq('S33-Q current progress repair stays inside four declared paths', [...s33ChangedPaths].filter((path) => !S33_PROGRESS_ENTRY_PATHS.has(path)), []);
+
 console.log('');
 if (failures > 0) {
   console.log(`VALIDATION FAILED: ${failures} of ${checks} checks failed.`);

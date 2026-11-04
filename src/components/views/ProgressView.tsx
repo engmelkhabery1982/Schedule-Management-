@@ -43,7 +43,7 @@ import {
   type SubcontractorPerformanceSummary,
   type SubcontractSource,
 } from '@/lib/subcontractEngine';
-import { calculateRetentionAmount } from '@/lib/commercialControlsEngine';
+import { quoteActivityProgressRate, quoteProgressValue, isValidProgressDate, calculateRetentionAmount } from '@/lib/commercialControlsEngine';
 import {
   TrendingUp,
   Save,
@@ -355,27 +355,17 @@ export default function ProgressView({ project }: ProgressViewProps) {
     setLoading(false);
   }
 
-  // Get Unit Rate for an Activity from BOQ or proportional contract BAC (Client Selling Rate)
-  const getActivityUnitRate = (act: Activity): number => {
-    const plannedQty = Math.max(1, act.planned_quantity || 1);
-    const boq = boqItems.find((b) => b.code === act.code || b.description.includes(act.name) || act.name.includes(b.description));
-    if (boq && boq.unit_price > 0) {
-      return boq.unit_price;
-    }
-    const defaultBac = project ? project.contract_value / Math.max(1, activities.length) : 50000;
-    return Math.round(defaultBac / plannedQty);
-  };
+  // Quote the canonical F6 activity budget, never an equal share of project BAC or a name match.
+  const getActivityUnitRate = (act: Activity): number | null =>
+    quoteActivityProgressRate(act.planned_quantity, costReport?.activities.find((row) => row.id === act.id));
 
-  /**
-   * Retention label that names the package's CONTRACTUAL percent (10%, 5%, 0%, ...) instead of the
-   * fixed 10% this screen used to assume, and that says so when the contract states none (GAP-020).
-   */
+  /** Retention stays contractual, including explicit zero and missing N/A. */
   const retentionLabel = (percent: number | null | undefined): string =>
     percent === null || percent === undefined
       ? 'مستقطع الضمان (غير منصوص عليه تعاقدياً - N/A)'
       : `مستقطع الضمان (${percent}% تعاقدي)`;
 
-  /** Formats a commercial amount, or states explicitly that it is not priced (GAP-020). */
+  /** Formats a commercial amount, or states explicitly that it is not priced. */
   const money = (value: number | null | undefined, suffix = 'ر.س'): string =>
     value === null || value === undefined || !Number.isFinite(Number(value))
       ? 'غير مُسعّر (N/A)'
@@ -691,8 +681,12 @@ export default function ProgressView({ project }: ProgressViewProps) {
 
   // Handle saving single activity daily progress
   async function handleSaveSingleDailyEntry() {
-    if (!project || !selectedActivityId || singleTodayQty <= 0) {
+    if (!project || !selectedActivityId || !Number.isFinite(singleTodayQty) || singleTodayQty <= 0) {
       setMessage('يرجى اختيار النشاط وإدخال كمية إنجاز اليوم.');
+      return;
+    }
+    if (!isValidProgressDate(entryDate)) {
+      setMessage('تعذر الحفظ: أدخل تاريخ يومية صالحاً / Enter a valid daily date.');
       return;
     }
     // F5 §1: an entry after the Data Date would plant a future actual — blocked.
@@ -717,7 +711,7 @@ export default function ProgressView({ project }: ProgressViewProps) {
     const actualFinish = newPercent >= 100 ? (act.actual_finish || entryDate) : null;
 
     const clientUnitRate = getActivityUnitRate(act);
-    const clientEarnedVal = Math.round(singleTodayQty * clientUnitRate);
+    const clientEarnedVal = quoteProgressValue(singleTodayQty, clientUnitRate);
 
     const isSubExecuted = singleExecutorType === 'subcontractor';
     const terms = resolveSubcontractTerms(act, singleSubcontractorId, Number(singleTodayQty));
@@ -767,8 +761,8 @@ export default function ProgressView({ project }: ProgressViewProps) {
       }).eq('id', act.id), 'تعذر تحديث النشاط بالمنجز التراكمي');
 
       const execLabel = isSubExecuted
-        ? `بواسطة مقاول الباطن (${subName || 'غير محدد'}) | تكلفة الباطن: ${money(subCost)} | إيراد المالك: ${clientEarnedVal.toLocaleString()} ر.س | الربح: ${money(profitMargin)} | ${retentionLabel(terms.retentionPercent)}: ${money(retention)}`
-        : `تنفيذ ذاتي (المقاول الرئيسي) بقيمة مكتسبة ${clientEarnedVal.toLocaleString()} ر.س`;
+        ? `بواسطة مقاول الباطن (${subName || 'غير محدد'}) | تكلفة الباطن: ${money(subCost)} | إيراد المالك: ${money(clientEarnedVal)} | الربح: ${money(profitMargin)} | ${retentionLabel(terms.retentionPercent)}: ${money(retention)}`
+        : `تنفيذ ذاتي (المقاول الرئيسي) بقيمة مكتسبة ${money(clientEarnedVal)}`;
 
       setMessage(`تم تسجيل منجز اليوم (+${singleTodayQty} ${act.unit || 'وحدة'}) للنشاط [${act.code}] - ${execLabel}`);
       setSingleTodayQty(0);
@@ -789,6 +783,10 @@ export default function ProgressView({ project }: ProgressViewProps) {
       setMessage('لم تقم بإدخال كميات لأي نشاط في يومية اليوم.');
       return;
     }
+    if (!isValidProgressDate(entryDate)) {
+      setMessage('تعذر الحفظ: أدخل تاريخ يومية صالحاً / Enter a valid daily date.');
+      return;
+    }
     // F5 §1: an entry after the Data Date would plant a future actual — blocked.
     if (isAfterDataDate(entryDate, governedDataDate)) {
       setMessage(`تعذر الحفظ: تاريخ اليومية (${entryDate}) بعد تاريخ التحديث المعتمد (${governedDataDate}).`);
@@ -802,6 +800,7 @@ export default function ProgressView({ project }: ProgressViewProps) {
       // as partial), instead of the old behaviour where every write error was invisible.
       const failedEntries: string[] = [];
       let totalEarnedToday = 0;
+      let unpricedClientEntries = 0;
       let totalSubCostToday = 0;
       // Entries whose package has no contractual rate: reported, never priced by estimate (GAP-020).
       let unpricedSubEntries = 0;
@@ -819,8 +818,9 @@ export default function ProgressView({ project }: ProgressViewProps) {
         const newPercent = Math.min(100, Number(((newCumulativeQty / plannedQty) * 100).toFixed(1)));
         const remainingDuration = Math.max(0, Math.round(act.duration_days * (1 - newPercent / 100)));
         const clientUnitRate = getActivityUnitRate(act);
-        const clientEarnedToday = Math.round(qty * clientUnitRate);
-        totalEarnedToday += clientEarnedToday;
+        const clientEarnedToday = quoteProgressValue(qty, clientUnitRate);
+        if (clientEarnedToday === null) unpricedClientEntries++;
+        else totalEarnedToday += clientEarnedToday;
 
         const execInfo = dailyExecutors[actId] || { executorType: 'self_direct' };
         const isSubEntry = execInfo.executorType === 'subcontractor';
@@ -884,7 +884,7 @@ export default function ProgressView({ project }: ProgressViewProps) {
 
       if (failedEntries.length === 0) {
         setMessage(
-          `تم اعتماد اليومية لـ (${savedCount}) أنشطة | إيراد المالك المكتسب: ${totalEarnedToday.toLocaleString()} ر.س | تكلفة مقاولي الباطن: ${totalSubCostToday.toLocaleString()} ر.س | صافي الهامش: +${(totalEarnedToday - totalSubCostToday).toLocaleString()} ر.س${
+          `تم اعتماد اليومية لـ (${savedCount}) أنشطة | إيراد المالك المكتسب: ${unpricedClientEntries ? "غير مكتمل (N/A)" : totalEarnedToday.toLocaleString()} ر.س | تكلفة مقاولي الباطن: ${totalSubCostToday.toLocaleString()} ر.س | صافي الهامش: +${unpricedClientEntries || unpricedSubEntries ? "غير مكتمل (N/A)" : (totalEarnedToday - totalSubCostToday).toLocaleString()} ر.س${
             unpricedSubEntries > 0
               ? ` | تنبيه: ${unpricedSubEntries} إدخال باطن بدون سعر تعاقدي (N/A) ولم تُحتسب تكلفته`
               : ''
@@ -922,7 +922,7 @@ export default function ProgressView({ project }: ProgressViewProps) {
       return;
     }
     const clientUnitRate = getActivityUnitRate(act);
-    const clientEV = Math.round(inspectionForm.quantity * clientUnitRate);
+    const clientEV = quoteProgressValue(inspectionForm.quantity, clientUnitRate);
 
     const isSubInspection = inspectionForm.executor_type === 'subcontractor';
     const inspTerms = resolveSubcontractTerms(act, inspectionForm.subcontractor_id, inspectionForm.quantity);
@@ -1027,8 +1027,8 @@ export default function ProgressView({ project }: ProgressViewProps) {
     const plannedQty = Math.max(1, act.planned_quantity || 1);
     const newPercent = Math.min(100, Number(((newCumulativeQty / plannedQty) * 100).toFixed(1)));
     const remainingDuration = Math.max(0, Math.round(act.duration_days * (1 - newPercent / 100)));
-    const clientUnitRate = req.client_unit_rate || getActivityUnitRate(act);
-    const clientEarnedVal = Math.round(qty * clientUnitRate);
+    const clientUnitRate = req.client_unit_rate ?? getActivityUnitRate(act);
+    const clientEarnedVal = quoteProgressValue(qty, clientUnitRate);
 
     const isSub = req.executor_type === 'subcontractor' || !!req.subcontractor_name || !!req.subcontractor_id;
     const terms = resolveSubcontractTerms(act, req.subcontractor_id, qty);
@@ -1039,7 +1039,7 @@ export default function ProgressView({ project }: ProgressViewProps) {
     const subCost = isSub
       ? req.subcontractor_cost ?? (subRate !== null && subRate !== undefined ? Math.round(qty * Number(subRate)) : null)
       : 0;
-    const profitMargin = subCost !== null ? clientEarnedVal - Number(subCost) : null;
+    const profitMargin = subCost !== null && clientEarnedVal !== null ? clientEarnedVal - Number(subCost) : null;
     const retentionPercent = isSub ? terms.retentionPercent : null;
     const retention =
       isSub && subCost !== null && retentionPercent !== null
@@ -1146,10 +1146,10 @@ export default function ProgressView({ project }: ProgressViewProps) {
       }
 
       const summaryText = isSub
-        ? `تم اعتماد طلب الفحص [${req.request_number}] بنجاح! تم تحويل (+${qty} ${act.unit || 'وحدة'}) إلى إنجاز فعلي للنشاط (${newPercent}%) بتاريخ ${req.inspection_date}، وتسجيل إيراد مكتسب للمالك قدره ${clientEarnedVal.toLocaleString()} ر.س، واستحقاق لمقاول الباطن (${subName || 'غير محدد'}) قدره ${money(subCost)}${
+        ? `تم اعتماد طلب الفحص [${req.request_number}] بنجاح! تم تحويل (+${qty} ${act.unit || 'وحدة'}) إلى إنجاز فعلي للنشاط (${newPercent}%) بتاريخ ${req.inspection_date}، وتسجيل إيراد مكتسب للمالك قدره ${money(clientEarnedVal)}، واستحقاق لمقاول الباطن (${subName || 'غير محدد'}) قدره ${money(subCost)}${
             retention !== null ? ` بعد ${retentionLabel(retentionPercent)} بمبلغ ${money(retention)}` : ' (نسبة الضمان التعاقدية غير منصوص عليها - N/A)'
           } بربح محقق ${money(profitMargin)}${subCost !== null ? '، وترحيل التكلفة إلى الميزانية!' : ' — لم تُرحّل التكلفة لأن البند غير مُسعّر تعاقدياً.'}`
-        : `تم اعتماد طلب الفحص [${req.request_number}] بنجاح! تم تحويل (+${qty} ${act.unit || 'وحدة'}) إلى إنجاز فعلي للنشاط (${newPercent}%) بقيمة مكتسبة ${clientEarnedVal.toLocaleString()} ر.س.`;
+        : `تم اعتماد طلب الفحص [${req.request_number}] بنجاح! تم تحويل (+${qty} ${act.unit || 'وحدة'}) إلى إنجاز فعلي للنشاط (${newPercent}%) بقيمة مكتسبة ${money(clientEarnedVal)}.`;
 
       setMessage(summaryText);
       await loadData();
@@ -1462,7 +1462,7 @@ export default function ProgressView({ project }: ProgressViewProps) {
                   const newCumulative = prevQty + enteredToday;
                   const newPct = Math.min(100, Number(((newCumulative / plannedQty) * 100).toFixed(1)));
                   const clientUnitRate = getActivityUnitRate(act);
-                  const clientEarnedToday = Math.round(enteredToday * clientUnitRate);
+                  const clientEarnedToday = quoteProgressValue(enteredToday, clientUnitRate);
                   const remainingQty = Math.max(0, plannedQty - newCumulative);
                   const isCompleted = newPct >= 100;
 
@@ -1551,7 +1551,7 @@ export default function ProgressView({ project }: ProgressViewProps) {
                               </select>
                               <div className="text-[9px] text-indigo-700 flex justify-between font-mono">
                                 <span>سعر الباطن: {money(subInfo.subRate)}</span>
-                                <span>سعر المالك: {clientUnitRate.toLocaleString()} ر.س</span>
+                                <span>سعر المالك: {money(clientUnitRate)}</span>
                               </div>
                             </div>
                           )}
@@ -1611,7 +1611,7 @@ export default function ProgressView({ project }: ProgressViewProps) {
                         {enteredToday > 0 ? (
                           isSub ? (
                             <div className="space-y-0.5">
-                              <div className="text-emerald-700 font-black">إيراد مالك: +{clientEarnedToday.toLocaleString()} ر.س</div>
+                              <div className="text-emerald-700 font-black">إيراد مالك: +{money(clientEarnedToday)}</div>
                               <div className="text-rose-700 font-bold text-[10px]">تكلفة باطن: {money(subCostToday)}</div>
                               <div className="text-indigo-700 font-black text-[10px] bg-indigo-50 px-1 py-0.5 rounded">
                                 صافي الربح: {money(profitMarginToday)}
@@ -1619,7 +1619,7 @@ export default function ProgressView({ project }: ProgressViewProps) {
                             </div>
                           ) : (
                             <div className="text-emerald-700 font-black">
-                              +{clientEarnedToday.toLocaleString()} ر.س <span className="text-[10px] text-slate-400 font-normal">(ذاتي)</span>
+                              +{money(clientEarnedToday)} <span className="text-[10px] text-slate-400 font-normal">(ذاتي)</span>
                             </div>
                           )
                         ) : (
@@ -1692,7 +1692,7 @@ export default function ProgressView({ project }: ProgressViewProps) {
                         <p className="text-xs font-bold text-slate-800 truncate">{act.name}</p>
                       </div>
                       <p className="text-[11px] text-slate-400">
-                        المنجز: {act.actual_quantity || 0} من {act.planned_quantity || 1} {act.unit || 'وحدة'} (سعر المالك: {getActivityUnitRate(act).toLocaleString()} ر.س)
+                        المنجز: {act.actual_quantity || 0} من {act.planned_quantity || 1} {act.unit || 'وحدة'} (سعر المالك: {money(getActivityUnitRate(act))})
                       </p>
                     </div>
 
@@ -1726,8 +1726,8 @@ export default function ProgressView({ project }: ProgressViewProps) {
                 const newCumulative = prevQty + Number(singleTodayQty || 0);
                 const newPct = Math.min(100, Number(((newCumulative / plannedQty) * 100).toFixed(1)));
                 const clientUnitRate = getActivityUnitRate(act);
-                const clientEarnedToday = Math.round(Number(singleTodayQty || 0) * clientUnitRate);
-                const clientTotalEarned = Math.round(newCumulative * clientUnitRate);
+                const clientEarnedToday = quoteProgressValue(Number(singleTodayQty || 0), clientUnitRate);
+                const clientTotalEarned = quoteProgressValue(newCumulative, clientUnitRate);
 
                 const isSub = singleExecutorType === 'subcontractor';
                 const subDetails = resolveSubcontractTerms(act, singleSubcontractorId, Number(singleTodayQty || 0));
@@ -1746,7 +1746,7 @@ export default function ProgressView({ project }: ProgressViewProps) {
                           {act.code}
                         </span>
                         <span className="text-xs font-bold text-slate-600">
-                          سعر العقد الرئيسي مع المالك: {clientUnitRate.toLocaleString()} ر.س/{act.unit || 'وحدة'}
+                          سعر الإنجاز من خط الأساس / الميزانية: {money(clientUnitRate)}/{act.unit || 'وحدة'}
                         </span>
                       </div>
                       <p className="text-sm font-bold text-slate-900">{act.name}</p>
@@ -1812,12 +1812,12 @@ export default function ProgressView({ project }: ProgressViewProps) {
                           </select>
                           <div className="flex items-center justify-between text-[11px] font-mono bg-white p-2 rounded-lg border border-indigo-100">
                             <span className="text-slate-600">سعر شراء الباطن: <strong className="text-rose-700">{money(subRate, 'SAR')}</strong></span>
-                            <span className="text-slate-600">سعر بيع المالك: <strong className="text-emerald-700">{clientUnitRate.toLocaleString()} SAR</strong></span>
+                            <span className="text-slate-600">سعر بيع المالك: <strong className="text-emerald-700">{money(clientUnitRate, 'SAR')}</strong></span>
                             <span className="text-indigo-800 font-bold">
                               فارق السعر:{' '}
                               {subRate === null
                                 ? 'غير مُسعّر (N/A)'
-                                : `+${(clientUnitRate - subRate).toLocaleString()} SAR/وحدة`}
+                                : `+${money(clientUnitRate === null ? null : clientUnitRate - subRate)} SAR/وحدة`}
                             </span>
                           </div>
                         </div>
@@ -1873,7 +1873,7 @@ export default function ProgressView({ project }: ProgressViewProps) {
                         </div>
                         <div className="p-2 bg-white rounded-lg border border-emerald-100">
                           <span className="text-[10px] text-slate-500 block">إيراد المالك المكتسب (EV):</span>
-                          <span className="font-mono font-black text-emerald-700">+{clientEarnedToday.toLocaleString()} ر.س</span>
+                          <span className="font-mono font-black text-emerald-700">+{money(clientEarnedToday)}</span>
                         </div>
                         {isSub ? (
                           <>
@@ -1901,7 +1901,7 @@ export default function ProgressView({ project }: ProgressViewProps) {
                         ) : (
                           <div className="p-2 bg-white rounded-lg border border-emerald-100">
                             <span className="text-[10px] text-slate-500 block">القيمة المكتسبة الكلية:</span>
-                            <span className="font-mono font-black text-slate-900">{clientTotalEarned.toLocaleString()} ر.س</span>
+                            <span className="font-mono font-black text-slate-900">{money(clientTotalEarned)}</span>
                           </div>
                         )}
                       </div>
@@ -1920,7 +1920,7 @@ export default function ProgressView({ project }: ProgressViewProps) {
 
                     <button
                       onClick={handleSaveSingleDailyEntry}
-                      disabled={saving || singleTodayQty <= 0}
+                      disabled={saving || !Number.isFinite(singleTodayQty) || singleTodayQty <= 0}
                       className="w-full flex items-center justify-center gap-2 bg-amber-500 text-slate-950 py-2.5 rounded-xl font-black text-xs hover:bg-amber-400 transition-colors shadow-sm disabled:opacity-50 cursor-pointer"
                     >
                       <Save size={16} />
