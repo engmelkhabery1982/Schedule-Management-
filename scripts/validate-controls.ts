@@ -6712,7 +6712,17 @@ console.log('--- S18 Pilot Closure (F9.5)');
   const guardKeysBefore = guardStore.map.size;
   const tampered = JSON.parse(backupText);
   tampered.tables.projects[0].contract_value = 1;
+  // Real checksums with invalid execution evidence must still be refused before any replacement.
+  const activityDateBackup = (patch: Record<string, unknown>): string => {
+    const state = JSON.parse(JSON.stringify(demoLoaded.state)) as WorkspaceState;
+    Object.assign(tableRows(state, 'activities')[0], { actual_start: null, actual_finish: null }, patch);
+    return serializeBackup(buildBackup(state, '2026-11-04T04:35:17Z'));
+  };
   const badBackups: Array<[string, string, string]> = [
+    ['future activity actual start', activityDateBackup({ actual_start: '2026-09-14' }), 'chronology'],
+    ['future activity actual finish', activityDateBackup({ actual_finish: '2026-09-14' }), 'chronology'],
+    ['reversed activity actual dates', activityDateBackup({ actual_start: '2026-09-12', actual_finish: '2026-09-11' }), 'date_order'],
+    ['impossible activity actual date', activityDateBackup({ actual_start: '2026-02-30' }), 'required_field'],
     ['not JSON', 'this is not json at all', 'not_json'],
     ['a JSON array instead of an envelope', '[]', 'not_an_object'],
     ['a CSV schedule export', 'code,name,start\nA1,Site,2026-01-01', 'not_json'],
@@ -6739,6 +6749,14 @@ console.log('--- S18 Pilot Closure (F9.5)');
     eq(`S29-G invalid backup (${label}) created no preserved/recovery keys`, guardStore.map.size, guardKeysBefore);
   }
   ok('S29-G validation alone never mutates storage', guardStore.getItem(WORKSPACE_STORAGE_KEY) === guardBefore && guardStore.writes === 0);
+  ok('S29-G actual dates on the cut-off remain restorable', validateBackup(activityDateBackup({ actual_start: '2026-09-13', actual_finish: '2026-09-13' })).ok);
+  ok('S29-G null actuals and future planned dates remain restorable', validateBackup(activityDateBackup({ early_start: '2026-10-01', early_finish: '2026-10-05' })).ok);
+  const forgedActualValidation = validateBackup(backupText);
+  tableRows(forgedActualValidation.state!, 'activities')[0].actual_finish = '2026-09-14';
+  const forgedActualRestore = restoreWorkspace(guardStore, forgedActualValidation);
+  ok('S29-G restore revalidates a forged future-actual state despite a prior successful preview', !forgedActualRestore.ok);
+  ok('S29-G future-actual restore refusal writes neither the workspace nor recovery keys',
+    guardStore.getItem(WORKSPACE_STORAGE_KEY) === guardBefore && guardStore.map.size === guardKeysBefore && guardStore.writes === 0);
 
   // -------------------------------------------------------------------------
   // S29-H — the shipped adapter honours these contracts.

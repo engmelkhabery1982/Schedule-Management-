@@ -1,5 +1,16 @@
 # SCH-20261027-SAFETY — local workspace storage safety (pilot increment)
 
+## Owner review repair — 4 November: actual-date restore cut-off
+
+Independent reproduction on b673a58 accepted checksum-valid backups whose activity actual_start or
+actual_finish was 2026-09-14 against the project's 2026-09-13 Data Date. Progress/cost-row validation
+did not cover these activity fields. Restores now reject future actuals, impossible actual dates and
+reversed actual start/finish, while preserving null actuals, execution on the cut-off and future
+planned dates. Regression coverage also forges a previously validated state and proves restore's
+second validation refuses it without workspace or recovery-key writes. The real browser paste path
+rejects the future completion and exposes no Restore button. This closes this restore-integrity gate
+only; it does not accept the complete historical work line or update the owner installation.
+
 **Task:** safe local single-user first pilot. **Not** new scheduling features, **not** a sale-ready
 claim, **not** commercial acceptance.
 **Base commit:** `1a12ad7b17dd7db9e394461b976d1bfd1c6b8a3a` (`main` == `arena/01a0d254-schedule-management` at start).

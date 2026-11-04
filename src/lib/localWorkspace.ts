@@ -1197,6 +1197,26 @@ export function validateBackup(input: string | unknown): BackupValidation {
     if (duration !== null && duration !== undefined && (num(duration) === null || (num(duration) as number) < 0)) {
       return fail('required_field', `${path}.duration_days`, 'duration_days must be a finite number >= 0');
     }
+    // Actual dates are recorded execution, unlike future planned dates. Restoring them must obey
+    // the same governed cut-off as progress/cost rows; a checksum alone does not establish validity.
+    const activityProject = projectById.get(String(activity.project_id));
+    const activityDataDate = activityProject && isIsoDateValue(activityProject.data_date)
+      ? activityProject.data_date : null;
+    for (const field of ['actual_start', 'actual_finish'] as const) {
+      const value = activity[field];
+      if (value === null || value === undefined) continue;
+      if (!isIsoDateValue(value) || new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) !== value) {
+        return fail('required_field', `${path}.${field}`, `${field} must be a real YYYY-MM-DD date or null`);
+      }
+      if (activityDataDate && value > activityDataDate) {
+        return fail('chronology', `${path}.${field}`,
+          `${field} dated ${value} is after the project Data Date ${activityDataDate}`);
+      }
+    }
+    if (isIsoDateValue(activity.actual_start) && isIsoDateValue(activity.actual_finish)
+      && activity.actual_start > activity.actual_finish) {
+      return fail('date_order', path, 'activity actual_start is after actual_finish');
+    }
     if (activity.wbs_node_id !== null && activity.wbs_node_id !== undefined) {
       const wbs = wbsById.get(String(activity.wbs_node_id));
       if (!wbs) return fail('missing_reference', `${path}.wbs_node_id`, 'activity WBS node does not exist');
