@@ -368,7 +368,7 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
               المالك / العميل: <span className="font-semibold text-slate-800">{project.client?.trim() ? project.client : 'غير مسجل'}</span> | الموقع: <span className="font-semibold text-slate-800">{project.location?.trim() ? project.location : 'غير مسجل'}</span>
             </p>
             <p className="text-xs text-slate-600">
-              قيمة العقد: <span className="font-bold text-slate-900">{Number.isFinite(project.contract_value) ? project.contract_value.toLocaleString() : 'غير مسجلة'} {project.currency?.trim() ? project.currency : 'عملة غير مسجلة'}</span> | البداية: <span className="font-mono">{project?.start_date}</span> | النهاية المعتمدة: <span className="font-mono">{project?.end_date}</span>
+              قيمة العقد: <span className="font-bold text-slate-900">{Number.isFinite(project.contract_value) ? project.contract_value.toLocaleString() : 'غير مسجلة'} {project.currency?.trim() ? project.currency : 'عملة غير مسجلة'}</span> | البداية: <span className="font-mono">{project?.start_date}</span> | النهاية المسجلة للمشروع: <span className="font-mono">{project?.end_date}</span>
             </p>
           </div>
 
@@ -454,8 +454,10 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
 
           <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-xl">
             <span className="text-[11px] text-slate-500 font-semibold">جودة وسلامة الجدول (DCMA)</span>
-            <div className="text-2xl font-black text-emerald-700 mt-1">{dcma.score}%</div>
-            <span className="text-[10px] text-emerald-600 font-bold">{dcma.totalPassed}/14 معايير معتمدة</span>
+            {dcma.points.length > 0 ? <>
+              <div className="text-2xl font-black text-emerald-700 mt-1">{dcma.score}%</div>
+              <span className="text-[10px] text-emerald-600 font-bold">{dcma.totalPassed}/14 معايير اجتازت الفحص</span>
+            </> : <p className="text-sm text-slate-600 mt-1">{dcma.summary}</p>}
           </div>
         </div>
 
