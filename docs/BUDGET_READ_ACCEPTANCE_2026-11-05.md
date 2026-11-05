@@ -1,0 +1,9 @@
+# Budget read safety — 5 November 2026
+
+Base c8ad636520fedea2d647d648fc92d37f21f87afc. Existing BudgetView only; all eleven required query results are checked before any rows become visible. A partial read/rejected promise hides figures and financial actions and offers retry. Project identity plus request generation/mount guards prevent late responses (including errors/finally) from replacing the current selection, and prevent an old save callback from reloading a different project. Existing DataDate refreshes, canonical engines, governed baseline query, write/approval rules, schema and stored records remain unchanged.
+
+Validation: shared report-read regression now covers each of eleven partial failures, null data, out-of-order success/error and retry. Typecheck/build exit0. Targeted BudgetView lint exactly matches baseline findings:12 existing errors and1 existing loadData dependency warning; no new findings. No installs/dependency changes.
+
+Actual isolated browser QA used the production BudgetView with a synthetic read adapter at3134, no owner storage or writes. Eleven Beta reads completed first, showing BETA ONLY LINE/222 in the actual budget-lines tab. Eleven delayed Alpha reads did not replace that row. A failed budget read hid the whole view, including expense/approval controls; the actual Retry button followed by eleven successful reads restored ALPHA ONLY LINE/111. Selecting no project left only the selection notice. An initial malformed synthetic row supplied null for required numeric committed_cost and crashed its table display; fixture corrected to0 before final successful run. No product fix is claimed for that fixture error.
+
+Private evidence: BUDGET_READ01_QA/ui-proof.json and lint-comparison.json. Existing input/BOQ/progress/cost acceptance flows were not repeated. This closes read-safety behavior in one existing screen, not full commercial acceptance or any engine expansion.
