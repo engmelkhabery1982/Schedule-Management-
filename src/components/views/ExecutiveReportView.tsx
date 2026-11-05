@@ -1,5 +1,6 @@
 import { useState, useEffect, useMemo } from 'react';
 import { supabase } from '@/lib/supabase';
+import { requireReportReads, runReportRead } from '@/lib/reportReadSafety';
 import type {
   Project,
   Activity,
@@ -58,59 +59,68 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
   const [risks, setRisks] = useState<Risk[]>([]);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    if (project) loadData();
-    else setLoading(false);
-  }, [project]);
+  const [readError, setReadError] = useState(false);
+  const [loadedProject, setLoadedProject] = useState<Project | null>(null);
+  const [reloadAttempt, setReloadAttempt] = useState(0);
 
-  async function loadData() {
-    if (!project) return;
-    setLoading(true);
-    const [actRes, linkRes, baselineRes, bgtRes, cstRes, prgRes, boqRes, rskRes] = await Promise.all([
-      supabase.from('activities').select('*').eq('project_id', project.id).order('sort_order'),
-      supabase.from('activity_links').select('*').eq('project_id', project.id),
-      // REVIEW FINDING 2 (HIGH): this was an unscoped `select('*')` filtered only client-side by
-      // `activity_id`. That stops CROSS-PROJECT rows but not cross-REVISION rows: every historical
-      // baseline revision of THIS project's activities still arrived, and F6 sums `planned_cost` over
-      // every row it is handed (so a second revision inflates BAC) while its `baselineByAct` map lets
-      // whichever revision sorts last silently decide per-activity BAC — and therefore EV and PV.
-      // Those rows reached `analyzeCostControl` (canonical EVM), the DCMA audit and the baseline
-      // S-Curve, breaking the F9.4 requirement that F6 / Dashboard / BudgetView / Executive Report
-      // all rest on the SAME governed baseline evidence.
-      //
-      // Now the identical governed query BudgetView / Dashboard / ProgressView / ScheduleView use:
-      // scope through `project_baselines` (the parent that carries `project_id`) to the revision that
-      // is both ACTIVE and APPROVED. The engine-side foreign-row guard stays as defence in depth, and
-      // the client-side activity-id filter below is kept for the same reason.
-      supabase.from('baseline_activities')
-        .select('*, project_baselines!inner(project_id, is_active, status)')
-        .eq('project_baselines.project_id', project.id)
-        .eq('project_baselines.is_active', true)
-        .eq('project_baselines.status', 'approved'),
-      supabase.from('budget_lines').select('*').eq('project_id', project.id),
-      supabase.from('cost_transactions').select('*').eq('project_id', project.id),
-      supabase.from('progress_updates').select('*').eq('project_id', project.id),
-      supabase.from('boq_items').select('*').eq('project_id', project.id),
-      supabase.from('risks').select('*').eq('project_id', project.id),
-    ]);
-    setActivities(actRes.data || []);
-    setLinks((linkRes.data || []) as ActivityLink[]);
-    // Defence in depth (kept deliberately). The query above is now the authoritative governance
-    // filter — it restricts to THIS project's ACTIVE APPROVED baseline revision. This client-side
-    // pass additionally drops any row whose `activity_id` is not an activity of the reported project,
-    // so a malformed or orphaned join result still cannot reach the DCMA audit, the baseline S-Curve
-    // or the canonical EVM. It is a filter, never a correction: it cannot widen the evidence set.
-    const projectActivityIds = new Set(((actRes.data || []) as Activity[]).map((a) => a.id));
-    setBaselineActivities(
-      ((baselineRes.data || []) as BaselineActivity[]).filter((b) => projectActivityIds.has(b.activity_id)),
-    );
-    setBudgetLines(bgtRes.data || []);
-    setTransactions((cstRes.data || []) as CostTransaction[]);
-    setProgressUpdates((prgRes.data || []) as ProgressUpdate[]);
-    setBoqItems((boqRes.data || []) as BoqItem[]);
-    setRisks(rskRes.data || []);
-    setLoading(false);
-  }
+  useEffect(() => {
+    let current = true;
+    setReadError(false);
+    setLoadedProject(null);
+    setLoading(Boolean(project));
+    if (!project) return () => { current = false; };
+
+    void runReportRead(async () => {
+      const [actRes, linkRes, baselineRes, bgtRes, cstRes, prgRes, boqRes, rskRes] = await Promise.all([
+        supabase.from('activities').select('*').eq('project_id', project.id).order('sort_order'),
+        supabase.from('activity_links').select('*').eq('project_id', project.id),
+        // REVIEW FINDING 2 (HIGH): this was an unscoped `select('*')` filtered only client-side by
+        // `activity_id`. That stops CROSS-PROJECT rows but not cross-REVISION rows: every historical
+        // baseline revision of THIS project's activities still arrived, and F6 sums `planned_cost` over
+        // every row it is handed (so a second revision inflates BAC) while its `baselineByAct` map lets
+        // whichever revision sorts last silently decide per-activity BAC — and therefore EV and PV.
+        // Those rows reached `analyzeCostControl` (canonical EVM), the DCMA audit and the baseline
+        // S-Curve, breaking the F9.4 requirement that F6 / Dashboard / BudgetView / Executive Report
+        // all rest on the SAME governed baseline evidence.
+        //
+        // Now the identical governed query BudgetView / Dashboard / ProgressView / ScheduleView use:
+        // scope through `project_baselines` (the parent that carries `project_id`) to the revision that
+        // is both ACTIVE and APPROVED. The engine-side foreign-row guard stays as defence in depth, and
+        // the client-side activity-id filter below is kept for the same reason.
+        supabase.from('baseline_activities')
+          .select('*, project_baselines!inner(project_id, is_active, status)')
+          .eq('project_baselines.project_id', project.id)
+          .eq('project_baselines.is_active', true)
+          .eq('project_baselines.status', 'approved'),
+        supabase.from('budget_lines').select('*').eq('project_id', project.id),
+        supabase.from('cost_transactions').select('*').eq('project_id', project.id),
+        supabase.from('progress_updates').select('*').eq('project_id', project.id),
+        supabase.from('boq_items').select('*').eq('project_id', project.id),
+        supabase.from('risks').select('*').eq('project_id', project.id),
+      ]);
+      requireReportReads([actRes, linkRes, baselineRes, bgtRes, cstRes, prgRes, boqRes, rskRes]);
+      return { actRes, linkRes, baselineRes, bgtRes, cstRes, prgRes, boqRes, rskRes };
+    }, () => current, ({ actRes, linkRes, baselineRes, bgtRes, cstRes, prgRes, boqRes, rskRes }) => {
+      setActivities(actRes.data || []);
+      setLinks((linkRes.data || []) as ActivityLink[]);
+      // Defence in depth (kept deliberately). The query above is now the authoritative governance
+      // filter — it restricts to THIS project's ACTIVE APPROVED baseline revision. This client-side
+      // pass additionally drops any row whose `activity_id` is not an activity of the reported project,
+      // so a malformed or orphaned join result still cannot reach the DCMA audit, the baseline S-Curve
+      // or the canonical EVM. It is a filter, never a correction: it cannot widen the evidence set.
+      const projectActivityIds = new Set(((actRes.data || []) as Activity[]).map((a) => a.id));
+      setBaselineActivities(
+        ((baselineRes.data || []) as BaselineActivity[]).filter((b) => projectActivityIds.has(b.activity_id)),
+      );
+      setBudgetLines(bgtRes.data || []);
+      setTransactions((cstRes.data || []) as CostTransaction[]);
+      setProgressUpdates((prgRes.data || []) as ProgressUpdate[]);
+      setBoqItems((boqRes.data || []) as BoqItem[]);
+      setRisks(rskRes.data || []);
+      setLoadedProject(project);
+    }, () => setReadError(true), () => setLoading(false));
+    return () => { current = false; };
+  }, [project, reloadAttempt]);
 
   // GAP-010: the DCMA audit runs at the governed Data Date — `project.data_date` or the
   // DEFAULT_DATA_DATE constant — which is exactly the resolution the canonical EVM engine applies
@@ -297,7 +307,22 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
     window.print();
   };
 
-  if (loading) {
+  if (!project) {
+    return <div role="status" className="p-6 text-slate-600">اختر مشروعاً لعرض التقرير التنفيذي.</div>;
+  }
+
+  if (readError) {
+    return (
+      <div role="alert" className="p-6 space-y-3 text-red-800 bg-red-50 rounded-xl">
+        <p>تعذر تحميل جميع بيانات التقرير. لم يتم إنشاء تقرير أو اعتباره خالياً من السجلات.</p>
+        <button type="button" onClick={() => setReloadAttempt((value) => value + 1)}
+          className="px-4 py-2 bg-white border rounded-lg">إعادة المحاولة</button>
+      </div>
+    );
+  }
+
+  // Mask old rows immediately, before effect cleanup runs for the new project.
+  if (loading || loadedProject !== project) {
     return (
       <div className="flex items-center justify-center min-h-[400px]">
         <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-amber-500"></div>
