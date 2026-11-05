@@ -1,5 +1,7 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { supabase } from '@/lib/supabase';
+import { requireReportReads, runReportRead } from '@/lib/reportReadSafety';
+import { getLanguage } from '@/lib/i18n';
 import type { Project, Risk, Issue, Activity, ActivityLink } from '@/types';
 import { runMonteCarloSimulation, type MonteCarloResult } from '@/lib/monteCarloEngine';
 import { AlertTriangle, Plus, X, Lightbulb, Shield, Dices, Play, CheckCircle2, TrendingUp, BarChart3 } from 'lucide-react';
@@ -27,21 +29,49 @@ export default function RisksView({ project }: RisksViewProps) {
   // Monte Carlo simulation state
   const [simulationResult, setSimulationResult] = useState<MonteCarloResult | null>(null);
   const [isSimulating, setIsSimulating] = useState(false);
+  const requestGeneration = useRef(0);
+  const mounted = useRef(true);
+  const selectedProject = useRef(project);
+  selectedProject.current = project;
+  const simulationTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [loadedProject, setLoadedProject] = useState<Project | null>(null);
+  const [readError, setReadError] = useState(false);
 
   useEffect(() => {
-    if (project) loadData();
+    mounted.current = true;
+    setShowRiskForm(false);
+    setShowIssueForm(false);
+    setIsSimulating(false);
+    if (project) void loadData();
     else setLoading(false);
+    return () => {
+      mounted.current = false;
+      requestGeneration.current += 1;
+      if (simulationTimer.current !== null) clearTimeout(simulationTimer.current);
+      simulationTimer.current = null;
+    };
   }, [project]);
 
   async function loadData() {
-    if (!project) return;
+    if (!project || !mounted.current || selectedProject.current !== project) return;
+    const generation = ++requestGeneration.current;
+    const isCurrent = () => mounted.current && selectedProject.current === project && requestGeneration.current === generation;
+    if (simulationTimer.current !== null) clearTimeout(simulationTimer.current);
+    simulationTimer.current = null;
+    setIsSimulating(false);
+    setSimulationResult(null);
     setLoading(true);
-    const [riskRes, issueRes, actRes, linkRes] = await Promise.all([
+    setReadError(false);
+    await runReportRead(async () => {
+      const results = await Promise.all([
       supabase.from('risks').select('*').eq('project_id', project.id).order('severity', { ascending: false }),
       supabase.from('issues').select('*').eq('project_id', project.id).order('raised_date', { ascending: false }),
       supabase.from('activities').select('*').eq('project_id', project.id),
       supabase.from('activity_links').select('*').eq('project_id', project.id),
-    ]);
+      ]);
+      requireReportReads(results);
+      return results;
+    }, isCurrent, ([riskRes, issueRes, actRes, linkRes]) => {
     const acts = (actRes.data || []) as Activity[];
     const rsk = (riskRes.data || []) as Risk[];
     const lnks = (linkRes.data || []) as ActivityLink[];
@@ -58,14 +88,17 @@ export default function RisksView({ project }: RisksViewProps) {
       });
       setSimulationResult(res);
     }
-
-    setLoading(false);
+    setLoadedProject(project);
+    }, () => setReadError(true), () => setLoading(false));
   }
 
   const handleRunSimulation = () => {
-    if (!project) return;
+    if (!project || readError || loading || loadedProject !== project) return;
+    const generation = requestGeneration.current;
     setIsSimulating(true);
-    setTimeout(() => {
+    simulationTimer.current = setTimeout(() => {
+      simulationTimer.current = null;
+      if (!mounted.current || selectedProject.current !== project || requestGeneration.current !== generation) return;
       const res = runMonteCarloSimulation(activities, links, risks, project.contract_value ?? null, 1000, undefined, {
         dataDate: project.data_date || null,
       });
@@ -120,16 +153,24 @@ export default function RisksView({ project }: RisksViewProps) {
     await loadData();
   }
 
-  if (loading) {
+  if (!project) {
+    return <div className="text-center text-slate-400 py-8">لا يوجد مشروع محدد</div>;
+  }
+
+  if (readError) {
+    const ar = getLanguage() === 'ar';
+    return <div role="alert" className="text-center py-8 space-y-3">
+      <p>{ar ? 'تعذرت قراءة بيانات المخاطر كاملة. أُخفيت السجلات والمحاكاة والإجراءات حتى تنجح جميع القراءات.' : 'Risk data could not be read completely. Records, simulation and actions are hidden until every read succeeds.'}</p>
+      <button type="button" className="px-4 py-2 border rounded-lg" onClick={() => void loadData()}>{ar ? 'إعادة المحاولة' : 'Retry'}</button>
+    </div>;
+  }
+
+  if (loading || loadedProject !== project) {
     return (
       <div className="flex items-center justify-center h-full min-h-[400px]">
         <div className="animate-spin rounded-full h-10 w-10 border-4 border-amber-500 border-t-transparent"></div>
       </div>
     );
-  }
-
-  if (!project) {
-    return <div className="text-center text-slate-400 py-8">لا يوجد مشروع محدد</div>;
   }
 
   function severityColor(severity: number): string {
