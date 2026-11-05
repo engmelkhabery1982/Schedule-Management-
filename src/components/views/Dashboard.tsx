@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { supabase } from '@/lib/supabase';
 import type {
   Project,
@@ -134,6 +134,11 @@ export default function Dashboard({ project, onNavigate }: DashboardProps) {
   const [alerts, setAlerts] = useState<ProjectAlert[]>([]);
   const [error, setError] = useState('');
   const [lang, setLang] = useState<Language>(getLanguage());
+  const requestGeneration = useRef(0);
+  const mounted = useRef(true);
+  const selectedProject = useRef(project);
+  selectedProject.current = project;
+  const [loadedProject, setLoadedProject] = useState<Project | null>(null);
 
   // FIDIC Notice Modal State
   const [showNoticeModal, setShowNoticeModal] = useState(false);
@@ -157,6 +162,7 @@ export default function Dashboard({ project, onNavigate }: DashboardProps) {
   });
 
   useEffect(() => {
+    mounted.current = true;
     if (project) {
       loadData();
     } else {
@@ -175,13 +181,16 @@ export default function Dashboard({ project, onNavigate }: DashboardProps) {
     window.addEventListener('app-language-changed', handleLangChange);
     window.addEventListener('project-data-date-changed', handleDataDateChange);
     return () => {
+      mounted.current = false;
       window.removeEventListener('app-language-changed', handleLangChange);
       window.removeEventListener('project-data-date-changed', handleDataDateChange);
     };
   }, [project]);
 
   async function loadData() {
-    if (!project) return;
+    if (!project || !mounted.current || selectedProject.current !== project) return;
+    const generation = ++requestGeneration.current;
+    const isCurrent = () => mounted.current && selectedProject.current === project && requestGeneration.current === generation;
     setLoading(true);
     setError('');
 
@@ -204,6 +213,7 @@ export default function Dashboard({ project, onNavigate }: DashboardProps) {
         supabase.from('activity_boq_allocations').select('*').eq('project_id', project.id),
         supabase.from('cost_control_snapshots').select('*').eq('project_id', project.id).order('data_date', { ascending: false }).limit(10),
       ]);
+      if (!isCurrent()) return;
 
       // F9 (item 5): supabase-js resolves failed reads with `{ error }` instead of throwing. A failed
       // read must never render as an "empty" dashboard (which reads as "no data"), so the first
@@ -243,13 +253,15 @@ export default function Dashboard({ project, onNavigate }: DashboardProps) {
       setCostAllocations((((calRes as { data?: unknown }).data || []) as ActivityBoqAllocation[]));
       setCostSnapshots((((csnapRes as { data?: unknown }).data || []) as CostControlSnapshot[]));
       setAlerts((alertsRes.data || []) as ProjectAlert[]);
+      setLoadedProject(project);
     } catch (err: any) {
+      if (!isCurrent()) return;
       // F9 (item 5): the failure is surfaced in the UI (banner below the header), not only logged —
       // a silent catch would render a healthy-looking but empty dashboard.
       console.error('Error loading dashboard:', err);
       setError(err?.message || (lang === 'ar' ? 'تعذر تحميل بيانات لوحة التحكم.' : 'Failed to load dashboard data.'));
     } finally {
-      setLoading(false);
+      if (isCurrent()) setLoading(false);
     }
   }
 
@@ -685,7 +697,15 @@ ${noticeForm.contractorName}`;
     );
   }
 
-  if (loading) {
+  if (error) {
+    return <div role="alert" className="p-6 space-y-3 bg-rose-50 text-rose-800 rounded-xl">
+      <p>{lang === 'ar' ? 'تعذر تحميل جميع بيانات لوحة التحكم. الأرقام والإجراءات محجوبة حتى نجاح القراءة كاملة.' : 'Dashboard data could not be fully loaded. Figures and actions are unavailable until all reads succeed.'}</p>
+      <p>{error}</p>
+      <button type="button" className="px-4 py-2 border rounded-lg" onClick={() => void loadData()}>{lang === 'ar' ? 'إعادة المحاولة' : 'Retry'}</button>
+    </div>;
+  }
+
+  if (loading || loadedProject !== project) {
     return (
       <div className="flex items-center justify-center min-h-[50vh]">
         <div className="animate-spin rounded-full h-10 w-10 border-4 border-amber-500 border-t-transparent"></div>
