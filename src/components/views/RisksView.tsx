@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { supabase } from '@/lib/supabase';
 import { requireReportReads, runReportRead } from '@/lib/reportReadSafety';
 import { getLanguage } from '@/lib/i18n';
+import { assertDbWriteOk } from '@/lib/supabaseErrors';
 import type { Project, Risk, Issue, Activity, ActivityLink } from '@/types';
 import { runMonteCarloSimulation, type MonteCarloResult } from '@/lib/monteCarloEngine';
 import { AlertTriangle, Plus, X, Lightbulb, Shield, Dices, Play, CheckCircle2, TrendingUp, BarChart3 } from 'lucide-react';
@@ -36,17 +37,27 @@ export default function RisksView({ project }: RisksViewProps) {
   const simulationTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [loadedProject, setLoadedProject] = useState<Project | null>(null);
   const [readError, setReadError] = useState(false);
+  const [writeError, setWriteError] = useState(false);
+  const [writing, setWriting] = useState(false);
+  const writingRef = useRef(false);
+  const writeGeneration = useRef(0);
 
   useEffect(() => {
     mounted.current = true;
     setShowRiskForm(false);
     setShowIssueForm(false);
     setIsSimulating(false);
+    setWriteError(false);
+    setWriting(false);
+    writingRef.current = false;
+    setRiskForm({ title: '', description: '', probability: 3, impact: 3, mitigation: '', category: '' });
+    setIssueForm({ title: '', description: '', priority: 'medium', proposed_solution: '', assignee: '' });
     if (project) void loadData();
     else setLoading(false);
     return () => {
       mounted.current = false;
       requestGeneration.current += 1;
+      writeGeneration.current += 1;
       if (simulationTimer.current !== null) clearTimeout(simulationTimer.current);
       simulationTimer.current = null;
     };
@@ -107,9 +118,31 @@ export default function RisksView({ project }: RisksViewProps) {
     }, 400);
   };
 
+  async function saveChange(
+    write: () => PromiseLike<{ error?: { message?: string } | null }>,
+    saved: () => void = () => {},
+  ) {
+    if (!project || selectedProject.current !== project || !mounted.current || readError || loading || loadedProject !== project || writingRef.current) return;
+    const generation = ++writeGeneration.current;
+    const isCurrent = () => mounted.current && selectedProject.current === project && writeGeneration.current === generation;
+    writingRef.current = true;
+    setWriting(true);
+    setWriteError(false);
+    try {
+      assertDbWriteOk(await write(), 'Risk/issue change');
+      if (!isCurrent()) return;
+      saved();
+      await loadData();
+    } catch {
+      if (isCurrent()) setWriteError(true);
+    } finally {
+      if (isCurrent()) { writingRef.current = false; setWriting(false); }
+    }
+  }
+
   async function addRisk() {
-    if (!project || !riskForm.title) return;
-    await supabase.from('risks').insert({
+    if (!project || !riskForm.title.trim()) return;
+    await saveChange(() => supabase.from('risks').insert({
       project_id: project.id,
       title: riskForm.title,
       description: riskForm.description || null,
@@ -119,15 +152,15 @@ export default function RisksView({ project }: RisksViewProps) {
       mitigation: riskForm.mitigation || null,
       category: riskForm.category || null,
       status: 'open',
+    }), () => {
+      setRiskForm({ title: '', description: '', probability: 3, impact: 3, mitigation: '', category: '' });
+      setShowRiskForm(false);
     });
-    setRiskForm({ title: '', description: '', probability: 3, impact: 3, mitigation: '', category: '' });
-    setShowRiskForm(false);
-    await loadData();
   }
 
   async function addIssue() {
-    if (!project || !issueForm.title) return;
-    await supabase.from('issues').insert({
+    if (!project || !issueForm.title.trim()) return;
+    await saveChange(() => supabase.from('issues').insert({
       project_id: project.id,
       title: issueForm.title,
       description: issueForm.description || null,
@@ -135,22 +168,22 @@ export default function RisksView({ project }: RisksViewProps) {
       proposed_solution: issueForm.proposed_solution || null,
       assignee: issueForm.assignee || null,
       status: 'open',
+    }), () => {
+      setIssueForm({ title: '', description: '', priority: 'medium', proposed_solution: '', assignee: '' });
+      setShowIssueForm(false);
     });
-    setIssueForm({ title: '', description: '', priority: 'medium', proposed_solution: '', assignee: '' });
-    setShowIssueForm(false);
-    await loadData();
   }
 
   async function updateRiskStatus(id: string, status: string) {
-    await supabase.from('risks').update({ status }).eq('id', id);
-    await loadData();
+    if (!project || !risks.some((risk) => risk.id === id)) return;
+    await saveChange(() => supabase.from('risks').update({ status }).eq('id', id).eq('project_id', project.id));
   }
 
   async function updateIssueStatus(id: string, status: string) {
+    if (!project || !issues.some((issue) => issue.id === id)) return;
     const updates: { status: string; resolved_date?: string } = { status };
     if (status === 'resolved') updates.resolved_date = new Date().toISOString().split('T')[0];
-    await supabase.from('issues').update(updates).eq('id', id);
-    await loadData();
+    await saveChange(() => supabase.from('issues').update(updates).eq('id', id).eq('project_id', project.id));
   }
 
   if (!project) {
@@ -186,7 +219,9 @@ export default function RisksView({ project }: RisksViewProps) {
   }
 
   return (
-    <div className="space-y-5">
+    <fieldset disabled={writing} className="space-y-5 border-0 min-w-0 p-0">
+      {writing && <p role="status">{getLanguage() === 'ar' ? 'جارٍ حفظ التغيير…' : 'Saving the change…'}</p>}
+      {writeError && <p role="alert" className="text-red-700">{getLanguage() === 'ar' ? 'لم يُحفظ التغيير. احتُفظ بالمدخلات؛ أعد المحاولة بعد زوال سبب الفشل.' : 'The change was not saved. Your input was retained; retry after the failure is resolved.'}</p>}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold text-slate-800">إدارة المخاطر والتحليل الاحتمالي</h1>
@@ -696,6 +731,6 @@ export default function RisksView({ project }: RisksViewProps) {
           )}
         </div>
       )}
-    </div>
+    </fieldset>
   );
 }
