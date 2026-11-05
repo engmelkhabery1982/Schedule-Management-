@@ -1,5 +1,6 @@
-import { useState, useMemo, useEffect } from 'react';
+import { useState, useMemo, useEffect, useRef } from 'react';
 import { isDemoMode, loadDemoWorkspace, supabase } from '@/lib/supabase';
+import { requireReportReads } from '@/lib/reportReadSafety';
 import { getLanguage, type Language } from '@/lib/i18n';
 import type { Project, ViewName, ProjectSector, Activity, BudgetLine, BoqItem, CostTransaction, ProgressUpdate, Risk, ActivityLink, BaselineActivity } from '@/types';
 // F9.4 (Controlled Pilot defect 1): every project's EVM here is a QUOTE of the canonical F6
@@ -45,6 +46,9 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
   const [allProgress, setAllProgress] = useState<ProgressUpdate[]>([]);
   const [allBaselines, setAllBaselines] = useState<BaselineActivity[]>([]);
   const [loading, setLoading] = useState(true);
+  const [readError, setReadError] = useState(false);
+  const mounted = useRef(true);
+  const requestGeneration = useRef(0);
   const [lang, setLang] = useState<Language>(getLanguage());
   const [sectorFilter, setSectorFilter] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState('');
@@ -76,7 +80,8 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
   const [demoNotice, setDemoNotice] = useState<string | null>(null);
 
   useEffect(() => {
-    loadPortfolio();
+    mounted.current = true;
+    void loadPortfolio();
     const handleLangChange = (e: any) => {
       setLang(e.detail?.lang || getLanguage());
     };
@@ -86,13 +91,18 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
     window.addEventListener('app-language-changed', handleLangChange);
     window.addEventListener('project-data-date-changed', handleGlobalDataDate);
     return () => {
+      mounted.current = false;
       window.removeEventListener('app-language-changed', handleLangChange);
       window.removeEventListener('project-data-date-changed', handleGlobalDataDate);
     };
   }, []);
 
   async function loadPortfolio() {
+    if (!mounted.current) return;
+    const generation = ++requestGeneration.current;
+    const isCurrent = () => mounted.current && requestGeneration.current === generation;
     setLoading(true);
+    setReadError(false);
     try {
       // REVIEW FINDING 1 (HIGH): slots 8 and 9 of this `Promise.all` were transposed — `prgData`
       // received `baseline_activities` while `baselineData` received `progress_updates`. So
@@ -144,7 +154,11 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
           .eq('project_baselines.is_active', true)
           .eq('project_baselines.status', 'approved'),
         supabase.from('progress_updates').select('*'),
-      ]);
+      ]).then((results) => {
+        requireReportReads(results);
+        return results;
+      });
+      if (!isCurrent()) return;
 
       setProjects(projData || []);
       setAllActivities(actData || []);
@@ -155,10 +169,10 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
       setAllBoqs(boqData || []);
       setAllProgress(prgData || []);
       setAllBaselines(baselineData || []);
-    } catch (err) {
-      console.error('Error loading portfolio:', err);
+    } catch {
+      if (isCurrent()) setReadError(true);
     } finally {
-      setLoading(false);
+      if (isCurrent()) setLoading(false);
     }
   }
 
@@ -405,6 +419,13 @@ export default function PortfolioView({ onSelectProject, onNavigate }: Portfolio
         return <span className="px-2.5 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-900 border border-amber-200">🏢 {lang === 'ar' ? 'مباني تجارية وإدارية' : 'Commercial & Office'}</span>;
     }
   };
+
+  if (readError) {
+    return <div role="alert" className="p-6 space-y-3 bg-red-50 text-red-800 rounded-xl">
+      <p>{lang === 'ar' ? 'تعذر تحميل جميع بيانات المحفظة. لم تُحسب إجماليات من بيانات ناقصة ولم تُعتبر المحفظة فارغة.' : 'Portfolio data could not be fully loaded. No totals or empty-portfolio result can be shown from incomplete reads.'}</p>
+      <button type="button" className="px-4 py-2 border rounded-lg" onClick={() => void loadPortfolio()}>{lang === 'ar' ? 'إعادة المحاولة' : 'Retry'}</button>
+    </div>;
+  }
 
   if (loading) {
     return (
