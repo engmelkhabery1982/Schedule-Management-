@@ -365,10 +365,10 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
               <h1 className="text-xl font-black text-slate-900">{project?.name}</h1>
             </div>
             <p className="text-xs text-slate-600">
-              المالك / العميل: <span className="font-semibold text-slate-800">{project?.client || 'شركة الأفق'}</span> | الموقع: <span className="font-semibold text-slate-800">{project?.location || 'الرياض'}</span>
+              المالك / العميل: <span className="font-semibold text-slate-800">{project.client?.trim() ? project.client : 'غير مسجل'}</span> | الموقع: <span className="font-semibold text-slate-800">{project.location?.trim() ? project.location : 'غير مسجل'}</span>
             </p>
             <p className="text-xs text-slate-600">
-              قيمة العقد: <span className="font-bold text-slate-900">{(project?.contract_value ?? 0).toLocaleString()} {project?.currency || 'ر.س'}</span> | البداية: <span className="font-mono">{project?.start_date}</span> | النهاية المعتمدة: <span className="font-mono">{project?.end_date}</span>
+              قيمة العقد: <span className="font-bold text-slate-900">{Number.isFinite(project.contract_value) ? project.contract_value.toLocaleString() : 'غير مسجلة'} {project.currency?.trim() ? project.currency : 'عملة غير مسجلة'}</span> | البداية: <span className="font-mono">{project?.start_date}</span> | النهاية المعتمدة: <span className="font-mono">{project?.end_date}</span>
             </p>
           </div>
 
