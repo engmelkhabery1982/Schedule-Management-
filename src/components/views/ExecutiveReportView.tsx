@@ -20,6 +20,7 @@ import { type ComprehensiveProjectEvm } from '@/lib/planningEngine';
 // running its own derivations. F6 is canonical for cost, F5/canonical CPM for criticality.
 import { analyzeCostControl, type CostControlReport } from '@/lib/costControlEngine';
 import { summarizeCanonicalCriticality } from '@/lib/scheduleControlEngine';
+import { executiveScheduleRows } from '@/lib/executiveScheduleRows';
 import { canonicalEvmToComprehensive, selectCanonicalEvm, type CanonicalEvm } from '@/lib/canonicalEvm';
 import {
   reconcileFinishForecasts,
@@ -215,9 +216,15 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
     }),
     [activities, links, dcmaDataDate, project?.calendar_type, project?.status_logic, progressUpdates],
   );
+  const currentSchedule = useMemo(() => executiveScheduleRows({
+    activities, links, baselines: baselineActivities, progressUpdates,
+    dataDate: dcmaDataDate,
+    calendarType: project?.calendar_type || '6_days',
+    statusLogic: project?.status_logic || 'retained_logic',
+  }), [activities, links, baselineActivities, progressUpdates, dcmaDataDate, project?.calendar_type, project?.status_logic]);
   const criticalActivitiesList = useMemo(
-    () => activities.filter((a) => criticality.byId.get(a.id)?.critical),
-    [activities, criticality],
+    () => currentSchedule.rows.filter((a) => a.is_critical),
+    [currentSchedule],
   );
 
   const sCurveData: SCurveData = useMemo(() => {
@@ -260,10 +267,7 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
   const statusedForecastFinish = useMemo(() => {
     if (!project) return null;
     return resolveDeterministicForecastFinish({
-      activities,
-      links,
-      baselines: baselineActivities,
-      progressUpdates,
+      activities, links, baselines: baselineActivities, progressUpdates,
       dataDate: dcmaDataDate,
       calendarType: project.calendar_type || '6_days',
       statusLogic: project.status_logic || 'retained_logic',
@@ -286,12 +290,12 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
     lookaheadEnd.setDate(lookaheadEnd.getDate() + 21);
     const lookaheadEndStr = lookaheadEnd.toISOString().split('T')[0];
 
-    return activities.filter((a) => {
-      if (a.percent_complete >= 100) return false;
+    return currentSchedule.rows.filter((a) => {
+      if (a.completed) return false;
       if (!a.early_start) return false;
       return a.early_start <= lookaheadEndStr;
     });
-  }, [activities, evmMetrics.dataDate]);
+  }, [currentSchedule, evmMetrics.dataDate]);
 
   // Report-generation metadata. This is the moment the document was rendered — it is NOT a project
   // status date, and it feeds no control calculation: BAC, PV, EV, AC, SPI(t), IEAC(t), the DCMA
@@ -598,8 +602,8 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
                 <tr>
                   <th className="p-2 text-right">كود النشاط</th>
                   <th className="p-2 text-right">اسم النشاط</th>
-                  <th className="p-2 text-right">البداية المبكرة</th>
-                  <th className="p-2 text-right">النهاية المبكرة</th>
+                  <th className="p-2 text-right">البداية الحالية (فعلي / CPM)</th>
+                  <th className="p-2 text-right">النهاية الحالية (فعلي / CPM)</th>
                   <th className="p-2 text-right">المدة</th>
                   <th className="p-2 text-right">الإنجاز</th>
                   <th className="p-2 text-right">كبح المسار (Drag)</th>
@@ -610,8 +614,8 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
                   <tr key={act.id} className="hover:bg-slate-50">
                     <td className="p-2 font-mono font-bold text-rose-700">{act.code}</td>
                     <td className="p-2 font-semibold text-slate-800">{act.name}</td>
-                    <td className="p-2 font-mono text-slate-600">{act.early_start}</td>
-                    <td className="p-2 font-mono text-slate-600">{act.early_finish}</td>
+                    <td className="p-2 font-mono text-slate-600">{act.early_start || 'N/A'}</td>
+                    <td className="p-2 font-mono text-slate-600">{act.early_finish || 'N/A'}</td>
                     <td className="p-2">{act.duration_days} يوم</td>
                     <td className="p-2 font-bold text-blue-700">{act.percent_complete}%</td>
                     <td className="p-2 font-mono">{act.activity_drag || act.duration_days} يوم</td>
@@ -635,8 +639,8 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
                   <th className="p-2 text-right">الكود</th>
                   <th className="p-2 text-right">النشاط المستهدف</th>
                   <th className="p-2 text-right">المقاول / الفريق</th>
-                  <th className="p-2 text-right">تاريخ البدء المخطط</th>
-                  <th className="p-2 text-right">تاريخ الإنجاز المخطط</th>
+                  <th className="p-2 text-right">البداية الحالية (فعلي / CPM)</th>
+                  <th className="p-2 text-right">النهاية الحالية (فعلي / CPM)</th>
                   <th className="p-2 text-right">الهامش (Float)</th>
                   <th className="p-2 text-center">الأولوية</th>
                 </tr>
@@ -649,7 +653,7 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
                     <td className="p-2 text-slate-500">{act.contractor || 'المقاول العام'}</td>
                     <td className="p-2 font-mono text-slate-700">{act.early_start}</td>
                     <td className="p-2 font-mono text-slate-700">{act.early_finish}</td>
-                    <td className="p-2 font-mono">{act.total_float || 0} يوم</td>
+                    <td className="p-2 font-mono">{act.total_float ?? 'N/A'} يوم</td>
                     <td className="p-2 text-center">
                       {act.is_critical ? (
                         <span className="px-2 py-0.5 rounded bg-rose-100 text-rose-800 font-bold text-[10px]">حرج جداً</span>
