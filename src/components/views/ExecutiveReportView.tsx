@@ -606,7 +606,7 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
                   <th className="p-2 text-right">النهاية الحالية (فعلي / CPM)</th>
                   <th className="p-2 text-right">المدة</th>
                   <th className="p-2 text-right">الإنجاز</th>
-                  <th className="p-2 text-right">كبح المسار (Drag)</th>
+                  <th className="p-2 text-right">كبح المسار المحفوظ (Drag)</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
@@ -618,7 +618,7 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
                     <td className="p-2 font-mono text-slate-600">{act.early_finish || 'N/A'}</td>
                     <td className="p-2">{act.duration_days} يوم</td>
                     <td className="p-2 font-bold text-blue-700">{act.percent_complete}%</td>
-                    <td className="p-2 font-mono">{act.activity_drag || act.duration_days} يوم</td>
+                    <td className="p-2 font-mono">{act.activity_drag ?? 'N/A'} يوم</td>
                   </tr>
                 ))}
               </tbody>

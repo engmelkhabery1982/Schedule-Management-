@@ -17,3 +17,6 @@ Verification:
 - Actual UI full workspace export after the report review:34tables and auxiliary state exactly match the prior cost-after-reopen export. Private executive-current-backup-proof.json records the actual downloaded path and SHA. The browser download-event waiter hung until timeout; the file was subsequently found and verified, and export was not retried. No PDF/print-dialog success is claimed.
 
 Evidence is private under AUTONOMOUS_EXECUTION_2026-10-27: executive-rows-check.mjs, executive-current-controls-final.log, executive-current-lint-comparison.json, executive-current-backup-proof.json and executive-current-ui-proof.json. Owner storage on3130 was not used. Actual installed/GitHub SHA and rollback are recorded after safe promotion. Human/business acceptance and unrelated analytical screens remain open.
+
+Final display-only follow-up: the Drag column used stored activity_drag || duration_days, inventing a duration-sized drag when no measurement existed and hiding a genuine zero. It now says recorded Drag and uses nullish N/A.46targeted assertions/current-scope guard,types/build passed; actual finalQA table showedN/A for all7unmeasured rows while dates/progress stayedcorrect. No stored measure or CPM formula was changed; historical13 scope-guard failures remain disclosed above.
+

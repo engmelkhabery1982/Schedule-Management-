@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import {execFileSync} from 'node:child_process';
+import {readFileSync} from 'node:fs';
 import { executiveScheduleRows } from '../src/lib/executiveScheduleRows';
 import { analyzeScheduleControl, type ScheduleControlInput } from '../src/lib/scheduleControlEngine';
 import type { Activity, ProgressUpdate } from '../src/types';
@@ -35,6 +36,9 @@ for(const [name,changes,updates] of [
   if(name==='future update is not current progress'||name==='unapproved update is not current progress')assert.equal(row.percent_complete,0,name);
 }
 assert.deepEqual(executiveScheduleRows({activities:[],links:[],baselines:[],dataDate:'2026-09-13'}),{rows:[],forecastFinish:null});
+const view=readFileSync('src/components/views/ExecutiveReportView.tsx','utf8');
+assert(view.includes("act.activity_drag ?? 'N/A'"),'A recorded zero drag must remain zero; absence is not the duration');
+assert(view.includes('كبح المسار المحفوظ (Drag)'),'Stored drag must not be presented as a fresh CPM calculation');
 const baseline='5cdf8bf7d46383c7702d6b6b409bbc558e97e7e9';
 const allowed=new Set(['src/components/views/ExecutiveReportView.tsx','src/lib/executiveScheduleRows.ts','scripts/validate-executive-rows.ts','docs/EXECUTIVE_CURRENT_ROWS_ACCEPTANCE_2026-11-06.md']);
 const changed=[...new Set([
@@ -43,5 +47,5 @@ const changed=[...new Set([
 ].filter(Boolean))];
 assert(changed.every(file=>allowed.has(file)),`Current increment escaped its four-path scope: ${changed}`);
 execFileSync('git',['diff','--exit-code',baseline,'--','src/lib/cpmEngine.ts','src/lib/calendarEngine.ts','src/lib/scheduleControlEngine.ts','src/lib/costControlEngine.ts','src/lib/governedProgress.ts','src/lib/forecastReconciliation.ts']);
-console.log(`Executive current-row contracts: ${checks+4} assertions passed; no scheduling formula changed.`);
+console.log(`Executive current-row contracts: ${checks+6} assertions passed; no scheduling formula changed.`);
 console.log('Current four-path diff guard and protected engine equality: PASS');
