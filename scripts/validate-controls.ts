@@ -4682,11 +4682,8 @@ console.log('--- S18 Pilot Closure (F9.5)');
       && !/\bcostPerDay\b/.test(`${recoveryEngineSrc}\n${recoveryViewSrc}`)
       && !/(?:SAR|ريال)\s*\/\s*(?:day|يوم)/i.test(`${recoveryEngineSrc}\n${recoveryViewSrc}`));
 
-  const changedPaths = new Set([
-    ...execFileSync('git', ['diff', '--name-only'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-    ...execFileSync('git', ['diff', '--name-only', '--cached'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-    ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-  ]);
+  // Historical delivered boundary: de96ffd8f61b3c04980012b82855e9fba237f3fd^ → de96ffd8f61b3c04980012b82855e9fba237f3fd.
+  const changedPaths = new Set(execFileSync('git', ['diff', '--name-only', 'de96ffd8f61b3c04980012b82855e9fba237f3fd^', 'de96ffd8f61b3c04980012b82855e9fba237f3fd'], { encoding: 'utf8' }).split('\n').filter(Boolean));
   const allowedRecoveryPaths = new Set([
     'src/lib/recoveryOptimizerEngine.ts',
     'src/components/views/ScheduleRecoveryView.tsx',
@@ -5509,11 +5506,8 @@ console.log('--- S18 Pilot Closure (F9.5)');
   ok('S26 TIA engine has no default daily rate or event-duration critical-delay fallback',
     !/4800|criticalDelayDays\s*=\s*delayDurationDays/.test(tiaSource));
 
-  const batch2bChangedPaths = new Set([
-    ...execFileSync('git', ['diff', '--name-only'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-    ...execFileSync('git', ['diff', '--name-only', '--cached'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-    ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-  ]);
+  // Historical delivered boundary: 250400c51830be1067147e82f670a3f4a50a6fd7^ → 250400c51830be1067147e82f670a3f4a50a6fd7.
+  const batch2bChangedPaths = new Set(execFileSync('git', ['diff', '--name-only', '250400c51830be1067147e82f670a3f4a50a6fd7^', '250400c51830be1067147e82f670a3f4a50a6fd7'], { encoding: 'utf8' }).split('\n').filter(Boolean));
   const allowedBatch2bPaths = new Set([
     'src/lib/tiaEngine.ts',
     'src/components/views/TimeImpactAnalysisView.tsx',
@@ -5864,11 +5858,8 @@ console.log('--- S18 Pilot Closure (F9.5)');
       && levelingEngineSource.includes('No profile is inferred.')
       && !levelingEngineSource.includes('uniform average demand'));
 
-  const changedPaths = new Set([
-    ...execFileSync('git', ['diff', '--name-only'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-    ...execFileSync('git', ['diff', '--name-only', '--cached'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-    ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-  ]);
+  // Historical delivered boundary: c296cda5e7ed705ce0233fecc7c25bd83d5d424b^ → c296cda5e7ed705ce0233fecc7c25bd83d5d424b.
+  const changedPaths = new Set(execFileSync('git', ['diff', '--name-only', 'c296cda5e7ed705ce0233fecc7c25bd83d5d424b^', 'c296cda5e7ed705ce0233fecc7c25bd83d5d424b'], { encoding: 'utf8' }).split('\n').filter(Boolean));
   const allowedBatch2cPaths = new Set([
     'src/lib/resourceLevelingEngine.ts',
     'src/components/views/ResourceHistogramView.tsx',
@@ -6197,11 +6188,8 @@ console.log('--- S18 Pilot Closure (F9.5)');
       && scopeRegister.includes('getScopeItemMetrics(item, orders, boqImpacts)')
       && !scopeRegister.includes('approvedCostSar'));
 
-  const s28ChangedPaths = new Set([
-    ...execFileSync('git', ['diff', '--name-only'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-    ...execFileSync('git', ['diff', '--name-only', '--cached'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-    ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-  ]);
+  // Historical delivered boundary: 1a12ad7b17dd7db9e394461b976d1bfd1c6b8a3a^ → 1a12ad7b17dd7db9e394461b976d1bfd1c6b8a3a.
+  const s28ChangedPaths = new Set(execFileSync('git', ['diff', '--name-only', '1a12ad7b17dd7db9e394461b976d1bfd1c6b8a3a^', '1a12ad7b17dd7db9e394461b976d1bfd1c6b8a3a'], { encoding: 'utf8' }).split('\n').filter(Boolean));
   ok('S28 changed files stay inside the requested Batch 3A governance boundary (or the later S29/S30 scope)',
     [...s28ChangedPaths].every((path) => BATCH3A_GOVERNANCE_PATHS.has(path) || S29_WORKSPACE_SAFETY_PATHS.has(path) || S30_IPC_PERSISTENCE_PATHS.has(path) || S32_BOQ_INPUT_PATHS.has(path) || S33_PROGRESS_ENTRY_PATHS.has(path) || S34_COST_ENTRY_PATHS.has(path)));
   const protectedBatch3aFiles = [
@@ -6939,12 +6927,8 @@ console.log('--- S18 Pilot Closure (F9.5)');
   })());
 
   // S29 owns this increment; the working diff must not reach outside it.
-  const s29ChangedPaths = new Set([
-    ...execFileSync('git', ['diff', '--name-only', '1a12ad7b17dd7db9e394461b976d1bfd1c6b8a3a', 'HEAD'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-    ...execFileSync('git', ['diff', '--name-only'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-    ...execFileSync('git', ['diff', '--name-only', '--cached'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-    ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-  ]);
+  // Historical delivered boundary: 1a12ad7b17dd7db9e394461b976d1bfd1c6b8a3a → e7d9a13d0fb67cdd785885eefcf27f70a1b25637.
+  const s29ChangedPaths = new Set(execFileSync('git', ['diff', '--name-only', '1a12ad7b17dd7db9e394461b976d1bfd1c6b8a3a', 'e7d9a13d0fb67cdd785885eefcf27f70a1b25637'], { encoding: 'utf8' }).split('\n').filter(Boolean));
   eq('S29-K1 the increment is confined to the storage-safety paths it declares',
     [...s29ChangedPaths].filter((path) => !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path) && !S31_XER_INPUT_PATHS.has(path) && !S32_BOQ_INPUT_PATHS.has(path) && !S33_PROGRESS_ENTRY_PATHS.has(path) && !S34_COST_ENTRY_PATHS.has(path)), []);
   ok('S29-K2 the increment actually touches the storage core it claims to repair',
@@ -7359,12 +7343,8 @@ console.log('--- S18 Pilot Closure (F9.5)');
   eq('S30-R12 duplicate ID update is atomic', s30Store.getItem(WORKSPACE_STORAGE_KEY), beforeDuplicateUpdate);
 
   // S30-K: Batch guard
-  const s30ChangedPaths = new Set([
-    ...execFileSync('git', ['diff', '--name-only', '140e7def681f2913e112987d5d5154e521e3ab57', 'HEAD'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-    ...execFileSync('git', ['diff', '--name-only'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-    ...execFileSync('git', ['diff', '--name-only', '--cached'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-    ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-  ]);
+  // Historical delivered boundary: 140e7def681f2913e112987d5d5154e521e3ab57 → 6f7862cc6a780d86b25372085e72e8494dfcab26.
+  const s30ChangedPaths = new Set(execFileSync('git', ['diff', '--name-only', '140e7def681f2913e112987d5d5154e521e3ab57', '6f7862cc6a780d86b25372085e72e8494dfcab26'], { encoding: 'utf8' }).split('\n').filter(Boolean));
   eq('S30-K1 changes outside S29 stay within declared S30 increment paths',
     [...s30ChangedPaths].filter((path) => !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path) && !S31_XER_INPUT_PATHS.has(path) && !S32_BOQ_INPUT_PATHS.has(path) && !S33_PROGRESS_ENTRY_PATHS.has(path) && !S34_COST_ENTRY_PATHS.has(path)), []);
   ok('S30-K2 S30 increment actually touches PaymentCertificatesView and workspace storage',
@@ -7375,17 +7355,13 @@ console.log('--- S18 Pilot Closure (F9.5)');
 }
 
 // S31's actual source delta is checked separately; no other feature/engine is exempted.
-const s31ChangedPaths = new Set([
-  ...execFileSync('git', ['diff', '--name-only', '6f7862cc6a780d86b25372085e72e8494dfcab26'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-  ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-]);
+// Historical delivered boundary: 3b873fbf8bf4e5db1aa5445b0596645de39cc336^ → 3b873fbf8bf4e5db1aa5445b0596645de39cc336.
+  const s31ChangedPaths = new Set(execFileSync('git', ['diff', '--name-only', '3b873fbf8bf4e5db1aa5445b0596645de39cc336^', '3b873fbf8bf4e5db1aa5445b0596645de39cc336'], { encoding: 'utf8' }).split('\n').filter(Boolean));
 eq('S31-A existing XER input repair stays inside its three declared paths', [...s31ChangedPaths].filter((path) => !S31_XER_INPUT_PATHS.has(path) && !S32_BOQ_INPUT_PATHS.has(path) && !S33_PROGRESS_ENTRY_PATHS.has(path) && !S34_COST_ENTRY_PATHS.has(path)), []);
 ok('S31-B existing import screen is actually changed', s31ChangedPaths.has('src/components/views/ImportView.tsx'));
 
-const s32ChangedPaths = new Set([
-  ...execFileSync('git', ['diff', '--name-only', '3b873fbf8bf4e5db1aa5445b0596645de39cc336'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-  ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-]);
+// Historical delivered boundary: 7ff992031755e17c1078c975e322afad10b0d07f^ → 7ff992031755e17c1078c975e322afad10b0d07f.
+  const s32ChangedPaths = new Set(execFileSync('git', ['diff', '--name-only', '7ff992031755e17c1078c975e322afad10b0d07f^', '7ff992031755e17c1078c975e322afad10b0d07f'], { encoding: 'utf8' }).split('\n').filter(Boolean));
 eq('S32-A BOQ input repair stays in its six declared paths', [...s32ChangedPaths].filter((path) => !S32_BOQ_INPUT_PATHS.has(path) && !S33_PROGRESS_ENTRY_PATHS.has(path) && !S34_COST_ENTRY_PATHS.has(path)), []);
 ok('S32-B BOQ input and production numeric parser are actually repaired', s32ChangedPaths.has('src/components/views/ImportView.tsx') && s32ChangedPaths.has('src/lib/boqParser.ts'));
 ok('S32-C real CSV/XLSX numeric parser regressions pass without storage writes', execFileSync(process.execPath, ['scripts/validate-boq-input.mjs'], { encoding: 'utf8' }).includes('BOQ INPUT VALIDATION PASSED: 14/14'));
@@ -7421,18 +7397,18 @@ ok('S32-C real CSV/XLSX numeric parser regressions pass without storage writes',
   ok('S33-O both actual daily write paths validate date before persistence', (progressSource.match(/if \(!isValidProgressDate\(entryDate\)\)/g) || []).length === 2);
   ok('S33-P unit-rate path quotes canonical F6 and removes equal-share fallback', progressSource.includes('costReport?.activities.find') && !progressSource.includes('const defaultBac') && !progressSource.includes('boqItems.find((b) => b.code === act.code || b.description.includes(act.name)'));
 }
-const s33ChangedPaths = new Set([
-  ...execFileSync('git', ['diff', '--name-only', '7ff992031755e17c1078c975e322afad10b0d07f'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-  ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-]);
+// Historical delivered boundary: 97ac2b34315292f42d11716294557a5083e4d75c^ → 97ac2b34315292f42d11716294557a5083e4d75c.
+  const s33ChangedPaths = new Set(execFileSync('git', ['diff', '--name-only', '97ac2b34315292f42d11716294557a5083e4d75c^', '97ac2b34315292f42d11716294557a5083e4d75c'], { encoding: 'utf8' }).split('\n').filter(Boolean));
 eq('S33-Q current progress repair stays inside four declared paths', [...s33ChangedPaths].filter((path) => !S33_PROGRESS_ENTRY_PATHS.has(path) && !S34_COST_ENTRY_PATHS.has(path)), []);
 
-const s34ChangedPaths = new Set([
-  ...execFileSync('git', ['diff', '--name-only', '97ac2b34315292f42d11716294557a5083e4d75c'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-  ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-]);
+// Historical delivered boundary: 7cf85ec69593086fda96f3533ce34ba49a367f04^ → 7cf85ec69593086fda96f3533ce34ba49a367f04.
+  const s34ChangedPaths = new Set(execFileSync('git', ['diff', '--name-only', '7cf85ec69593086fda96f3533ce34ba49a367f04^', '7cf85ec69593086fda96f3533ce34ba49a367f04'], { encoding: 'utf8' }).split('\n').filter(Boolean));
 eq('S34-A current cost-entry increment stays inside three declared paths', [...s34ChangedPaths].filter((path) => !S34_COST_ENTRY_PATHS.has(path)), []);
 ok('S34-B existing cost input is changed, not a new feature', s34ChangedPaths.has('src/components/views/BudgetView.tsx'));
+ok('SCH closeout current-release exact path/protected-engine boundary',
+  execFileSync(process.execPath, ['scripts/validate-release-boundary.mjs'], { encoding: 'utf8' }).includes('Release boundary passed'));
+ok('SCH closeout production scope evidence regressions',
+  execFileSync(process.execPath, ['scripts/validate-scope-bridge.mjs'], { encoding: 'utf8' }).includes('27/27 passed'));
 console.log('');
 if (failures > 0) {
   console.log(`VALIDATION FAILED: ${failures} of ${checks} checks failed.`);
