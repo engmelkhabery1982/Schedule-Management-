@@ -43,6 +43,7 @@ import {
   isPendingVariationOrderStatus,
 } from '@/lib/scopeChangeEngine';
 import { supabase } from '@/lib/supabase';
+import { requireScopeRows, requireScopePointer } from '@/lib/scopeReadSafety';
 
 interface ScopeChangeRegisterProps {
   project: Project | null;
@@ -254,33 +255,33 @@ function ProjectScopeChangeRegister({ project }: ScopeChangeRegisterProps) {
         supabase.from('cost_transactions').select('*').eq('project_id', project.id),
         supabase.from('delay_claims').select('*').eq('project_id', project.id),
       ]);
-      const allResults = [pointerResult, baselinesResult, boqResult, wbsResult, activityResult, allocationResult, orderResult, impactResult, wbsLinkResult, activityLinkResult, eventResult, transactionResult, claimResult];
       if (epoch !== readEpoch.current) return;
-      setTransactions((transactionResult.data || []) as CostTransaction[]);
-      setClaims((claimResult.data || []) as DelayClaimEvent[]);
-      const failed = allResults.find((result) => result.error);
-      if (failed?.error) throw new Error(failed.error.message || 'Unable to load scope governance records');
-
-      for (const result of allResults) {
-        const rows = Array.isArray(result.data) ? result.data : result.data ? [result.data] : [];
-        if (rows.some((row: { project_id?: string }) => row.project_id !== project.id)) {
-          throw new Error('Cross-project scope response refused');
-        }
-      }
-      const pointer = (pointerResult.data || null) as { baseline_id: string } | null;
-      const revisions = (baselinesResult.data || []) as ProjectBaseline[];
+      const pointer = requireScopePointer(pointerResult, project.id);
+      const revisions = requireScopeRows<ProjectBaseline>(baselinesResult, project.id, 'Baselines');
+      // Validate every required result before publishing any partial evidence.
+      const boq = requireScopeRows<BoqItem>(boqResult, project.id, 'BOQ');
+      const wbs = requireScopeRows<WbsNode>(wbsResult, project.id, 'WBS');
+      const acts = requireScopeRows<Activity>(activityResult, project.id, 'Activities');
+      const allocs = requireScopeRows<ActivityBoqAllocation>(allocationResult, project.id, 'Allocations');
+      const vos = requireScopeRows<VariationOrder>(orderResult, project.id, 'VOs');
+      const impacts = requireScopeRows<VariationOrderBoqImpact>(impactResult, project.id, 'Impacts');
+      const voWbs = requireScopeRows<VariationOrderWbsLink>(wbsLinkResult, project.id, 'VO WBS');
+      const voActs = requireScopeRows<VariationOrderActivityLink>(activityLinkResult, project.id, 'VO activities');
+      const history = requireScopeRows<VariationOrderEvent>(eventResult, project.id, 'VO events');
+      const costs = requireScopeRows<CostTransaction>(transactionResult, project.id, 'Costs');
+      const analyses = requireScopeRows<DelayClaimEvent>(claimResult, project.id, 'Claims');
       const activeBaseline = pointer ? revisions.find((revision) => revision.id === pointer.baseline_id) : undefined;
       setBaselinePointer(pointer);
       setBaselineHistory(revisions.filter((revision) => revision.baseline_kind === 'scope' || revision.baseline_kind === 'integrated'));
-      setCurrentBoq((boqResult.data || []) as BoqItem[]);
-      setCurrentWbs((wbsResult.data || []) as WbsNode[]);
-      setActivities((activityResult.data || []) as Activity[]);
-      setAllocations((allocationResult.data || []) as ActivityBoqAllocation[]);
-      setOrders((orderResult.data || []) as VariationOrder[]);
-      setBoqImpacts((impactResult.data || []) as VariationOrderBoqImpact[]);
-      setWbsLinks((wbsLinkResult.data || []) as VariationOrderWbsLink[]);
-      setActivityLinks((activityLinkResult.data || []) as VariationOrderActivityLink[]);
-      setEvents((eventResult.data || []) as VariationOrderEvent[]);
+      setCurrentBoq(boq);
+      setCurrentWbs(wbs);
+      setActivities(acts);
+      setAllocations(allocs);
+      setOrders(vos);
+      setBoqImpacts(impacts);
+      setWbsLinks(voWbs);
+      setActivityLinks(voActs);
+      setEvents(history);
 
       if (pointer?.baseline_id) {
         if (!activeBaseline || activeBaseline.status !== 'approved' || !['scope', 'integrated'].includes(activeBaseline.baseline_kind || '')) {
@@ -290,19 +291,19 @@ function ProjectScopeChangeRegister({ project }: ScopeChangeRegisterProps) {
           supabase.from('baseline_boq_items').select('*').eq('project_id', project.id).eq('baseline_id', pointer.baseline_id).order('sort_order', { ascending: true }),
           supabase.from('baseline_wbs_nodes').select('*').eq('project_id', project.id).eq('baseline_id', pointer.baseline_id).order('sort_order', { ascending: true }),
         ]);
-        if (baselineBoqResult.error) throw new Error(baselineBoqResult.error.message);
-        if (baselineWbsResult.error) throw new Error(baselineWbsResult.error.message);
         if (epoch !== readEpoch.current) return;
-        setBaselineItems((baselineBoqResult.data || []) as BaselineBoqItem[]);
-        setBaselineWbs((baselineWbsResult.data || []) as BaselineWbsNode[]);
+        setBaselineItems(requireScopeRows<BaselineBoqItem>(baselineBoqResult, project.id, 'Baseline BOQ', pointer.baseline_id));
+        setBaselineWbs(requireScopeRows<BaselineWbsNode>(baselineWbsResult, project.id, 'Baseline WBS', pointer.baseline_id));
       } else {
         setBaselineItems([]);
         setBaselineWbs([]);
       }
+      setTransactions(costs);
+      setClaims(analyses);
       setReady(true);
     } catch (error) {
       if (epoch !== readEpoch.current) return;
-      setLoadError((error as Error).message || 'Unable to load scope governance records');
+      setLoadError((error instanceof Error ? error.message : String(error)) || 'Unable to load scope governance records');
     } finally {
       if (epoch === readEpoch.current) setLoading(false);
     }
@@ -466,7 +467,7 @@ function ProjectScopeChangeRegister({ project }: ScopeChangeRegisterProps) {
       setShowDraftModal(false);
       await loadData();
     } catch (error) {
-      setLoadError((error as Error).message || 'Unable to save VO draft');
+      setLoadError((error instanceof Error ? error.message : String(error)) || 'Unable to save VO draft');
     } finally {
       setBusy(false);
     }
@@ -498,7 +499,7 @@ function ProjectScopeChangeRegister({ project }: ScopeChangeRegisterProps) {
       setTransition(null);
       await loadData();
     } catch (error) {
-      setLoadError((error as Error).message || 'Unable to change VO status');
+      setLoadError((error instanceof Error ? error.message : String(error)) || 'Unable to change VO status');
     } finally {
       setBusy(false);
     }
