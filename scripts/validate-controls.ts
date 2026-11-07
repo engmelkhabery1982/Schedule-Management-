@@ -6849,6 +6849,11 @@ console.log('--- S18 Pilot Closure (F9.5)');
     const name = match.replace(/^from\('/, '').replace(/'\)$/, '');
     if (name) usedTables.add(name);
   }
+  // The local RPC contracts also address persisted tables without supabase.from().
+  for (const match of execFileSync('git', ['grep', '-ohE', "db\\['[a-z_]+'\\]", '--', 'src/lib'], { encoding: 'utf8' }).split('\n')) {
+    const name = match.replace(/^db\['/, '').replace(/'\]$/, '');
+    if (name) usedTables.add(name);
+  }
   const inventory = new Set(PERSISTED_TABLE_NAMES);
   const missingFromInventory = [...usedTables].filter((name) => !inventory.has(name)).sort();
   const unusedInSource = [...inventory].filter((name) => !usedTables.has(name)).sort();

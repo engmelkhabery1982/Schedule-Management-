@@ -128,6 +128,7 @@ export const PERSISTED_TABLES: readonly PersistedTableSpec[] = [
   { name: 'activity_boq_allocations', idField: 'id', projectScoped: true, label: 'Activity ↔ BOQ allocations' },
   { name: 'budget_lines', idField: 'id', projectScoped: true, label: 'Budget lines' },
   { name: 'cost_transactions', idField: 'id', projectScoped: true, label: 'Cost transactions' },
+  { name: 'approval_events', idField: 'id', projectScoped: true, label: 'Existing cost approval audit events (RPC)' },
   { name: 'progress_updates', idField: 'id', projectScoped: true, label: 'Progress updates (approvals)' },
   { name: 'risks', idField: 'id', projectScoped: true, label: 'Risks' },
   { name: 'issues', idField: 'id', projectScoped: true, label: 'Issues' },
@@ -1607,6 +1608,18 @@ export function validateBackup(input: string | unknown): BackupValidation {
       const row = tables[spec][i];
       if (!baselineById.has(String(row.baseline_id))) {
         return fail('missing_reference', `tables.${spec}[${i}].baseline_id`, 'baseline revision does not exist');
+      }
+    }
+  }
+
+  // Existing RPC audit rows are business data, not disposable query-cache state.
+  const costsById = index('cost_transactions');
+  for (let i = 0; i < tables.approval_events.length; i += 1) {
+    const event = tables.approval_events[i];
+    if (event.entity_type === 'cost_transaction') {
+      const transaction = costsById.get(String(event.entity_id));
+      if (!transaction || transaction.project_id !== event.project_id) {
+        return fail('missing_reference', `tables.approval_events[${i}].entity_id`, 'cost approval event must reference its own project transaction');
       }
     }
   }
