@@ -1,7 +1,19 @@
 # Consolidated release package — CLOSEOUT01 / CLOSEOUT02 / PRINT-CLOSEOUT03
 
-**Version:** 2026.11.07-rc2-source. **Remaining product code delivered; RELEASE ACCEPTED: NO.**
-Print pagination still requires the final native-PDF review. XML remains a human browser Keep confirmation, not a source failure. No new order, roadmap, deployment or commercial acceptance is implied.
+**Version:** 2026.11.07-local-pilot. **OWNER-HOST TECHNICAL QUALIFICATION ACCEPTED for the declared local single-user release scope.**
+The reviewer completed final native-PDF pagination and saved-XML checks on7November2026. This is technical acceptance of the existing Launch3B/4 local-pilot scope, not commercial, cloud/multi-user, live-backend-security or contractual acceptance. Installation/promotion is recorded separately with exact source and artifact hashes.
+
+## Final independent owner-host qualification — 7 November2026
+
+- Reviewed exact incoming tip `0f15968a055ca8c059496247a85723437f1b0cc6`, ancestry fromfaac199 and exact six changed paths. The three QA fixes match preserved host corrections; report marker and shell rules are retained; only new product delta is scoped print S-curve pagination/sizing. Protected engines/storage/dependencies/SQL unchanged. Known host patch was preserved before integration; no reset/clean/stash.
+- Final affected checks: exact21-path guard PASS, TypeScript exit0, production build exit0, git diff whitespace PASS. Built asset `index-CJ-xn9Ob.js` / `index-BugYsSj1.css`. Existing Browserslist/chunk warnings retained. No installation or provisioning.
+- Reused unchanged evidence: full1888/1888 atfaac199; delta93/93, model27/27, restore14/14; real production React harness456 assertions and actual35-table snapshot backup/restore/re-export equality. These suites and user flows were NOT rerun for print-only source changes.
+- Actual native Microsoft Print to PDF, A3 landscape, two pages,551610bytes. Both pages rendered and visually inspected: shell absent, Arabic/figures/tables legible, S-curve title/full chart/legend together onpage2, no missing section, clipping or blank page. PDF SHA256 `217a6e5fc69978e585d534546ba1f03db501d8f6293446219bf01f0d262115e7`. Private host filename `schedule-print03-accepted.pdf`; PDF/QA data are not committed.
+- Owner confirmed Keep. Actual final `Synthetic_alpha_Schedule.xml`,492bytes, SHA256 `e465f2f62eda2a7ce70368d54774c707866b656888cc9b61a21f0204f452e93a`; parsed with DTD prohibited/no external resolver. MSP namespace, project/task names, duration and recorded task values verified. This is the existing activity-oriented export of saved activity dates, not a full relationships/resources/CPM round trip or Microsoft Project interoperability certification. No warning bypass or alternate exporter.
+- Canonical report quotes remain BAC/PV1000,EV200,AC100,CPI2,SPI.2,EAC500,ETC400,VAC500,CPMfinish2026-09-16 atDataDate2026-09-13. No computation changed by print CSS.
+- Historical sandbox metadata preservation remains attributed to Arena; the old external recovery archive was not independently accessed. Acceptance relies on reviewed delivered source/ancestry, owner-host executed behavior and preserved owner baseline, not on that archive as proof of a current product capability.
+
+The earlier sections below retain the implementation/handoff history. Their pre-review PDF/XML pending labels are superseded by this final qualification. Safe FF promotion with rollback and build-byte matching is the remaining installation operation; it is not a new feature or another functional test cycle.
 
 ## 1. Exact authority and continuation
 
