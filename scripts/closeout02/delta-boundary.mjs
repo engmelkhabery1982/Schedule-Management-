@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 export const deltaPaths = [
+ 'src/index.css', 'src/components/views/ExecutiveReportView.tsx',
  'src/components/views/ScopeChangeRegister.tsx', 'src/lib/scopeReadSafety.ts',
  'src/lib/localWorkspace.ts', 'src/lib/xerExporter.ts',
  'scripts/validate-controls.ts', 'scripts/validate-release-boundary.mjs',

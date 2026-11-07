@@ -335,7 +335,7 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
   }
 
   return (
-    <div className="space-y-6">
+    <div className="executive-report-print space-y-6">
       {/* Control Bar (Hidden in Print) */}
       <div className="flex items-center justify-between bg-white p-4 rounded-xl border border-slate-200 shadow-sm print:hidden">
         <div>
@@ -575,8 +575,8 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
           </div>
         </div>
 
-        {/* S-Curve Chart Section */}
-        <div className="border border-slate-200 rounded-xl p-4">
+        {/* Keep this heading, chart and legend in one printable card when it fits a page. */}
+        <div className="executive-report-scurve border border-slate-200 rounded-xl p-4">
           <h3 className="text-xs font-bold text-slate-800 mb-2 flex items-center gap-1.5">
             <TrendingUp size={15} className="text-amber-600" />
             منحنى الإنجاز التراكمي ومطابقة خط الأساس (Baseline S-Curve & EVM)

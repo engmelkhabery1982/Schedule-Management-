@@ -28,7 +28,7 @@ async function fill(label,value){const input=field(label);const proto=input inst
  Object.getOwnPropertyDescriptor(proto,'value').set.call(input,value);input.dispatchEvent(new Event('input',{bubbles:true}));input.dispatchEvent(new Event('change',{bubbles:true}));await delay();}
 async function mount(id,remount=false){root.render(React.createElement(Boundary,{key:remount?Date.now()+Math.random():'boundary'},React.createElement(ScopeChangeRegister,{project:read(qa.storage).projects.find(p=>p.id===id)})));await delay();}
 async function ready(){await until(()=>button('New VO')&&!button('New VO').disabled,'complete scope read');}
-const row=number=>[...app.querySelectorAll('tbody tr')].find(e=>visible(e)&&e.textContent.includes(number));
+const row=number=>[...app.querySelectorAll('tbody tr')].find(e=>visible(e)&&e.cells[0]?.textContent.includes(number));
 async function newDraft(title){await click('New VO');await fill('Title',title);await fill('Source / origin (required)','Synthetic UI');await fill('Requested by','Synthetic UI author');await fill('Requested date','2026-09-13');}
 async function test(name,fn){await fn();results.push('PASS '+name);output.textContent=results.join('\n');}
 async function run(){
