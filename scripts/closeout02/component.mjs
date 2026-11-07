@@ -60,10 +60,13 @@ async function run(){
   qa.faults.clear();await click('Retry');await ready();
  });
  await test('Held Alpha baseline second-phase cannot affect Beta',async()=>{
-  qa.reset();const release=qa.hold('alpha','baseline_boq_items');await mount('alpha',true);
-  await until(()=>qa.requests.some(r=>r.project==='alpha'&&r.table==='baseline_boq_items'),'Alpha baseline phase held');
-  await mount('beta');await ready();release();for(let i=0;i<5;i++)await delay();
-  check(!button('New VO').disabled&&!text().includes('alpha-claim'),'Baseline generation isolated');
+  for(const fault of [null,'error','reject']) {
+   qa.reset();if(fault)qa.faults.set('baseline_boq_items',fault);
+   const release=qa.hold('alpha','baseline_boq_items');await mount('alpha',true);
+   await until(()=>qa.requests.some(r=>r.project==='alpha'&&r.table==='baseline_boq_items'),'Alpha baseline phase held');
+   qa.faults.clear();await mount('beta');await ready();release();for(let i=0;i<5;i++)await delay();
+   check(!button('New VO').disabled&&!text().includes('alpha-claim')&&!text().includes('QA denied'),'Baseline generation isolated '+fault);
+  }
  });
  await test('Rejected save retains draft; rejected transition retains modal/stored state',async()=>{
   qa.reset();await mount('beta',true);await ready();const before=JSON.stringify(read(qa.storage));
@@ -75,11 +78,13 @@ async function run(){
   qa.writeFault=null;await click('Record transition');await until(()=>!button('Record transition'),'successful retry');await ready();
  });
  await test('Old Alpha write completion never clears Beta draft',async()=>{
-  for(const fault of [null,'reject']){
-   qa.reset();await mount('alpha',true);await ready();await newDraft('Alpha held draft');
-   qa.writeFault=fault;const release=qa.holdWrite();await click('Save as draft');
+  for(const operation of ['draft','transition'])for(const fault of [null,'reject']){
+   qa.reset();await mount('alpha',true);await ready();
+   if(operation==='draft')await newDraft('Alpha held draft');
+   else {await click('Submit',row('VO-PENDING'));await fill('Accountable actor','Alpha held actor');}
+   qa.writeFault=fault;const release=qa.holdWrite();await click(operation==='draft'?'Save as draft':'Record transition');
    await mount('beta');await ready();await newDraft('Beta stays');release();for(let i=0;i<5;i++)await delay();
-   check(field('Title').value==='Beta stays'&&!!button('Save as draft'),'Beta modal preserved on old Alpha '+fault);
+   check(field('Title').value==='Beta stays'&&!!button('Save as draft'),'Beta modal preserved on old Alpha '+operation+' '+fault);
    check(!text().includes('QA rejected write'),'Old Alpha error not published into Beta');
   }
  });
