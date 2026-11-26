@@ -15,12 +15,13 @@ export const deltaPaths = [
 ];
 const git=(...args)=>execFileSync('git',args,{encoding:'utf8'}).trim();
 const base='6a814940194bdf440b54031db6a8e022f565d2d6';
-git('merge-base','--is-ancestor',base,'HEAD');
-assert.equal(git('branch','--show-current'),'arena/3db7d6ec-schedule-management');
+// The closeout boundary applies to its recorded delivery, including when a
+// later release is tested on a different branch.
+export const closeout02Head='cfb9f2ae24eb67e523ed9b345e6e4b185158930d';
+git('merge-base','--is-ancestor',base,closeout02Head);
+git('merge-base','--is-ancestor',closeout02Head,'HEAD');
 const changed=new Set([
- ...git('diff','--name-only',base).split('\n'),
- ...git('diff','--cached','--name-only',base).split('\n'),
- ...git('ls-files','--others','--exclude-standard').split('\n'),
+ ...git('diff','--name-only',base,closeout02Head).split('\n'),
 ].filter(Boolean));
 assert.deepEqual([...changed].filter(p=>!deltaPaths.includes(p)),[]);
 console.log(`CLOSEOUT02 exact delta boundary passed: ${changed.size} paths; protected engines/dependencies/SQL unchanged.`);

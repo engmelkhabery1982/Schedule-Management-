@@ -295,4 +295,3 @@ invented deductions, exported 34 tables, and restored that actual export. All or
 32 tables remained byte-for-byte equal as JSON values. A future-dated paid IPC was
 refused visibly. Header-only certificates remain explicitly **Not itemized**; this
 does not constitute acceptance of commercial readiness or automatic EVM posting.
-
