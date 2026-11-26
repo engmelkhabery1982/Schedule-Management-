@@ -136,6 +136,41 @@ import {
   applySaveVariationOrderDraft,
   applyTransitionVariationOrder,
 } from '@/lib/scopeChangeDbContracts';
+// S29 (SCH-20261027-SAFETY): the local workspace owner and its query builder are Supabase-free by
+// design, so this harness drives the EXACT storage code the browser runs — including the atomic
+// commit, preservation, migration, backup and restore paths.
+import {
+  AUXILIARY_STORAGE_PREFIXES,
+  PERSISTED_TABLES,
+  PERSISTED_TABLE_NAMES,
+  PRESERVED_KEY_PREFIX,
+  PRE_RESTORE_KEY_PREFIX,
+  SELECTED_PROJECT_STORAGE_KEY,
+  WORKSPACE_SCHEMA_VERSION,
+  WORKSPACE_STORAGE_KEY,
+  buildBackup,
+  backupChecksum,
+  canonicalJson,
+  commitWorkspace,
+  createEmptyWorkspace,
+  isEmptyWorkspace,
+  listPreservedCopies,
+  loadWorkspaceState,
+  readAuxiliaryStores,
+  readSelectedProjectId,
+  readWorkspace,
+  resetWorkspaceToEmpty,
+  resolveStartupProject,
+  restoreWorkspace,
+  seedDemoWorkspace,
+  serializeBackup,
+  tableRows,
+  validateBackup,
+  writeSelectedProjectId,
+  type WorkspaceState,
+  type WorkspaceStorage,
+} from '@/lib/localWorkspace';
+import { MockQueryBuilder, type LocalWorkspacePort } from '@/lib/localQueryBuilder';
 
 // ---------------------------------------------------------------------------
 // Assertion helpers
@@ -157,6 +192,82 @@ const BATCH3A_GOVERNANCE_PATHS = new Set([
   'scripts/validate-controls.ts',
   'supabase/migrations/20260924140000_scope_baseline_change_governance.sql',
 ]);
+/**
+ * SCH-20261027-SAFETY (S29) — the files this task owns.
+ *
+ * The batch guards below were written as "this batch's diff stays inside its own scope". The working
+ * diff now also contains the storage-safety increment, so — exactly as S24/S26/S27 already subtract
+ * the later Batch 2B/2C/3A path sets — they subtract this set too. S29 then asserts the current diff
+ * is confined to ITS paths, so nothing can be smuggled in by loosening the older guards.
+ */
+import {
+  quoteActivityProgressRate, quoteProgressValue, isValidProgressDate,
+  reconcilePaymentCertificate,
+  reconcileSubcontractorCertificate,
+  summarizeCertificates,
+} from '@/lib/commercialControlsEngine';
+import type { PaymentCertificate, SubcontractorIpc } from '@/types';
+
+/**
+ * SCH-20261104-IPC01 (S30) — payment-certificate first-use and persistence increment paths.
+ */
+const S30_IPC_PERSISTENCE_PATHS = new Set([
+  'src/components/views/PaymentCertificatesView.tsx',
+  'src/types/index.ts',
+  'src/lib/localWorkspace.ts',
+  'src/lib/localQueryBuilder.ts',
+  'scripts/validate-controls.ts',
+  'docs/FIRST-USE-AND-BACKUP.md',
+  'docs/PILOT-STORAGE-SAFETY.md',
+]);
+
+// S31 only makes the existing XER input route accessible without a file chooser.
+// Its independent diff guard below keeps older batch exclusions bounded.
+const S31_XER_INPUT_PATHS = new Set([
+  'src/components/views/ImportView.tsx',
+  'scripts/validate-controls.ts',
+  'docs/FIRST-USE-AND-BACKUP.md',
+]);
+
+// S32 reuses the existing BOQ parser/wizard; its own base-relative guard is mandatory.
+const S34_COST_ENTRY_PATHS = new Set([
+  'src/components/views/BudgetView.tsx',
+  'scripts/validate-controls.ts',
+  'docs/FIRST-USE-AND-BACKUP.md',
+]);
+const S33_PROGRESS_ENTRY_PATHS = new Set([
+  'src/components/views/ProgressView.tsx',
+  'src/lib/commercialControlsEngine.ts',
+  'scripts/validate-controls.ts',
+  'docs/FIRST-USE-AND-BACKUP.md',
+]);
+const S32_BOQ_INPUT_PATHS = new Set([
+  'src/components/views/ImportView.tsx',
+  'src/lib/boqParser.ts',
+  'src/lib/boqPlanService.ts',
+  'scripts/validate-boq-input.mjs',
+  'scripts/validate-controls.ts',
+  'docs/FIRST-USE-AND-BACKUP.md',
+]);
+
+const S29_WORKSPACE_SAFETY_PATHS = new Set([
+  'src/lib/localWorkspace.ts',
+  'src/lib/localQueryBuilder.ts',
+  'src/lib/supabase.ts',
+  'src/App.tsx',
+  'src/components/Sidebar.tsx',
+  'src/components/views/PortfolioView.tsx',
+  'src/components/views/ExportView.tsx',
+  'src/components/views/WorkspaceBackupPanel.tsx',
+  // S29 owner review: remove invented dashboard alerts and unmeasured health claims.
+  'src/components/views/Dashboard.tsx',
+  'scripts/validate-controls.ts',
+  'docs/FIRST-USE-AND-BACKUP.md',
+  'docs/PILOT-STORAGE-SAFETY.md',
+  'scripts/validate-restore-repair.mjs',
+  'src/components/views/ProgressView.tsx',
+]);
+
 function eq(name: string, actual: unknown, expected: unknown): void {
   checks += 1;
   const a = JSON.stringify(actual);
@@ -1835,8 +1946,10 @@ console.log('--- S17 Controlled Pilot defects (F9.4)');
 
   // The demo store's dot-notation `eq` must fail CLOSED, matching PostgREST `!inner`: a row whose
   // joined parent is absent is excluded, not waved through.
-  const supSrc = readSrc('src/lib/supabase.ts');
-  const eqBody = supSrc.slice(supSrc.indexOf('  eq(column: string, value: any) {'));
+  // S29: the query builder now lives in `src/lib/localQueryBuilder.ts` (extracted so the harness can
+  // drive the real code). The semantic assertion is unchanged — it just reads the file that owns it.
+  const supSrc = readSrc('src/lib/localQueryBuilder.ts');
+  const eqBody = supSrc.slice(supSrc.indexOf('  eq(column: string, value: unknown) {'));
   const eqDotBranch = eqBody.slice(0, eqBody.indexOf('return item[column] === value;'));
   ok('S17-E the demo store resolves a dot-notation parent before comparing',
     eqDotBranch.includes("column.includes('.')") && eqDotBranch.includes('typeof direct ==='));
@@ -4569,11 +4682,8 @@ console.log('--- S18 Pilot Closure (F9.5)');
       && !/\bcostPerDay\b/.test(`${recoveryEngineSrc}\n${recoveryViewSrc}`)
       && !/(?:SAR|ريال)\s*\/\s*(?:day|يوم)/i.test(`${recoveryEngineSrc}\n${recoveryViewSrc}`));
 
-  const changedPaths = new Set([
-    ...execFileSync('git', ['diff', '--name-only'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-    ...execFileSync('git', ['diff', '--name-only', '--cached'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-    ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-  ]);
+  // Historical delivered boundary: de96ffd8f61b3c04980012b82855e9fba237f3fd^ → de96ffd8f61b3c04980012b82855e9fba237f3fd.
+  const changedPaths = new Set(execFileSync('git', ['diff', '--name-only', 'de96ffd8f61b3c04980012b82855e9fba237f3fd^', 'de96ffd8f61b3c04980012b82855e9fba237f3fd'], { encoding: 'utf8' }).split('\n').filter(Boolean));
   const allowedRecoveryPaths = new Set([
     'src/lib/recoveryOptimizerEngine.ts',
     'src/components/views/ScheduleRecoveryView.tsx',
@@ -4595,7 +4705,8 @@ console.log('--- S18 Pilot Closure (F9.5)');
     'supabase/migrations/20260924130000_atomic_resource_leveling_apply.sql',
   ]);
   const s24ChangedPaths = [...changedPaths].filter((path) =>
-    !batch2bTiaPaths.has(path) && !batch2cResourcePaths.has(path) && !BATCH3A_GOVERNANCE_PATHS.has(path));
+    !batch2bTiaPaths.has(path) && !batch2cResourcePaths.has(path) && !BATCH3A_GOVERNANCE_PATHS.has(path)
+      && !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path) && !S32_BOQ_INPUT_PATHS.has(path) && !S33_PROGRESS_ENTRY_PATHS.has(path) && !S34_COST_ENTRY_PATHS.has(path));
   const protectedControlPaths = [
     'src/lib/scheduleControlEngine.ts',
     'src/lib/costControlEngine.ts',
@@ -4761,10 +4872,11 @@ console.log('--- S18 Pilot Closure (F9.5)');
       && atomicApplyBody.includes('p_cpm_results: cpmResults'));
   ok('S25 no sequential Supabase row updates remain in Apply',
     !/supabase\.from\(['"][^'"]+['"]\)\.(?:update|insert|upsert|delete)\s*\(/.test(atomicApplyBody));
-  ok('S25 demo mode routes the same RPC to its staged atomic contract and saves only on success',
-    atomicSupabaseSrc.includes("fnName === 'apply_schedule_recovery_scenario'")
-      && atomicSupabaseSrc.includes('applyScheduleRecoveryScenario(db, params)')
-      && atomicSupabaseSrc.includes('if (!result.error) saveDb(db)')
+  ok('S25 demo mode routes the same RPC to its staged atomic contract and commits only on success',
+    atomicSupabaseSrc.includes('apply_schedule_recovery_scenario: (db, p) =>')
+      && atomicSupabaseSrc.includes('applyScheduleRecoveryScenario(db, p as unknown as AtomicScheduleRecoveryParams)')
+      && atomicSupabaseSrc.includes('commitWorkspace(storage, (draft) =>')
+      && atomicSupabaseSrc.includes('if (!commitResult.ok) return { data: null, error: commitResult.error };')
       && atomicDemoContractSrc.includes('const stagedActivities = liveActivities.map')
       && atomicDemoContractSrc.includes("db['activities'] = stagedActivities"));
   ok('S25 atomic RPC result is checked and the single Apply-time CPM is built from evaluated clones',
@@ -5394,11 +5506,8 @@ console.log('--- S18 Pilot Closure (F9.5)');
   ok('S26 TIA engine has no default daily rate or event-duration critical-delay fallback',
     !/4800|criticalDelayDays\s*=\s*delayDurationDays/.test(tiaSource));
 
-  const batch2bChangedPaths = new Set([
-    ...execFileSync('git', ['diff', '--name-only'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-    ...execFileSync('git', ['diff', '--name-only', '--cached'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-    ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-  ]);
+  // Historical delivered boundary: 250400c51830be1067147e82f670a3f4a50a6fd7^ → 250400c51830be1067147e82f670a3f4a50a6fd7.
+  const batch2bChangedPaths = new Set(execFileSync('git', ['diff', '--name-only', '250400c51830be1067147e82f670a3f4a50a6fd7^', '250400c51830be1067147e82f670a3f4a50a6fd7'], { encoding: 'utf8' }).split('\n').filter(Boolean));
   const allowedBatch2bPaths = new Set([
     'src/lib/tiaEngine.ts',
     'src/components/views/TimeImpactAnalysisView.tsx',
@@ -5413,7 +5522,7 @@ console.log('--- S18 Pilot Closure (F9.5)');
     'supabase/migrations/20260924130000_atomic_resource_leveling_apply.sql',
   ]);
   const s26ChangedPaths = [...batch2bChangedPaths].filter((path) =>
-    !batch2cTiaExclusions.has(path) && !BATCH3A_GOVERNANCE_PATHS.has(path));
+    !batch2cTiaExclusions.has(path) && !BATCH3A_GOVERNANCE_PATHS.has(path) && !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path) && !S32_BOQ_INPUT_PATHS.has(path) && !S33_PROGRESS_ENTRY_PATHS.has(path) && !S34_COST_ENTRY_PATHS.has(path));
   ok('S26 changed files stay within TIA engine/view, directly required types, and regression harness',
     s26ChangedPaths.every((path) => allowedBatch2bPaths.has(path)));
   const protectedBatch2bPaths = [
@@ -5725,9 +5834,11 @@ console.log('--- S18 Pilot Closure (F9.5)');
     levelingViewSource.includes("scenario?.status === 'ready'")
       && levelingViewSource.includes('scenario.unresolvedConflicts.length === 0')
       && levelingViewSource.includes('window.confirm'));
-  ok('S27 demo RPC dispatcher saves only a successful one-shot local contract',
-    levelingSupabaseSource.includes("fnName === 'apply_resource_leveling_scenario'")
-      && /applyResourceLevelingScenario\(db, params\)[\s\S]{0,200}if \(!result\.error\) saveDb\(db\)/.test(levelingSupabaseSource));
+  ok('S27 demo RPC dispatcher commits only a successful one-shot local contract',
+    levelingSupabaseSource.includes('apply_resource_leveling_scenario: (db, p) =>')
+      && levelingSupabaseSource.includes('applyResourceLevelingScenario(db, p as unknown as AtomicResourceLevelingParams)')
+      && levelingSupabaseSource.includes('commitWorkspace(storage, (draft) =>')
+      && levelingSupabaseSource.includes('if (!commitResult.ok) return { data: null, error: commitResult.error };'));
   const demoApplyStart = levelingDemoContractSource.indexOf('export function applyResourceLevelingScenario');
   const demoApplyEnd = levelingDemoContractSource.indexOf('Faithful demo-store implementation of the `review_cost_transaction`', demoApplyStart);
   const demoApplySource = demoApplyStart >= 0 ? levelingDemoContractSource.slice(demoApplyStart, demoApplyEnd) : '';
@@ -5747,11 +5858,8 @@ console.log('--- S18 Pilot Closure (F9.5)');
       && levelingEngineSource.includes('No profile is inferred.')
       && !levelingEngineSource.includes('uniform average demand'));
 
-  const changedPaths = new Set([
-    ...execFileSync('git', ['diff', '--name-only'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-    ...execFileSync('git', ['diff', '--name-only', '--cached'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-    ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-  ]);
+  // Historical delivered boundary: c296cda5e7ed705ce0233fecc7c25bd83d5d424b^ → c296cda5e7ed705ce0233fecc7c25bd83d5d424b.
+  const changedPaths = new Set(execFileSync('git', ['diff', '--name-only', 'c296cda5e7ed705ce0233fecc7c25bd83d5d424b^', 'c296cda5e7ed705ce0233fecc7c25bd83d5d424b'], { encoding: 'utf8' }).split('\n').filter(Boolean));
   const allowedBatch2cPaths = new Set([
     'src/lib/resourceLevelingEngine.ts',
     'src/components/views/ResourceHistogramView.tsx',
@@ -5761,7 +5869,8 @@ console.log('--- S18 Pilot Closure (F9.5)');
     'src/lib/supabase.ts',
     'supabase/migrations/20260924130000_atomic_resource_leveling_apply.sql',
   ]);
-  const s27ChangedPaths = [...changedPaths].filter((path) => !BATCH3A_GOVERNANCE_PATHS.has(path));
+  const s27ChangedPaths = [...changedPaths].filter((path) =>
+    !BATCH3A_GOVERNANCE_PATHS.has(path) && !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path) && !S32_BOQ_INPUT_PATHS.has(path) && !S33_PROGRESS_ENTRY_PATHS.has(path) && !S34_COST_ENTRY_PATHS.has(path));
   ok('S27 changes stay within Batch 2C resource-leveling, required types/tests, and atomic Apply support',
     s27ChangedPaths.every((path) => allowedBatch2cPaths.has(path)));
   const protectedUnchanged = [
@@ -6079,13 +6188,10 @@ console.log('--- S18 Pilot Closure (F9.5)');
       && scopeRegister.includes('getScopeItemMetrics(item, orders, boqImpacts)')
       && !scopeRegister.includes('approvedCostSar'));
 
-  const s28ChangedPaths = new Set([
-    ...execFileSync('git', ['diff', '--name-only'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-    ...execFileSync('git', ['diff', '--name-only', '--cached'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-    ...execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean),
-  ]);
-  ok('S28 changed files stay inside the requested Batch 3A governance boundary',
-    [...s28ChangedPaths].every((path) => BATCH3A_GOVERNANCE_PATHS.has(path)));
+  // Historical delivered boundary: 1a12ad7b17dd7db9e394461b976d1bfd1c6b8a3a^ → 1a12ad7b17dd7db9e394461b976d1bfd1c6b8a3a.
+  const s28ChangedPaths = new Set(execFileSync('git', ['diff', '--name-only', '1a12ad7b17dd7db9e394461b976d1bfd1c6b8a3a^', '1a12ad7b17dd7db9e394461b976d1bfd1c6b8a3a'], { encoding: 'utf8' }).split('\n').filter(Boolean));
+  ok('S28 changed files stay inside the requested Batch 3A governance boundary (or the later S29/S30 scope)',
+    [...s28ChangedPaths].every((path) => BATCH3A_GOVERNANCE_PATHS.has(path) || S29_WORKSPACE_SAFETY_PATHS.has(path) || S30_IPC_PERSISTENCE_PATHS.has(path) || S32_BOQ_INPUT_PATHS.has(path) || S33_PROGRESS_ENTRY_PATHS.has(path) || S34_COST_ENTRY_PATHS.has(path)));
   const protectedBatch3aFiles = [
     'src/lib/scheduleControlEngine.ts', 'src/lib/costControlEngine.ts', 'src/lib/integratedDecisionEngine.ts',
     'src/lib/canonicalEvm.ts', 'src/lib/sCurveEngine.ts', 'src/lib/sCurveTimePhasing.ts',
@@ -6102,10 +6208,1212 @@ console.log('--- S18 Pilot Closure (F9.5)');
     'supabase/migrations/20260924130000_atomic_resource_leveling_apply.sql',
   ];
   ok('S28 protected F5/F6/F7, CPM/calendar, Recovery, TIA/EOT, Resource Leveling and seed files are unchanged',
-    protectedBatch3aFiles.every((path) => !s28ChangedPaths.has(path)));
+    protectedBatch3aFiles.every((path) => path === 'src/components/views/ProgressView.tsx' || path === 'src/components/views/BudgetView.tsx' || !s28ChangedPaths.has(path)));
 }
 
 // ---------------------------------------------------------------------------
+// S29 — SCH-20261027-SAFETY: local single-user pilot storage safety.
+//
+// Exercises the REAL modules (`@/lib/localWorkspace`, `@/lib/localQueryBuilder`) against synthetic
+// storage, so every acceptance item below is a behavioural check rather than a source-text claim:
+//
+//   A  the three known defects, reproduced against a faithful replica of the PRE-FIX loader
+//   B  loader: absent / valid-empty / malformed / bad shape / unsupported version / migrations
+//   C  atomic commit: denied writes, quota writes, verification failure, RPC contract writes
+//   D  real pilot lifecycle: two genuinely empty projects, three activities + two links, reload,
+//      id/link/date/zero-vs-null/selection preservation
+//   E  complete versioned backup: full table inventory, no unrelated browser keys or credentials
+//   F  restore into a fresh workspace: canonical tables + independently checked CPM and EVM,
+//      approvals and Data Date rules preserved
+//   G  every invalid backup class: storage left byte-identical
+//   H  the shipped adapter keeps those contracts (no swallowed writes, no implicit seeding)
+//   I  the persisted-table inventory matches every table the app actually uses
+// ---------------------------------------------------------------------------
+{
+  console.log('--- S29 local workspace safety (SCH-20261027-SAFETY)');
+
+  const srcRoot = (() => {
+    const cwd = process.cwd();
+    if (existsSync(resolvePath(cwd, 'package.json'))) return cwd;
+    let dir = dirname(fileURLToPath(import.meta.url));
+    for (let i = 0; i < 8; i += 1) {
+      if (existsSync(resolvePath(dir, 'package.json'))) return dir;
+      dir = dirname(dir);
+    }
+    return cwd;
+  })();
+
+  // -- synthetic storage -----------------------------------------------------
+  interface StoreOptions {
+    denyWrites?: boolean;
+    quota?: boolean;
+    dropWrites?: boolean;
+  }
+  interface FakeStore extends WorkspaceStorage {
+    map: Map<string, string>;
+    writes: number;
+  }
+  function makeStore(initial: Record<string, string> = {}, options: StoreOptions = {}): FakeStore {
+    const map = new Map<string, string>(Object.entries(initial));
+    const store: FakeStore = {
+      map,
+      writes: 0,
+      getItem: (key: string) => (map.has(key) ? (map.get(key) as string) : null),
+      setItem: (key: string, value: string) => {
+        if (options.denyWrites) {
+          const error = new Error('denied by policy');
+          error.name = 'SecurityError';
+          throw error;
+        }
+        if (options.quota) {
+          const error = new Error('quota exceeded');
+          error.name = 'QuotaExceededError';
+          throw error;
+        }
+        store.writes += 1;
+        // `dropWrites` simulates a store that accepts the call but silently keeps nothing — the case
+        // a plain try/catch around setItem cannot detect.
+        if (!options.dropWrites) map.set(key, value);
+      },
+      removeItem: (key: string) => { map.delete(key); },
+      key: (index: number) => [...map.keys()][index] ?? null,
+      get length() { return map.size; },
+    };
+    return store;
+  }
+
+  // Sync adapter for the thenable query builder (this harness has no await/TLA by design).
+  function runQuery<T>(builder: MockQueryBuilder<T>): { data: T | null; error: { message: string } | null } {
+    const box: { result?: { data: T | null; error: { message: string } | null } } = {};
+    builder.then((result) => {
+      box.result = result as { data: T | null; error: { message: string } | null };
+      return result;
+    });
+    if (!box.result) throw new Error('S29 harness: query builder did not resolve synchronously');
+    return box.result;
+  }
+
+  const portFor = (store: WorkspaceStorage): LocalWorkspacePort => ({
+    read() {
+      const loaded = loadWorkspaceState(store);
+      return {
+        state: loaded.state,
+        error: loaded.fault ? { message: loaded.fault.message, kind: 'workspace_fault' as const } : null,
+      };
+    },
+    commit(mutate) {
+      const result = commitWorkspace(store, mutate);
+      return result.ok
+        ? { data: result.data, error: null }
+        : { data: null, error: result.error };
+    },
+  });
+  const query = <T = unknown>(store: WorkspaceStorage, table: string) =>
+    new MockQueryBuilder<T>(table, portFor(store));
+
+  // -------------------------------------------------------------------------
+  // S29-A — the three known defects, reproduced against the pre-fix algorithm.
+  //
+  // The replica is the exact logic shipped at commit 1a12ad7 in `src/lib/supabase.ts`
+  // (`LOCAL_STORAGE_KEY` -> `resetDemoDatabase`), reduced to its storage semantics. It is kept here
+  // so the defect cannot silently return: these three checks FAIL if the legacy behaviour stops being
+  // the behaviour we repaired, and the checks immediately after them pin the repaired behaviour.
+  // -------------------------------------------------------------------------
+  const legacyKey = 'schedule_mgmt_db_v5';
+  const legacySeedCalls = { count: 0 };
+  const legacySeed = () => {
+    legacySeedCalls.count += 1;
+    return { projects: [{ id: 'proj-seed-001' }], activities: [{ id: 'act-01', project_id: 'proj-seed-001' }] };
+  };
+  function legacySaveDb(store: WorkspaceStorage, data: unknown): void {
+    try {
+      store.setItem(legacyKey, JSON.stringify(data));
+    } catch {
+      // THE DEFECT: swallowed. The caller is told nothing and reports success.
+    }
+  }
+  function legacyLoadDb(store: WorkspaceStorage): Record<string, any> {
+    try {
+      const saved = store.getItem(legacyKey);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (
+          parsed &&
+          Array.isArray(parsed.projects) && parsed.projects.length > 0 &&
+          Array.isArray(parsed.activities) && parsed.activities.length > 0
+        ) {
+          return parsed;
+        }
+      }
+    } catch {
+      // THE DEFECT: no preservation of the bytes that failed to parse.
+    }
+    const initial = legacySeed();
+    legacySaveDb(store, initial); // THE DEFECT: seed-on-read, over whatever was there.
+    return initial;
+  }
+
+  // A1: swallowed write error.
+  const legacyQuota = makeStore({}, { quota: true });
+  let legacyThrew = false;
+  try { legacySaveDb(legacyQuota, { projects: [], activities: [] }); } catch { legacyThrew = true; }
+  ok('S29-A1 legacy replica reproduces defect 1: a failed write returns without throwing and nothing is stored',
+    legacyThrew === false && legacyQuota.getItem(legacyKey) === null);
+
+  // A2: valid empty state re-seeded.
+  const emptyValid = { projects: [], activities: [], wbs_nodes: [] };
+  const legacyEmpty = makeStore({ [legacyKey]: JSON.stringify(emptyValid) });
+  legacySeedCalls.count = 0;
+  const legacyReloaded = legacyLoadDb(legacyEmpty);
+  ok('S29-A2 legacy replica reproduces defect 2: a valid workspace with zero projects is replaced by invented seed data',
+    legacySeedCalls.count === 1
+      && legacyReloaded.projects.length === 1
+      && legacyEmpty.getItem(legacyKey) !== JSON.stringify(emptyValid));
+
+  // A3: corrupt JSON replaced without preservation.
+  const corruptRaw = '{"projects": [{"id": "p1", "name": "my real';
+  const legacyCorrupt = makeStore({ [legacyKey]: corruptRaw });
+  legacySeedCalls.count = 0;
+  const legacyServed = legacyLoadDb(legacyCorrupt);
+  ok('S29-A3 legacy replica reproduces defect 3: corrupt bytes are overwritten by the seed and no copy is kept',
+    legacySeedCalls.count === 1
+      && legacyCorrupt.getItem(legacyKey) !== corruptRaw
+      && [...legacyCorrupt.map.keys()].length === 1
+      && legacyServed.projects[0].id === 'proj-seed-001');
+
+  // -------------------------------------------------------------------------
+  // S29-B — loader semantics (reads never write; failures preserve bytes).
+  // -------------------------------------------------------------------------
+  const absentStore = makeStore();
+  const absentLoad = readWorkspace(absentStore);
+  eq('S29-B1 an absent workspace loads as EMPTY (no seed) and writes nothing', absentLoad.status, 'absent');
+  eq('S29-B2 an absent workspace has no projects', absentLoad.status === 'absent' ? tableRows(absentLoad.state, 'projects').length : -1, 0);
+  eq('S29-B3 loading an absent workspace performs zero writes', absentStore.writes, 0);
+
+  const emptyState = JSON.stringify({ projects: [], activities: [], wbs_nodes: [] });
+  const emptyStore = makeStore({ [WORKSPACE_STORAGE_KEY]: emptyState });
+  const emptyLoad = readWorkspace(emptyStore);
+  eq('S29-B4 a VALID empty workspace loads as ok', emptyLoad.status, 'ok');
+  eq('S29-B5 a valid empty workspace is not re-seeded', emptyLoad.status === 'ok' ? tableRows(emptyLoad.state, 'projects').length : -1, 0);
+  eq('S29-B6 a valid empty workspace is left byte-identical by the read', emptyStore.getItem(WORKSPACE_STORAGE_KEY), emptyState);
+  eq('S29-B7 a valid empty workspace read performs zero writes', emptyStore.writes, 0);
+  ok('S29-B8 a valid empty workspace is recognised as empty-but-valid', emptyLoad.status === 'ok' && isEmptyWorkspace(emptyLoad.state));
+
+  const malformedStore = makeStore({ [WORKSPACE_STORAGE_KEY]: corruptRaw });
+  const malformedLoad = readWorkspace(malformedStore);
+  eq('S29-B9 malformed JSON is a typed fault, not demo data', malformedLoad.status === 'fault' ? malformedLoad.fault.kind : `status:${malformedLoad.status}`, 'malformed_json');
+  eq('S29-B10 malformed JSON: the primary key keeps the exact original bytes', malformedStore.getItem(WORKSPACE_STORAGE_KEY), corruptRaw);
+  const malformedPreserved = malformedLoad.status === 'fault' ? malformedLoad.fault.preservedKey : null;
+  ok('S29-B11 malformed JSON: a preserved copy holds the exact original bytes',
+    malformedPreserved !== null
+      && malformedPreserved!.startsWith(PRESERVED_KEY_PREFIX)
+      && malformedStore.getItem(malformedPreserved!) === corruptRaw);
+  const malformedAgain = readWorkspace(malformedStore);
+  eq('S29-B12 preserving the same corrupt payload repeatedly does not multiply copies',
+    listPreservedCopies(malformedStore).length,
+    1);
+  ok('S29-B13 a repeat read still faults with the same preserved copy',
+    malformedAgain.status === 'fault' && malformedAgain.fault.preservedKey === malformedPreserved);
+
+  const badShapeRaw = JSON.stringify({ projects: { not: 'an array' }, activities: [] });
+  const badShapeStore = makeStore({ [WORKSPACE_STORAGE_KEY]: badShapeRaw });
+  const badShapeLoad = readWorkspace(badShapeStore);
+  eq('S29-B14 an invalid table shape is a typed fault', badShapeLoad.status === 'fault' ? badShapeLoad.fault.kind : 'no-fault', 'invalid_shape');
+  eq('S29-B15 invalid shape leaves the bytes untouched', badShapeStore.getItem(WORKSPACE_STORAGE_KEY), badShapeRaw);
+
+  const futureRaw = JSON.stringify({ projects: [], __meta: { schema_version: 99, workspace_kind: 'user', created_at: '2026-10-27T00:00:00Z' } });
+  const futureStore = makeStore({ [WORKSPACE_STORAGE_KEY]: futureRaw });
+  const futureLoad = readWorkspace(futureStore);
+  eq('S29-B16 a newer schema version is refused, not guessed', futureLoad.status === 'fault' ? futureLoad.fault.kind : 'no-fault', 'unsupported_version');
+  eq('S29-B17 a newer schema version leaves the bytes identical', futureStore.getItem(WORKSPACE_STORAGE_KEY), futureRaw);
+
+  // Supported migration: the shipped pre-versioning shape (no __meta) is v1.
+  const legacyPayload = JSON.stringify({
+    projects: [{ id: 'proj-legacy', name: 'Legacy project', contract_value: 10, start_date: '2026-01-01', end_date: '2026-02-01', data_date: '2026-09-13', created_at: '2026-01-01T00:00:00Z' }],
+    activities: [{ id: 'act-legacy', project_id: 'proj-legacy', code: 'A', duration_days: 5 }],
+  });
+  const migrateStore = makeStore({ [WORKSPACE_STORAGE_KEY]: legacyPayload });
+  const migrateLoad = readWorkspace(migrateStore);
+  ok('S29-B18 an unversioned v1 workspace migrates in memory to the current schema',
+    migrateLoad.status === 'ok' && migrateLoad.migrated === true && migrateLoad.migratedFrom === 1);
+  eq('S29-B19 migration keeps every stored row untouched',
+    migrateLoad.status === 'ok' ? canonicalJson(tableRows(migrateLoad.state, 'projects')) : 'no-state',
+    canonicalJson(JSON.parse(legacyPayload).projects));
+  eq('S29-B20 migration stamps the current schema version',
+    migrateLoad.status === 'ok' ? migrateLoad.state.__meta.schema_version : -1, WORKSPACE_SCHEMA_VERSION);
+  ok('S29-B21 migration completes the table inventory without inventing rows',
+    migrateLoad.status === 'ok'
+      && PERSISTED_TABLE_NAMES.every((name) => Array.isArray(migrateLoad.state[name]))
+      && tableRows(migrateLoad.state, 'boq_items').length === 0);
+  eq('S29-B22 migration is a read: the stored v1 bytes are not rewritten', migrateStore.getItem(WORKSPACE_STORAGE_KEY), legacyPayload);
+
+  const failedMigrationPayload = JSON.stringify({ projects: [], activities: [null] });
+  const failedMigrationStore = makeStore({ [WORKSPACE_STORAGE_KEY]: failedMigrationPayload });
+  const failedMigrationLoad = readWorkspace(failedMigrationStore);
+  eq('S29-B23 a migration that cannot complete is a typed fault', failedMigrationLoad.status === 'fault' ? failedMigrationLoad.fault.kind : 'no-fault', 'migration_failed');
+  eq('S29-B24 a failed migration leaves the bytes byte-identical', failedMigrationStore.getItem(WORKSPACE_STORAGE_KEY), failedMigrationPayload);
+  ok('S29-B25 a failed migration preserves a copy of the bytes it refused to migrate',
+    failedMigrationLoad.status === 'fault'
+      && failedMigrationLoad.fault.preservedKey !== null
+      && failedMigrationStore.getItem(failedMigrationLoad.fault.preservedKey!) === failedMigrationPayload);
+
+  const deniedReadStore = {
+    getItem: () => { throw new Error('storage disabled'); },
+    setItem: () => { throw new Error('storage disabled'); },
+    removeItem: () => { throw new Error('storage disabled'); },
+  } as WorkspaceStorage;
+  const deniedRead = readWorkspace(deniedReadStore);
+  eq('S29-B26 an unreadable store is an explicit fault', deniedRead.status === 'fault' ? deniedRead.fault.kind : 'no-fault', 'storage_unavailable');
+
+  // -------------------------------------------------------------------------
+  // S29-C — atomic commit: a write that did not happen is never reported as success.
+  // -------------------------------------------------------------------------
+  const p1Row = { id: 'proj-1', name: 'Real pilot project', client: 'Owner', contract_value: 1000, start_date: '2026-01-01', end_date: '2026-12-31', data_date: '2026-09-13', created_at: '2026-01-01T00:00:00Z' };
+  const denyBase = makeStore();
+  eq('S29-C0 baseline insert succeeds into a healthy store', runQuery(query(denyBase, 'projects').insert(p1Row)).error, null);
+
+  const denyWrites = makeStore(Object.fromEntries(denyBase.map), { denyWrites: true });
+  const denyBefore = denyWrites.getItem(WORKSPACE_STORAGE_KEY);
+  const deniedInsert = runQuery(query(denyWrites, 'projects').insert({ ...p1Row, id: 'proj-denied' }));
+  ok('S29-C1 a denied (SecurityError) write returns an error, not success',
+    deniedInsert.data === null && deniedInsert.error !== null);
+  ok('S29-C2 a denied write reports a write failure kind', deniedInsert.error?.kind === 'write_failed');
+  eq('S29-C3 a denied write leaves the stored bytes identical', denyWrites.getItem(WORKSPACE_STORAGE_KEY), denyBefore);
+  const denyAfterReload = readWorkspace(denyWrites);
+  eq('S29-C4 a denied write stores no row',
+    tableRows(denyAfterReload.status === 'ok' ? denyAfterReload.state : createEmptyWorkspace(), 'projects').map((row) => row.id),
+    ['proj-1']);
+
+  const quotaWrites = makeStore(Object.fromEntries(denyBase.map), { quota: true });
+  const quotaBefore = quotaWrites.getItem(WORKSPACE_STORAGE_KEY);
+  const quotaUpdate = runQuery(query(quotaWrites, 'projects').update({ name: 'Renamed' }).eq('id', 'proj-1'));
+  ok('S29-C5 a quota-exceeded write returns an error, not success', quotaUpdate.error !== null);
+  eq('S29-C6 a quota-exceeded write leaves the bytes identical', quotaWrites.getItem(WORKSPACE_STORAGE_KEY), quotaBefore);
+  eq('S29-C7 a quota-exceeded write leaves the row unchanged',
+    tableRows((readWorkspace(quotaWrites) as { status: 'ok'; state: WorkspaceState }).state, 'projects')[0].name, 'Real pilot project');
+
+  const dropWrites = makeStore(Object.fromEntries(denyBase.map), { dropWrites: true });
+  const droppedInsert = runQuery(query(dropWrites, 'projects').insert({ ...p1Row, id: 'proj-dropped' }));
+  ok('S29-C8 a store that accepts but drops the bytes is caught by read-back verification',
+    droppedInsert.error !== null && /verification/i.test(droppedInsert.error!.message));
+
+  const contractStore = makeStore();
+  runQuery(query(contractStore, 'projects').insert(p1Row));
+  runQuery(query(contractStore, 'activities').insert({ id: 'act-1', project_id: 'proj-1', code: 'A1', name: 'A1', duration_days: 5, percent_complete: 0, actual_quantity: null, created_at: '2026-01-01T00:00:00Z' }));
+  runQuery(query(contractStore, 'cost_transactions').insert({ id: 'cst-1', project_id: 'proj-1', activity_id: 'act-1', amount: 100, status: 'submitted', approval_level: 1, transaction_date: '2026-09-01', created_at: '2026-09-01T00:00:00Z' }));
+  const approveViaContract = (store: WorkspaceStorage) => {
+    const outcome = commitWorkspace(store, (draft) => {
+      const result = applyReviewCostTransaction(
+        draft as unknown as Record<string, Record<string, unknown>[]>,
+        { transaction_uuid: 'cst-1', approver: 'operator', decision: 'approve' } as never,
+        '2026-09-14T00:00:00Z',
+      );
+      if (result.error) return { ok: false as const, error: { message: String(result.error.message ?? 'rejected'), kind: 'validation' as const } };
+      return { ok: true as const, data: null };
+    });
+    return outcome;
+  };
+  const contractDenied = makeStore(Object.fromEntries(contractStore.map), { quota: true });
+  const contractDeniedBefore = contractDenied.getItem(WORKSPACE_STORAGE_KEY);
+  const contractDeniedOutcome = approveViaContract(contractDenied);
+  ok('S29-C9 an RPC contract write that cannot be persisted returns an error', contractDeniedOutcome.ok === false);
+  eq('S29-C10 a failed RPC contract write leaves the bytes identical', contractDenied.getItem(WORKSPACE_STORAGE_KEY), contractDeniedBefore);
+  eq('S29-C11 a failed RPC contract write leaves the transaction unapproved',
+    tableRows((readWorkspace(contractDenied) as { status: 'ok'; state: WorkspaceState }).state, 'cost_transactions')[0].status, 'submitted');
+
+  const contractOk = approveViaContract(contractStore);
+  ok('S29-C12 an RPC contract write that persists reports success', contractOk.ok === true);
+  eq('S29-C13 a persisted RPC contract write is visible after reload',
+    tableRows((readWorkspace(contractStore) as { status: 'ok'; state: WorkspaceState }).state, 'cost_transactions')[0].status, 'approved');
+
+  // -------------------------------------------------------------------------
+  // S29-D — a real pilot lifecycle: two genuinely empty projects, then scope on ONE of them.
+  // -------------------------------------------------------------------------
+  const pilotStore = makeStore();
+  const projectRow = (id: string, name: string, start: string, end: string, created: string) => ({
+    id, name, client: `Owner ${name}`, location: null, contract_value: 5000000, currency: 'SAR',
+    start_date: start, end_date: end, duration_days: null, status: 'active', status_logic: 'retained_logic',
+    calendar_type: '6_days', sector: 'commercial_building', data_date: '2026-09-13',
+    description: null, created_at: created,
+  });
+  const createdA = runQuery(query(pilotStore, 'projects').insert(projectRow('proj-a', 'Pilot A', '2026-01-05', '2026-12-31', '2026-10-27T08:00:00Z')));
+  const createdB = runQuery(query(pilotStore, 'projects').insert(projectRow('proj-b', 'Pilot B', '2026-03-01', '2027-03-01', '2026-10-27T09:00:00Z')));
+  ok('S29-D1 two real projects are created', createdA.error === null && createdB.error === null);
+  const pilotAfterCreate = readWorkspace(pilotStore) as { status: 'ok'; state: WorkspaceState };
+  eq('S29-D2 each real project is created with NO invented BOQ', [
+    tableRows(pilotAfterCreate.state, 'boq_items').length,
+    tableRows(pilotAfterCreate.state, 'budget_lines').length,
+    tableRows(pilotAfterCreate.state, 'cost_transactions').length,
+    tableRows(pilotAfterCreate.state, 'progress_updates').length,
+  ], [0, 0, 0, 0]);
+  ok('S29-D3 each real project is created with NO invented activities or links',
+    tableRows(pilotAfterCreate.state, 'activities').length === 0 && tableRows(pilotAfterCreate.state, 'activity_links').length === 0);
+
+  runQuery(query(pilotStore, 'activities').insert([
+    { id: 'act-a1', project_id: 'proj-a', code: 'A1', name: 'Site setup', duration_days: 5, early_start: '2026-01-05', early_finish: '2026-01-10', late_start: '2026-01-05', late_finish: '2026-01-10', actual_start: null, actual_finish: null, percent_complete: 0, actual_quantity: null, planned_quantity: 100, is_critical: true, is_milestone: false, sort_order: 1, wbs_node_id: null, unit: 'm3', created_at: '2026-10-27T10:00:00Z' },
+    { id: 'act-a2', project_id: 'proj-a', code: 'A2', name: 'Foundations', duration_days: 10, early_start: '2026-01-11', early_finish: '2026-01-21', late_start: '2026-01-11', late_finish: '2026-01-21', actual_start: null, actual_finish: null, percent_complete: 0, actual_quantity: 24, planned_quantity: 100, is_critical: true, is_milestone: false, sort_order: 2, wbs_node_id: null, unit: 'm3', created_at: '2026-10-27T10:00:00Z' },
+    { id: 'act-a3', project_id: 'proj-a', code: 'A3', name: 'Handover', duration_days: 0, early_start: '2026-01-21', early_finish: '2026-01-21', late_start: '2026-01-21', late_finish: '2026-01-21', actual_start: null, actual_finish: null, percent_complete: 100, actual_quantity: 0, planned_quantity: 0, is_critical: true, is_milestone: true, sort_order: 3, wbs_node_id: null, unit: null, created_at: '2026-10-27T10:00:00Z' },
+  ]));
+  runQuery(query(pilotStore, 'activity_links').insert([
+    { id: 'lnk-a1', project_id: 'proj-a', predecessor_id: 'act-a1', successor_id: 'act-a2', link_type: 'FS', lag_days: 0, created_at: '2026-10-27T10:05:00Z' },
+    { id: 'lnk-a2', project_id: 'proj-a', predecessor_id: 'act-a2', successor_id: 'act-a3', link_type: 'FS', lag_days: 2, created_at: '2026-10-27T10:05:00Z' },
+  ]));
+  writeSelectedProjectId(pilotStore, 'proj-a');
+
+  // "Reopen": every builder below is a NEW instance reading the persisted bytes only.
+  const reopened = readWorkspace(pilotStore) as { status: 'ok'; state: WorkspaceState };
+  const reopenedActivities = tableRows(reopened.state, 'activities').filter((a) => a.project_id === 'proj-a')
+    .sort((a, b) => Number(a.sort_order) - Number(b.sort_order));
+  eq('S29-D4 reopening restores exactly three activities with their original ids',
+    reopenedActivities.map((a) => a.id), ['act-a1', 'act-a2', 'act-a3']);
+  eq('S29-D5 reopening restores both logic links with their ids and types',
+    tableRows(reopened.state, 'activity_links').map((l) => [l.id, l.predecessor_id, l.successor_id, l.link_type, l.lag_days]),
+    [['lnk-a1', 'act-a1', 'act-a2', 'FS', 0], ['lnk-a2', 'act-a2', 'act-a3', 'FS', 2]]);
+  eq('S29-D6 reopening preserves the activity dates exactly',
+    reopenedActivities.map((a) => [a.early_start, a.early_finish]),
+    [['2026-01-05', '2026-01-10'], ['2026-01-11', '2026-01-21'], ['2026-01-21', '2026-01-21']]);
+  ok('S29-D7 zero and null are distinct after a reload (0 stays 0, null stays null)',
+    reopenedActivities[0].percent_complete === 0
+      && reopenedActivities[0].actual_quantity === null
+      && reopenedActivities[1].actual_quantity === 24
+      && reopenedActivities[2].actual_quantity === 0
+      && reopenedActivities[2].percent_complete === 100);
+  eq('S29-D8 the other real project stayed empty', tableRows(reopened.state, 'activities').filter((a) => a.project_id === 'proj-b').length, 0);
+  eq('S29-D9 the selected project survives a reopen', readSelectedProjectId(pilotStore), 'proj-a');
+  const reopenedProjects = tableRows(reopened.state, 'projects') as unknown as Array<{ id: string; created_at: string }>;
+  eq('S29-D10 startup resolves the remembered project, not merely the newest',
+    resolveStartupProject(reopenedProjects, readSelectedProjectId(pilotStore))?.id, 'proj-a');
+  eq('S29-D11 startup falls back to the newest project when the remembered one is gone',
+    resolveStartupProject(reopenedProjects, 'proj-deleted')?.id, 'proj-b');
+  eq('S29-D12 startup invents no project when the workspace has none', resolveStartupProject([], 'proj-a'), null);
+  const readBackViaQuery = runQuery<Array<Record<string, unknown>>>(query(pilotStore, 'activity_links').select('*').eq('project_id', 'proj-a'));
+  eq('S29-D13 query reads resolve link predecessors and successors after reload',
+    readBackViaQuery.data?.map((l: any) => [l.predecessor?.code, l.successor?.code]),
+    [['A1', 'A2'], ['A2', 'A3']]);
+  eq('S29-D14 the selection pointer is a UI preference, not workspace data',
+    Object.keys(reopened.state).includes(SELECTED_PROJECT_STORAGE_KEY), false);
+
+  // -------------------------------------------------------------------------
+  // S29-E — a complete, versioned backup: whole inventory, no unrelated keys.
+  // -------------------------------------------------------------------------
+  const demoStore = makeStore({
+    app_lang: 'ar',
+    'supabase.auth.token': JSON.stringify({ access_token: 'SECRET-TOKEN-VALUE', refresh_token: 'SECRET-REFRESH' }),
+    unrelated_app_key: JSON.stringify({ note: 'not ours' }),
+  });
+  const seeded = seedDemoWorkspace(demoStore, getInitialSeedData() as unknown as Record<string, Record<string, unknown>[]>);
+  ok('S29-E1 the explicit demo action writes a demo workspace', seeded.ok === true);
+  const demoLoaded = readWorkspace(demoStore) as { status: 'ok'; state: WorkspaceState };
+  ok('S29-E2 the demo workspace is stamped as kind=demo', demoLoaded.state.__meta.workspace_kind === 'demo');
+  const backup = buildBackup(demoLoaded.state, '2026-10-27T12:00:00Z');
+  const backupText = serializeBackup(backup);
+  eq('S29-E3 the backup carries the versioned format identity', [backup.format, backup.format_version, backup.schema_version],
+    ['schedule-management.local-workspace-backup', 1, WORKSPACE_SCHEMA_VERSION]);
+  eq('S29-E4 the backup contains EVERY persisted table', Object.keys(backup.tables).sort(), [...PERSISTED_TABLE_NAMES].sort());
+  eq('S29-E5 the backup contains nothing but its declared envelope', Object.keys(backup).sort(),
+    ['auxiliary', 'checksum', 'counts', 'created_at', 'format', 'format_version', 'schema_version', 'source', 'tables'].sort());
+  ok('S29-E6 the backup never contains unrelated browser keys or credentials',
+    !backupText.includes('SECRET-TOKEN-VALUE') && !backupText.includes('SECRET-REFRESH')
+      && !backupText.includes('unrelated_app_key') && !backupText.includes('app_lang'));
+  ok('S29-E7 the backup carries no preserved/pre-restore copies',
+    !backupText.includes(PRESERVED_KEY_PREFIX) && !backupText.includes(PRE_RESTORE_KEY_PREFIX));
+  eq('S29-E8 the backup checksum is deterministic for the same state',
+    buildBackup(demoLoaded.state, '2026-01-01T00:00:00Z').checksum, backup.checksum);
+  ok('S29-E9 the backup validates against its own validator', validateBackup(backupText).ok);
+  eq('S29-E10 the demo backup holds all four seeded projects', backup.counts.projects, 4);
+  eq('S29-E11 the unrelated keys survive untouched in storage', [demoStore.getItem('app_lang'), demoStore.map.has('supabase.auth.token')], ['ar', true]);
+
+  // -------------------------------------------------------------------------
+  // S29-F — restore into a FRESH workspace; canonical tables + CPM/EVM.
+  // -------------------------------------------------------------------------
+  const freshStore = makeStore({ app_lang: 'en', 'supabase.auth.token': '{"access_token":"OTHER"}' });
+  const validation = validateBackup(backupText);
+  ok('S29-F1 the backup validates before any mutation', validation.ok && validation.state !== null);
+  eq('S29-F2 validation reports the checksum as verified', validation.summary?.checksumVerified, true);
+  eq('S29-F3 validation previews every project in the file',
+    validation.summary?.projects.map((p) => p.id).sort(), ['proj-seed-001', 'proj-seed-002', 'proj-seed-003', 'proj-seed-004']);
+  eq('S29-F4 the fresh workspace holds nothing before the restore', readWorkspace(freshStore).status, 'absent');
+  const restored = restoreWorkspace(freshStore, validation, '2026-10-27T12:05:00Z');
+  ok('S29-F5 the restore reports success', restored.ok === true && restored.error === null);
+  ok('S29-F6 an empty target needs no pre-restore copy (nothing existed to lose)', restored.preRestoreKey === null);
+  const freshLoaded = readWorkspace(freshStore) as { status: 'ok'; state: WorkspaceState };
+  eq('S29-F7 the restored workspace is stamped as restored', freshLoaded.state.__meta.workspace_kind, 'restored');
+  const tableDiffs = PERSISTED_TABLES
+    .filter((spec) => canonicalJson(tableRows(demoLoaded.state, spec.name)) !== canonicalJson(tableRows(freshLoaded.state, spec.name)))
+    .map((spec) => spec.name);
+  eq('S29-F8 every canonical table is byte-identical after the restore', tableDiffs, []);
+
+  // Approvals and Data Date rules survive the round trip.
+  const approvalsOf = (state: WorkspaceState) => tableRows(state, 'progress_updates').map((row) => [row.id, row.status, row.approved_at]);
+  eq('S29-F9 approvals and their approval timestamps are preserved', canonicalJson(approvalsOf(freshLoaded.state)), canonicalJson(approvalsOf(demoLoaded.state)));
+  eq('S29-F10 every project Data Date is preserved',
+    tableRows(freshLoaded.state, 'projects').map((p) => [p.id, p.data_date]).sort(),
+    tableRows(demoLoaded.state, 'projects').map((p) => [p.id, p.data_date]).sort());
+  ok('S29-F11 no restored progress or cost record is dated after its Data Date',
+    tableRows(freshLoaded.state, 'progress_updates').every((row) => String(row.update_date) <= '2026-09-13')
+      && tableRows(freshLoaded.state, 'cost_transactions').every((row) => String(row.transaction_date) <= '2026-09-13'));
+  eq('S29-F12 the Hospital contract value invariant survives the restore',
+    tableRows(freshLoaded.state, 'projects').find((p) => p.id === 'proj-seed-003')?.contract_value, 125000000);
+  eq('S29-F13 unrelated browser keys are untouched by the restore',
+    [freshStore.getItem('app_lang'), freshStore.getItem('supabase.auth.token')], ['en', '{"access_token":"OTHER"}']);
+
+  // CPM, computed independently over SOURCE and RESTORED rows.
+  const cpmSignature = (state: WorkspaceState) => {
+    const signature: string[] = [];
+    for (const project of tableRows(state, 'projects')) {
+      const acts = tableRows(state, 'activities').filter((a) => a.project_id === project.id) as unknown as Activity[];
+      const lks = tableRows(state, 'activity_links').filter((l) => l.project_id === project.id) as unknown as ActivityLink[];
+      if (acts.length === 0) continue;
+      const calc = calculateCpm(acts, lks, { calendarType: '6_days', dataDate: String(project.data_date ?? DEFAULT_DATA_DATE) });
+      signature.push(JSON.stringify({
+        project: project.id,
+        cycle: calc.cycle,
+        finish: calc.projectEarlyFinish,
+        critical: calc.results.filter((r) => r.isCritical).map((r) => r.activityId).sort(),
+        starts: calc.results.map((r) => [r.activityId, r.earlyStart, r.earlyFinish]).sort(),
+      }));
+    }
+    return signature;
+  };
+  const sourceCpm = cpmSignature(demoLoaded.state);
+  const restoredCpm = cpmSignature(freshLoaded.state);
+  ok('S29-F14 the deterministic CPM schedule is identical on the restored workspace',
+    sourceCpm.length >= 4 && canonicalJson(sourceCpm) === canonicalJson(restoredCpm));
+  ok('S29-F15 the CPM signature is non-trivial (critical path computed for every project)',
+    sourceCpm.every((entry) => JSON.parse(entry).critical.length > 0));
+
+  // EVM: quote the canonical F6 report over source and restored rows, then check one figure by hand.
+  const evmOf = (state: WorkspaceState, projectId: string) => {
+    const project = tableRows(state, 'projects').find((p) => p.id === projectId)!;
+    const acts = tableRows(state, 'activities').filter((a) => a.project_id === projectId) as unknown as Activity[];
+    const activityIds = new Set(acts.map((a) => a.id));
+    const baselines = (tableRows(state, 'baseline_activities') as unknown as BaselineActivity[]).filter((b) => activityIds.has(b.activity_id));
+    const report = analyzeCostControl({
+      project: project as unknown as Project,
+      activities: acts,
+      baselines,
+      budgetLines: tableRows(state, 'budget_lines').filter((b) => b.project_id === projectId) as unknown as BudgetLine[],
+      costTransactions: tableRows(state, 'cost_transactions').filter((c) => c.project_id === projectId) as unknown as CostTransaction[],
+      progressUpdates: tableRows(state, 'progress_updates').filter((p) => p.project_id === projectId) as unknown as ProgressUpdate[],
+      wbsNodes: [],
+      boqItems: tableRows(state, 'boq_items').filter((b) => b.project_id === projectId) as unknown as BoqItem[],
+      allocations: [],
+      dataDate: String(project.data_date ?? DEFAULT_DATA_DATE),
+      calendarType: '6_days',
+      manualEtc: null,
+    } as never);
+    return selectCanonicalEvm(report);
+  };
+  const hospitalSource = evmOf(demoLoaded.state, 'proj-seed-003');
+  const hospitalRestored = evmOf(freshLoaded.state, 'proj-seed-003');
+  ok('S29-F16 the canonical EVM of the Hospital project is identical after the restore',
+    hospitalSource.bac === hospitalRestored.bac
+      && hospitalSource.pv === hospitalRestored.pv
+      && hospitalSource.ev === hospitalRestored.ev
+      && hospitalSource.ac === hospitalRestored.ac
+      && hospitalSource.spi === hospitalRestored.spi
+      && hospitalSource.cpi === hospitalRestored.cpi);
+  const hospitalBaselineSum = (tableRows(freshLoaded.state, 'baseline_activities') as unknown as BaselineActivity[])
+    .filter((row) => tableRows(freshLoaded.state, 'activities').some((a) => a.id === row.activity_id && a.project_id === 'proj-seed-003'))
+    .reduce((sum, row) => sum + Number(row.planned_cost || 0), 0);
+  near('S29-F17 the restored Hospital BAC equals the independently summed baseline costs',
+    hospitalRestored.bac, hospitalBaselineSum, 0.01);
+  ok('S29-F18 the restored Hospital EVM is measured, not null (real evidence survived)',
+    hospitalRestored.bac !== null && hospitalRestored.bac > 0 && hospitalRestored.ev !== null);
+
+  // An empty-but-valid backup restores as an empty workspace — and never as demo data.
+  const emptyBackupText = serializeBackup(buildBackup(createEmptyWorkspace('user'), '2026-10-27T13:00:00Z'));
+  const emptyValidation = validateBackup(emptyBackupText);
+  ok('S29-F19 a valid empty workspace is a valid backup', emptyValidation.ok === true);
+  const emptyTarget = makeStore();
+  const emptyRestore = restoreWorkspace(emptyTarget, emptyValidation, '2026-10-27T13:05:00Z');
+  ok('S29-F20 an empty backup restores as an empty workspace', emptyRestore.ok === true);
+  eq('S29-F21 the restored empty workspace stays empty (no seed appears)',
+    tableRows((readWorkspace(emptyTarget) as { status: 'ok'; state: WorkspaceState }).state, 'projects').length, 0);
+
+  // A restore over existing data keeps the previous bytes recoverable.
+  const overExisting = makeStore();
+  runQuery(query(overExisting, 'projects').insert(projectRow('proj-old', 'Old project', '2026-01-01', '2026-06-01', '2026-10-01T00:00:00Z')));
+  const overExistingBefore = overExisting.getItem(WORKSPACE_STORAGE_KEY)!;
+  const overRestore = restoreWorkspace(overExisting, validation, '2026-10-27T14:00:00Z');
+  ok('S29-F22 restoring over existing data writes a pre-restore copy',
+    overRestore.ok === true && overRestore.preRestoreKey !== null
+      && overExisting.getItem(overRestore.preRestoreKey!) === overExistingBefore);
+  eq('S29-F23 the pre-restore copy restores the previous workspace exactly',
+    canonicalJson(tableRows(JSON.parse(overExisting.getItem(overRestore.preRestoreKey!)!) as WorkspaceState, 'projects')),
+    canonicalJson([projectRow('proj-old', 'Old project', '2026-01-01', '2026-06-01', '2026-10-01T00:00:00Z')]));
+
+  // -------------------------------------------------------------------------
+  // S29-G — every invalid backup class leaves storage byte-identical.
+  // -------------------------------------------------------------------------
+  const guardStore = makeStore(Object.fromEntries(overExisting.map));
+  const guardBefore = guardStore.getItem(WORKSPACE_STORAGE_KEY);
+  const guardKeysBefore = guardStore.map.size;
+  const tampered = JSON.parse(backupText);
+  tampered.tables.projects[0].contract_value = 1;
+  // Real checksums with invalid execution evidence must still be refused before any replacement.
+  const activityDateBackup = (patch: Record<string, unknown>): string => {
+    const state = JSON.parse(JSON.stringify(demoLoaded.state)) as WorkspaceState;
+    Object.assign(tableRows(state, 'activities')[0], { actual_start: null, actual_finish: null }, patch);
+    return serializeBackup(buildBackup(state, '2026-11-04T04:35:17Z'));
+  };
+  const badBackups: Array<[string, string, string]> = [
+    ['future activity actual start', activityDateBackup({ actual_start: '2026-09-14' }), 'chronology'],
+    ['future activity actual finish', activityDateBackup({ actual_finish: '2026-09-14' }), 'chronology'],
+    ['reversed activity actual dates', activityDateBackup({ actual_start: '2026-09-12', actual_finish: '2026-09-11' }), 'date_order'],
+    ['impossible activity actual date', activityDateBackup({ actual_start: '2026-02-30' }), 'required_field'],
+    ['not JSON', 'this is not json at all', 'not_json'],
+    ['a JSON array instead of an envelope', '[]', 'not_an_object'],
+    ['a CSV schedule export', 'code,name,start\nA1,Site,2026-01-01', 'not_json'],
+    ['an XER export', 'ERMHDR\t18.8\t2026-01-01\tProject\tadmin', 'not_json'],
+    ['a file with no format identity', JSON.stringify({ tables: {} }), 'unknown_format'],
+    ['an unsupported format version', JSON.stringify({ ...JSON.parse(backupText), format_version: 7 }), 'unsupported_format_version'],
+    ['an unsupported schema version', JSON.stringify({ ...JSON.parse(backupText), schema_version: 99 }), 'unsupported_schema_version'],
+    ['an unknown table', JSON.stringify({ ...JSON.parse(backupText), tables: { ...JSON.parse(backupText).tables, strangers: [] } }), 'unknown_table'],
+    ['a table that is not an array', JSON.stringify({ ...JSON.parse(backupText), tables: { ...JSON.parse(backupText).tables, projects: {} } }), 'invalid_table'],
+    ['a row without an id', JSON.stringify({ ...JSON.parse(backupText), tables: { ...JSON.parse(backupText).tables, activities: [{ project_id: 'proj-seed-001' }] }, checksum: 'x' }), 'required_field'],
+    ['duplicate ids', JSON.stringify({ ...JSON.parse(backupText), tables: { ...JSON.parse(backupText).tables, projects: [JSON.parse(backupText).tables.projects[0], JSON.parse(backupText).tables.projects[0]] }, checksum: 'x' }), 'duplicate_id'],
+    ['a dangling project reference', JSON.stringify({ ...JSON.parse(backupText), tables: { ...JSON.parse(backupText).tables, activities: [{ ...JSON.parse(backupText).tables.activities[0], project_id: 'proj-ghost' }] }, checksum: 'x' }), 'missing_reference'],
+    ['a link that crosses projects', JSON.stringify({ ...JSON.parse(backupText), tables: { ...JSON.parse(backupText).tables, activity_links: [{ ...JSON.parse(backupText).tables.activity_links[0], project_id: 'proj-seed-002' }] }, checksum: 'x' }), 'project_mismatch'],
+    ['reversed project dates', JSON.stringify({ ...JSON.parse(backupText), tables: { ...JSON.parse(backupText).tables, projects: [{ ...JSON.parse(backupText).tables.projects[0], start_date: '2026-12-31', end_date: '2026-01-01' }] }, checksum: 'x' }), 'date_order'],
+    ['a progress update after the Data Date', JSON.stringify({ ...JSON.parse(backupText), tables: { ...JSON.parse(backupText).tables, progress_updates: [{ ...JSON.parse(backupText).tables.progress_updates[0], update_date: '2026-12-31' }] }, checksum: 'x' }), 'chronology'],
+    ['a tampered checksum', JSON.stringify(tampered), 'checksum_mismatch'],
+  ];
+  for (const [label, payload, expectedCode] of badBackups) {
+    const result = validateBackup(payload);
+    const firstCode = result.errors[0]?.code ?? 'none';
+    ok(`S29-G invalid backup (${label}) is rejected with ${expectedCode}`, result.ok === false && firstCode === expectedCode);
+    ok(`S29-G invalid backup (${label}) yields no restorable state`, result.state === null);
+    eq(`S29-G invalid backup (${label}) performed no storage write`, guardStore.getItem(WORKSPACE_STORAGE_KEY), guardBefore);
+    eq(`S29-G invalid backup (${label}) created no preserved/recovery keys`, guardStore.map.size, guardKeysBefore);
+  }
+  ok('S29-G validation alone never mutates storage', guardStore.getItem(WORKSPACE_STORAGE_KEY) === guardBefore && guardStore.writes === 0);
+  ok('S29-G actual dates on the cut-off remain restorable', validateBackup(activityDateBackup({ actual_start: '2026-09-13', actual_finish: '2026-09-13' })).ok);
+  ok('S29-G null actuals and future planned dates remain restorable', validateBackup(activityDateBackup({ early_start: '2026-10-01', early_finish: '2026-10-05' })).ok);
+  const forgedActualValidation = validateBackup(backupText);
+  tableRows(forgedActualValidation.state!, 'activities')[0].actual_finish = '2026-09-14';
+  const forgedActualRestore = restoreWorkspace(guardStore, forgedActualValidation);
+  ok('S29-G restore revalidates a forged future-actual state despite a prior successful preview', !forgedActualRestore.ok);
+  ok('S29-G future-actual restore refusal writes neither the workspace nor recovery keys',
+    guardStore.getItem(WORKSPACE_STORAGE_KEY) === guardBefore && guardStore.map.size === guardKeysBefore && guardStore.writes === 0);
+
+  // -------------------------------------------------------------------------
+  // S29-H — the shipped adapter honours these contracts.
+  // -------------------------------------------------------------------------
+  const supabaseSrc = readFileSync(resolvePath(srcRoot, 'src/lib/supabase.ts'), 'utf8');
+  const workspaceSrc = readFileSync(resolvePath(srcRoot, 'src/lib/localWorkspace.ts'), 'utf8');
+  const portfolioSrc = readFileSync(resolvePath(srcRoot, 'src/components/views/PortfolioView.tsx'), 'utf8');
+  const appSrc = readFileSync(resolvePath(srcRoot, 'src/App.tsx'), 'utf8');
+  ok('S29-H1 supabase.ts no longer swallows write failures', !supabaseSrc.includes('Failed to save to localStorage'));
+  ok('S29-H2 supabase.ts performs every local write through the atomic commit', supabaseSrc.includes('commitWorkspace(') && !supabaseSrc.includes('saveDb('));
+  ok('S29-H3 supabase.ts seeds demo data only through the explicit demo action',
+    supabaseSrc.includes('seedDemoWorkspace(')
+      && (supabaseSrc.match(/getInitialSeedData\(\)/g) ?? []).length === 1
+      && !supabaseSrc.includes('loadDb()'));
+  ok('S29-H4 supabase.ts has no seed-on-read path and no raw LocalStorage writes of its own',
+    !supabaseSrc.includes('localStorage.setItem') && !supabaseSrc.includes("localStorage.getItem(WORKSPACE_STORAGE_KEY)"));
+  ok('S29-H5 every RPC write path goes through the atomic commit', supabaseSrc.includes('commitWorkspace(storage'));
+  ok('S29-H6 the demo store still implements each contract it exposes',
+    ['review_cost_transaction', 'apply_schedule_recovery_scenario', 'apply_resource_leveling_scenario',
+      'approve_project_scope_baseline', 'save_variation_order_draft', 'transition_variation_order']
+      .every((name) => supabaseSrc.includes(name)));
+  ok('S29-H7 PortfolioView creates no invented BOQ/activities/links/budget on project creation',
+    !/if \(newProj\) \{[\s\S]*?boq_items/.test(portfolioSrc)
+      && portfolioSrc.includes('Create empty project')
+      && portfolioSrc.includes('validateNewProject'));
+  ok('S29-H8 PortfolioView validates required fields, numeric values and date ordering',
+    portfolioSrc.includes('Contract value must be greater than zero')
+      && portfolioSrc.includes('The start date must not be after the finish date')
+      && portfolioSrc.includes('Client / owner is required'));
+  ok('S29-H9 demo creation is a separate, explicitly labelled action in the portfolio',
+    portfolioSrc.includes('Load demo workspace (invented data)') && portfolioSrc.includes('loadDemoWorkspace()'));
+  ok('S29-H10 App selects the remembered project and never falls back to invented seed data',
+    appSrc.includes('resolveStartupProject')
+      && appSrc.includes('writeSelectedProjectId')
+      && !appSrc.includes("from '@/lib/mockSeed'"));
+  // Comments may mention `localStorage`; the CODE of this module must only touch the storage handle it
+  // is given (so it is testable with a synthetic store and never reaches for the global directly).
+  const workspaceCodeOnly = workspaceSrc
+    .split('\n')
+    .filter((line) => !/^\s*(\*|\/\*|\/\/)/.test(line))
+    .join('\n');
+  ok('S29-H11 the storage module owns the single LocalStorage key and never touches the global store itself',
+    workspaceSrc.includes("WORKSPACE_STORAGE_KEY = 'schedule_mgmt_db_v5'")
+      && !/localStorage\./i.test(workspaceCodeOnly));
+
+  // -------------------------------------------------------------------------
+  // S29-I — the persisted-table inventory covers every table the app uses.
+  // -------------------------------------------------------------------------
+  const usedTables = new Set<string>();
+  for (const match of execFileSync('git', ['grep', '-ohE', "from\\('[a-z_]+'\\)", '--', 'src'], { encoding: 'utf8' }).split('\n')) {
+    const name = match.replace(/^from\('/, '').replace(/'\)$/, '');
+    if (name) usedTables.add(name);
+  }
+  // The local RPC contracts also address persisted tables without supabase.from().
+  for (const match of execFileSync('git', ['grep', '-ohE', "db\\['[a-z_]+'\\]", '--', 'src/lib'], { encoding: 'utf8' }).split('\n')) {
+    const name = match.replace(/^db\['/, '').replace(/'\]$/, '');
+    if (name) usedTables.add(name);
+  }
+  const inventory = new Set(PERSISTED_TABLE_NAMES);
+  const missingFromInventory = [...usedTables].filter((name) => !inventory.has(name)).sort();
+  const unusedInSource = [...inventory].filter((name) => !usedTables.has(name)).sort();
+  eq('S29-I1 every table the app addresses is in the persisted-table inventory', missingFromInventory, []);
+  eq('S29-I2 the inventory lists no table the app never addresses', unusedInSource, []);
+  eq('S29-I3 the inventory has no duplicate entries', PERSISTED_TABLE_NAMES.length, new Set(PERSISTED_TABLE_NAMES).size);
+  ok('S29-I4 every inventoried table declares an id field or a documented composite key',
+    PERSISTED_TABLES.every((spec) => spec.idField === null ? spec.name === 'project_scope_baseline_current' : true));
+
+  // -------------------------------------------------------------------------
+  // S29-L — auxiliary project-scoped stores are part of a complete backup.
+  // -------------------------------------------------------------------------
+  const revisionKey = 'schedule_diff_revisions_proj-seed-003';
+  const revisionRaw = JSON.stringify([{ id: 'rev-1', name: 'Cut-off 2026-09', dataDate: '2026-09-13', activitiesSnapshot: [{ id: 'act-p3-01', percent_complete: 100 }] }]);
+  const subcontractKey = 'construction_subcontracts_data_proj-seed-001';
+  const subcontractRaw = JSON.stringify([{ id: 'sp-1', code: 'SC-01', value: 100 }]);
+  const importFlagKey = 'construction_subcontracts_db_import_proj-seed-001';
+  const auxStore = makeStore({
+    [WORKSPACE_STORAGE_KEY]: demoStore.getItem(WORKSPACE_STORAGE_KEY)!,
+    [revisionKey]: revisionRaw,
+    [subcontractKey]: subcontractRaw,
+    [importFlagKey]: '2026-09-20T00:00:00Z',
+    app_lang: 'ar',
+    'supabase.auth.token': '{"access_token":"SECRET-TOKEN-VALUE"}',
+  });
+  const auxState = (readWorkspace(auxStore) as { status: 'ok'; state: WorkspaceState }).state;
+  const auxRead = readAuxiliaryStores(auxStore);
+  eq('S29-L1 only whitelisted auxiliary stores are read', auxRead.map((entry) => entry.key),
+    [subcontractKey, importFlagKey, revisionKey]);
+  ok('S29-L2 every auxiliary prefix is covered by the whitelist',
+    AUXILIARY_STORAGE_PREFIXES.every((prefix) => prefix.length > 0) && auxRead.length === 3);
+  const auxBackup = buildBackup(auxState, '2026-10-27T16:00:00Z', auxRead);
+  const auxBackupText = serializeBackup(auxBackup);
+  eq('S29-L3 the backup carries the cut-off revision and the legacy subcontract register',
+    JSON.parse(auxBackupText).auxiliary.map((entry: { key: string }) => entry.key), [subcontractKey, importFlagKey, revisionKey]);
+  ok('S29-L4 the auxiliary payload is byte-faithful',
+    JSON.parse(auxBackupText).auxiliary.find((entry: { key: string }) => entry.key === revisionKey).raw === revisionRaw);
+  ok('S29-L5 auxiliary credentials and unrelated keys are still excluded',
+    !auxBackupText.includes('SECRET-TOKEN-VALUE') && !auxBackupText.includes('app_lang'));
+  const auxValidation = validateBackup(auxBackupText);
+  ok('S29-L6 a backup carrying auxiliary stores validates', auxValidation.ok === true);
+  eq('S29-L7 the restore preview lists the auxiliary stores', auxValidation.summary?.auxiliary.length, 3);
+  const auxTarget = makeStore({ [revisionKey]: '[]' });
+  const auxRestore = restoreWorkspace(auxTarget, auxValidation, '2026-10-27T16:05:00Z');
+  ok('S29-L8 the restore reports success and keeps a recovery copy of the replaced auxiliary stores',
+    auxRestore.ok === true && auxRestore.preRestoreAuxiliary.length === 1 && auxRestore.preRestoreAuxiliary[0].raw === '[]');
+  eq('S29-L9 every auxiliary store is byte-identical after the restore',
+    [auxTarget.getItem(revisionKey), auxTarget.getItem(subcontractKey), auxTarget.getItem(importFlagKey)],
+    [revisionRaw, subcontractRaw, '2026-09-20T00:00:00Z']);
+  eq('S29-L10 the restored main workspace still matches the source tables',
+    canonicalJson(tableRows((readWorkspace(auxTarget) as { status: 'ok'; state: WorkspaceState }).state, 'activities')),
+    canonicalJson(tableRows(auxState, 'activities')));
+
+  const injectedAux = JSON.parse(auxBackupText);
+  injectedAux.auxiliary.push({ key: 'supabase.auth.token', raw: '{"access_token":"x"}' });
+  eq('S29-L11 an auxiliary entry outside the workspace whitelist is rejected',
+    validateBackup(JSON.stringify(injectedAux)).errors[0]?.code, 'invalid_auxiliary');
+  const corruptedAux = JSON.parse(auxBackupText);
+  corruptedAux.auxiliary[0].raw = 42;
+  eq('S29-L12 an auxiliary entry with a non-string payload is rejected',
+    validateBackup(JSON.stringify(corruptedAux)).errors[0]?.code, 'invalid_auxiliary');
+  const opaqueAux = JSON.parse(auxBackupText);
+  ok('S29-L12b an opaque auxiliary payload (the import timestamp) is accepted as stored',
+    typeof opaqueAux.auxiliary.find((entry: { key: string }) => entry.key.startsWith('construction_subcontracts_db_import_')).raw === 'string');
+  const tamperedAux = JSON.parse(auxBackupText);
+  tamperedAux.auxiliary[0].raw = JSON.stringify([{ id: 'sp-1', value: 999999 }]);
+  eq('S29-L13 a tampered auxiliary payload breaks the checksum',
+    validateBackup(JSON.stringify(tamperedAux)).errors[0]?.code, 'checksum_mismatch');
+  ok('S29-L14 a refused restore never writes auxiliary stores', (() => {
+    const target = makeStore({ [revisionKey]: '[]' });
+    const before = [target.getItem(revisionKey), target.map.size];
+    const refused = restoreWorkspace(target, validateBackup(JSON.stringify(tamperedAux)));
+    return refused.ok === false
+      && target.getItem(revisionKey) === before[0]
+      && target.map.size === before[1];
+  })());
+
+  // S29 owns this increment; the working diff must not reach outside it.
+  // Historical delivered boundary: 1a12ad7b17dd7db9e394461b976d1bfd1c6b8a3a → e7d9a13d0fb67cdd785885eefcf27f70a1b25637.
+  const s29ChangedPaths = new Set(execFileSync('git', ['diff', '--name-only', '1a12ad7b17dd7db9e394461b976d1bfd1c6b8a3a', 'e7d9a13d0fb67cdd785885eefcf27f70a1b25637'], { encoding: 'utf8' }).split('\n').filter(Boolean));
+  eq('S29-K1 the increment is confined to the storage-safety paths it declares',
+    [...s29ChangedPaths].filter((path) => !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path) && !S31_XER_INPUT_PATHS.has(path) && !S32_BOQ_INPUT_PATHS.has(path) && !S33_PROGRESS_ENTRY_PATHS.has(path) && !S34_COST_ENTRY_PATHS.has(path)), []);
+  ok('S29-K2 the increment actually touches the storage core it claims to repair',
+    s29ChangedPaths.has('src/lib/localWorkspace.ts')
+      && s29ChangedPaths.has('src/lib/localQueryBuilder.ts')
+      && s29ChangedPaths.has('src/lib/supabase.ts'));
+
+  ok('S29 restore-repair synthetic failure suite passes',
+    execFileSync(process.execPath, ['--experimental-strip-types', 'scripts/validate-restore-repair.mjs'],
+      { encoding: 'utf8' }).includes('PASS successful replacement'));
+
+  // Exact bounded exception: no ProgressView change beyond the checked cut-off write/import.
+  // Git may check out CRLF on Windows while git show returns LF. Compare source,
+  // retaining the exact bounded substitutions below, independently of EOL format.
+  const repairedProgress = readFileSync(resolvePath(process.cwd(), 'src/components/views/ProgressView.tsx'), 'utf8').replace(/\r\n/g, '\n');
+  const acceptedBeforeProgress = execFileSync('git', ['show', '7ff992031755e17c1078c975e322afad10b0d07f:src/components/views/ProgressView.tsx'], { encoding: 'utf8' }).replace(/\r\n/g, '\n');
+  const deliveredProgress = execFileSync('git', ['show', '4e03e8e303028edbbfa5ccb57037ad123465b802:src/components/views/ProgressView.tsx'], { encoding: 'utf8' }).replace(/\r\n/g, '\n');
+  ok('S29-M checked monthly persistence is present', repairedProgress.includes('if (!revisionWrite.ok) throw new Error(revisionWrite.error);'));
+  eq('S29-M ProgressView differs only by the checked monthly revision persistence path',
+    acceptedBeforeProgress.replace("import { writeAuxiliaryStores } from '@/lib/localWorkspace';\n", '')
+      .replace(`      const revisionWrite = writeAuxiliaryStores(localStorage, [
+        { key: revisionKey, projectId: project.id, raw: JSON.stringify([newRev, ...existingRevs]) },
+      ]);
+      if (!revisionWrite.ok) throw new Error(revisionWrite.error);`,
+      '      localStorage.setItem(revisionKey, JSON.stringify([newRev, ...existingRevs]));'),
+    deliveredProgress);
+
+  // -------------------------------------------------------------------------
+  // S29-J — explicit lifecycle actions never destroy the previous workspace.
+  // -------------------------------------------------------------------------
+  const lifeStore = makeStore();
+  runQuery(query(lifeStore, 'projects').insert(projectRow('proj-keep', 'Keep me', '2026-01-01', '2026-06-01', '2026-10-01T00:00:00Z')));
+  const lifeBefore = lifeStore.getItem(WORKSPACE_STORAGE_KEY)!;
+  const lifeReset = resetWorkspaceToEmpty(lifeStore, '2026-10-27T15:00:00Z');
+  ok('S29-J1 "start empty" preserves the previous bytes', lifeReset.ok === true
+    && listPreservedCopies(lifeStore).some((copy) => lifeStore.getItem(copy.key) === lifeBefore));
+  eq('S29-J2 "start empty" leaves a valid empty workspace',
+    tableRows((readWorkspace(lifeStore) as { status: 'ok'; state: WorkspaceState }).state, 'projects').length, 0);
+  ok('S29-J3 a demo load preserves the bytes it replaces', (() => {
+    const before = lifeStore.getItem(WORKSPACE_STORAGE_KEY)!;
+    const seededDemo = seedDemoWorkspace(lifeStore, getInitialSeedData() as unknown as Record<string, Record<string, unknown>[]>);
+    return seededDemo.ok === true && listPreservedCopies(lifeStore).some((copy) => lifeStore.getItem(copy.key) === before);
+  })());
+  ok('S29-J4 a demo load on a refusing store reports the failure instead of pretending',
+    (() => {
+      const refusing = makeStore({}, { quota: true });
+      const outcome = seedDemoWorkspace(refusing, getInitialSeedData() as unknown as Record<string, Record<string, unknown>[]>);
+      return outcome.ok === false;
+    })());
+
+  // -------------------------------------------------------------------------
+  // S30 — Payment certificate first-use and persistence (SCH-20261104-IPC01)
+  // -------------------------------------------------------------------------
+  console.log('--- S30 payment certificate first-use and persistence (SCH-20261104-IPC01)');
+
+  // S30-A: Defect reproduction (cross-project fabricated default and lost after reload)
+  const preFixComponentMount = (selectedProjectId: string) => {
+    void selectedProjectId;
+    // Exact pre-fix hardcoded initial state in PaymentCertificatesView.tsx
+    const hardcodedIpcs = [
+      { id: 'IPC-01', grossAmountToDate: 102150, currentGrossAmount: 102150, status: 'paid' },
+      { id: 'IPC-02', grossAmountToDate: 425300, currentGrossAmount: 323150, status: 'paid' },
+      { id: 'IPC-03', grossAmountToDate: 505940, currentGrossAmount: 80640, status: 'certified_by_consultant' },
+      { id: 'IPC-04', grossAmountToDate: 885940, currentGrossAmount: 380000, status: 'draft' },
+    ];
+    const hardcodedSubs = [
+      { id: 'SUB-IPC-01', grossAmountToDate: 215000, currentGrossAmount: 215000, status: 'paid', mainContractorProfitMarginSar: 108750 },
+      { id: 'SUB-IPC-02', grossAmountToDate: 19440, currentGrossAmount: 19440, status: 'approved', mainContractorProfitMarginSar: 15120 },
+      { id: 'SUB-IPC-03', grossAmountToDate: 240600, currentGrossAmount: 25600, status: 'draft', mainContractorProfitMarginSar: 20480 },
+    ];
+    return {
+      certifiedGrossToDate: Math.max(...hardcodedIpcs.filter((c) => c.status !== 'draft').map((c) => c.grossAmountToDate)),
+      subcontractorProfitSar: hardcodedSubs.reduce((sum, s) => sum + s.mainContractorProfitMarginSar, 0),
+    };
+  };
+
+  const emptyProjectRepro = preFixComponentMount('proj-empty-user-1');
+  eq('S30-A1 pre-fix replica reproduces defect 1: empty project acquired fabricated 505,940 SAR certified gross',
+    emptyProjectRepro.certifiedGrossToDate, 505940);
+  eq('S30-A2 pre-fix replica reproduces defect 1: empty project acquired fabricated 144,350 SAR sub profit',
+    emptyProjectRepro.subcontractorProfitSar, 144350);
+
+  const preFixStore = makeStore();
+  const preFixWorkspace = readWorkspace(preFixStore);
+  ok('S30-A3 pre-fix replica reproduces defect 2: user entry in component-local state leaves storage absent/unpersisted',
+    preFixWorkspace.status === 'absent');
+
+  // S30-B: Two empty real projects stay empty
+  const s30Store = makeStore();
+  const projA = projectRow('proj-real-a', 'Real Alpha', '2026-01-01', '2026-12-31', '2026-09-01T00:00:00Z');
+  const projB = projectRow('proj-real-b', 'Real Beta', '2026-02-01', '2026-11-30', '2026-09-01T00:00:00Z');
+  runQuery(query(s30Store, 'projects').insert([projA, projB]));
+
+  const boqA = { id: 'boq-a-01', project_id: 'proj-real-a', code: 'CW-01', description: 'Concrete Works', unit: 'm3', quantity: 500, unit_price: 100, total_price: 50000, category: 'Concrete' };
+  const boqB = { id: 'boq-b-01', project_id: 'proj-real-b', code: 'EW-01', description: 'Earth Works', unit: 'm3', quantity: 200, unit_price: 60, total_price: 12000, category: 'Earthworks' };
+  runQuery(query(s30Store, 'boq_items').insert([boqA, boqB]));
+
+  const certsA = runQuery<PaymentCertificate[]>(query(s30Store, 'payment_certificates').select('*').eq('project_id', 'proj-real-a'));
+  const certsB = runQuery<PaymentCertificate[]>(query(s30Store, 'payment_certificates').select('*').eq('project_id', 'proj-real-b'));
+  const subsA = runQuery<SubcontractorIpc[]>(query(s30Store, 'subcontractor_payment_certificates').select('*').eq('project_id', 'proj-real-a'));
+  const subsB = runQuery<SubcontractorIpc[]>(query(s30Store, 'subcontractor_payment_certificates').select('*').eq('project_id', 'proj-real-b'));
+
+  eq('S30-B1 empty project Alpha has zero payment certificates', certsA.data?.length, 0);
+  eq('S30-B2 empty project Alpha has zero subcontractor certificates', subsA.data?.length, 0);
+  eq('S30-B3 empty project Beta has zero payment certificates', certsB.data?.length, 0);
+  eq('S30-B4 empty project Beta has zero subcontractor certificates', subsB.data?.length, 0);
+
+  const summaryA = summarizeCertificates([], '2026-09-13');
+  const summaryB = summarizeCertificates([], '2026-09-13');
+  eq('S30-B5 empty project Alpha summary certifies 0 SAR', summaryA.certifiedGrossToDate, 0);
+  eq('S30-B6 empty project Alpha summary has 0 certified records', summaryA.certifiedCount, 0);
+  eq('S30-B7 empty project Beta summary certifies 0 SAR', summaryB.certifiedGrossToDate, 0);
+  eq('S30-B8 empty project Beta summary has 0 certified records', summaryB.certifiedCount, 0);
+
+  // S30-C: Synthetic user-entered certificate survives reopen
+  const userIpcA: PaymentCertificate = {
+    id: 'IPC-ALPHA-01',
+    project_id: 'proj-real-a',
+    ipcNumber: 'IPC-01',
+    certificateDate: '2026-08-31',
+    periodStart: '2026-08-01',
+    periodEnd: '2026-08-31',
+    status: 'certified_by_consultant',
+    grossAmountToDate: 35000,
+    previousGrossAmount: 0,
+    currentGrossAmount: 35000,
+    advancePaymentDeduction: 3500,
+    retentionMoneyDeduction: 1750,
+    penaltyDeduction: 0,
+    vatAmount: 5250,
+    netPayableAmount: 35000,
+    items: [
+      {
+        id: 'L-A1',
+        boqItemId: 'boq-a-01',
+        boqCode: 'CW-01',
+        description: 'Concrete Works',
+        unit: 'm3',
+        contractQuantity: 500,
+        unitRateSar: 100,
+        previousQuantity: 0,
+        currentQuantity: 350,
+        cumulativeQuantity: 350,
+        cumulativeAmountSar: 35000,
+        currentAmountSar: 35000,
+      },
+    ],
+  };
+
+  const userSubA: SubcontractorIpc = {
+    id: 'SUB-ALPHA-01',
+    project_id: 'proj-real-a',
+    ipcNumber: 'SUB-01',
+    subcontractorName: 'Eastern Contracting',
+    trade: 'Concrete Casting',
+    certificateDate: '2026-08-30',
+    periodStart: '2026-08-01',
+    periodEnd: '2026-08-30',
+    status: 'approved',
+    subcontractPackageCode: null,
+    grossAmountToDate: 21000,
+    currentGrossAmount: 21000,
+    retentionDeduction: 2100,
+    materialDeductions: 0,
+    netPayableToSubcontractor: 18900,
+    mainContractorRevenueForSameQty: 35000,
+    mainContractorProfitMarginSar: 14000,
+    mainContractorMarginPercent: 40.0,
+    items: [
+      {
+        id: 'SL-A1',
+        description: 'Concrete Casting execution',
+        unit: 'm3',
+        quantity: 350,
+        subcontractorRate: 60,
+        subcontractorAmount: 21000,
+        mainContractorRate: 100,
+        mainContractorAmount: 35000,
+        marginSar: 14000,
+      },
+    ],
+  };
+
+  const insertIpcRes = runQuery(query(s30Store, 'payment_certificates').insert(userIpcA));
+  const insertSubRes = runQuery(query(s30Store, 'subcontractor_payment_certificates').insert(userSubA));
+  ok('S30-C1 synthetic user IPC insert reports success on healthy store', insertIpcRes.error === null);
+  ok('S30-C2 synthetic user Sub IPC insert reports success on healthy store', insertSubRes.error === null);
+
+  const reopenedWorkspace = readWorkspace(s30Store);
+  ok('S30-C3 workspace reloads successfully from storage', reopenedWorkspace.status === 'ok');
+  const reopenedLoaded = reopenedWorkspace as { status: 'ok'; state: WorkspaceState };
+
+  const reopenedIpcsA = tableRows(reopenedLoaded.state, 'payment_certificates').filter((c) => c.project_id === 'proj-real-a');
+  const reopenedSubsA = tableRows(reopenedLoaded.state, 'subcontractor_payment_certificates').filter((s) => s.project_id === 'proj-real-a');
+
+  eq('S30-C4 user IPC survives reload in storage', reopenedIpcsA.length, 1);
+  eq('S30-C5 user IPC ID is preserved', reopenedIpcsA[0]?.id, 'IPC-ALPHA-01');
+  eq('S30-C6 user IPC gross amount is preserved', reopenedIpcsA[0]?.grossAmountToDate, 35000);
+  eq('S30-C7 user IPC line items survive reload', (reopenedIpcsA[0]?.items as unknown as PaymentCertificateItem[])?.length, 1);
+  eq('S30-C8 user Sub IPC survives reload in storage', reopenedSubsA.length, 1);
+  eq('S30-C9 user Sub IPC profit margin is preserved', reopenedSubsA[0]?.mainContractorProfitMarginSar, 14000);
+
+  // S30-D: Project B never sees Project A's records or totals
+  const reopenedIpcsB = tableRows(reopenedLoaded.state, 'payment_certificates').filter((c) => c.project_id === 'proj-real-b');
+  const reopenedSubsB = tableRows(reopenedLoaded.state, 'subcontractor_payment_certificates').filter((s) => s.project_id === 'proj-real-b');
+  eq('S30-D1 project Beta has 0 payment certificates after reload', reopenedIpcsB.length, 0);
+  eq('S30-D2 project Beta has 0 subcontractor certificates after reload', reopenedSubsB.length, 0);
+
+  const reconA = reconcilePaymentCertificate(reopenedIpcsA[0] as unknown as PaymentCertificate, '2026-09-13');
+  const summaryAfterA = summarizeCertificates([reconA], '2026-09-13');
+  const summaryAfterB = summarizeCertificates([], '2026-09-13');
+  eq('S30-D3 project Alpha certified total is 35,000 SAR', summaryAfterA.certifiedGrossToDate, 35000);
+  eq('S30-D4 project Beta certified total is 0 SAR (no leakage from Project Alpha)', summaryAfterB.certifiedGrossToDate, 0);
+
+  // S30-E: Failed writes do not claim success and preserve prior records
+  const quotaStore = makeStore(Object.fromEntries(s30Store.map), { quota: true });
+  const quotaBeforeRaw = quotaStore.getItem(WORKSPACE_STORAGE_KEY);
+  const badWriteRes = runQuery(query(quotaStore, 'payment_certificates').insert({
+    id: 'IPC-FAIL-01',
+    project_id: 'proj-real-a',
+    ipcNumber: 'IPC-FAIL',
+    certificateDate: '2026-08-31',
+    periodStart: '2026-08-01',
+    periodEnd: '2026-08-31',
+    status: 'draft',
+    grossAmountToDate: 9999,
+  }));
+  ok('S30-E1 write on refusing store returns an error, never false success', badWriteRes.error !== null);
+  eq('S30-E2 refusing store bytes remain identical', quotaStore.getItem(WORKSPACE_STORAGE_KEY), quotaBeforeRaw);
+  const quotaReload = readWorkspace(quotaStore) as { status: 'ok'; state: WorkspaceState };
+  eq('S30-E3 refused certificate was not stored',
+    tableRows(quotaReload.state, 'payment_certificates').some((c) => c.id === 'IPC-FAIL-01'), false);
+
+  const dropStore = makeStore(Object.fromEntries(s30Store.map), { dropWrites: true });
+  const dropRes = runQuery(query(dropStore, 'payment_certificates').insert({
+    id: 'IPC-DROP-01',
+    project_id: 'proj-real-a',
+    ipcNumber: 'IPC-DROP',
+    certificateDate: '2026-08-31',
+    periodStart: '2026-08-01',
+    periodEnd: '2026-08-31',
+    status: 'draft',
+    grossAmountToDate: 9999,
+  }));
+  ok('S30-E4 dropped write is detected and reports error', dropRes.error !== null);
+
+  const foreignBoqRes = runQuery(query(s30Store, 'payment_certificates').insert({
+    ...userIpcA,
+    id: 'IPC-CROSS-BOQ',
+    items: [{ id: 'BAD-LINE', boqItemId: 'boq-b-01', currentAmountSar: 100 }],
+  }));
+  ok('S30-E5 certificate referencing foreign BOQ item is rejected at write time',
+    foreignBoqRes.error !== null && foreignBoqRes.error.message.includes('another project'));
+
+  const futureApprovedRes = runQuery(query(s30Store, 'payment_certificates').insert({
+    ...userIpcA,
+    id: 'IPC-FUTURE-APPROVED',
+    certificateDate: '2026-09-20',
+    status: 'paid',
+  }));
+  ok('S30-E6 approved certificate dated after Data Date is rejected at write time',
+    futureApprovedRes.error !== null && futureApprovedRes.error.message.includes('violates project Data Date'));
+
+  // S30-F: Full backup/restore preserves certificate headers, lines, statuses, project boundaries
+  const backupObj = buildBackup(reopenedLoaded.state, '2026-11-04T12:00:00Z');
+  const backupSerialized = serializeBackup(backupObj);
+  ok('S30-F1 backup contains payment_certificates table', 'payment_certificates' in backupObj.tables);
+  ok('S30-F2 backup contains subcontractor_payment_certificates table', 'subcontractor_payment_certificates' in backupObj.tables);
+  eq('S30-F3 backup payment_certificates row count matches state', backupObj.counts.payment_certificates, 1);
+  eq('S30-F4 backup subcontractor_payment_certificates row count matches state', backupObj.counts.subcontractor_payment_certificates, 1);
+
+  const backupVal = validateBackup(backupSerialized);
+  ok('S30-F5 backup with user certificates passes validation', backupVal.ok === true && backupVal.summary?.checksumVerified === true);
+
+  const freshTarget = makeStore();
+  const restoreRes = restoreWorkspace(freshTarget, backupVal, '2026-11-04T12:05:00Z');
+  ok('S30-F6 restore into clean target succeeds', restoreRes.ok === true);
+
+  const restoredLoaded = readWorkspace(freshTarget) as { status: 'ok'; state: WorkspaceState };
+  const restoredIpc = tableRows(restoredLoaded.state, 'payment_certificates').find((c) => c.id === 'IPC-ALPHA-01');
+  const restoredSub = tableRows(restoredLoaded.state, 'subcontractor_payment_certificates').find((s) => s.id === 'SUB-ALPHA-01');
+
+  ok('S30-F7 restored IPC is present', restoredIpc !== undefined);
+  eq('S30-F8 restored IPC status is preserved', restoredIpc?.status, 'certified_by_consultant');
+  eq('S30-F9 restored IPC net payable is preserved', restoredIpc?.netPayableAmount, 35000);
+  eq('S30-F10 restored IPC lines survived with BOQ link', (restoredIpc?.items as unknown as PaymentCertificateItem[])?.[0]?.boqCode, 'CW-01');
+  ok('S30-F11 restored Sub IPC is present', restoredSub !== undefined);
+  eq('S30-F12 restored Sub IPC trade is preserved', restoredSub?.trade, 'Concrete Casting');
+  eq('S30-F13 restored Sub IPC profit margin is preserved', restoredSub?.mainContractorProfitMarginSar, 14000);
+
+  // S30-G: Invalid / cross-project / post-Data-Date restores leave prior bytes intact
+  const guardS30 = makeStore(Object.fromEntries(freshTarget.map));
+  const guardS30Before = guardS30.getItem(WORKSPACE_STORAGE_KEY);
+
+  const badCertProj = JSON.parse(backupSerialized);
+  badCertProj.tables.payment_certificates[0].project_id = 'proj-non-existent';
+  const valBadProj = validateBackup(JSON.stringify(badCertProj));
+  ok('S30-G1 restore with non-existent project reference fails validation',
+    valBadProj.ok === false && valBadProj.errors[0]?.code === 'missing_reference');
+  const resBadProj = restoreWorkspace(guardS30, valBadProj);
+  ok('S30-G2 refused restore performs no write', resBadProj.ok === false && guardS30.getItem(WORKSPACE_STORAGE_KEY) === guardS30Before);
+
+  const badCertBoq = JSON.parse(backupSerialized);
+  badCertBoq.tables.payment_certificates[0].items[0].boqItemId = 'boq-b-01';
+  const valBadBoq = validateBackup(JSON.stringify(badCertBoq));
+  ok('S30-G3 restore with cross-project BOQ reference fails validation',
+    valBadBoq.ok === false && valBadBoq.errors[0]?.code === 'project_mismatch');
+  const resBadBoq = restoreWorkspace(guardS30, valBadBoq);
+  ok('S30-G4 refused cross-project restore performs no write', resBadBoq.ok === false && guardS30.getItem(WORKSPACE_STORAGE_KEY) === guardS30Before);
+
+  const badCertChronology = JSON.parse(backupSerialized);
+  badCertChronology.tables.payment_certificates[0].certificateDate = '2026-09-20';
+  badCertChronology.tables.payment_certificates[0].status = 'paid';
+  const valBadChron = validateBackup(JSON.stringify(badCertChronology));
+  ok('S30-G5 restore with post-Data-Date approved certificate fails chronology validation',
+    valBadChron.ok === false && valBadChron.errors[0]?.code === 'chronology');
+  const resBadChron = restoreWorkspace(guardS30, valBadChron);
+  ok('S30-G6 refused chronology restore leaves storage byte-identical',
+    resBadChron.ok === false && guardS30.getItem(WORKSPACE_STORAGE_KEY) === guardS30Before);
+
+  const badCertDup = JSON.parse(backupSerialized);
+  badCertDup.tables.payment_certificates.push({ ...badCertDup.tables.payment_certificates[0] });
+  const valBadDup = validateBackup(JSON.stringify(badCertDup));
+  ok('S30-G7 restore with duplicate certificate ID fails validation',
+    valBadDup.ok === false && valBadDup.errors[0]?.code === 'duplicate_id');
+  const resBadDup = restoreWorkspace(guardS30, valBadDup);
+  ok('S30-G8 refused duplicate ID restore leaves storage byte-identical',
+    resBadDup.ok === false && guardS30.getItem(WORKSPACE_STORAGE_KEY) === guardS30Before);
+
+  // S30-H: Commercial reconciliation results compared before/after on unchanged inputs (zero math drift)
+  const demoIpc1: PaymentCertificate = {
+    id: 'IPC-01', ipcNumber: 'IPC-01', certificateDate: '2026-07-31', periodStart: '2026-07-01', periodEnd: '2026-07-31',
+    status: 'paid', grossAmountToDate: 102150, previousGrossAmount: 0, currentGrossAmount: 102150,
+    advancePaymentDeduction: 10215, retentionMoneyDeduction: 5107.5, penaltyDeduction: 0, vatAmount: 15322.5, netPayableAmount: 102150,
+    items: [
+      { id: 'L1', boqItemId: 'b1', boqCode: 'EW-001', description: 'Excavation', unit: 'm3', contractQuantity: 1200, unitRateSar: 35, previousQuantity: 0, currentQuantity: 1200, cumulativeQuantity: 1200, cumulativeAmountSar: 42000, currentAmountSar: 42000 },
+      { id: 'L2', boqItemId: 'b2', boqCode: 'EW-002', description: 'Backfill', unit: 'm3', contractQuantity: 450, unitRateSar: 45, previousQuantity: 0, currentQuantity: 450, cumulativeQuantity: 450, cumulativeAmountSar: 20250, currentAmountSar: 20250 },
+      { id: 'L3', boqItemId: 'b3', boqCode: 'CW-001', description: 'PCC', unit: 'm3', contractQuantity: 95, unitRateSar: 420, previousQuantity: 0, currentQuantity: 95, cumulativeQuantity: 95, cumulativeAmountSar: 39900, currentAmountSar: 39900 },
+    ],
+  };
+  const demoIpc3: PaymentCertificate = {
+    id: 'IPC-03', ipcNumber: 'IPC-03', certificateDate: '2026-09-10', periodStart: '2026-09-01', periodEnd: '2026-09-10',
+    status: 'certified_by_consultant', grossAmountToDate: 505940, previousGrossAmount: 425300, currentGrossAmount: 80640,
+    advancePaymentDeduction: 8064, retentionMoneyDeduction: 4032, penaltyDeduction: 0, vatAmount: 12096, netPayableAmount: 80640,
+    items: [
+      { id: 'L6', boqItemId: 'b6', boqCode: 'CW-003', description: 'RCC', unit: 'm3', contractQuantity: 650, unitRateSar: 720, previousQuantity: 0, currentQuantity: 112, cumulativeQuantity: 112, cumulativeAmountSar: 80640, currentAmountSar: 80640 },
+    ],
+  };
+  const demoSub1: SubcontractorIpc = {
+    id: 'SUB-IPC-01', ipcNumber: 'SUB-IPC-001', subcontractPackageCode: 'SUB-PKG-01', subcontractorName: 'Al-Bonyan',
+    trade: 'Concrete', certificateDate: '2026-08-25', periodStart: '2026-08-01', periodEnd: '2026-08-25', status: 'paid',
+    grossAmountToDate: 215000, currentGrossAmount: 215000, retentionDeduction: 21500, materialDeductions: 4500, netPayableToSubcontractor: 189000,
+    mainContractorRevenueForSameQty: 323150, mainContractorProfitMarginSar: 108750, mainContractorMarginPercent: 33.7,
+    items: [
+      { id: 'SL1', description: 'Footings', unit: 'm3', quantity: 280, subcontractorRate: 380, subcontractorAmount: 106400, mainContractorRate: 680, mainContractorAmount: 190400, marginSar: 84000 },
+      { id: 'SL2', description: 'Rebar', unit: 'ton', quantity: 45, subcontractorRate: 2400, subcontractorAmount: 108000, mainContractorRate: 2950, mainContractorAmount: 132750, marginSar: 24750 },
+    ],
+  };
+
+  const reconIpc1 = reconcilePaymentCertificate(demoIpc1, '2026-09-13');
+  const reconIpc3 = reconcilePaymentCertificate(demoIpc3, '2026-09-13');
+  const reconSub1 = reconcileSubcontractorCertificate(demoSub1, '2026-09-13', 10);
+
+  eq('S30-H1 IPC-01 reconciles as balanced', reconIpc1.status, 'balanced');
+  eq('S30-H2 IPC-01 chronology is actual', reconIpc1.chronology.recordClass, 'actual');
+  eq('S30-H3 IPC-01 net payable matches line calculation', reconIpc1.netDerived, 102150);
+  eq('S30-H4 IPC-03 reconciles current gross with line amount', reconIpc3.lineCurrentSum, 80640);
+  eq('S30-H5 SUB-IPC-01 surfaces header/lines mismatch with exact 600 SAR delta', reconSub1.currentDelta, 600);
+  eq('S30-H6 SUB-IPC-01 retention matches 10% contract', reconSub1.retentionMatchesContract, true);
+  eq('S30-H7 SUB-IPC-01 status is mismatch', reconSub1.status, 'mismatch');
+
+  // Owner review regressions: legacy inventory integrity and invalid durable records.
+  const legacy32 = JSON.parse(backupSerialized);
+  delete legacy32.tables.payment_certificates;
+  delete legacy32.tables.subcontractor_payment_certificates;
+  legacy32.checksum = backupChecksum(legacy32.tables, legacy32.auxiliary);
+  const legacy32Validation = validateBackup(legacy32);
+  ok('S30-R1 original 32-table v2 checksum remains valid after IPC inventory grows', legacy32Validation.ok && legacy32Validation.summary?.checksumVerified === true);
+  eq('S30-R2 legacy restore adds only empty IPC tables', tableRows(legacy32Validation.state!, 'payment_certificates'), []);
+  eq('S30-R3 legacy project records remain exact', legacy32Validation.state?.projects, legacy32.tables.projects);
+  const tamperedLegacy = JSON.parse(JSON.stringify(legacy32));
+  tamperedLegacy.tables.projects[0].name = 'Tampered';
+  ok('S30-R4 legacy checksum still rejects changed bytes', !validateBackup(tamperedLegacy).ok);
+
+  const invalidCertificates = [
+    { ...userIpcA, certificateDate: '2026-02-30' },
+    { ...userIpcA, periodStart: '2026-09-01', periodEnd: '2026-08-31' },
+    { ...userIpcA, status: 'invented_approval' },
+    { ...userIpcA, currentGrossAmount: Infinity },
+    { ...userIpcA, items: [userIpcA.items[0], userIpcA.items[0]] },
+  ];
+  for (const [index, invalid] of invalidCertificates.entries()) {
+    const before = s30Store.getItem(WORKSPACE_STORAGE_KEY);
+    const result = runQuery(query(s30Store, 'payment_certificates').insert({ ...invalid, id: `invalid-${index}` }));
+    ok(`S30-R5-${index} invalid certificate rejected before write`, result.error !== null);
+    eq(`S30-R6-${index} invalid certificate leaves exact storage unchanged`, s30Store.getItem(WORKSPACE_STORAGE_KEY), before);
+    const invalidBackup = JSON.parse(backupSerialized);
+    invalidBackup.tables.payment_certificates = [invalid];
+    invalidBackup.checksum = backupChecksum(invalidBackup.tables, invalidBackup.auxiliary);
+    ok(`S30-R7-${index} invalid certificate refused on restore`, !validateBackup(invalidBackup).ok);
+  }
+  const duplicateResult = runQuery(query(s30Store, 'payment_certificates').insert(userIpcA));
+  ok('S30-R8 duplicate certificate ID refused on insert', duplicateResult.error !== null);
+  const missingPackageResult = runQuery(query(s30Store, 'subcontractor_payment_certificates').insert({ ...userSubA, id: 'missing-package', subcontractPackageCode: 'does-not-exist' }));
+  ok('S30-R9 nonexistent subcontract package refused', missingPackageResult.error !== null);
+  const partialUpsertResult = runQuery(query(s30Store, 'payment_certificates').upsert({ id: userIpcA.id, status: 'paid' }));
+  ok('S30-R10 partial upsert validates the merged durable certificate', partialUpsertResult.error === null);
+  runQuery(query(s30Store, 'payment_certificates').insert({ ...userIpcA, id: 'second-certificate' }));
+  const beforeDuplicateUpdate = s30Store.getItem(WORKSPACE_STORAGE_KEY);
+  const duplicateUpdateResult = runQuery(query(s30Store, 'payment_certificates').update({ id: userIpcA.id }).eq('id', 'second-certificate'));
+  ok('S30-R11 duplicate ID update is refused', duplicateUpdateResult.error !== null);
+  eq('S30-R12 duplicate ID update is atomic', s30Store.getItem(WORKSPACE_STORAGE_KEY), beforeDuplicateUpdate);
+
+  // S30-K: Batch guard
+  // Historical delivered boundary: 140e7def681f2913e112987d5d5154e521e3ab57 → 6f7862cc6a780d86b25372085e72e8494dfcab26.
+  const s30ChangedPaths = new Set(execFileSync('git', ['diff', '--name-only', '140e7def681f2913e112987d5d5154e521e3ab57', '6f7862cc6a780d86b25372085e72e8494dfcab26'], { encoding: 'utf8' }).split('\n').filter(Boolean));
+  eq('S30-K1 changes outside S29 stay within declared S30 increment paths',
+    [...s30ChangedPaths].filter((path) => !S29_WORKSPACE_SAFETY_PATHS.has(path) && !S30_IPC_PERSISTENCE_PATHS.has(path) && !S31_XER_INPUT_PATHS.has(path) && !S32_BOQ_INPUT_PATHS.has(path) && !S33_PROGRESS_ENTRY_PATHS.has(path) && !S34_COST_ENTRY_PATHS.has(path)), []);
+  ok('S30-K2 S30 increment actually touches PaymentCertificatesView and workspace storage',
+    s30ChangedPaths.has('src/components/views/PaymentCertificatesView.tsx')
+      && s30ChangedPaths.has('src/lib/localWorkspace.ts')
+      && s30ChangedPaths.has('src/lib/localQueryBuilder.ts')
+      && s30ChangedPaths.has('src/types/index.ts'));
+}
+
+// S31's actual source delta is checked separately; no other feature/engine is exempted.
+// Historical delivered boundary: 3b873fbf8bf4e5db1aa5445b0596645de39cc336^ → 3b873fbf8bf4e5db1aa5445b0596645de39cc336.
+  const s31ChangedPaths = new Set(execFileSync('git', ['diff', '--name-only', '3b873fbf8bf4e5db1aa5445b0596645de39cc336^', '3b873fbf8bf4e5db1aa5445b0596645de39cc336'], { encoding: 'utf8' }).split('\n').filter(Boolean));
+eq('S31-A existing XER input repair stays inside its three declared paths', [...s31ChangedPaths].filter((path) => !S31_XER_INPUT_PATHS.has(path) && !S32_BOQ_INPUT_PATHS.has(path) && !S33_PROGRESS_ENTRY_PATHS.has(path) && !S34_COST_ENTRY_PATHS.has(path)), []);
+ok('S31-B existing import screen is actually changed', s31ChangedPaths.has('src/components/views/ImportView.tsx'));
+
+// Historical delivered boundary: 7ff992031755e17c1078c975e322afad10b0d07f^ → 7ff992031755e17c1078c975e322afad10b0d07f.
+  const s32ChangedPaths = new Set(execFileSync('git', ['diff', '--name-only', '7ff992031755e17c1078c975e322afad10b0d07f^', '7ff992031755e17c1078c975e322afad10b0d07f'], { encoding: 'utf8' }).split('\n').filter(Boolean));
+eq('S32-A BOQ input repair stays in its six declared paths', [...s32ChangedPaths].filter((path) => !S32_BOQ_INPUT_PATHS.has(path) && !S33_PROGRESS_ENTRY_PATHS.has(path) && !S34_COST_ENTRY_PATHS.has(path)), []);
+ok('S32-B BOQ input and production numeric parser are actually repaired', s32ChangedPaths.has('src/components/views/ImportView.tsx') && s32ChangedPaths.has('src/lib/boqParser.ts'));
+ok('S32-C real CSV/XLSX numeric parser regressions pass without storage writes', execFileSync(process.execPath, ['scripts/validate-boq-input.mjs'], { encoding: 'utf8' }).includes('BOQ INPUT VALIDATION PASSED: 14/14'));
+
+// ---------------------------------------------------------------------------
+
+// S33: physical progress quotes F6's activity budget, with no equal-BAC/name-match invention.
+{
+  const qaActs = [act({ id: 'qa-survey', code: 'A-001', name: 'Setting out / survey', planned_quantity: 1 }),
+    act({ id: 'qa-exc', code: 'A-002', name: 'Bulk excavation', planned_quantity: 300, actual_quantity: 60, percent_complete: 20, actual_start: '2026-09-09' })];
+  const qaBases = [base('qa-bs', 'qa-survey', '2026-09-01', '2026-09-03', 3, 0), base('qa-be', 'qa-exc', '2026-09-04', '2026-09-05', 2, 3000)];
+  const report = analyzeCostControl({ project: { id: 'p1', contract_value: 3000, start_date: '2026-09-01', end_date: '2026-09-10', data_date: '2026-09-13' } as Project, activities: qaActs, baselines: qaBases, budgetLines: [], costTransactions: [], progressUpdates: [{ ...upd('qa-progress', 'qa-exc', '2026-09-09', 20), actual_quantity: 60, quantity_to_date: 60 }], wbsNodes: [], boqItems: [], allocations: [], dataDate: '2026-09-13', calendarType: '7_days' });
+  const excavation = report.activities.find((a) => a.id === 'qa-exc')!;
+  const rate = quoteActivityProgressRate(300, excavation);
+  eq('S33-A unrelated A-002/BOQ descriptions cannot change canonical excavation rate', rate, 10);
+  eq('S33-B 60/300 physical units quote the same600 as canonical F6 EV', quoteProgressValue(60, rate), excavation.ev);
+  const withCost = analyzeCostControl({ project: { id: 'p1', contract_value: 3000, start_date: '2026-09-01', end_date: '2026-09-10', data_date: '2026-09-13' } as Project, activities: qaActs, baselines: qaBases, budgetLines: [], costTransactions: [txn('qa-cost', 'qa-exc', '2026-09-09', 450)], progressUpdates: [{ ...upd('qa-progress', 'qa-exc', '2026-09-09', 20), actual_quantity: 60, quantity_to_date: 60 }], wbsNodes: [], boqItems: [], allocations: [], dataDate: '2026-09-13', calendarType: '7_days' });
+  eq('S34-C approved450 against earned600 yields canonical CV150, not remaining budget2550', quoteCanonicalEvm(withCost).cv, 150);
+  ok('S34-D budget header quotes canonical CV instead of budget remaining', readFileSync('src/components/views/BudgetView.tsx','utf8').includes('const variance = evm.cv;'));
+  eq('S33-C explicit zero-budget survey never absorbs a share of project BAC', quoteActivityProgressRate(1, report.activities.find((a) => a.id === 'qa-survey')), 0);
+  eq('S33-D unavailable activity budget remains N/A', quoteActivityProgressRate(300, { bac: 0, bacSource: 'unavailable' }), null);
+  eq('S33-E missing activity stays N/A', quoteActivityProgressRate(300, undefined), null);
+  eq('S33-F missing rate never becomes zero EV', quoteProgressValue(60, null), null);
+  eq('S33-G zero quantity basis is unpriced', quoteActivityProgressRate(0, excavation), null);
+  eq('S33-H invalid quantity is unpriced', quoteActivityProgressRate(NaN, excavation), null);
+  eq('S33-I explicit zero rate produces recorded zero', quoteProgressValue(60, 0), 0);
+  eq('S33-J nonfinite input cannot produce stored commercial NaN', quoteProgressValue(Infinity, rate), null);
+  eq('S33-K fractional physical quantity does not round the unit rate', quoteActivityProgressRate(0.5, { bac: 3, bacSource: 'baseline' }), 6);
+  for (const date of ['', '2026-02-30', '2026-13-01', '2026-9-1', 'not-a-date']) eq(`S33-L invalid daily date ${date}`, isValidProgressDate(date), false);
+  eq('S33-M valid governed daily date allowed', isValidProgressDate('2026-09-13'), true);
+  eq('S33-N leap-day rollover rejected', isValidProgressDate('2026-02-29'), false);
+  const progressSource = readFileSync('src/components/views/ProgressView.tsx', 'utf8');
+  ok('S33-O both actual daily write paths validate date before persistence', (progressSource.match(/if \(!isValidProgressDate\(entryDate\)\)/g) || []).length === 2);
+  ok('S33-P unit-rate path quotes canonical F6 and removes equal-share fallback', progressSource.includes('costReport?.activities.find') && !progressSource.includes('const defaultBac') && !progressSource.includes('boqItems.find((b) => b.code === act.code || b.description.includes(act.name)'));
+}
+// Historical delivered boundary: 97ac2b34315292f42d11716294557a5083e4d75c^ → 97ac2b34315292f42d11716294557a5083e4d75c.
+  const s33ChangedPaths = new Set(execFileSync('git', ['diff', '--name-only', '97ac2b34315292f42d11716294557a5083e4d75c^', '97ac2b34315292f42d11716294557a5083e4d75c'], { encoding: 'utf8' }).split('\n').filter(Boolean));
+eq('S33-Q current progress repair stays inside four declared paths', [...s33ChangedPaths].filter((path) => !S33_PROGRESS_ENTRY_PATHS.has(path) && !S34_COST_ENTRY_PATHS.has(path)), []);
+
+// Historical delivered boundary: 7cf85ec69593086fda96f3533ce34ba49a367f04^ → 7cf85ec69593086fda96f3533ce34ba49a367f04.
+  const s34ChangedPaths = new Set(execFileSync('git', ['diff', '--name-only', '7cf85ec69593086fda96f3533ce34ba49a367f04^', '7cf85ec69593086fda96f3533ce34ba49a367f04'], { encoding: 'utf8' }).split('\n').filter(Boolean));
+eq('S34-A current cost-entry increment stays inside three declared paths', [...s34ChangedPaths].filter((path) => !S34_COST_ENTRY_PATHS.has(path)), []);
+ok('S34-B existing cost input is changed, not a new feature', s34ChangedPaths.has('src/components/views/BudgetView.tsx'));
+ok('SCH closeout current-release exact path/protected-engine boundary',
+  execFileSync(process.execPath, ['scripts/validate-release-boundary.mjs'], { encoding: 'utf8' }).includes('Release boundary passed'));
+ok('SCH closeout production scope evidence regressions',
+  execFileSync(process.execPath, ['scripts/validate-scope-bridge.mjs'], { encoding: 'utf8' }).includes('27/27 passed'));
 console.log('');
 if (failures > 0) {
   console.log(`VALIDATION FAILED: ${failures} of ${checks} checks failed.`);

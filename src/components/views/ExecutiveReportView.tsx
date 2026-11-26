@@ -1,5 +1,6 @@
 import { useState, useEffect, useMemo } from 'react';
 import { supabase } from '@/lib/supabase';
+import { requireReportReads, runReportRead } from '@/lib/reportReadSafety';
 import type {
   Project,
   Activity,
@@ -19,6 +20,7 @@ import { type ComprehensiveProjectEvm } from '@/lib/planningEngine';
 // running its own derivations. F6 is canonical for cost, F5/canonical CPM for criticality.
 import { analyzeCostControl, type CostControlReport } from '@/lib/costControlEngine';
 import { summarizeCanonicalCriticality } from '@/lib/scheduleControlEngine';
+import { executiveScheduleRows } from '@/lib/executiveScheduleRows';
 import { canonicalEvmToComprehensive, selectCanonicalEvm, type CanonicalEvm } from '@/lib/canonicalEvm';
 import {
   reconcileFinishForecasts,
@@ -58,59 +60,68 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
   const [risks, setRisks] = useState<Risk[]>([]);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    if (project) loadData();
-    else setLoading(false);
-  }, [project]);
+  const [readError, setReadError] = useState(false);
+  const [loadedProject, setLoadedProject] = useState<Project | null>(null);
+  const [reloadAttempt, setReloadAttempt] = useState(0);
 
-  async function loadData() {
-    if (!project) return;
-    setLoading(true);
-    const [actRes, linkRes, baselineRes, bgtRes, cstRes, prgRes, boqRes, rskRes] = await Promise.all([
-      supabase.from('activities').select('*').eq('project_id', project.id).order('sort_order'),
-      supabase.from('activity_links').select('*').eq('project_id', project.id),
-      // REVIEW FINDING 2 (HIGH): this was an unscoped `select('*')` filtered only client-side by
-      // `activity_id`. That stops CROSS-PROJECT rows but not cross-REVISION rows: every historical
-      // baseline revision of THIS project's activities still arrived, and F6 sums `planned_cost` over
-      // every row it is handed (so a second revision inflates BAC) while its `baselineByAct` map lets
-      // whichever revision sorts last silently decide per-activity BAC — and therefore EV and PV.
-      // Those rows reached `analyzeCostControl` (canonical EVM), the DCMA audit and the baseline
-      // S-Curve, breaking the F9.4 requirement that F6 / Dashboard / BudgetView / Executive Report
-      // all rest on the SAME governed baseline evidence.
-      //
-      // Now the identical governed query BudgetView / Dashboard / ProgressView / ScheduleView use:
-      // scope through `project_baselines` (the parent that carries `project_id`) to the revision that
-      // is both ACTIVE and APPROVED. The engine-side foreign-row guard stays as defence in depth, and
-      // the client-side activity-id filter below is kept for the same reason.
-      supabase.from('baseline_activities')
-        .select('*, project_baselines!inner(project_id, is_active, status)')
-        .eq('project_baselines.project_id', project.id)
-        .eq('project_baselines.is_active', true)
-        .eq('project_baselines.status', 'approved'),
-      supabase.from('budget_lines').select('*').eq('project_id', project.id),
-      supabase.from('cost_transactions').select('*').eq('project_id', project.id),
-      supabase.from('progress_updates').select('*').eq('project_id', project.id),
-      supabase.from('boq_items').select('*').eq('project_id', project.id),
-      supabase.from('risks').select('*').eq('project_id', project.id),
-    ]);
-    setActivities(actRes.data || []);
-    setLinks((linkRes.data || []) as ActivityLink[]);
-    // Defence in depth (kept deliberately). The query above is now the authoritative governance
-    // filter — it restricts to THIS project's ACTIVE APPROVED baseline revision. This client-side
-    // pass additionally drops any row whose `activity_id` is not an activity of the reported project,
-    // so a malformed or orphaned join result still cannot reach the DCMA audit, the baseline S-Curve
-    // or the canonical EVM. It is a filter, never a correction: it cannot widen the evidence set.
-    const projectActivityIds = new Set(((actRes.data || []) as Activity[]).map((a) => a.id));
-    setBaselineActivities(
-      ((baselineRes.data || []) as BaselineActivity[]).filter((b) => projectActivityIds.has(b.activity_id)),
-    );
-    setBudgetLines(bgtRes.data || []);
-    setTransactions((cstRes.data || []) as CostTransaction[]);
-    setProgressUpdates((prgRes.data || []) as ProgressUpdate[]);
-    setBoqItems((boqRes.data || []) as BoqItem[]);
-    setRisks(rskRes.data || []);
-    setLoading(false);
-  }
+  useEffect(() => {
+    let current = true;
+    setReadError(false);
+    setLoadedProject(null);
+    setLoading(Boolean(project));
+    if (!project) return () => { current = false; };
+
+    void runReportRead(async () => {
+      const [actRes, linkRes, baselineRes, bgtRes, cstRes, prgRes, boqRes, rskRes] = await Promise.all([
+        supabase.from('activities').select('*').eq('project_id', project.id).order('sort_order'),
+        supabase.from('activity_links').select('*').eq('project_id', project.id),
+        // REVIEW FINDING 2 (HIGH): this was an unscoped `select('*')` filtered only client-side by
+        // `activity_id`. That stops CROSS-PROJECT rows but not cross-REVISION rows: every historical
+        // baseline revision of THIS project's activities still arrived, and F6 sums `planned_cost` over
+        // every row it is handed (so a second revision inflates BAC) while its `baselineByAct` map lets
+        // whichever revision sorts last silently decide per-activity BAC — and therefore EV and PV.
+        // Those rows reached `analyzeCostControl` (canonical EVM), the DCMA audit and the baseline
+        // S-Curve, breaking the F9.4 requirement that F6 / Dashboard / BudgetView / Executive Report
+        // all rest on the SAME governed baseline evidence.
+        //
+        // Now the identical governed query BudgetView / Dashboard / ProgressView / ScheduleView use:
+        // scope through `project_baselines` (the parent that carries `project_id`) to the revision that
+        // is both ACTIVE and APPROVED. The engine-side foreign-row guard stays as defence in depth, and
+        // the client-side activity-id filter below is kept for the same reason.
+        supabase.from('baseline_activities')
+          .select('*, project_baselines!inner(project_id, is_active, status)')
+          .eq('project_baselines.project_id', project.id)
+          .eq('project_baselines.is_active', true)
+          .eq('project_baselines.status', 'approved'),
+        supabase.from('budget_lines').select('*').eq('project_id', project.id),
+        supabase.from('cost_transactions').select('*').eq('project_id', project.id),
+        supabase.from('progress_updates').select('*').eq('project_id', project.id),
+        supabase.from('boq_items').select('*').eq('project_id', project.id),
+        supabase.from('risks').select('*').eq('project_id', project.id),
+      ]);
+      requireReportReads([actRes, linkRes, baselineRes, bgtRes, cstRes, prgRes, boqRes, rskRes]);
+      return { actRes, linkRes, baselineRes, bgtRes, cstRes, prgRes, boqRes, rskRes };
+    }, () => current, ({ actRes, linkRes, baselineRes, bgtRes, cstRes, prgRes, boqRes, rskRes }) => {
+      setActivities(actRes.data || []);
+      setLinks((linkRes.data || []) as ActivityLink[]);
+      // Defence in depth (kept deliberately). The query above is now the authoritative governance
+      // filter — it restricts to THIS project's ACTIVE APPROVED baseline revision. This client-side
+      // pass additionally drops any row whose `activity_id` is not an activity of the reported project,
+      // so a malformed or orphaned join result still cannot reach the DCMA audit, the baseline S-Curve
+      // or the canonical EVM. It is a filter, never a correction: it cannot widen the evidence set.
+      const projectActivityIds = new Set(((actRes.data || []) as Activity[]).map((a) => a.id));
+      setBaselineActivities(
+        ((baselineRes.data || []) as BaselineActivity[]).filter((b) => projectActivityIds.has(b.activity_id)),
+      );
+      setBudgetLines(bgtRes.data || []);
+      setTransactions((cstRes.data || []) as CostTransaction[]);
+      setProgressUpdates((prgRes.data || []) as ProgressUpdate[]);
+      setBoqItems((boqRes.data || []) as BoqItem[]);
+      setRisks(rskRes.data || []);
+      setLoadedProject(project);
+    }, () => setReadError(true), () => setLoading(false));
+    return () => { current = false; };
+  }, [project, reloadAttempt]);
 
   // GAP-010: the DCMA audit runs at the governed Data Date — `project.data_date` or the
   // DEFAULT_DATA_DATE constant — which is exactly the resolution the canonical EVM engine applies
@@ -205,9 +216,15 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
     }),
     [activities, links, dcmaDataDate, project?.calendar_type, project?.status_logic, progressUpdates],
   );
+  const currentSchedule = useMemo(() => executiveScheduleRows({
+    activities, links, baselines: baselineActivities, progressUpdates,
+    dataDate: dcmaDataDate,
+    calendarType: project?.calendar_type || '6_days',
+    statusLogic: project?.status_logic || 'retained_logic',
+  }), [activities, links, baselineActivities, progressUpdates, dcmaDataDate, project?.calendar_type, project?.status_logic]);
   const criticalActivitiesList = useMemo(
-    () => activities.filter((a) => criticality.byId.get(a.id)?.critical),
-    [activities, criticality],
+    () => currentSchedule.rows.filter((a) => a.is_critical),
+    [currentSchedule],
   );
 
   const sCurveData: SCurveData = useMemo(() => {
@@ -250,10 +267,7 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
   const statusedForecastFinish = useMemo(() => {
     if (!project) return null;
     return resolveDeterministicForecastFinish({
-      activities,
-      links,
-      baselines: baselineActivities,
-      progressUpdates,
+      activities, links, baselines: baselineActivities, progressUpdates,
       dataDate: dcmaDataDate,
       calendarType: project.calendar_type || '6_days',
       statusLogic: project.status_logic || 'retained_logic',
@@ -276,12 +290,12 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
     lookaheadEnd.setDate(lookaheadEnd.getDate() + 21);
     const lookaheadEndStr = lookaheadEnd.toISOString().split('T')[0];
 
-    return activities.filter((a) => {
-      if (a.percent_complete >= 100) return false;
+    return currentSchedule.rows.filter((a) => {
+      if (a.completed) return false;
       if (!a.early_start) return false;
       return a.early_start <= lookaheadEndStr;
     });
-  }, [activities, evmMetrics.dataDate]);
+  }, [currentSchedule, evmMetrics.dataDate]);
 
   // Report-generation metadata. This is the moment the document was rendered — it is NOT a project
   // status date, and it feeds no control calculation: BAC, PV, EV, AC, SPI(t), IEAC(t), the DCMA
@@ -297,7 +311,22 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
     window.print();
   };
 
-  if (loading) {
+  if (!project) {
+    return <div role="status" className="p-6 text-slate-600">اختر مشروعاً لعرض التقرير التنفيذي.</div>;
+  }
+
+  if (readError) {
+    return (
+      <div role="alert" className="p-6 space-y-3 text-red-800 bg-red-50 rounded-xl">
+        <p>تعذر تحميل جميع بيانات التقرير. لم يتم إنشاء تقرير أو اعتباره خالياً من السجلات.</p>
+        <button type="button" onClick={() => setReloadAttempt((value) => value + 1)}
+          className="px-4 py-2 bg-white border rounded-lg">إعادة المحاولة</button>
+      </div>
+    );
+  }
+
+  // Mask old rows immediately, before effect cleanup runs for the new project.
+  if (loading || loadedProject !== project) {
     return (
       <div className="flex items-center justify-center min-h-[400px]">
         <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-amber-500"></div>
@@ -306,7 +335,7 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
   }
 
   return (
-    <div className="space-y-6">
+    <div className="executive-report-print space-y-6">
       {/* Control Bar (Hidden in Print) */}
       <div className="flex items-center justify-between bg-white p-4 rounded-xl border border-slate-200 shadow-sm print:hidden">
         <div>
@@ -340,10 +369,10 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
               <h1 className="text-xl font-black text-slate-900">{project?.name}</h1>
             </div>
             <p className="text-xs text-slate-600">
-              المالك / العميل: <span className="font-semibold text-slate-800">{project?.client || 'شركة الأفق'}</span> | الموقع: <span className="font-semibold text-slate-800">{project?.location || 'الرياض'}</span>
+              المالك / العميل: <span className="font-semibold text-slate-800">{project.client?.trim() ? project.client : 'غير مسجل'}</span> | الموقع: <span className="font-semibold text-slate-800">{project.location?.trim() ? project.location : 'غير مسجل'}</span>
             </p>
             <p className="text-xs text-slate-600">
-              قيمة العقد: <span className="font-bold text-slate-900">{(project?.contract_value ?? 0).toLocaleString()} {project?.currency || 'ر.س'}</span> | البداية: <span className="font-mono">{project?.start_date}</span> | النهاية المعتمدة: <span className="font-mono">{project?.end_date}</span>
+              قيمة العقد: <span className="font-bold text-slate-900">{Number.isFinite(project.contract_value) ? project.contract_value.toLocaleString() : 'غير مسجلة'} {project.currency?.trim() ? project.currency : 'عملة غير مسجلة'}</span> | البداية: <span className="font-mono">{project?.start_date}</span> | النهاية المسجلة للمشروع: <span className="font-mono">{project?.end_date}</span>
             </p>
           </div>
 
@@ -429,8 +458,10 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
 
           <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-xl">
             <span className="text-[11px] text-slate-500 font-semibold">جودة وسلامة الجدول (DCMA)</span>
-            <div className="text-2xl font-black text-emerald-700 mt-1">{dcma.score}%</div>
-            <span className="text-[10px] text-emerald-600 font-bold">{dcma.totalPassed}/14 معايير معتمدة</span>
+            {dcma.points.length > 0 ? <>
+              <div className="text-2xl font-black text-emerald-700 mt-1">{dcma.score}%</div>
+              <span className="text-[10px] text-emerald-600 font-bold">{dcma.totalPassed}/14 معايير اجتازت الفحص</span>
+            </> : <p className="text-sm text-slate-600 mt-1">{dcma.summary}</p>}
           </div>
         </div>
 
@@ -544,8 +575,8 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
           </div>
         </div>
 
-        {/* S-Curve Chart Section */}
-        <div className="border border-slate-200 rounded-xl p-4">
+        {/* Keep this heading, chart and legend in one printable card when it fits a page. */}
+        <div className="executive-report-scurve border border-slate-200 rounded-xl p-4">
           <h3 className="text-xs font-bold text-slate-800 mb-2 flex items-center gap-1.5">
             <TrendingUp size={15} className="text-amber-600" />
             منحنى الإنجاز التراكمي ومطابقة خط الأساس (Baseline S-Curve & EVM)
@@ -571,11 +602,11 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
                 <tr>
                   <th className="p-2 text-right">كود النشاط</th>
                   <th className="p-2 text-right">اسم النشاط</th>
-                  <th className="p-2 text-right">البداية المبكرة</th>
-                  <th className="p-2 text-right">النهاية المبكرة</th>
+                  <th className="p-2 text-right">البداية الحالية (فعلي / CPM)</th>
+                  <th className="p-2 text-right">النهاية الحالية (فعلي / CPM)</th>
                   <th className="p-2 text-right">المدة</th>
                   <th className="p-2 text-right">الإنجاز</th>
-                  <th className="p-2 text-right">كبح المسار (Drag)</th>
+                  <th className="p-2 text-right">كبح المسار المحفوظ (Drag)</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
@@ -583,11 +614,11 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
                   <tr key={act.id} className="hover:bg-slate-50">
                     <td className="p-2 font-mono font-bold text-rose-700">{act.code}</td>
                     <td className="p-2 font-semibold text-slate-800">{act.name}</td>
-                    <td className="p-2 font-mono text-slate-600">{act.early_start}</td>
-                    <td className="p-2 font-mono text-slate-600">{act.early_finish}</td>
+                    <td className="p-2 font-mono text-slate-600">{act.early_start || 'N/A'}</td>
+                    <td className="p-2 font-mono text-slate-600">{act.early_finish || 'N/A'}</td>
                     <td className="p-2">{act.duration_days} يوم</td>
                     <td className="p-2 font-bold text-blue-700">{act.percent_complete}%</td>
-                    <td className="p-2 font-mono">{act.activity_drag || act.duration_days} يوم</td>
+                    <td className="p-2 font-mono">{act.activity_drag ?? 'N/A'} يوم</td>
                   </tr>
                 ))}
               </tbody>
@@ -608,8 +639,8 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
                   <th className="p-2 text-right">الكود</th>
                   <th className="p-2 text-right">النشاط المستهدف</th>
                   <th className="p-2 text-right">المقاول / الفريق</th>
-                  <th className="p-2 text-right">تاريخ البدء المخطط</th>
-                  <th className="p-2 text-right">تاريخ الإنجاز المخطط</th>
+                  <th className="p-2 text-right">البداية الحالية (فعلي / CPM)</th>
+                  <th className="p-2 text-right">النهاية الحالية (فعلي / CPM)</th>
                   <th className="p-2 text-right">الهامش (Float)</th>
                   <th className="p-2 text-center">الأولوية</th>
                 </tr>
@@ -622,7 +653,7 @@ export default function ExecutiveReportView({ project }: ExecutiveReportViewProp
                     <td className="p-2 text-slate-500">{act.contractor || 'المقاول العام'}</td>
                     <td className="p-2 font-mono text-slate-700">{act.early_start}</td>
                     <td className="p-2 font-mono text-slate-700">{act.early_finish}</td>
-                    <td className="p-2 font-mono">{act.total_float || 0} يوم</td>
+                    <td className="p-2 font-mono">{act.total_float ?? 'N/A'} يوم</td>
                     <td className="p-2 text-center">
                       {act.is_critical ? (
                         <span className="px-2 py-0.5 rounded bg-rose-100 text-rose-800 font-bold text-[10px]">حرج جداً</span>

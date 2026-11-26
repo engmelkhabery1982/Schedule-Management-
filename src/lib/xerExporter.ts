@@ -111,7 +111,8 @@ export function generateXer(data: XerExportData): string {
 }
 
 export function downloadXer(content: string, filename: string) {
-  const blob = new Blob([content], { type: 'text/tab-separated-values;charset=utf-8' });
+  const blob = new Blob([content], { type: filename.toLowerCase().endsWith('.xml')
+    ? 'application/xml;charset=utf-8' : 'text/tab-separated-values;charset=utf-8' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
@@ -163,8 +164,8 @@ export function activitiesToMsProjectXml(activities: Activity[], projectName: st
       <ID>${index + 1}</ID>
       <Name>${xmlEscape(activity.name)}</Name>
       <WBS>${xmlEscape(activity.code)}</WBS>
-      <Start>${activity.early_start || ''}T08:00:00</Start>
-      <Finish>${activity.early_finish || ''}T17:00:00</Finish>
+      ${activity.early_start ? `<Start>${activity.early_start}T08:00:00</Start>` : ''}
+      ${activity.early_finish ? `<Finish>${activity.early_finish}T17:00:00</Finish>` : ''}
       <Duration>PT${Math.max(0, activity.duration_days) * 8}H0M0S</Duration>
       <PercentComplete>${Math.round(activity.percent_complete || 0)}</PercentComplete>
       <Milestone>${activity.is_milestone ? 1 : 0}</Milestone>

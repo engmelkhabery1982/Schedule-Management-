@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import {
   AlertCircle,
@@ -17,6 +17,8 @@ import {
   XCircle,
 } from 'lucide-react';
 import type {
+  CostTransaction,
+  DelayClaimEvent,
   Activity,
   ActivityBoqAllocation,
   BaselineBoqItem,
@@ -35,11 +37,13 @@ import type {
 import { getLanguage, type Language } from '@/lib/i18n';
 import { approveScopeBaseline } from '@/lib/boqPlanService';
 import {
+  buildVoImpactEvidence,
   calculateScopeSummary,
   getScopeItemMetrics,
   isPendingVariationOrderStatus,
 } from '@/lib/scopeChangeEngine';
 import { supabase } from '@/lib/supabase';
+import { requireScopeRows, requireScopePointer } from '@/lib/scopeReadSafety';
 
 interface ScopeChangeRegisterProps {
   project: Project | null;
@@ -168,7 +172,16 @@ function nextVoNumber(orders: VariationOrder[]): string {
   return `VO-${String(max + 1).padStart(3, '0')}`;
 }
 
-export default function ScopeChangeRegister({ project }: ScopeChangeRegisterProps) {
+export default function ScopeChangeRegister(props: ScopeChangeRegisterProps) {
+  // Remount the entire project-bound editor; old async completions cannot replace a new editor.
+  return <ProjectScopeChangeRegister key={props.project?.id ?? 'empty'} {...props} />;
+}
+
+function ProjectScopeChangeRegister({ project }: ScopeChangeRegisterProps) {
+  const readEpoch = useRef(0);
+  const [ready, setReady] = useState(false);
+  const [transactions, setTransactions] = useState<CostTransaction[]>([]);
+  const [claims, setClaims] = useState<DelayClaimEvent[]>([]);
   const [lang, setLang] = useState<Language>(getLanguage());
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -202,6 +215,8 @@ export default function ScopeChangeRegister({ project }: ScopeChangeRegisterProp
   }, []);
 
   async function loadData() {
+    const epoch = ++readEpoch.current;
+    setReady(false);
     if (!project?.id) {
       setBaselinePointer(null);
       setBaselineHistory([]);
@@ -225,7 +240,7 @@ export default function ScopeChangeRegister({ project }: ScopeChangeRegisterProp
     setBaselineItems([]);
     setBaselineWbs([]);
     try {
-      const [pointerResult, baselinesResult, boqResult, wbsResult, activityResult, allocationResult, orderResult, impactResult, wbsLinkResult, activityLinkResult, eventResult] = await Promise.all([
+      const [pointerResult, baselinesResult, boqResult, wbsResult, activityResult, allocationResult, orderResult, impactResult, wbsLinkResult, activityLinkResult, eventResult, transactionResult, claimResult] = await Promise.all([
         supabase.from('project_scope_baseline_current').select('*').eq('project_id', project.id).maybeSingle(),
         supabase.from('project_baselines').select('*').eq('project_id', project.id).order('version', { ascending: false }),
         supabase.from('boq_items').select('*').eq('project_id', project.id).order('sort_order', { ascending: true }),
@@ -237,51 +252,66 @@ export default function ScopeChangeRegister({ project }: ScopeChangeRegisterProp
         supabase.from('variation_order_wbs_links').select('*').eq('project_id', project.id),
         supabase.from('variation_order_activity_links').select('*').eq('project_id', project.id),
         supabase.from('variation_order_events').select('*').eq('project_id', project.id).order('changed_at', { ascending: false }),
+        supabase.from('cost_transactions').select('*').eq('project_id', project.id),
+        supabase.from('delay_claims').select('*').eq('project_id', project.id),
       ]);
-      const allResults = [pointerResult, baselinesResult, boqResult, wbsResult, activityResult, allocationResult, orderResult, impactResult, wbsLinkResult, activityLinkResult, eventResult];
-      const failed = allResults.find((result) => result.error);
-      if (failed?.error) throw new Error(failed.error.message || 'Unable to load scope governance records');
-
-      const pointer = (pointerResult.data || null) as { baseline_id: string } | null;
-      const revisions = (baselinesResult.data || []) as ProjectBaseline[];
+      if (epoch !== readEpoch.current) return;
+      const pointer = requireScopePointer(pointerResult, project.id);
+      const revisions = requireScopeRows<ProjectBaseline>(baselinesResult, project.id, 'Baselines');
+      // Validate every required result before publishing any partial evidence.
+      const boq = requireScopeRows<BoqItem>(boqResult, project.id, 'BOQ');
+      const wbs = requireScopeRows<WbsNode>(wbsResult, project.id, 'WBS');
+      const acts = requireScopeRows<Activity>(activityResult, project.id, 'Activities');
+      const allocs = requireScopeRows<ActivityBoqAllocation>(allocationResult, project.id, 'Allocations');
+      const vos = requireScopeRows<VariationOrder>(orderResult, project.id, 'VOs');
+      const impacts = requireScopeRows<VariationOrderBoqImpact>(impactResult, project.id, 'Impacts');
+      const voWbs = requireScopeRows<VariationOrderWbsLink>(wbsLinkResult, project.id, 'VO WBS');
+      const voActs = requireScopeRows<VariationOrderActivityLink>(activityLinkResult, project.id, 'VO activities');
+      const history = requireScopeRows<VariationOrderEvent>(eventResult, project.id, 'VO events');
+      const costs = requireScopeRows<CostTransaction>(transactionResult, project.id, 'Costs');
+      const analyses = requireScopeRows<DelayClaimEvent>(claimResult, project.id, 'Claims');
       const activeBaseline = pointer ? revisions.find((revision) => revision.id === pointer.baseline_id) : undefined;
       setBaselinePointer(pointer);
       setBaselineHistory(revisions.filter((revision) => revision.baseline_kind === 'scope' || revision.baseline_kind === 'integrated'));
-      setCurrentBoq((boqResult.data || []) as BoqItem[]);
-      setCurrentWbs((wbsResult.data || []) as WbsNode[]);
-      setActivities((activityResult.data || []) as Activity[]);
-      setAllocations((allocationResult.data || []) as ActivityBoqAllocation[]);
-      setOrders((orderResult.data || []) as VariationOrder[]);
-      setBoqImpacts((impactResult.data || []) as VariationOrderBoqImpact[]);
-      setWbsLinks((wbsLinkResult.data || []) as VariationOrderWbsLink[]);
-      setActivityLinks((activityLinkResult.data || []) as VariationOrderActivityLink[]);
-      setEvents((eventResult.data || []) as VariationOrderEvent[]);
+      setCurrentBoq(boq);
+      setCurrentWbs(wbs);
+      setActivities(acts);
+      setAllocations(allocs);
+      setOrders(vos);
+      setBoqImpacts(impacts);
+      setWbsLinks(voWbs);
+      setActivityLinks(voActs);
+      setEvents(history);
 
       if (pointer?.baseline_id) {
         if (!activeBaseline || activeBaseline.status !== 'approved' || !['scope', 'integrated'].includes(activeBaseline.baseline_kind || '')) {
           throw new Error('The current scope pointer does not resolve to an approved scope baseline revision.');
         }
         const [baselineBoqResult, baselineWbsResult] = await Promise.all([
-          supabase.from('baseline_boq_items').select('*').eq('baseline_id', pointer.baseline_id).order('sort_order', { ascending: true }),
-          supabase.from('baseline_wbs_nodes').select('*').eq('baseline_id', pointer.baseline_id).order('sort_order', { ascending: true }),
+          supabase.from('baseline_boq_items').select('*').eq('project_id', project.id).eq('baseline_id', pointer.baseline_id).order('sort_order', { ascending: true }),
+          supabase.from('baseline_wbs_nodes').select('*').eq('project_id', project.id).eq('baseline_id', pointer.baseline_id).order('sort_order', { ascending: true }),
         ]);
-        if (baselineBoqResult.error) throw new Error(baselineBoqResult.error.message);
-        if (baselineWbsResult.error) throw new Error(baselineWbsResult.error.message);
-        setBaselineItems((baselineBoqResult.data || []) as BaselineBoqItem[]);
-        setBaselineWbs((baselineWbsResult.data || []) as BaselineWbsNode[]);
+        if (epoch !== readEpoch.current) return;
+        setBaselineItems(requireScopeRows<BaselineBoqItem>(baselineBoqResult, project.id, 'Baseline BOQ', pointer.baseline_id));
+        setBaselineWbs(requireScopeRows<BaselineWbsNode>(baselineWbsResult, project.id, 'Baseline WBS', pointer.baseline_id));
       } else {
         setBaselineItems([]);
         setBaselineWbs([]);
       }
+      setTransactions(costs);
+      setClaims(analyses);
+      setReady(true);
     } catch (error) {
-      setLoadError((error as Error).message || 'Unable to load scope governance records');
+      if (epoch !== readEpoch.current) return;
+      setLoadError((error instanceof Error ? error.message : String(error)) || 'Unable to load scope governance records');
     } finally {
-      setLoading(false);
+      if (epoch === readEpoch.current) setLoading(false);
     }
   }
 
   useEffect(() => {
     void loadData();
+    return () => { readEpoch.current++; };
     // Loading is project-scoped; keeping the callback local avoids stale project records on switch.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project?.id]);
@@ -389,7 +419,7 @@ export default function ScopeChangeRegister({ project }: ScopeChangeRegisterProp
   }
 
   async function handleSaveDraft() {
-    if (!project?.id) return;
+    if (!project?.id || !ready || busy) return;
     const unlinkedLineHasData = draftForm.boqImpacts.some((line) => !line.boqItemId && (line.quantityImpact !== '' || line.valueImpact !== '' || line.notes.trim() !== ''));
     const selectedLines = draftForm.boqImpacts.filter((line) => line.boqItemId);
     const parsedLines = selectedLines.map((line) => ({
@@ -437,7 +467,7 @@ export default function ScopeChangeRegister({ project }: ScopeChangeRegisterProp
       setShowDraftModal(false);
       await loadData();
     } catch (error) {
-      setLoadError((error as Error).message || 'Unable to save VO draft');
+      setLoadError((error instanceof Error ? error.message : String(error)) || 'Unable to save VO draft');
     } finally {
       setBusy(false);
     }
@@ -450,7 +480,7 @@ export default function ScopeChangeRegister({ project }: ScopeChangeRegisterProp
   }
 
   async function handleTransition() {
-    if (!transition) return;
+    if (!transition || !ready || busy || transition.order.project_id !== project?.id) return;
     setBusy(true);
     setLoadError('');
     try {
@@ -469,14 +499,14 @@ export default function ScopeChangeRegister({ project }: ScopeChangeRegisterProp
       setTransition(null);
       await loadData();
     } catch (error) {
-      setLoadError((error as Error).message || 'Unable to change VO status');
+      setLoadError((error instanceof Error ? error.message : String(error)) || 'Unable to change VO status');
     } finally {
       setBusy(false);
     }
   }
 
   async function handleApproveScopeBaseline() {
-    if (!project?.id) return;
+    if (!project?.id || !ready || busy) return;
     setBusy(true);
     setLoadError('');
     setNotice('');
@@ -522,10 +552,10 @@ export default function ScopeChangeRegister({ project }: ScopeChangeRegisterProp
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
-          <button disabled={loading || busy} onClick={() => openNewDraft()} className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-3 py-2 text-xs font-bold text-slate-950 hover:bg-amber-400 disabled:cursor-not-allowed disabled:opacity-50">
+          <button disabled={!ready || loading || busy} onClick={() => openNewDraft()} className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-3 py-2 text-xs font-bold text-slate-950 hover:bg-amber-400 disabled:cursor-not-allowed disabled:opacity-50">
             <Plus size={14} /> {text('أمر تغييري جديد', 'New VO')}
           </button>
-          <button disabled={loading || busy} onClick={() => { setLoadError(''); setNotice(''); setBaselineEvidence({ approvedBy: '', approvalReference: '', approvedAt: '' }); setShowBaselineModal(true); }} className="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-bold text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50">
+          <button disabled={!ready || loading || busy} onClick={() => { setLoadError(''); setNotice(''); setBaselineEvidence({ approvedBy: '', approvalReference: '', approvedAt: '' }); setShowBaselineModal(true); }} className="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-bold text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50">
             <ShieldCheck size={14} /> {text(currentBaseline ? 'اعتماد إصدار نطاق جديد' : 'اعتماد خط أساس النطاق', currentBaseline ? 'Approve scope revision' : 'Approve scope baseline')}
           </button>
         </div>
@@ -536,6 +566,15 @@ export default function ScopeChangeRegister({ project }: ScopeChangeRegisterProp
       )}
       {notice && <div className="flex items-start gap-2 rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-xs text-emerald-800"><CheckCircle2 size={16} className="mt-0.5 shrink-0" />{notice}</div>}
 
+      {!ready && <div role="alert" className="p-3 text-rose-800">
+        {text('بيانات النطاق غير متاحة. أعد التحميل؛ لم تُحذف المسودات.', 'Scope data unavailable. Retry loading; drafts are retained.')}
+        <button disabled={loading || busy} onClick={() => void loadData()}>{text('إعادة المحاولة', 'Retry')}</button>
+      </div>}
+      <div hidden={!ready}>
+      <p className="rounded border border-amber-200 p-3 text-xs">
+        {text('الجدول: المقاس الحالي والمعتمد غير متاحين. الأيام المدخلة غير مثبتة؛ لا تجمع أيام الأوامر بسبب احتمال التداخل. لا ترحيل تلقائي إلى BAC/AC/EAC/F6.',
+          'Schedule: current measured and approved impact unavailable. Entered days are unproven; potential overlap prevents day aggregation. No automatic posting to BAC/AC/EAC/F6.')}
+      </p>
       <section className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
         <div className="flex flex-wrap items-start justify-between gap-3 border-b border-slate-100 pb-3">
           <div>
@@ -675,7 +714,9 @@ export default function ScopeChangeRegister({ project }: ScopeChangeRegisterProp
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {orders.map((order) => {
-                  const itemImpacts = impactByOrder.get(order.id) || [];
+                  const evidence = buildVoImpactEvidence({ projectId: project.id, order, impacts: boqImpacts,
+                    activityLinks, wbsLinks, transactions, claims });
+                  const itemImpacts = evidence.quantityRows;
                   const orderWbs = wbsLinksByOrder.get(order.id) || [];
                   const orderActivities = activityLinksByOrder.get(order.id) || [];
                   const orderEvents = eventsByOrder.get(order.id) || [];
@@ -687,7 +728,7 @@ export default function ScopeChangeRegister({ project }: ScopeChangeRegisterProp
                           <div className="font-mono font-black text-amber-900">{order.vo_number}</div>
                           <span className={`mt-1 inline-flex rounded-full border px-2 py-0.5 font-bold ${statusTone(order.status)}`}>{statusLabel(order.status, lang)}</span>
                           {revisedFrom && <div className="mt-1 text-[9px] text-violet-700">{text('تصحيح لـ', 'Revision of')} {revisedFrom.vo_number}</div>}
-                          {order.status === 'approved' && <div className="mt-1 flex items-center gap-1 text-[9px] font-bold text-emerald-700"><CheckCircle2 size={11} />{text('الاعتماد بالدليل', 'Evidence-backed')}</div>}
+                          {evidence.approvalComplete && <div className="mt-1 flex items-center gap-1 text-[9px] font-bold text-emerald-700"><CheckCircle2 size={11} />{text('الاعتماد بالدليل', 'Evidence-backed')}</div>}
                           {order.status === 'approved' && (!order.approval_reference || !order.approval_evidence_reference) && <div className="mt-1 text-[9px] font-bold text-rose-700">{text('دليل الاعتماد ناقص', 'Evidence incomplete')}</div>}
                         </td>
                         <td className="px-3 py-3">
@@ -745,7 +786,24 @@ export default function ScopeChangeRegister({ project }: ScopeChangeRegisterProp
                           ) : <span className="text-amber-700">{text('لم يعتمد — لا يدخل النطاق المعدل', 'Not approved — excluded from revised scope')}</span>}
                         </td>
                         <td className="px-3 py-3">
-                          <div>{numericLabel(order.schedule_impact_days, text('يوم', 'd'), lang)}</div>
+                          <div>{text('أيام مدخلة فقط:', 'Entered days only:')} {numericLabel(evidence.enteredScheduleDays, text('يوم', 'd'), lang)}</div>
+                          <div>{text('تأخير مقاس حالي / معتمد: غير متاح', 'Current measured / approved delay: N/A')}</div>
+                          <div>{text('تداخل محتمل — لا يمكن جمع الأيام', 'Potential overlap — aggregation unavailable')}</div>
+                          <div>{text('معرف الأمر / إصدار السجل:', 'VO ID / record revision:')} {order.id} / {order.updated_at}</div>
+                          <div>{text('قيمة مباشرة محفوظة:', 'Stored direct value:')} {amountLabel(evidence.directValue, lang, currency)} · {statusLabel(order.status, lang)}</div>
+                          {itemImpacts.map(row => <div key={row.id}>{row.id}: {row.boq_item_id} · {text('كمية:', 'Quantity:')} {numericLabel(row.quantity_impact, null, lang)}</div>)}
+                          <div>{text('دليل التكلفة: سياق مرتبط فقط؛ ليس تكلفة إضافية أو إسناداً للأمر', 'Cost evidence: related context only; not additional AC or VO attribution')}</div>
+                          {!evidence.costContext.length && <div>N/A</div>}
+                          {evidence.costContext.map(row => <div key={row.id}>
+                            {row.id} · {row.source ?? 'N/A'} · {row.transaction_date} · {row.status} / {row.approval_level ?? 'N/A'} · {amountLabel(row.amount, lang, currency)}
+                          </div>)}
+                          <div>{text('مرجع تحليل مطابق للمعرف فقط:', 'Exact-ID analysis reference only:')} {evidence.analysis?.id ?? 'N/A'}</div>
+                          {evidence.analysis && <div>
+                            {evidence.analysis.analysis_method ?? 'N/A'} · {evidence.analysis.created_at} · {evidence.analysis.status}<br />
+                            {text('قياس تاريخي مسجل (ليس قياساً حالياً):', 'Historical recorded measurement (not current):')} {numericLabel(evidence.analysis.critical_delay_days, null, lang)}<br />
+                            {text('إصدار المصدر / تاريخ البيانات غير متاح؛ الحداثة غير مثبتة', 'Source revision / Data Date unavailable; freshness unverified')}
+                          </div>}
+                          <div>{text('الثقة: دليل جزئي؛ اعتماد النطاق لا يثبت التأخير', 'Confidence: partial evidence; scope approval does not prove delay')}</div>
                           <div className="mt-1 max-w-[180px] break-all text-slate-500">{order.schedule_impact_reference || text('مرجع/دليل غير مسجل', 'reference/evidence N/A')}</div>
                           <div className="mt-1 text-[9px] text-slate-400">{text('دليل فقط؛ لا يحدّث CPM أو TIA/EOT.', 'Evidence only; does not update CPM or TIA/EOT.')}</div>
                         </td>
@@ -795,6 +853,8 @@ export default function ScopeChangeRegister({ project }: ScopeChangeRegisterProp
           </div>
         )}
       </section>
+
+      </div>
 
       {showBaselineModal && (
         <Modal onClose={() => setShowBaselineModal(false)} title={text('اعتماد لقطة BOQ/WBS', 'Approve a BOQ/WBS snapshot')}>

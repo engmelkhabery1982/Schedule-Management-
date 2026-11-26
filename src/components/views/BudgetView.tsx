@@ -1,9 +1,11 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { supabase } from '@/lib/supabase';
+import { requireReportReads, runReportRead } from '@/lib/reportReadSafety';
 import { getLanguage, type Language } from '@/lib/i18n';
 import { quoteCanonicalEvm } from '@/lib/canonicalEvm';
 import { reviewStateOf } from '@/lib/demoDbContracts';
 import { assertDbWriteOk } from '@/lib/supabaseErrors';
+import { isValidProgressDate as isValidCostDate } from '@/lib/commercialControlsEngine';
 import { calculateEarnedSchedule, type EarnedScheduleResult } from '@/lib/earnedScheduleEngine';
 import {
   aggregateCbsCostCenters,
@@ -127,8 +129,16 @@ export default function BudgetView({ project }: BudgetViewProps) {
     authorizationNotes: 'موافقة لجنة التحكم المالي لتغطية فارق تكلفة التوريد العاجل',
   });
 
+  const requestGeneration = useRef(0);
+  const mounted = useRef(true);
+  const selectedProject = useRef(project);
+  selectedProject.current = project;
+  const [loadedProject, setLoadedProject] = useState<Project | null>(null);
+  const [readError, setReadError] = useState(false);
+
   useEffect(() => {
-    if (project) loadData();
+    mounted.current = true;
+    if (project) void loadData();
     else setLoading(false);
 
     const handleLangChange = (e: any) => {
@@ -141,6 +151,7 @@ export default function BudgetView({ project }: BudgetViewProps) {
     };
     window.addEventListener('project-data-date-changed', handleDataDateChange);
     return () => {
+      mounted.current = false;
       window.removeEventListener('app-language-changed', handleLangChange);
       window.removeEventListener('project-data-date-changed', handleDataDateChange);
     };
@@ -156,41 +167,57 @@ export default function BudgetView({ project }: BudgetViewProps) {
   }, [project]);
 
   async function loadData() {
-    if (!project) return;
+    if (!project || !mounted.current || selectedProject.current !== project) return;
+    const generation = ++requestGeneration.current;
+    const isCurrent = () => mounted.current && selectedProject.current === project && requestGeneration.current === generation;
     setLoading(true);
-    const [{ data }, { data: transactionData }, { data: boqData }, { data: activityData }, { data: progressData }, baseRes, linkRes, wbsRes, allocRes, pkgRes, snapRes] = await Promise.all([
-      supabase.from('budget_lines').select('*').eq('project_id', project.id),
-      supabase.from('cost_transactions').select('*').eq('project_id', project.id).order('transaction_date', { ascending: false }),
-      supabase.from('boq_items').select('*').eq('project_id', project.id).order('sort_order'),
-      supabase.from('activities').select('*').eq('project_id', project.id).order('sort_order'),
-      supabase.from('progress_updates').select('*').eq('project_id', project.id),
-      supabase.from('baseline_activities').select('*, project_baselines!inner(project_id, is_active, status)').eq('project_baselines.project_id', project.id).eq('project_baselines.is_active', true).eq('project_baselines.status', 'approved'),
-      supabase.from('activity_links').select('*').eq('project_id', project.id),
-      supabase.from('wbs_nodes').select('*').eq('project_id', project.id).order('sort_order'),
-      supabase.from('activity_boq_allocations').select('*').eq('project_id', project.id),
-      // Direct rows only: the cached loader falls back to demo defaults, which F6 must not read as exposure.
-      supabase.from('subcontract_packages').select('status, total_subcontract_value_sar').eq('project_id', project.id),
-      supabase.from('cost_control_snapshots').select('*').eq('project_id', project.id).order('data_date', { ascending: false }).limit(10),
-    ]);
-    setBudgetLines(data || []);
-    setTransactions((transactionData || []) as CostTransaction[]);
-    setBoqItems((boqData || []) as BoqItem[]);
-    setActivities((activityData || []) as Activity[]);
-    setProgressUpdates((progressData || []) as ProgressUpdate[]);
-    setBaselines(((baseRes as { data?: unknown }).data || []) as BaselineActivity[]);
-    setLinks(((linkRes as { data?: unknown }).data || []) as ActivityLink[]);
-    setWbsNodes(((wbsRes as { data?: unknown }).data || []) as WbsNode[]);
-    setAllocations(((allocRes as { data?: unknown }).data || []) as ActivityBoqAllocation[]);
-    setPackages((((pkgRes as { data?: unknown }).data || []) as Array<Record<string, unknown>>).map((r) => ({
-      status: String(r.status || ''),
-      totalSubcontractValueSar: typeof r.total_subcontract_value_sar === 'number' ? (r.total_subcontract_value_sar as number) : null,
-    })));
-    setCostSnapshots(((snapRes as { data?: unknown }).data || []) as CostControlSnapshot[]);
-    setLoading(false);
+    setReadError(false);
+    await runReportRead(async () => {
+      const results = await Promise.all([
+        supabase.from('budget_lines').select('*').eq('project_id', project.id),
+        supabase.from('cost_transactions').select('*').eq('project_id', project.id).order('transaction_date', { ascending: false }),
+        supabase.from('boq_items').select('*').eq('project_id', project.id).order('sort_order'),
+        supabase.from('activities').select('*').eq('project_id', project.id).order('sort_order'),
+        supabase.from('progress_updates').select('*').eq('project_id', project.id),
+        supabase.from('baseline_activities').select('*, project_baselines!inner(project_id, is_active, status)').eq('project_baselines.project_id', project.id).eq('project_baselines.is_active', true).eq('project_baselines.status', 'approved'),
+        supabase.from('activity_links').select('*').eq('project_id', project.id),
+        supabase.from('wbs_nodes').select('*').eq('project_id', project.id).order('sort_order'),
+        supabase.from('activity_boq_allocations').select('*').eq('project_id', project.id),
+        // Direct rows only: the cached loader falls back to demo defaults, which F6 must not read as exposure.
+        supabase.from('subcontract_packages').select('status, total_subcontract_value_sar').eq('project_id', project.id),
+        supabase.from('cost_control_snapshots').select('*').eq('project_id', project.id).order('data_date', { ascending: false }).limit(10),
+      ]);
+      requireReportReads(results);
+      return results;
+    }, isCurrent, ([{ data }, { data: transactionData }, { data: boqData }, { data: activityData }, { data: progressData }, baseRes, linkRes, wbsRes, allocRes, pkgRes, snapRes]) => {
+      setBudgetLines(data || []);
+      setTransactions((transactionData || []) as CostTransaction[]);
+      setBoqItems((boqData || []) as BoqItem[]);
+      setActivities((activityData || []) as Activity[]);
+      setProgressUpdates((progressData || []) as ProgressUpdate[]);
+      setBaselines(((baseRes as { data?: unknown }).data || []) as BaselineActivity[]);
+      setLinks(((linkRes as { data?: unknown }).data || []) as ActivityLink[]);
+      setWbsNodes(((wbsRes as { data?: unknown }).data || []) as WbsNode[]);
+      setAllocations(((allocRes as { data?: unknown }).data || []) as ActivityBoqAllocation[]);
+      setPackages((((pkgRes as { data?: unknown }).data || []) as Array<Record<string, unknown>>).map((r) => ({
+        status: String(r.status || ''),
+        totalSubcontractValueSar: typeof r.total_subcontract_value_sar === 'number' ? (r.total_subcontract_value_sar as number) : null,
+      })));
+      setCostSnapshots(((snapRes as { data?: unknown }).data || []) as CostControlSnapshot[]);
+      setLoadedProject(project);
+    }, () => setReadError(true), () => setLoading(false));
   }
 
   async function addTransaction() {
-    if (!project || !transactionForm.description || transactionForm.amount <= 0) return;
+    if (!project) return;
+    if (!transactionForm.description.trim() || !Number.isFinite(transactionForm.amount) || transactionForm.amount <= 0) {
+      setNotice(lang === 'ar' ? 'أدخل وصفاً ومبلغاً موجباً صالحاً للحركة.' : 'Enter a description and a valid positive amount.');
+      return;
+    }
+    if (!isValidCostDate(txnDate)) {
+      setNotice(lang === 'ar' ? 'أدخل تاريخ حركة صالحاً قبل التسجيل.' : 'Enter a valid transaction date before saving.');
+      return;
+    }
     // F6 §1: a transaction dated after the Data Date is not an actual — blocked at entry.
     if (isAfterDataDate(txnDate, governedDataDate)) {
       setNotice(`تعذر التسجيل: تاريخ الحركة (${txnDate}) بعد تاريخ التحديث المعتمد (${governedDataDate}).`);
@@ -198,7 +225,7 @@ export default function BudgetView({ project }: BudgetViewProps) {
     }
     const { error } = await supabase.from('cost_transactions').insert({
       project_id: project.id,
-      description: transactionForm.description,
+      description: transactionForm.description.trim(),
       amount: transactionForm.amount,
       cost_type: transactionForm.cost_type,
       transaction_date: txnDate,
@@ -475,7 +502,7 @@ export default function BudgetView({ project }: BudgetViewProps) {
     const planned = evm.bac;
     const actual = evm.ac;
     const remaining = planned - actual;
-    const variance = planned - actual;
+    const variance = evm.cv;
     return { planned, committed: committedSummary.total, actual, remaining, variance };
   }, [evm, committedSummary]);
 
@@ -661,7 +688,14 @@ export default function BudgetView({ project }: BudgetViewProps) {
     setShowReserveModal(false);
   };
 
-  if (loading) {
+  if (project && readError) {
+    return <div role="alert" className="p-6 space-y-3 bg-red-50 text-red-800 rounded-xl">
+      <p>{lang === 'ar' ? 'تعذر تحميل جميع بيانات الميزانية. لا يمكن عرض الأرقام أو تسجيل إجراءات بناءً على قراءة ناقصة.' : 'Budget data could not be fully loaded. Figures and actions are unavailable until all reads succeed.'}</p>
+      <button type="button" className="px-4 py-2 border rounded-lg" onClick={() => void loadData()}>{lang === 'ar' ? 'إعادة المحاولة' : 'Retry'}</button>
+    </div>;
+  }
+
+  if (project && (loading || loadedProject !== project)) {
     return (
       <div className="flex items-center justify-center min-h-[400px]">
         <div className="animate-spin rounded-full h-10 w-10 border-4 border-amber-500 border-t-transparent"></div>

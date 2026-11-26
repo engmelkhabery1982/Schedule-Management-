@@ -3,6 +3,7 @@ import { supabase } from '@/lib/supabase';
 import type { Project, Activity, ActivityLink, WbsNode, Resource, ActivityResource } from '@/types';
 import { generateXer, downloadXer, downloadCsv, activitiesToCsv, activitiesToMsProjectXml } from '@/lib/xerExporter';
 import { Download, FileText, FileSpreadsheet, Database, Loader } from 'lucide-react';
+import WorkspaceBackupPanel from './WorkspaceBackupPanel';
 
 interface ExportViewProps {
   project: Project | null;
@@ -95,14 +96,28 @@ export default function ExportView({ project }: ExportViewProps) {
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center h-full">
-        <div className="animate-spin rounded-full h-12 w-12 border-4 border-amber-500 border-t-transparent"></div>
+      <div className="space-y-6">
+        {/* S29: the workspace backup panel is available even while a project's schedule is loading —
+            it does not depend on the selected project. */}
+        <WorkspaceBackupPanel />
+        <div className="flex items-center justify-center h-full">
+          <div className="animate-spin rounded-full h-12 w-12 border-4 border-amber-500 border-t-transparent"></div>
+        </div>
       </div>
     );
   }
 
   if (!project) {
-    return <div className="text-center text-slate-400 py-8">لا يوجد مشروع محدد</div>;
+    // S29: workspace-level backup/restore stays reachable even with no project selected — after a
+    // fresh start (or a damaged payload) this is the surface a pilot user needs first.
+    return (
+      <div className="space-y-6">
+        <WorkspaceBackupPanel />
+        <div className="text-center text-slate-400 py-8">
+          لا يوجد مشروع محدد — تصدير الجدول الزمني (XER/CSV/XML) يتطلب اختيار مشروع
+        </div>
+      </div>
+    );
   }
 
   const exportOptions = [
@@ -150,6 +165,8 @@ export default function ExportView({ project }: ExportViewProps) {
         <h1 className="text-2xl font-bold text-slate-800">تصدير البيانات</h1>
         <p className="text-sm text-slate-500 mt-1">تصدير الجدول الزمني والبيانات بصيغ مختلفة للاستخدام في برامج أخرى</p>
       </div>
+
+      <WorkspaceBackupPanel />
 
       {/* Summary */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">

@@ -1,5 +1,8 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { supabase } from '@/lib/supabase';
+import { requireReportReads, runReportRead } from '@/lib/reportReadSafety';
+import { getLanguage } from '@/lib/i18n';
+import { assertDbWriteOk } from '@/lib/supabaseErrors';
 import type { Project, Risk, Issue, Activity, ActivityLink } from '@/types';
 import { runMonteCarloSimulation, type MonteCarloResult } from '@/lib/monteCarloEngine';
 import { AlertTriangle, Plus, X, Lightbulb, Shield, Dices, Play, CheckCircle2, TrendingUp, BarChart3 } from 'lucide-react';
@@ -27,21 +30,59 @@ export default function RisksView({ project }: RisksViewProps) {
   // Monte Carlo simulation state
   const [simulationResult, setSimulationResult] = useState<MonteCarloResult | null>(null);
   const [isSimulating, setIsSimulating] = useState(false);
+  const requestGeneration = useRef(0);
+  const mounted = useRef(true);
+  const selectedProject = useRef(project);
+  selectedProject.current = project;
+  const simulationTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [loadedProject, setLoadedProject] = useState<Project | null>(null);
+  const [readError, setReadError] = useState(false);
+  const [writeError, setWriteError] = useState(false);
+  const [writing, setWriting] = useState(false);
+  const writingRef = useRef(false);
+  const writeGeneration = useRef(0);
 
   useEffect(() => {
-    if (project) loadData();
+    mounted.current = true;
+    setShowRiskForm(false);
+    setShowIssueForm(false);
+    setIsSimulating(false);
+    setWriteError(false);
+    setWriting(false);
+    writingRef.current = false;
+    setRiskForm({ title: '', description: '', probability: 3, impact: 3, mitigation: '', category: '' });
+    setIssueForm({ title: '', description: '', priority: 'medium', proposed_solution: '', assignee: '' });
+    if (project) void loadData();
     else setLoading(false);
+    return () => {
+      mounted.current = false;
+      requestGeneration.current += 1;
+      writeGeneration.current += 1;
+      if (simulationTimer.current !== null) clearTimeout(simulationTimer.current);
+      simulationTimer.current = null;
+    };
   }, [project]);
 
   async function loadData() {
-    if (!project) return;
+    if (!project || !mounted.current || selectedProject.current !== project) return;
+    const generation = ++requestGeneration.current;
+    const isCurrent = () => mounted.current && selectedProject.current === project && requestGeneration.current === generation;
+    if (simulationTimer.current !== null) clearTimeout(simulationTimer.current);
+    simulationTimer.current = null;
+    setIsSimulating(false);
+    setSimulationResult(null);
     setLoading(true);
-    const [riskRes, issueRes, actRes, linkRes] = await Promise.all([
+    setReadError(false);
+    await runReportRead(async () => {
+      const results = await Promise.all([
       supabase.from('risks').select('*').eq('project_id', project.id).order('severity', { ascending: false }),
       supabase.from('issues').select('*').eq('project_id', project.id).order('raised_date', { ascending: false }),
       supabase.from('activities').select('*').eq('project_id', project.id),
       supabase.from('activity_links').select('*').eq('project_id', project.id),
-    ]);
+      ]);
+      requireReportReads(results);
+      return results;
+    }, isCurrent, ([riskRes, issueRes, actRes, linkRes]) => {
     const acts = (actRes.data || []) as Activity[];
     const rsk = (riskRes.data || []) as Risk[];
     const lnks = (linkRes.data || []) as ActivityLink[];
@@ -58,14 +99,17 @@ export default function RisksView({ project }: RisksViewProps) {
       });
       setSimulationResult(res);
     }
-
-    setLoading(false);
+    setLoadedProject(project);
+    }, () => setReadError(true), () => setLoading(false));
   }
 
   const handleRunSimulation = () => {
-    if (!project) return;
+    if (!project || readError || loading || loadedProject !== project) return;
+    const generation = requestGeneration.current;
     setIsSimulating(true);
-    setTimeout(() => {
+    simulationTimer.current = setTimeout(() => {
+      simulationTimer.current = null;
+      if (!mounted.current || selectedProject.current !== project || requestGeneration.current !== generation) return;
       const res = runMonteCarloSimulation(activities, links, risks, project.contract_value ?? null, 1000, undefined, {
         dataDate: project.data_date || null,
       });
@@ -74,9 +118,31 @@ export default function RisksView({ project }: RisksViewProps) {
     }, 400);
   };
 
+  async function saveChange(
+    write: () => PromiseLike<{ error?: { message?: string } | null }>,
+    saved: () => void = () => {},
+  ) {
+    if (!project || selectedProject.current !== project || !mounted.current || readError || loading || loadedProject !== project || writingRef.current) return;
+    const generation = ++writeGeneration.current;
+    const isCurrent = () => mounted.current && selectedProject.current === project && writeGeneration.current === generation;
+    writingRef.current = true;
+    setWriting(true);
+    setWriteError(false);
+    try {
+      assertDbWriteOk(await write(), 'Risk/issue change');
+      if (!isCurrent()) return;
+      saved();
+      await loadData();
+    } catch {
+      if (isCurrent()) setWriteError(true);
+    } finally {
+      if (isCurrent()) { writingRef.current = false; setWriting(false); }
+    }
+  }
+
   async function addRisk() {
-    if (!project || !riskForm.title) return;
-    await supabase.from('risks').insert({
+    if (!project || !riskForm.title.trim()) return;
+    await saveChange(() => supabase.from('risks').insert({
       project_id: project.id,
       title: riskForm.title,
       description: riskForm.description || null,
@@ -86,15 +152,15 @@ export default function RisksView({ project }: RisksViewProps) {
       mitigation: riskForm.mitigation || null,
       category: riskForm.category || null,
       status: 'open',
+    }), () => {
+      setRiskForm({ title: '', description: '', probability: 3, impact: 3, mitigation: '', category: '' });
+      setShowRiskForm(false);
     });
-    setRiskForm({ title: '', description: '', probability: 3, impact: 3, mitigation: '', category: '' });
-    setShowRiskForm(false);
-    await loadData();
   }
 
   async function addIssue() {
-    if (!project || !issueForm.title) return;
-    await supabase.from('issues').insert({
+    if (!project || !issueForm.title.trim()) return;
+    await saveChange(() => supabase.from('issues').insert({
       project_id: project.id,
       title: issueForm.title,
       description: issueForm.description || null,
@@ -102,34 +168,42 @@ export default function RisksView({ project }: RisksViewProps) {
       proposed_solution: issueForm.proposed_solution || null,
       assignee: issueForm.assignee || null,
       status: 'open',
+    }), () => {
+      setIssueForm({ title: '', description: '', priority: 'medium', proposed_solution: '', assignee: '' });
+      setShowIssueForm(false);
     });
-    setIssueForm({ title: '', description: '', priority: 'medium', proposed_solution: '', assignee: '' });
-    setShowIssueForm(false);
-    await loadData();
   }
 
   async function updateRiskStatus(id: string, status: string) {
-    await supabase.from('risks').update({ status }).eq('id', id);
-    await loadData();
+    if (!project || !risks.some((risk) => risk.id === id)) return;
+    await saveChange(() => supabase.from('risks').update({ status }).eq('id', id).eq('project_id', project.id));
   }
 
   async function updateIssueStatus(id: string, status: string) {
+    if (!project || !issues.some((issue) => issue.id === id)) return;
     const updates: { status: string; resolved_date?: string } = { status };
     if (status === 'resolved') updates.resolved_date = new Date().toISOString().split('T')[0];
-    await supabase.from('issues').update(updates).eq('id', id);
-    await loadData();
+    await saveChange(() => supabase.from('issues').update(updates).eq('id', id).eq('project_id', project.id));
   }
 
-  if (loading) {
+  if (!project) {
+    return <div className="text-center text-slate-400 py-8">لا يوجد مشروع محدد</div>;
+  }
+
+  if (readError) {
+    const ar = getLanguage() === 'ar';
+    return <div role="alert" className="text-center py-8 space-y-3">
+      <p>{ar ? 'تعذرت قراءة بيانات المخاطر كاملة. أُخفيت السجلات والمحاكاة والإجراءات حتى تنجح جميع القراءات.' : 'Risk data could not be read completely. Records, simulation and actions are hidden until every read succeeds.'}</p>
+      <button type="button" className="px-4 py-2 border rounded-lg" onClick={() => void loadData()}>{ar ? 'إعادة المحاولة' : 'Retry'}</button>
+    </div>;
+  }
+
+  if (loading || loadedProject !== project) {
     return (
       <div className="flex items-center justify-center h-full min-h-[400px]">
         <div className="animate-spin rounded-full h-10 w-10 border-4 border-amber-500 border-t-transparent"></div>
       </div>
     );
-  }
-
-  if (!project) {
-    return <div className="text-center text-slate-400 py-8">لا يوجد مشروع محدد</div>;
   }
 
   function severityColor(severity: number): string {
@@ -145,7 +219,9 @@ export default function RisksView({ project }: RisksViewProps) {
   }
 
   return (
-    <div className="space-y-5">
+    <fieldset disabled={writing} className="space-y-5 border-0 min-w-0 p-0">
+      {writing && <p role="status">{getLanguage() === 'ar' ? 'جارٍ حفظ التغيير…' : 'Saving the change…'}</p>}
+      {writeError && <p role="alert" className="text-red-700">{getLanguage() === 'ar' ? 'لم يُحفظ التغيير. احتُفظ بالمدخلات؛ أعد المحاولة بعد زوال سبب الفشل.' : 'The change was not saved. Your input was retained; retry after the failure is resolved.'}</p>}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold text-slate-800">إدارة المخاطر والتحليل الاحتمالي</h1>
@@ -655,6 +731,6 @@ export default function RisksView({ project }: RisksViewProps) {
           )}
         </div>
       )}
-    </div>
+    </fieldset>
   );
 }

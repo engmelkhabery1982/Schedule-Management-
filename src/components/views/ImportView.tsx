@@ -73,6 +73,8 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
     description: '',
   });
   const [boqFile, setBoqFile] = useState<File | null>(null);
+  const [boqText, setBoqText] = useState('');
+  const boqReadVersion = useRef(0);
   const [parsedRows, setParsedRows] = useState<ParsedBoqRow[]>([]);
 
   // F2: BOQ planning wizard state (preview -> review -> confirm -> persist; no auto-baseline)
@@ -87,6 +89,8 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
 
   // XER state
   const [xerFile, setXerFile] = useState<File | null>(null);
+  const [xerText, setXerText] = useState('');
+  const xerReadVersion = useRef(0);
   const [parsedXer, setParsedXer] = useState<ParsedXerResult | null>(null);
   const [xerDataDate, setXerDataDate] = useState('');
   const [xerCurrency, setXerCurrency] = useState('SAR');
@@ -139,14 +143,26 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const xerFileInputRef = useRef<HTMLInputElement>(null);
 
-  async function handleBoqFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setBoqFile(file);
+  function clearBoqPreview() {
+    boqReadVersion.current += 1;
+    setParsedRows([]);
+    setBoqOverrides(EMPTY_BOQ_OVERRIDES);
+    setBoqDone(null);
+    setBoqBaseline(null);
+    setBaselineApprovalEvidence({ approvedBy: '', approvalReference: '', approvedAt: '' });
+    setDoneSource(null);
+    setParseProgress('');
     setError('');
+  }
+
+  async function previewBoqFile(file: File) {
+    clearBoqPreview();
+    const version = boqReadVersion.current;
     try {
       setParseProgress('جاري قراءة ملف المقايسة...');
       const rows = await parseBoqFile(file);
+      if (version !== boqReadVersion.current) return;
+      setParseProgress('');
       if (rows.length === 0) {
         setError('لم يتم العثور على بنود صالحة في الملف. تأكد من وجود أعمدة للكود والوصف والكمية والسعر');
         return;
@@ -162,19 +178,35 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
       setBaselineApprovalEvidence({ approvedBy: '', approvalReference: '', approvedAt: '' });
       setDoneSource(null);
       setParseProgress(`تم تحليل ${rows.length} بند بنجاح`);
-    } catch {
-      setError('حدث خطأ أثناء قراءة الملف. تأكد من صيغة الملف (Excel أو CSV)');
+    } catch (err) {
+      if (version !== boqReadVersion.current) return;
+      setParseProgress('');
+      setError(err instanceof Error ? err.message : 'حدث خطأ أثناء قراءة الملف. تأكد من صيغة الملف (Excel أو CSV)');
     }
   }
 
-  async function handleXerFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
+  async function handleBoqFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
+    e.target.value = '';
     if (!file) return;
-    setXerFile(file);
+    setBoqFile(file);
+    setBoqText('');
+    await previewBoqFile(file);
+  }
+
+  function clearXerPreview() {
+    xerReadVersion.current += 1;
+    setParsedXer(null);
+    setFinalPlan(null);
+    setFinalRecon(null);
+    setXerBaselineOptIn(false);
+    setParseProgress('');
     setError('');
+  }
+
+  function previewXerContent(text: string) {
+    setParseProgress('');
     try {
-      setParseProgress('جاري قراءة وتحليل ملف Primavera XER...');
-      const text = await file.text();
       const result = parseXerContent(text);
       if (!result.project || result.activities.length === 0) {
         setError('لم يتم العثور على مشروع/أنشطة في ملف XER. تأكد من صلاحية الملف.');
@@ -196,6 +228,26 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
       setParseProgress(`تم استخراج ${result.activities.length} نشاط و ${result.links.length} علاقة و ${result.wbs.length} عقدة WBS و ${result.calendars.length} تقويم`);
     } catch {
       setError('تعذر قراءة ملف XER. تأكد من أنه ملف نصي متوافق مع Primavera P6.');
+    }
+  }
+
+  async function handleXerFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = ''; // Selecting the same file after a failed/replaced preview must work.
+    if (!file) return;
+    clearXerPreview();
+    const version = xerReadVersion.current;
+    setXerFile(file);
+    setXerText('');
+    setParseProgress('جاري قراءة وتحليل ملف Primavera XER...');
+    try {
+      const text = await file.text();
+      if (version !== xerReadVersion.current) return;
+      previewXerContent(text);
+    } catch {
+      if (version !== xerReadVersion.current) return;
+      setParseProgress('');
+      setError('تعذر قراءة ملف XER — لم تُحفظ أي بيانات. Could not read XER file.');
     }
   }
 
@@ -265,6 +317,7 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
         quantity: row.quantity,
         unit_price: row.unit_price,
         total_price: row.total_price,
+        category: row.category,
       }));
       const persist = buildBoqPersistPlan(
         plan,
@@ -661,12 +714,33 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
             )}
           </div>
 
+          <details className="mt-4 border border-slate-200 rounded-lg p-3">
+            <summary className="cursor-pointer text-sm font-semibold">لصق جدول CSV / Paste BOQ CSV</summary>
+            <p className="text-xs text-slate-500 my-2">الصق صف العناوين والبنود ثم راجع التصنيف والخطة قبل الحفظ. Paste headers and items, then review the plan before saving.</p>
+            <label htmlFor="boq-csv-input" className="text-xs font-semibold">محتوى BOQ CSV / BOQ CSV contents</label>
+            <textarea
+              id="boq-csv-input"
+              value={boqText}
+              onChange={(e) => { clearBoqPreview(); setBoqFile(null); setBoqText(e.target.value); }}
+              rows={7}
+              dir="ltr"
+              className="w-full mt-1 p-2 border border-slate-300 rounded-lg font-mono text-xs"
+            />
+            <button
+              type="button"
+              disabled={!boqText.trim()}
+              onClick={() => previewBoqFile(new File([boqText], 'pasted-boq.csv', { type: 'text/csv' }))}
+              className="mt-2 px-4 py-2 bg-emerald-600 text-white rounded-lg disabled:opacity-50"
+            >تحليل ومعاينة BOQ / Analyze and preview BOQ</button>
+          </details>
+
           {parsedRows.length > 0 && (
             <div className="mt-4 space-y-4">
               {/* F2: calendar + detected families */}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
                 <div>
                   <label className="block font-medium text-slate-600 mb-1">تقويم الخطة (أيام العمل)</label>
+                  <p className="text-xs text-slate-500 mb-2">تاريخ البيانات الافتراضي للمسودة / Draft Data Date: {DEFAULT_DATA_DATE}</p>
                   <select
                     value={boqCalendar}
                     onChange={(e) => setBoqCalendar(e.target.value as CalendarType)}
@@ -1379,6 +1453,30 @@ export default function ImportView({ onProjectCreated }: ImportViewProps) {
               </div>
             )}
           </div>
+
+          <details className="mt-4 border border-slate-200 rounded-lg p-3">
+            <summary className="cursor-pointer text-sm font-semibold">لصق محتوى XER / Paste XER text</summary>
+            <p className="text-xs text-slate-500 my-2">الصق محتوى الملف النصي لمعاينته. لا يُحفظ مشروع إلا بعد مراجعة الخطة وتأكيد الاستيراد. Paste the file contents to preview; saving requires confirmation.</p>
+            <label htmlFor="xer-text-input" className="text-xs font-semibold">محتوى XER / XER text contents</label>
+            <textarea
+              id="xer-text-input"
+              value={xerText}
+              onChange={(e) => {
+                clearXerPreview();
+                setXerFile(null);
+                setXerText(e.target.value);
+              }}
+              rows={7}
+              dir="ltr"
+              className="w-full mt-1 p-2 border border-slate-300 rounded-lg font-mono text-xs"
+            />
+            <button
+              type="button"
+              disabled={!xerText.trim()}
+              onClick={() => { clearXerPreview(); previewXerContent(xerText); }}
+              className="mt-2 px-4 py-2 bg-blue-600 text-white rounded-lg disabled:opacity-50"
+            >تحليل ومعاينة XER / Analyze and preview XER</button>
+          </details>
 
           {parsedXer && (
             <div className="mt-4 space-y-3">

@@ -1013,3 +1013,27 @@ export function summarizeSubcontractPortfolio(
     futureDatedItemCount: computed.reduce((sum, p) => sum + p.futureDatedItemCount, 0),
   };
 }
+
+
+/** Unit conversion of F6's resolved activity BAC; no parallel budget/rate inference. */
+export function quoteActivityProgressRate(
+  plannedQuantity: number | null | undefined,
+  activityCost: { bac: number; bacSource: string } | null | undefined,
+): number | null {
+  if (!activityCost || activityCost.bacSource === 'unavailable'
+      || !Number.isFinite(activityCost.bac) || activityCost.bac < 0
+      || typeof plannedQuantity !== 'number' || !Number.isFinite(plannedQuantity) || plannedQuantity <= 0) return null;
+  return activityCost.bac / plannedQuantity;
+}
+
+export function quoteProgressValue(quantity: number, unitRate: number | null): number | null {
+  return unitRate === null || !Number.isFinite(unitRate) || !Number.isFinite(quantity)
+    ? null : Math.round(quantity * unitRate);
+}
+
+/** Reject empty, malformed and impossible calendar dates before a daily record is written. */
+export function isValidProgressDate(value: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const date = new Date(`${value}T00:00:00Z`);
+  return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value;
+}

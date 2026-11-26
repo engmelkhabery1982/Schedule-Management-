@@ -1,0 +1,24 @@
+import './node-loader.mjs';
+import assert from 'node:assert/strict';
+import { activitiesToMsProjectXml, activitiesToCsv, generateXer, downloadXer } from '../../src/lib/xerExporter.ts';
+import { fixture, read } from './fixture.mjs';
+const state=read(fixture(['alpha']));
+const activity={...state.activities[0],name:'QA & <test> "مرحبا"',code:'A&1'};
+const xml=activitiesToMsProjectXml([activity],'Project & <QA>');
+assert.match(xml, /<Project xmlns="http:\/\/schemas.microsoft.com\/project">/);
+assert.match(xml, /<Name>Project &amp; &lt;QA&gt;<\/Name>/);
+assert.match(xml, /QA &amp; &lt;test&gt; &quot;مرحبا&quot;/);
+assert.match(xml, /<Start>2026-09-01T08:00:00<\/Start>/);
+assert.match(xml, /<Duration>PT40H0M0S<\/Duration>/);
+assert.match(xml, /<\/Project>$/);
+assert.match(activitiesToCsv([activity]), /"QA & <test> ""مرحبا"""/);
+assert.match(generateXer({project:state.projects[0],activities:[activity],links:[],wbsNodes:state.wbs_nodes,resources:[],activityResources:[]}), /%T\tTASK/);
+const undated=activitiesToMsProjectXml([{...activity,early_start:null,early_finish:null}],'No dates');
+assert.ok(!undated.includes('<Start>') && !undated.includes('<Finish>'), 'Missing dates must be omitted, not invalid T08:00:00');
+// Capture actual browser download request, not a saved file / successful native dialog.
+let blob, clicked=false, revoked=false;
+globalThis.URL={createObjectURL(value){blob=value;return 'blob:qa';},revokeObjectURL(){revoked=true;}};
+globalThis.document={createElement(){return {click(){clicked=true;}};},body:{appendChild(){},removeChild(){}}};
+downloadXer(xml,'Synthetic_Schedule.xml');
+assert.equal(blob.type,'application/xml;charset=utf-8'); assert.equal(await blob.text(),xml); assert.ok(clicked && revoked);
+console.log('Export content: 12/12 passed; XML/CSV/XER content and download-request only, NOT a saved XML/PDF.');

@@ -54,3 +54,50 @@ input[type="range"]::-webkit-slider-thumb {
   border: 2px solid white;
   box-shadow: 0 1px 3px rgba(0,0,0,0.2);
 }
+
+
+/* Executive-only print isolation (HOST-reviewed shell correction). */
+@media print {
+  body:has(.executive-report-print) aside,
+  body:has(.executive-report-print) main > header {
+    display: none !important;
+  }
+
+  body:has(.executive-report-print) main {
+    margin: 0 !important;
+    padding: 0 !important;
+    min-height: 0 !important;
+  }
+
+  .executive-report-print {
+    width: 100%;
+    color: #0f172a;
+  }
+
+  /* Only the S-curve card is kept together, not the report or its tables.
+     No forced page break or fixed card height: if a card exceeds a printable
+     page, the browser can relax avoidance and fragment without clipping it. */
+  .executive-report-print .executive-report-scurve {
+    break-inside: avoid-page;
+    page-break-inside: avoid;
+    height: auto;
+    overflow: visible;
+  }
+
+  .executive-report-print .executive-report-scurve h3 {
+    break-after: avoid-page;
+    page-break-after: avoid;
+  }
+
+  /* The plotted SVG (not its icon SVGs) retains its full viewBox. This bounds
+     chart height in print without hiding labels, legends or data points. */
+  .executive-report-print .executive-report-scurve svg.select-none {
+    width: 100%;
+    height: auto;
+    max-height: 72mm;
+  }
+
+  .executive-report-print .executive-report-scurve .overflow-x-auto {
+    overflow: visible !important;
+  }
+}

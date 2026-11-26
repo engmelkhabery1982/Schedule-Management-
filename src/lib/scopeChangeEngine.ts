@@ -133,3 +133,49 @@ export function calculateScopeSummary(
 export function isPendingVariationOrderStatus(status: VariationOrderStatus): boolean {
   return PENDING_STATUSES.has(status);
 }
+
+/** Read-only evidence bridge. Associations are context, never additional cost postings.
+ * Existing claims have no source revision/Data Date: quote the record but refuse a current
+ * measurement or entitlement inference. An exact ID is required; free text is never parsed.
+ */
+export function buildVoImpactEvidence(input: {
+  projectId: string;
+  order: VariationOrder;
+  impacts: readonly VariationOrderBoqImpact[];
+  activityLinks: readonly import('@/types').VariationOrderActivityLink[];
+  wbsLinks: readonly import('@/types').VariationOrderWbsLink[];
+  transactions: readonly import('@/types').CostTransaction[];
+  claims: readonly import('@/types').DelayClaimEvent[];
+}) {
+  const { projectId, order } = input;
+  if (order.project_id !== projectId) throw new Error('Cross-project VO evidence refused');
+  const belongs = (row: { project_id: string; variation_order_id: string }) =>
+    row.project_id === projectId && row.variation_order_id === order.id;
+  const quantityRows = input.impacts.filter(belongs);
+  const activities = input.activityLinks.filter(belongs);
+  const wbs = input.wbsLinks.filter(belongs);
+  const boqIds = new Set(quantityRows.map(row => row.boq_item_id));
+  const activityIds = new Set(activities.map(row => row.activity_id));
+  const wbsIds = new Set(wbs.map(row => row.wbs_node_id));
+  const costContext = input.transactions.filter(row => row.project_id === projectId &&
+    ((row.boq_item_id != null && boqIds.has(row.boq_item_id)) ||
+     (row.activity_id != null && activityIds.has(row.activity_id)) ||
+     (row.wbs_node_id != null && wbsIds.has(row.wbs_node_id))));
+  const analysis = input.claims.find(row => row.project_id === projectId &&
+    row.id === order.schedule_impact_reference) ?? null;
+  return {
+    order, quantityRows, activities, wbs,
+    classification: order.status === 'approved' ? 'approved' : PENDING_STATUSES.has(order.status) ? 'pending' : 'excluded',
+    directValue: quantityRows.length ? sumKnownImpacts(quantityRows.map(row => row.value_impact)) : null,
+    costContext,
+    costEvidenceStatus: costContext.length ? 'related-context-not-attributed' : 'unavailable',
+    enteredScheduleDays: order.schedule_impact_days,
+    analysis,
+    analysisFreshness: analysis ? 'unverified' : 'unavailable',
+    measuredScheduleDays: null,
+    approvedScheduleDays: null,
+    approvalComplete: order.status === 'approved' && Boolean(order.approved_by && order.approval_date &&
+      order.approval_reference && order.approval_evidence_reference),
+    scheduleAggregation: 'unavailable-potential-overlap',
+  } as const;
+}
